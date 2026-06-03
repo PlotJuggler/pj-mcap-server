@@ -1,0 +1,614 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PJ Cloud Connector — Overview</title>
+<style>
+:root {
+  --fg: #1d1d1f;
+  --fg-muted: #55555c;
+  --bg: #ffffff;
+  --accent: #2f5a8c;
+  --accent-soft: #eaf1f8;
+  --rule: #dcdce0;
+  --code-bg: #f5f5f7;
+  --code-border: #e4e4e7;
+  --table-stripe: #fafafb;
+  --ok: #2e7d4f;
+  --ok-bg: #eaf6ef;
+  --warn: #9a6a00;
+  --warn-bg: #fbf3e0;
+  --note: #2f5a8c;
+  --note-bg: #eaf1f8;
+}
+* { box-sizing: border-box; }
+html { font-size: 16px; -webkit-font-smoothing: antialiased; scroll-behavior: smooth; }
+body {
+  font-family: -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  color: var(--fg);
+  background: var(--bg);
+  line-height: 1.6;
+  max-width: 900px;
+  margin: 0 auto;
+  padding: 2.5rem 1.5rem 5rem;
+}
+h1 {
+  font-size: 2.1rem;
+  font-weight: 700;
+  letter-spacing: -0.015em;
+  margin: 0 0 0.4rem 0;
+  line-height: 1.2;
+}
+.subtitle { color: var(--fg-muted); font-size: 1.1rem; margin: 0 0 1.4rem 0; }
+h2 {
+  font-size: 1.5rem;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  margin: 2.8rem 0 0.9rem 0;
+  padding-bottom: 0.4rem;
+  border-bottom: 2px solid var(--fg);
+}
+h3 { font-size: 1.18rem; font-weight: 650; margin: 1.8rem 0 0.5rem 0; }
+p, ul, ol { margin: 0.6rem 0 0.9rem 0; }
+ul, ol { padding-left: 1.4rem; }
+li { margin: 0.3rem 0; }
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+strong { font-weight: 650; }
+hr { border: none; border-top: 1px solid var(--rule); margin: 2rem 0; }
+code {
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+  font-size: 0.86em;
+  background: var(--code-bg);
+  border: 1px solid var(--code-border);
+  border-radius: 3px;
+  padding: 0.05em 0.35em;
+}
+table {
+  border-collapse: collapse;
+  width: 100%;
+  margin: 1rem 0;
+  font-size: 0.94rem;
+}
+th, td { padding: 0.55rem 0.7rem; text-align: left; border: 1px solid var(--rule); vertical-align: top; }
+thead th { background: var(--code-bg); font-weight: 650; }
+tbody tr:nth-child(even) { background: var(--table-stripe); }
+
+/* Header metadata card */
+.meta {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 0.2rem 1.2rem;
+  background: var(--accent-soft);
+  border: 1px solid var(--rule);
+  border-radius: 8px;
+  padding: 1rem 1.2rem;
+  margin: 0 0 1.6rem 0;
+  font-size: 0.95rem;
+}
+.meta dt { color: var(--fg-muted); font-weight: 600; }
+.meta dd { margin: 0; }
+
+/* Table of contents */
+nav.toc {
+  background: var(--code-bg);
+  border: 1px solid var(--rule);
+  border-radius: 8px;
+  padding: 1rem 1.4rem;
+  margin: 1.6rem 0;
+}
+nav.toc strong { display: block; margin-bottom: 0.4rem; }
+nav.toc ol { margin: 0; columns: 2; column-gap: 2rem; }
+nav.toc li { margin: 0.22rem 0; }
+@media (max-width: 640px) { nav.toc ol { columns: 1; } }
+
+/* Callout boxes */
+.box { border-radius: 8px; padding: 0.8rem 1.1rem; margin: 1.1rem 0; border: 1px solid; }
+.box p:first-child { margin-top: 0; }
+.box p:last-child { margin-bottom: 0; }
+.box .tag { font-weight: 700; font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.04em; display: block; margin-bottom: 0.3rem; }
+.box.note { background: var(--note-bg); border-color: #c4d6ea; }
+.box.note .tag { color: var(--note); }
+.box.ok { background: var(--ok-bg); border-color: #bfe3cd; }
+.box.ok .tag { color: var(--ok); }
+.box.warn { background: var(--warn-bg); border-color: #ecd9a8; }
+.box.warn .tag { color: var(--warn); }
+
+/* Diagrams */
+.diagram { margin: 1.4rem 0; text-align: center; }
+.diagram .mermaid { display: block; }
+.caption { color: var(--fg-muted); font-size: 0.88rem; margin-top: 0.4rem; font-style: italic; }
+
+/* "At a glance" key-number grid */
+.facts { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 0.8rem; margin: 1.2rem 0; }
+.fact { background: var(--code-bg); border: 1px solid var(--rule); border-radius: 8px; padding: 0.8rem 0.9rem; }
+.fact .n { font-size: 1.25rem; font-weight: 700; color: var(--accent); display: block; }
+.fact .l { font-size: 0.82rem; color: var(--fg-muted); }
+
+.pill { display: inline-block; font-size: 0.75rem; font-weight: 650; padding: 0.08em 0.5em; border-radius: 10px; background: var(--accent-soft); color: var(--accent); border: 1px solid #c4d6ea; }
+.pill.dex { background: #eef3e9; color: #4a6a2e; border-color: #cfe0bd; }
+.pill.asen { background: #f3eef6; color: #6a3e7a; border-color: #ddc9e6; }
+
+footer { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid var(--rule); color: var(--fg-muted); font-size: 0.85rem; }
+
+@media print {
+  html { font-size: 11pt; }
+  body { max-width: none; }
+  nav.toc { break-inside: avoid; }
+  h2 { break-after: avoid; }
+  .box, table, .diagram { break-inside: avoid; }
+}
+</style>
+</head>
+<body>
+
+<h1>PlotJuggler Cloud Connector</h1>
+<p class="subtitle">One system that streams recordings from cloud storage to PlotJuggler, on demand — built once, used for two customer engagements.</p>
+
+<dl class="meta">
+  <dt>Date</dt><dd>3 June 2026</dd>
+  <dt>Status</dt><dd>Design and implementation plan complete. Implementation not yet started.</dd>
+  <dt>Engagements</dt><dd><span class="pill dex">Dexory · AWS S3</span> &nbsp; <span class="pill asen">Asensus Surgical · Google Cloud Storage</span></dd>
+  <dt>Audience</dt><dd>This page is a readable overview for people. The detailed plans live in the Markdown files next to it (those are written for the engineering AI agents that will build the system).</dd>
+</dl>
+
+<nav class="toc">
+  <strong>Contents</strong>
+  <ol>
+    <li><a href="#goals">Goals and the core idea</a></li>
+    <li><a href="#experience">What a user does</a></li>
+    <li><a href="#architecture">Architecture</a></li>
+    <li><a href="#seams">The two seams that keep it one codebase</a></li>
+    <li><a href="#streaming">How streaming works</a></li>
+    <li><a href="#catalog">Catalog, search, and indexing</a></li>
+    <li><a href="#specs">Specifications at a glance</a></li>
+    <li><a href="#cache">Re-opening without re-downloading</a></li>
+    <li><a href="#deploy">Deployment</a></li>
+    <li><a href="#plan">Implementation plan</a></li>
+    <li><a href="#testing">Testing strategy</a></li>
+    <li><a href="#status">Status and open items</a></li>
+  </ol>
+</nav>
+
+<h2 id="goals">1. Goals and the core idea</h2>
+
+<p>Today, engineers who want to inspect a recording first download the entire log file from cloud
+storage, then open it locally. The files are large, so this is slow and wasteful — most of the
+time only a few signals over a short window are actually needed.</p>
+
+<p>The Cloud Connector removes that step. A user connects PlotJuggler to a server, browses the
+available recordings, picks exactly the files, topics, and time range they care about, and the
+server streams only that selection back. The data appears in PlotJuggler without ever saving a
+full file to disk.</p>
+
+<p>Two customers need essentially the same product, differing only in <em>where the files live</em>
+and <em>how access is authorized</em>:</p>
+
+<ul>
+  <li><span class="pill dex">Dexory</span> stores recordings in <strong>AWS S3</strong> and self-hosts a single server binary.</li>
+  <li><span class="pill asen">Asensus Surgical</span> stores recordings in <strong>Google Cloud Storage</strong> and runs the server on a Google Compute Engine virtual machine. They also need to search recordings by metadata such as robot identifier, procedure date, and operator.</li>
+</ul>
+
+<div class="box ok">
+  <span class="tag">The core idea</span>
+  <p>About 70% of the work — the network protocol, the catalog, the indexer, the streaming engine,
+  the entire client library, and the test harness — does not depend on the storage provider or the
+  file format. That part is written <strong>once</strong>. It touches storage through one small
+  interface and recordings through one small interface, so it never needs to know whether the bytes
+  came from S3 or from Google Cloud Storage.</p>
+  <p>The extra cost of serving the <em>second</em> customer is roughly <strong>8–12%</strong>: a
+  Google Cloud Storage backend, a credential setup, an added test dimension, a deployment guide, and
+  one optional file-browser view. Each deployment is configured, never forked into a separate
+  codebase.</p>
+</div>
+
+<div class="facts">
+  <div class="fact"><span class="n">~70%</span><span class="l">shared, storage-independent code</span></div>
+  <div class="fact"><span class="n">~8–12%</span><span class="l">extra cost for the second customer</span></div>
+  <div class="fact"><span class="n">1</span><span class="l">Go server binary</span></div>
+  <div class="fact"><span class="n">1</span><span class="l">shared C++ client core</span></div>
+  <div class="fact"><span class="n">2</span><span class="l">storage backends behind one interface</span></div>
+</div>
+
+<h2 id="experience">2. What a user does</h2>
+
+<p>From the user's point of view the flow is short and the same on both clients (the command-line
+tool used for validation, and the PlotJuggler plugin that ships later):</p>
+
+<div class="diagram">
+<pre class="mermaid">
+flowchart LR
+  A["Open PlotJuggler<br/>or the command-line tool"] --> B["Connect to a<br/>cloud server address"]
+  B --> C["Browse and search<br/>recordings by name,<br/>date, and metadata"]
+  C --> D["Select files, topics,<br/>and a time range"]
+  D --> E["Stream that exact<br/>selection over one<br/>secure connection"]
+  E --> F["Signals appear<br/>in PlotJuggler"]
+</pre>
+<div class="caption">The end-to-end user flow. Nothing is saved to disk as a separate file; the data is reconstructed in memory.</div>
+</div>
+
+<h2 id="architecture">3. Architecture</h2>
+
+<p>There are two halves: a <strong>server</strong> written in Go, and a <strong>client</strong>
+written in C++. They talk to each other over a single secure WebSocket connection. The server reads
+the recordings from cloud storage and forwards the selected data to the client.</p>
+
+<div class="diagram">
+<pre class="mermaid">
+flowchart LR
+  subgraph Client["Client — one shared C++ core"]
+    PJ["PlotJuggler 4 plugin"]
+    CLI["Command-line tool"]
+    CORE["client-core<br/>protocol · decompress · cache"]
+    PJ --> CORE
+    CLI --> CORE
+  end
+  subgraph Server["Server — one Go binary"]
+    direction TB
+    WS["WebSocket endpoint"]
+    CAT["Catalog<br/>(list / search)"]
+    SES["Session<br/>(streaming)"]
+    IDX["Indexer<br/>(background scan)"]
+    DASH["Dashboard · health · metrics"]
+    WS --> CAT
+    WS --> SES
+    IDX --> CAT
+  end
+  subgraph Storage["Storage — one BlobStore interface"]
+    S3[("AWS S3")]
+    GCS[("Google Cloud Storage")]
+  end
+  CORE -- "wss:// + Protobuf" --> WS
+  SES -- "ranged reads" --> S3
+  SES -- "ranged reads" --> GCS
+  IDX --> S3
+  IDX --> GCS
+</pre>
+<div class="caption">The server is a single process. The storage box is the seam where S3 and Google Cloud Storage plug in interchangeably.</div>
+</div>
+
+<h3>The server</h3>
+<p>The server is one self-contained Go binary listening on one network port. Inside it, a few
+cooperating parts share that port:</p>
+<ul>
+  <li><strong>Catalog</strong> — answers requests to list and search recordings. It reads from a local SQLite database (using a pure-Go driver, so there is no C dependency to compile).</li>
+  <li><strong>Session</strong> — does the actual streaming. It reads the needed pieces of each file from storage and sends them to the client in batches.</li>
+  <li><strong>Indexer</strong> — runs in the background, periodically scanning storage for new or changed recordings and updating the catalog.</li>
+  <li><strong>Dashboard, health, and metrics</strong> — a read-only status page plus standard health and monitoring endpoints.</li>
+</ul>
+
+<h3>The client</h3>
+<p>The client is built around <strong>client-core</strong>, a C++ library that handles the
+connection, the protocol, and decompression. It is deliberately free of any user-interface toolkit
+so the same library can be used in three places without change:</p>
+<ul>
+  <li>a <strong>command-line tool</strong> used to prove the system reconstructs data correctly;</li>
+  <li>a <strong>PlotJuggler 4 plugin</strong> (delivered in the second milestone) with a graphical browse-and-select dialog;</li>
+  <li>a <strong>browser version</strong> for Dexory, compiled to WebAssembly (a preview, not a contractual feature).</li>
+</ul>
+
+<div class="box note">
+  <span class="tag">Important design choice</span>
+  <p>The connector does not interpret the contents of messages. It passes each raw message to
+  PlotJuggler's existing message-parser plugins (for ROS, Protobuf, and JSON-Schema), which already
+  know how to turn messages into numeric series. This keeps the connector small and means it ships
+  no format-specific decoders of its own.</p>
+</div>
+
+<h2 id="seams">4. The two seams that keep it one codebase</h2>
+
+<p>"Seam" here means a small, well-defined boundary where one implementation can be swapped for
+another. The whole "build once, serve two customers" approach rests on a handful of these. The two
+that matter most:</p>
+
+<table>
+  <thead><tr><th>Seam</th><th>What it hides</th><th>Dexory</th><th>Asensus</th></tr></thead>
+  <tbody>
+    <tr>
+      <td><strong>BlobStore</strong><br/>(storage)</td>
+      <td>Reading a byte range from an object, getting its size, and listing objects. Errors are normalized to two kinds: temporary (retry) and permanent (fail).</td>
+      <td>An S3 implementation over the AWS SDK.</td>
+      <td>A Google Cloud Storage implementation. Same interface, same behavior.</td>
+    </tr>
+    <tr>
+      <td><strong>Authentication</strong><br/>(two independent parts)</td>
+      <td>(a) Proving the client may talk to the server. (b) Proving the server may read the storage bucket. The two are kept separate on purpose.</td>
+      <td>(a) A shared bearer token. (b) Standard AWS credentials.</td>
+      <td>(a) The same shared bearer token. (b) A server-owned Google identity (Workload Identity), with no key stored on disk.</td>
+    </tr>
+    <tr>
+      <td><strong>FormatCodec</strong><br/>(recording format)</td>
+      <td>Reading a recording's summary, planning which chunks to fetch, and iterating its messages.</td>
+      <td colspan="2">One MCAP implementation, shared by both. A future format would be a new implementation behind the same interface — there is no plugin system in version 1, by deliberate choice.</td>
+    </tr>
+  </tbody>
+</table>
+
+<p>A strict rule enforces this separation: only the storage package is allowed to reference a cloud
+provider's SDK, and only the MCAP package is allowed to reference the MCAP library. A check in the
+build fails if anything else does. This is what prevents the single codebase from quietly drifting
+into two.</p>
+
+<h2 id="streaming">5. How streaming works</h2>
+
+<p>The streaming model is a <strong>bounded bulk download, sent as fast as the network and storage
+allow</strong>. It is not paced playback. The client commits up front to a precise selection — a set
+of files, a set of topics, and a time range — and the server plans the whole transfer and sends it.</p>
+
+<p>Everything travels over <strong>one</strong> WebSocket connection. Catalog requests and the data
+stream share that single connection, wrapped in a Protobuf envelope that says what each message is.
+A useful property of the protocol: it carries <strong>no</strong> storage-specific fields at all,
+which is part of why the storage provider stays invisible to the client.</p>
+
+<div class="diagram">
+<pre class="mermaid">
+sequenceDiagram
+  autonumber
+  participant C as Client
+  participant S as Server
+  participant B as Storage (S3 / GCS)
+  C->>S: Hello (protocol version + token)
+  S-->>C: HelloResponse (capabilities)
+  C->>S: ListFiles (filter by time, topics, metadata)
+  S-->>C: list of recordings + metadata
+  C->>S: OpenFresh (file ids, topics, time range)
+  S-->>C: SessionAck (estimated size + message count)
+  loop until the whole selection is sent
+    S->>B: ranged reads of the needed chunks
+    B-->>S: chunk bytes
+    S-->>C: MessageBatch (compressed)
+    C-->>S: acknowledge progress
+  end
+  S-->>C: End of stream (COMPLETE)
+</pre>
+<div class="caption">A full session. The server gives a size estimate before sending, so the client can show an accurate progress bar.</div>
+</div>
+
+<h3>Stitching several recordings into one</h3>
+<p>A common case is selecting three or more consecutive recordings and viewing them as a single
+continuous session — one time range, the combined set of topics, one ordered stream. The server does
+this joining; the client simply asks for the set of files and receives one stream.</p>
+
+<h3>Resuming after a dropped connection</h3>
+<p>If the network drops mid-transfer, the client can reconnect and continue from where it left off,
+as long as it returns within a short retention window. The server keeps a bounded buffer of recent
+data for exactly this purpose. If the window has passed, the server says so clearly and the client
+simply starts the selection over.</p>
+
+<div class="diagram">
+<pre class="mermaid">
+stateDiagram-v2
+  [*] --> Streaming
+  Streaming --> Disconnected: network drop
+  Disconnected --> Resumed: reconnect within the retention window
+  Resumed --> Streaming: continue from last acknowledged point
+  Disconnected --> Expired: window elapsed
+  Expired --> Streaming: client restarts the selection
+  Streaming --> [*]: End of stream (COMPLETE)
+</pre>
+<div class="caption">Resume after a drop. The client can also cancel mid-stream at any time; the server stops and discards the buffer.</div>
+</div>
+
+<h2 id="catalog">6. Catalog, search, and indexing</h2>
+
+<p>The catalog is a small SQLite database holding one row per recording, plus its topics and its
+tags. Tags can be edited; an edited tag takes precedence over the value read from the file, through a
+simple "override wins" view.</p>
+
+<p>The <strong>indexer</strong> keeps the catalog current. On a schedule (every few minutes by
+default) it lists storage and detects changes by comparing each object's identity, size, and
+last-modified time. For new or changed recordings it reads the file's summary and records its topics
+and embedded metadata.</p>
+
+<div class="box note">
+  <span class="tag">Where search metadata comes from</span>
+  <p>Asensus's search by robot identifier, procedure date, and operator is powered by metadata stored
+  <em>inside</em> each MCAP recording (its footer), read during indexing. The system does not rely on
+  storage-level custom metadata. This keeps S3 and Google Cloud Storage behaving identically and
+  avoids an extra storage call.</p>
+</div>
+
+<h2 id="specs">7. Specifications at a glance</h2>
+
+<table>
+  <thead><tr><th>Area</th><th>Specification</th></tr></thead>
+  <tbody>
+    <tr><td>Transport</td><td>One secure WebSocket per client; all traffic wrapped in a Protobuf envelope.</td></tr>
+    <tr><td>Streaming model</td><td>Bounded bulk download of a committed selection, sent as fast as possible (not paced playback).</td></tr>
+    <tr><td>Compression</td><td>Per-message compression (ZSTD / LZ4) above a size threshold.</td></tr>
+    <tr><td>Resume buffer</td><td>Recent data retained (256 batches or 64 MB) to support reconnect.</td></tr>
+    <tr><td>Resume window</td><td>A session is held for about 60 seconds after a disconnect.</td></tr>
+    <tr><td>Indexer poll</td><td>Every 5 minutes by default; change detection on identity + size + last-modified.</td></tr>
+    <tr><td>Database</td><td>SQLite with write-ahead logging, a single writer, pure-Go driver (no C compiler needed).</td></tr>
+    <tr><td>Correctness gate</td><td>A reconstructed recording must match the original message-for-message on topic, timestamps, payload, and schema.</td></tr>
+    <tr><td>Throughput gate</td><td>At least 200 MB/s sustained on a defined reference machine, enforced as a regression check.</td></tr>
+    <tr><td>Concurrency</td><td>Single server instance in version 1; a configurable limit on simultaneous sessions (default 16).</td></tr>
+  </tbody>
+</table>
+
+<h2 id="cache">8. Re-opening without re-downloading</h2>
+
+<p>Within a running client session, re-opening the exact same selection is served from memory — no
+second download, and the server sees no new session. The cache key is the selection itself (server
+address, files, topics, time range). Only completed downloads are cached; a cancelled or failed one
+leaves nothing behind.</p>
+
+<div class="box warn">
+  <span class="tag">A deliberate limit</span>
+  <p>This cache lives in memory only. It speeds up repeated access <em>during one running session</em>.
+  After PlotJuggler is restarted, or for a different engineer, the data is fetched again. Persistent,
+  cross-restart caching is intentionally out of version 1. For Asensus this is the one place the
+  wording of their statement of work needs confirming — long-term caching is meant to be handled by
+  their separate disk-cache task, which this connector can integrate with later.</p>
+</div>
+
+<h2 id="deploy">9. Deployment</h2>
+
+<p>Both customers run the server as a <strong>single long-lived container or process</strong>.
+Dexory self-hosts it. Asensus runs it on a Google Compute Engine virtual machine, using a
+machine-attached identity (so no credential file sits on disk) and a persistent disk for the catalog
+database.</p>
+
+<div class="box note">
+  <span class="tag">Why not a serverless platform (Cloud Run)</span>
+  <p>The server holds live state in memory: the set of active sessions, the resume buffer, the
+  short window during which a dropped client can reconnect, and the always-on background indexer. A
+  scale-to-zero, request-scoped serverless platform breaks all four. Version 1 is therefore a single
+  always-on instance. A serverless mode would be a separate, paid follow-on if it is ever required.</p>
+</div>
+
+<h2 id="plan">10. Implementation plan</h2>
+
+<p>The work is organized as shared milestones plus thin per-customer milestones. The shared parts are
+built first and only once; the customer-specific parts attach to them.</p>
+
+<div class="diagram">
+<pre class="mermaid">
+flowchart TB
+  M0["M0 · Pin the shared surface<br/>protocol, seams, config, CI"]
+  M1a["M1a · S3 + MCAP<br/>server core"]
+  M1b["M1b · Google Cloud Storage<br/>backend (Asensus-funded)"]
+  M1c["M1c · client core + tool<br/>round-trip proof"]
+  M2a["M2a · hardening, deploy,<br/>throughput gate"]
+  M2b["M2b · PlotJuggler 4 plugin"]
+  M2cD["M2c-DEX · Dexory deploy<br/>+ browser preview"]
+  M2cA["M2c-ASEN · GCE guide,<br/>identity, file browser"]
+  M0 --> M1a --> M1b
+  M1a --> M1c
+  M1b --> M1c
+  M1c --> M2a --> M2b
+  M2b --> M2cD
+  M2b --> M2cA
+  M2a --> M2cA
+  M1b --> M2cA
+  classDef dex fill:#eef3e9,stroke:#cfe0bd,color:#3c5424;
+  classDef asen fill:#f3eef6,stroke:#ddc9e6,color:#5a3468;
+  class M1c,M2cD dex;
+  class M1b,M2cA asen;
+</pre>
+<div class="caption">Milestone dependencies. Green = Dexory-facing, purple = Asensus-funded or Asensus-facing, grey = shared.</div>
+</div>
+
+<div class="diagram">
+<pre class="mermaid">
+gantt
+  title Effort estimate (sequencing, not a fixed calendar)
+  dateFormat YYYY-MM-DD
+  axisFormat %b %d
+  section Shared core
+  M0 pin shared surface      :m0,  2026-06-15, 8d
+  M1a S3 + MCAP core         :m1a, after m0, 20d
+  section Per-backend
+  M1b Google Cloud Storage   :m1b, after m1a, 8d
+  section Client + proof
+  M1c client core + tool     :m1c, after m1a, 15d
+  section Milestone 2
+  M2a hardening + deploy      :m2a, after m1c, 15d
+  M2b PlotJuggler plugin      :m2b, after m2a, 13d
+  M2c-DEX Dexory + preview    :m2cd, after m2b, 5d
+  M2c-ASEN GCE + browser      :m2ca, after m2b, 8d
+</pre>
+<div class="caption">Durations are effort estimates. They show order and relative size, not committed dates.</div>
+</div>
+
+<h3>What each milestone delivers</h3>
+<table>
+  <thead><tr><th>Milestone</th><th>Delivers</th></tr></thead>
+  <tbody>
+    <tr><td><strong>M0</strong></td><td>The expensive-to-change shared surface: the wire protocol, the seam interfaces, the storage configuration, and a continuous-integration setup that already tests both S3 and Google Cloud Storage.</td></tr>
+    <tr><td><strong>M1a</strong> <span class="pill dex">Dexory</span></td><td>The shared Go server core behind the seams, with S3 and MCAP wired first so Dexory's first milestone can ship: catalog, indexer, streaming with stitching and resume, dashboard, metrics.</td></tr>
+    <tr><td><strong>M1b</strong> <span class="pill asen">Asensus</span></td><td>The Google Cloud Storage backend behind the same interface, in the same phase as S3 (not deferred). The full component test suite runs on both backends.</td></tr>
+    <tr><td><strong>M1c</strong> <span class="pill dex">Dexory</span></td><td>The client library and command-line tool, proving a lossless round trip on both backends. This is the core of Dexory's first milestone.</td></tr>
+    <tr><td><strong>M2a</strong></td><td>Production hardening, shared deployment artifacts, and the throughput regression gate.</td></tr>
+    <tr><td><strong>M2b</strong></td><td>The PlotJuggler 4 plugin, reusing an existing browse-and-select dialog and swapping in the new transport and ingest. The same work serves both Dexory's second milestone and Asensus's client deliverable.</td></tr>
+    <tr><td><strong>M2c-DEX</strong> <span class="pill dex">Dexory</span></td><td>Dexory deployment artifacts and runbook, plus the browser (WebAssembly) preview.</td></tr>
+    <tr><td><strong>M2c-ASEN</strong> <span class="pill asen">Asensus</span></td><td>The Google Compute Engine deployment guide, the storage identity setup, and an optional file-hierarchy browser view.</td></tr>
+  </tbody>
+</table>
+
+<div class="box note">
+  <span class="tag">Commercial framing</span>
+  <p>M0 + M1a + M1c form Dexory's <strong>Milestone 1</strong> (a proof of concept). Written approval
+  is required before Milestone 2 begins. M2a + M2b + M2c-DEX form Dexory's <strong>Milestone 2</strong>.
+  Asensus's incremental work is M1b plus its own triggers for the shared M2 work plus M2c-ASEN —
+  consistent with the 8–12% figure.</p>
+</div>
+
+<h3>The four engineering plans</h3>
+<p>The detailed, agent-facing plans are kept as separate Markdown documents:</p>
+<table>
+  <thead><tr><th>Plan</th><th>Scope</th><th>File</th></tr></thead>
+  <tbody>
+    <tr><td><strong>A</strong></td><td>The Go server, task by task.</td><td><code>2026-05-28-pj-cloud-server-v1.md</code></td></tr>
+    <tr><td><strong>B</strong></td><td>The C++ client library and command-line tool.</td><td><code>2026-05-28-pj-cloud-client-cpp.md</code></td></tr>
+    <tr><td><strong>C</strong></td><td>The cross-language correctness harness (round-trip comparison on both backends).</td><td><code>2026-05-28-pj-cloud-integration.md</code></td></tr>
+    <tr><td><strong>D</strong></td><td>The PlotJuggler 4 plugin.</td><td><code>2026-06-03-pj-cloud-pj4-plugin.md</code></td></tr>
+  </tbody>
+</table>
+<p>The single source of truth for the design is <code>2026-05-28-pj-cloud-connector-design.md</code>;
+the unified two-engagement plan is <code>2026-06-03-unified-cloud-connector-plan.md</code>.</p>
+
+<h2 id="testing">11. Testing strategy</h2>
+
+<p>Testing is layered, and every layer is tied to a milestone gate. Cross-backend coverage is built
+in: the same tests run against both an S3 emulator and a Google Cloud Storage emulator, and a
+failure on either backend blocks the change.</p>
+
+<table>
+  <thead><tr><th>Layer</th><th>What it checks</th><th>When it runs</th></tr></thead>
+  <tbody>
+    <tr><td><strong>Unit</strong></td><td>Individual pieces in isolation: catalog queries, indexer change detection, format reading, plan building, error normalization, protocol encoding (verified against a shared reference set in both Go and C++).</td><td>Every change.</td></tr>
+    <tr><td><strong>Component</strong></td><td>One language against live local storage emulators: full session lifecycle, cancel, resume, error injection, backpressure, and the in-memory cache — run against both S3 and Google Cloud Storage.</td><td>Every change.</td></tr>
+    <tr><td><strong>End-to-end</strong></td><td>The real server and the real client together: stream a recording out and read it back, then confirm it matches the original message-for-message. This is the version-1 release gate.</td><td>Before merging; on both backends.</td></tr>
+    <tr><td><strong>Benchmark</strong></td><td>Throughput, compression cost, behavior under a slow client, and a storage-parity check (Google Cloud Storage within ~10% of S3). Treated as a regression guard, not an open-ended target.</td><td>Nightly and on release.</td></tr>
+  </tbody>
+</table>
+
+<div class="box note">
+  <span class="tag">The headline correctness check</span>
+  <p>The release gate is message-level equality, not byte-for-byte file equality. Two valid writers
+  can produce different bytes for the same data (different chunking or ordering), so the system
+  compares the meaningful content: topic, timestamps, payload, and schema. This matches what the
+  design specification already requires.</p>
+</div>
+
+<h2 id="status">12. Status and open items</h2>
+
+<p>All the technical decisions are settled. What remains is mostly commercial — questions only the
+customers can answer.</p>
+
+<h3>Settled (decided 3 June 2026)</h3>
+<ul>
+  <li><strong>Client cache</strong> is in-memory and session-lifetime only (matches the specification; no disk caching is built).</li>
+  <li><strong>Asensus deployment</strong> is a long-lived Google Compute Engine container; the serverless option is excluded from version 1.</li>
+  <li><strong>Google Cloud Storage access</strong> uses a server-owned identity (Workload Identity), with no key on disk. Per-user access is a future extension.</li>
+  <li><strong>Search metadata</strong> comes from the MCAP file footer, not from storage-level custom metadata.</li>
+  <li><strong>Message handling</strong>: the connector forwards raw messages to PlotJuggler's existing parsers; it bundles no decoders.</li>
+  <li><strong>Format support</strong>: one interface with one MCAP implementation and a documented path to add more — no plugin system.</li>
+</ul>
+
+<h3>Open — needs the customers</h3>
+<ol>
+  <li><strong>Dexory milestone-1 scope.</strong> Tag editing and intra-file time-range selection are outside milestone 1 in the proposal. Confirm they move to milestone 2, or agree (in writing) to expand and possibly re-price milestone 1.</li>
+  <li><strong>Acceptance wording.</strong> The proposal says "byte-for-byte"; the implementation provides message-level equality (what the design specification itself defines). Confirm this satisfies the milestone-1 sign-off.</li>
+  <li><strong>Timeline versus price.</strong> The effort estimates exceed one month per milestone. Confirm whether the one-month figure applies to Dexory-funded scope only, or whether durations and price need revising.</li>
+  <li><strong>Asensus funding trigger.</strong> Asensus's main deliverables share milestone-2 work, which is gated on Dexory's approval. Define how that work is funded and triggered for Asensus independently.</li>
+  <li><strong>Cache wording for Asensus.</strong> Confirm that cross-restart, cross-user caching is owned by Asensus's separate disk-cache task, or renegotiate the relevant statement-of-work line.</li>
+  <li><strong>Reference machine.</strong> Pin the exact CPU, network, and disk for the 200 MB/s throughput gate so it is enforceable.</li>
+</ol>
+
+<footer>
+  <p>This overview is generated for human readers and summarizes the design and plan documents in this
+  folder. The Markdown files are the authoritative, detailed sources used to build the system.
+  Diagrams are rendered with Mermaid, which loads from a content-delivery network, so an internet
+  connection is needed to display them.</p>
+</footer>
+
+<script type="module">
+  import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+  mermaid.initialize({ startOnLoad: true, theme: 'neutral', securityLevel: 'loose', flowchart: { useMaxWidth: true } });
+</script>
+
+</body>
+</html>
