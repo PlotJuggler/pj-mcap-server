@@ -66,7 +66,9 @@ Editing the proposal = edit the `.md`, re-run the script, regenerate the PDF.
 A single WebSocket per client carries everything, multiplexed via a Protobuf envelope:
 catalog RPCs **and** session data streaming on one connection. Streaming is
 **bounded-horizon, as-fast-as-possible** (a bulk download with a known size), *not*
-wall-clock-paced playback. Supports reconnect-and-resume (short retain window) and
+wall-clock-paced playback. "Streaming" here means *incremental/progressive download* — bytes arrive
+in batches so the client can show already-received data while the rest downloads in the background —
+**not** real-time pacing. Supports reconnect-and-resume (short retain window) and
 cancel-mid-stream.
 
 - **Go server** — one static binary, five subsystems on one TCP listener: Catalog

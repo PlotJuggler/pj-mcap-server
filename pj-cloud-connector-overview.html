@@ -29,9 +29,13 @@ body {
   color: var(--fg);
   background: var(--bg);
   line-height: 1.6;
-  max-width: 900px;
+  max-width: 820px;
   margin: 0 auto;
   padding: 2.5rem 1.5rem 5rem;
+}
+/* On wide screens, leave room for the fixed TOC sidebar and center content in the rest. */
+@media (min-width: 1120px) {
+  body { margin-left: max(280px, calc((100% - 820px) / 2)); }
 }
 h1 {
   font-size: 2.1rem;
@@ -90,17 +94,37 @@ tbody tr:nth-child(even) { background: var(--table-stripe); }
 .meta dt { color: var(--fg-muted); font-weight: 600; }
 .meta dd { margin: 0; }
 
-/* Table of contents */
+/* Table of contents — fixed left sidebar on wide screens */
 nav.toc {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 260px;
+  height: 100vh;
+  overflow-y: auto;
   background: var(--code-bg);
-  border: 1px solid var(--rule);
-  border-radius: 8px;
-  padding: 1rem 1.4rem;
-  margin: 1.6rem 0;
+  border-right: 1px solid var(--rule);
+  padding: 1.6rem 1.3rem;
+  margin: 0;
+  font-size: 0.92rem;
 }
-nav.toc strong { display: block; margin-bottom: 0.4rem; }
-nav.toc ol { margin: 0; columns: 2; column-gap: 2rem; }
-nav.toc li { margin: 0.22rem 0; }
+nav.toc strong { display: block; margin-bottom: 0.6rem; font-size: 0.95rem; }
+nav.toc ol { margin: 0; columns: 1; padding-left: 1.1rem; }
+nav.toc li { margin: 0.34rem 0; }
+/* Below the sidebar breakpoint, the TOC returns to the normal flow as a card. */
+@media (max-width: 1119px) {
+  nav.toc {
+    position: static;
+    width: auto;
+    height: auto;
+    overflow: visible;
+    border: 1px solid var(--rule);
+    border-radius: 8px;
+    padding: 1rem 1.4rem;
+    margin: 1.6rem 0;
+  }
+  nav.toc ol { columns: 2; column-gap: 2rem; }
+}
 @media (max-width: 640px) { nav.toc ol { columns: 1; } }
 
 /* Callout boxes */
@@ -134,8 +158,9 @@ footer { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid var(--rule);
 
 @media print {
   html { font-size: 11pt; }
-  body { max-width: none; }
-  nav.toc { break-inside: avoid; }
+  body { max-width: none; margin: 0; }
+  nav.toc { position: static; width: auto; height: auto; overflow: visible; border: 1px solid var(--rule); border-radius: 8px; margin: 1.6rem 0; break-inside: avoid; }
+  nav.toc ol { columns: 2; }
   h2 { break-after: avoid; }
   .box, table, .diagram { break-inside: avoid; }
 }
@@ -153,6 +178,15 @@ footer { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid var(--rule);
   <dt>Audience</dt><dd>This page is a readable overview for people. The detailed plans live in the Markdown files next to it (those are written for the engineering AI agents that will build the system).</dd>
 </dl>
 
+<div class="box note">
+  <span class="tag">What "streaming" means here</span>
+  <p>In this project, "streaming" is a <strong>progressive bulk download</strong>, sent as fast as the
+  network and storage allow. It is not real-time playback, and it does not replay messages at their
+  original recording speed. The only reason it is called streaming is that delivery is incremental and
+  the interface never blocks: PlotJuggler shows and plots the part that has already arrived while the
+  rest keeps downloading in the background.</p>
+</div>
+
 <nav class="toc">
   <strong>Contents</strong>
   <ol>
@@ -160,7 +194,7 @@ footer { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid var(--rule);
     <li><a href="#experience">What a user does</a></li>
     <li><a href="#architecture">Architecture</a></li>
     <li><a href="#seams">The two seams that keep it one codebase</a></li>
-    <li><a href="#streaming">How streaming works</a></li>
+    <li><a href="#streaming">How streaming works (the bulk download)</a></li>
     <li><a href="#catalog">Catalog, search, and indexing</a></li>
     <li><a href="#specs">Specifications at a glance</a></li>
     <li><a href="#cache">Re-opening without re-downloading</a></li>
@@ -179,8 +213,9 @@ time only a few signals over a short window are actually needed.</p>
 
 <p>The Cloud Connector removes that step. A user connects PlotJuggler to a server, browses the
 available recordings, picks exactly the files, topics, and time range they care about, and the
-server streams only that selection back. The data appears in PlotJuggler without ever saving a
-full file to disk.</p>
+server streams only that selection back. Here "streams" means a fast incremental download, not
+real-time playback: the data appears in PlotJuggler as it arrives, without ever saving a full file
+to disk.</p>
 
 <p>Two customers need essentially the same product, differing only in <em>where the files live</em>
 and <em>how access is authorized</em>:</p>
@@ -330,11 +365,16 @@ provider's SDK, and only the MCAP package is allowed to reference the MCAP libra
 build fails if anything else does. This is what prevents the single codebase from quietly drifting
 into two.</p>
 
-<h2 id="streaming">5. How streaming works</h2>
+<h2 id="streaming">5. How streaming works (the bulk download)</h2>
 
-<p>The streaming model is a <strong>bounded bulk download, sent as fast as the network and storage
-allow</strong>. It is not paced playback. The client commits up front to a precise selection — a set
-of files, a set of topics, and a time range — and the server plans the whole transfer and sends it.</p>
+<p>What this system calls "streaming" is a <strong>bounded bulk download, sent as fast as the network
+and storage allow</strong>. It is not paced playback, and it never replays the recording at its
+original speed. The client commits up front to a precise selection — a set
+of files, a set of topics, and a time range — and the server plans the whole transfer and sends it.
+The word "streaming" here means only that the data is delivered <strong>progressively</strong>: it
+arrives in batches, and PlotJuggler shows the part that has already arrived while the rest keeps
+downloading in the background. The interface stays responsive throughout — there is no frozen window
+waiting for a large transfer to finish, and no attempt to replay the recording at its original speed.</p>
 
 <p>Everything travels over <strong>one</strong> WebSocket connection. Catalog requests and the data
 stream share that single connection, wrapped in a Protobuf envelope that says what each message is.
@@ -369,6 +409,15 @@ sequenceDiagram
 <p>A common case is selecting three or more consecutive recordings and viewing them as a single
 continuous session — one time range, the combined set of topics, one ordered stream. The server does
 this joining; the client simply asks for the set of files and receives one stream.</p>
+
+<h3>Compression makes the download fast</h3>
+<p>Each batch is compressed before it is sent: the server groups a batch's messages together and
+compresses the whole group as one block (using ZSTD). Doing this per batch — rather than one message at
+a time — matters because robotics logs are dominated by many small, repetitive messages (for example a
+transform topic at a high rate). Compressing them together shrinks them far more than compressing each
+one alone, and it uses less processing on both ends. The compression is independent of how the source
+files happened to be stored. Each batch is compressed on its own, which is also what lets a dropped
+connection resume cleanly from the last completed batch.</p>
 
 <h3>Resuming after a dropped connection</h3>
 <p>If the network drops mid-transfer, the client can reconnect and continue from where it left off,
@@ -416,7 +465,7 @@ and embedded metadata.</p>
   <tbody>
     <tr><td>Transport</td><td>One secure WebSocket per client; all traffic wrapped in a Protobuf envelope.</td></tr>
     <tr><td>Streaming model</td><td>Bounded bulk download of a committed selection, sent as fast as possible (not paced playback).</td></tr>
-    <tr><td>Compression</td><td>Per-message compression (ZSTD / LZ4) above a size threshold.</td></tr>
+    <tr><td>Compression</td><td>Batch-level compression: each batch is compressed as one ZSTD frame (one-shot), so even high-rate small messages shrink. Independent of how the source files were stored.</td></tr>
     <tr><td>Resume buffer</td><td>Recent data retained (256 batches or 64 MB) to support reconnect.</td></tr>
     <tr><td>Resume window</td><td>A session is held for about 60 seconds after a disconnect.</td></tr>
     <tr><td>Indexer poll</td><td>Every 5 minutes by default; change detection on identity + size + last-modified.</td></tr>

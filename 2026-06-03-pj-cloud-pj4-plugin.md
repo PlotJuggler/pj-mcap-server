@@ -220,7 +220,11 @@ PJ4/pj_plugins/pj_cloud/
   the lambda must be idempotent + thread-safe (the host may invoke it 0..n times per policy).
   Serialize the whole per-message host-write section under a `host_write_mu_` (lifted from
   Mosaico [C1]) because session batches may arrive on `client-core` worker threads. **Ships
-  no decoders.** On `end(COMPLETE)` call `runtimeHost().reportMessage(kInfo, ...)`; the
+  no decoders.** **Progressive-availability requirement (the reason this is called "streaming"):**
+  push each message to the host the moment its batch arrives — never buffer the whole session before
+  handing off — so PlotJuggler renders the already-downloaded portion of the selection while the
+  remaining batches keep arriving on `client-core` worker threads. This is incremental, non-blocking
+  delivery for UI responsiveness, **not** time-paced playback. On `end(COMPLETE)` call `runtimeHost().reportMessage(kInfo, ...)`; the
   FileSourceBase machine flushes on `importData()` return. **ASSUMPTION A1 (flagged):** the
   `ensureParserBinding`/`pushMessage` mapping of MCAP `schema_name/encoding` → PJ4
   `parser_encoding`/`type_name` is verified against a live PJ4 host before M2b coding (the

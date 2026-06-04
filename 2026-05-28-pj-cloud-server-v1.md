@@ -585,8 +585,14 @@ message OpenSessionResponse {
 enum PayloadEncoding {
   PAYLOAD_ENCODING_UNSPECIFIED = 0;
   PAYLOAD_ENCODING_RAW         = 1;
-  PAYLOAD_ENCODING_ZSTD        = 2;
-  PAYLOAD_ENCODING_LZ4         = 3;
+  PAYLOAD_ENCODING_ZSTD        = 2;         // body_encoding=NONE fallback path only
+  PAYLOAD_ENCODING_LZ4         = 3;         // inbound decode only; server never emits
+}
+
+enum BodyEncoding {
+  BODY_ENCODING_UNSPECIFIED = 0;            // treat as NONE; v1 server always sets explicitly
+  BODY_ENCODING_NONE        = 1;            // messages ride in `messages` (singleton/legacy)
+  BODY_ENCODING_ZSTD        = 2;            // `body` = one self-contained ZSTD frame (default)
 }
 
 message Message {
@@ -598,12 +604,17 @@ message Message {
   bytes  payload         = 6;
 }
 
+message MessageBatchBody {                  // marshaled, then compressed per MessageBatch.body_encoding
+  repeated Message messages = 1;
+}
+
 message MessageBatch {
   uint64 seq             = 1;
   uint64 source_file_id  = 2;
-  repeated Message messages = 3;
-  reserved 4;
-  reserved "body_encoding";                // future batch-level cross-message compression
+  repeated Message messages = 3;            // populated ONLY when body_encoding = NONE
+  BodyEncoding body_encoding    = 4;        // default path: ZSTD
+  uint64 body_uncompressed_size = 5;        // size of marshaled MessageBatchBody before compression
+  bytes  body                   = 6;        // compressed marshaled MessageBatchBody (default path)
 }
 
 message Progress {
@@ -5990,7 +6001,8 @@ type ProducerOpts struct {
 	MaxBatchBytes          int
 	MaxBatchAgeMs          int
 	MaxMessageBytes        int
-	CompressThresholdBytes int
+	BodyZstdLevel          int // ZSTD level for the batch-body frame (one-shot per batch); default 3
+	CompressThresholdBytes int // fallback only: per-message RAW/ZSTD on body_encoding=NONE singletons
 }
 
 // Producer is the per-session "fetch from S3 → batch → append to retain" goroutine.
@@ -6006,19 +6018,26 @@ type Producer struct {
 	OnDrop       func(reason string)
 
 	nextSeq      uint64
-	zstdEncoder  *zstd.Encoder
+	bodyEncoder  *zstd.Encoder // one-shot EncodeAll per batch body; NEVER a streaming context across flushes
 }
 
 // Run streams the plan into the retain buffer. Returns when the plan is exhausted
 // or ctx is cancelled. Blocks on RetainBuffer.Append when the retain caps are reached
 // (this is the natural backpressure for slow consumers).
 func (p *Producer) Run(ctx context.Context) error {
-	enc, err := zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.SpeedFastest))
+	level := p.Opts.BodyZstdLevel
+	if level <= 0 {
+		level = 3
+	}
+	// One-shot encoder: EncodeAll emits a complete, self-contained frame per call.
+	// NEVER use a streaming zstd.Writer across flushes — that would make a batch depend
+	// on prior batches and break reconnect-resume (see design spec §6.4 hard invariant).
+	enc, err := zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.EncoderLevelFromZstd(level)))
 	if err != nil {
 		return fmt.Errorf("zstd init: %w", err)
 	}
 	defer enc.Close()
-	p.zstdEncoder = enc
+	p.bodyEncoder = enc
 
 	bb := newBatchBuilder(p.Opts.MaxBatchBytes, time.Duration(p.Opts.MaxBatchAgeMs)*time.Millisecond)
 
@@ -6026,16 +6045,35 @@ func (p *Producer) Run(ctx context.Context) error {
 		if bb.empty() {
 			return nil
 		}
-		batch := &pb.MessageBatch{
-			Seq:          p.nextSeq + 1,
-			SourceFileId: sourceFileID,
-			Messages:     bb.takeMessages(),
+		msgs := bb.takeMessages()
+		p.nextSeq++
+		batch := &pb.MessageBatch{Seq: p.nextSeq, SourceFileId: sourceFileID}
+
+		if len(msgs) == 1 && len(msgs[0].Payload) > p.Opts.MaxBatchBytes {
+			// Singleton oversized payload (camera/point-cloud): NONE path, per-message encoding.
+			m := msgs[0]
+			if len(m.Payload) >= p.Opts.CompressThresholdBytes {
+				m.Payload = p.bodyEncoder.EncodeAll(m.Payload, nil)
+				m.PayloadEncoding = pb.PayloadEncoding_PAYLOAD_ENCODING_ZSTD
+			}
+			batch.BodyEncoding = pb.BodyEncoding_BODY_ENCODING_NONE
+			batch.Messages = []*pb.Message{m}
+		} else {
+			// Default path: compress the whole batch body as ONE self-contained frame.
+			// Inner Messages stay RAW; their ids/timestamps/payloads ride inside `body`.
+			rawBody, err := proto.Marshal(&pb.MessageBatchBody{Messages: msgs})
+			if err != nil {
+				return fmt.Errorf("marshal batch body: %w", err)
+			}
+			batch.BodyEncoding = pb.BodyEncoding_BODY_ENCODING_ZSTD
+			batch.BodyUncompressedSize = uint64(len(rawBody))
+			batch.Body = p.bodyEncoder.EncodeAll(rawBody, nil) // one-shot; no cross-flush state
 		}
+
 		payload, err := proto.Marshal(batch)
 		if err != nil {
 			return fmt.Errorf("marshal batch: %w", err)
 		}
-		p.nextSeq++
 		p.Retain.Append(BatchEnvelope{
 			Seq:          batch.Seq,
 			SourceFileID: sourceFileID,
@@ -6070,20 +6108,15 @@ func (p *Producer) Run(ctx context.Context) error {
 			}
 			schemaID := p.SchemaID[m.Topic]
 
-			payload := m.Payload
-			enc := pb.PayloadEncoding_PAYLOAD_ENCODING_RAW
-			if len(payload) >= p.Opts.CompressThresholdBytes {
-				payload = p.zstdEncoder.EncodeAll(m.Payload, nil)
-				enc = pb.PayloadEncoding_PAYLOAD_ENCODING_ZSTD
-			}
-
+			// Inner messages stay RAW; the batch body is compressed once at flush()
+			// (the singleton-oversized path in flush() handles the rare per-message case).
 			pbMsg := &pb.Message{
 				TopicId:        topicID,
 				SchemaId:       schemaID,
 				LogTimeNs:      m.LogTimeNs,
 				PublishTimeNs:  m.PublishTimeNs,
-				PayloadEncoding: enc,
-				Payload:        payload,
+				PayloadEncoding: pb.PayloadEncoding_PAYLOAD_ENCODING_RAW,
+				Payload:        m.Payload,
 			}
 			pbSize := protoSize(pbMsg)
 

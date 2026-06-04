@@ -10,7 +10,7 @@
 
 ## 1. Summary
 
-`pj-cloud` is a self-hosted server + client toolkit that serves MCAP recordings from an S3 bucket to PlotJuggler-class clients on demand. The server presents a queryable catalog with rich tag-based filtering, and streams **selected (files × topics × time-range)** subsets of MCAP message data over a single WebSocket connection per client. Streaming is **bounded-horizon, as-fast-as-possible** (not realtime-paced): the client knows the full session size up front and downloads in bulk while reconstructing the data locally.
+`pj-cloud` is a self-hosted server + client toolkit that serves MCAP recordings from an S3 bucket to PlotJuggler-class clients on demand. The server presents a queryable catalog with rich tag-based filtering, and streams **selected (files × topics × time-range)** subsets of MCAP message data over a single WebSocket connection per client. Streaming is **bounded-horizon, as-fast-as-possible** (not realtime-paced): the client knows the full session size up front and downloads in bulk while reconstructing the data locally. **Throughout these documents "streaming" always means _incremental bulk download_, never time-paced playback:** the server delivers the bytes in batches as fast as the pipe allows, and the client surfaces each batch *as it arrives* so the user can already inspect the downloaded portion of the session while the remainder keeps downloading in the background. The UI never blocks on the full transfer, and messages are never replayed at their original wall-clock rate.
 
 The v1 deliverable is the Go server plus a Qt C++ test client that round-trips data back to MCAP — together they validate the wire protocol end-to-end. A subsequent project (separate spec) will lift the Qt client-core library into a PlotJuggler 4 DataSource plugin.
 
@@ -23,6 +23,7 @@ The v1 deliverable is the Go server plus a Qt C++ test client that round-trips d
 - **Server-side stitching**: selecting N consecutive MCAPs presents one continuous logical session (one time range, union of topics, ordered message stream).
 - **Pre-selected topics + time-range subset**: before streaming starts, the client commits to a set of `(file_ids[], topic_names[], time_range)`. Server returns approximate pre-flight numbers (`estimated_chunk_bytes` is the S3-fetch upper bound; `approximate_messages` is best-effort from MCAP chunk/message indexes — exact when MessageIndex records are present, an upper bound otherwise).
 - **Streaming as fast as the network and S3 allow**, not paced by playback wall clock. The client treats it as a bulk download with a known horizon, not a live source.
+- **Progressive, non-blocking availability**: the client hands each batch to its sink (PlotJuggler's datastore in the future plugin) *as soon as it arrives*, so the user can view and plot the already-downloaded portion of the session while the rest keeps downloading in the background. The UI must never block waiting for the full transfer. This progressive delivery — *not* wall-clock pacing — is the only thing the word "streaming" denotes anywhere in this spec.
 - **Per-message wire format**: raw MCAP message records `(topic, ts, schema, payload_bytes)` are forwarded with their schemas; the client (a future `MessageParser` in PJ4, or the test CLI's MCAP writer in v1) is responsible for decoding.
 - **Single WebSocket per client** carrying both catalog RPCs and streaming session pushes, multiplexed via a Protobuf envelope.
 - **Reconnect-and-resume**: a client that drops the WS within a short retain window (default 60 s) can reattach and continue from the last received sequence without re-downloading.
@@ -345,8 +346,16 @@ Topic names and schemas come over the wire **once**, identified by small `uint32
 enum PayloadEncoding {
   PAYLOAD_ENCODING_UNSPECIFIED = 0;
   PAYLOAD_ENCODING_RAW         = 1;
-  PAYLOAD_ENCODING_ZSTD        = 2;         // per-message ZSTD frame
-  PAYLOAD_ENCODING_LZ4         = 3;         // per-message LZ4 frame
+  PAYLOAD_ENCODING_ZSTD        = 2;         // per-message ZSTD frame (body_encoding=NONE fallback path only)
+  PAYLOAD_ENCODING_LZ4         = 3;         // inbound decode only; the v1 server never emits LZ4
+}
+
+// How a MessageBatch carries its messages. The v1 default is ZSTD (the whole
+// batch body compressed as one self-contained frame).
+enum BodyEncoding {
+  BODY_ENCODING_UNSPECIFIED = 0;            // treat as NONE for back-compat; v1 server always sets it explicitly
+  BODY_ENCODING_NONE        = 1;            // no `body`; messages ride in `messages` (singleton/legacy fallback)
+  BODY_ENCODING_ZSTD        = 2;            // `body` = one self-contained ZSTD frame (the default path)
 }
 
 message Message {
@@ -354,31 +363,40 @@ message Message {
   uint32 schema_id       = 2;
   sint64 log_time_ns     = 3;
   sint64 publish_time_ns = 4;
-  PayloadEncoding payload_encoding = 5;
+  PayloadEncoding payload_encoding = 5;     // RAW on the batched path; RAW/ZSTD only on the NONE fallback
   bytes  payload         = 6;
+}
+
+// The compression unit: marshaled, then compressed per MessageBatch.body_encoding.
+message MessageBatchBody {
+  repeated Message messages = 1;
 }
 
 message MessageBatch {
   uint64 seq             = 1;               // monotonic per subscription, used by SessionAck
   uint64 source_file_id  = 2;               // which source MCAP this batch came from
-  repeated Message messages = 3;
-  reserved 4;                                // reserved for future batch-level body_encoding
-  reserved "body_encoding";
+  // Exactly one of (messages, body) is populated.
+  repeated Message messages = 3;            // populated ONLY when body_encoding = NONE (singleton/legacy)
+  BodyEncoding body_encoding    = 4;        // default path: ZSTD
+  uint64 body_uncompressed_size = 5;        // size of the marshaled MessageBatchBody before compression
+  bytes  body                   = 6;        // compressed marshaled MessageBatchBody (the default path)
 }
 ```
 
-**Server-side MCAP chunk handling.** Chunks fetched from S3 are decompressed in full server-side before message-level filtering. MCAP's chunk compression (`zstd` / `lz4` at the chunk container level) is a *storage* property — once a chunk's container is decompressed, the individual `Message.data` records inside are raw bytes. There is no per-message compressed form to "pass through". So the server's encoding choice for `Message.payload_encoding` is independent of the source MCAP's chunk compression: the server decompresses the chunk, filters out messages it doesn't want, and decides per-message what encoding to send.
+**Server-side MCAP chunk handling.** Chunks fetched from S3 are decompressed in full server-side before message-level filtering. MCAP's chunk compression (`zstd` / `lz4` at the chunk container level) is a *storage* property — once a chunk's container is decompressed, the individual `Message.data` records inside are raw bytes. There is no per-message compressed form to "pass through". So the wire compression is independent of the source MCAP's chunk compression: the server decompresses the chunk, filters out messages it doesn't want, and compresses the *surviving* messages together as one batch body (see **Batch-body compression** below). This is also why source chunks are never forwarded verbatim ("chunk passthrough"): an MCAP chunk is an atomic compression unit that cannot honor a topic/time subset without first being decompressed.
 
 **Batching policy on the server:**
 
 - **Target size:** accumulate filtered messages until either (a) accumulated `payload.size()` bytes exceed `max_batch_bytes` (default 512 KB) or (b) `max_batch_age_ms` (default 50 ms) has elapsed since the first message in the batch — then flush.
-- **Oversized messages:** a single message whose payload exceeds `max_batch_bytes` is sent as a **singleton batch** (one `Message` in the `messages` list, batch size > `max_batch_bytes`). This is rare-by-design (camera images, point clouds) but supported.
+- **Oversized messages:** a single message whose payload exceeds `max_batch_bytes` is sent as a **singleton batch** (`body_encoding = NONE`, the one `Message` in the `messages` list, batch size > `max_batch_bytes`). This is rare-by-design (camera images, point clouds) but supported.
 - **Hard frame limit:** `max_message_bytes` (default 16 MB) is the maximum size of any single `Message.payload` the server will emit. Messages exceeding this are dropped from the stream with a warning logged and the count surfaced in `Progress.dropped_messages` and (eventually) on the dashboard. This prevents pathological payloads from blocking the WS for arbitrarily long.
 - **Head-of-line bound:** worst-case time a `Progress` or new RPC waits behind a session frame is `frame_size / write_throughput` — i.e. up to ~`max_message_bytes / link_speed` for a singleton oversized batch (~130 ms on a gigabit link with a 16 MB message). For the common case (typical batches under 1 MB), this is a few milliseconds.
 
-**Per-message encoding choice on the server:** RAW for payloads `< compress_threshold_bytes` (default 4 KB); ZSTD otherwise. LZ4 is a supported inbound decode but the v1 server does not emit LZ4 (the enum value is reserved so a future server or alternative implementation can choose it without a proto change).
+**Batch-body compression (the v1 default).** The server does **not** compress messages individually. At each flush it takes the surviving (already topic+time filtered) `Message` records, marshals them as a `MessageBatchBody` (`repeated Message`), and compresses that whole body as a **single one-shot ZSTD frame** placed in `MessageBatch.body`, with `body_encoding = ZSTD` and `body_uncompressed_size` set; `messages` (field 3) is then empty. ZSTD level defaults to 3 (`body_zstd_level`, configurable). Because the body is a marshaled protobuf, the client recovers message boundaries with protobuf's own length-validated framing — no hand-rolled parser, and `ParseFromArray` copies each payload so nothing aliases the decompression scratch. Inner `Message.payload_encoding` stays `RAW` on this path (the body frame does the compressing; double-compressing tiny payloads is pointless). There is **no** 4 KB threshold here — even small messages enter the compressed body, which is exactly where the win is (e.g. `/tf` at 1 kHz: many near-identical small records become in-window matches, typically ~3× on small payloads, and the ~9–13 byte ZSTD frame header is paid once per batch instead of per message).
 
-**Future extension (reserved, not in v1):** batch-level cross-message compression — exploiting redundancy across many small messages of the same topic (e.g. `/tf` at 1 kHz with similar transforms) — will use the reserved `MessageBatch.body_encoding` field number. v1 clients must reject batches with an unknown `body_encoding` value (defensive parsing) so when the field is added later, clients without support fail loudly rather than silently misinterpret.
+**Hard invariant — one-shot per batch.** Each batch body is compressed with a single `EncodeAll`; the server **MUST NOT** carry a ZSTD context across flushes. Doing so would make batch *N* depend on prior batches and break reconnect-resume (it would silently become a session-wide stream). Because the frame boundary then coincides exactly with the batch / `seq` / resume boundary, the retain-buffer + `SessionAck` + `OpenResume` machinery (§6.5/§6.6) works byte-identically — the retain buffer already stores opaque marshaled batch bytes, so resume replays whole retained batches with no decoder state to checkpoint.
+
+**Singleton / incompressible fallback (`body_encoding = NONE`).** A singleton oversized batch (one message whose payload exceeds `max_batch_bytes` — camera images, point clouds) is emitted with `body_encoding = NONE`, the single record in the legacy `messages` field, and per-message `payload_encoding` chosen by `compress_threshold_bytes` (RAW below 4 KB, ZSTD above). This keeps the per-message codepath alive for the rare blob case and avoids re-compressing already-compressed payloads. LZ4 remains inbound-decode-only. **Clients MUST reject a batch with an unknown `body_encoding`** (defensive parsing) so a future encoding can be added without silent misinterpretation.
 
 **Multiplexing fairness:** the WS writer goroutine pulls from a small high-priority channel first (RPC responses + errors), then from a bulk channel (session batches). Catalog latency stays low between batches even during streaming — the priority channel can only win at frame boundaries, so the head-of-line bound above is the worst-case latency for a high-priority message. The bulk channel has a small capacity (16 frames) so a slow client backpressures the S3 fetcher naturally instead of unbounded buffering.
 
@@ -651,7 +669,8 @@ session:
   s3_concurrent_requests: 32
   max_batch_bytes: 524288                      # 512 KB
   max_batch_age_ms: 50
-  compress_threshold_bytes: 4096
+  body_zstd_level: 3                           # ZSTD level for the batch-body frame (one-shot per batch)
+  compress_threshold_bytes: 4096               # fallback only: per-message RAW/ZSTD on body_encoding=NONE singletons
   write_timeout: 30s
 dashboard:
   enabled: true
@@ -903,8 +922,8 @@ Fixtures committed to git (~5 MB total) so CI is hermetic. Generator script reta
 | **Transport** | Single persistent WebSocket per client; binary frames; Protobuf envelope; mini-RPC over WS (request_id + subscription_id) |
 | **Session open** | `OpenSessionRequest` is a `oneof { OpenFresh, OpenResume }` — no ambiguous-fields mode |
 | **File-overlap rule** | Selected files' time ranges must be pairwise non-overlapping; otherwise `Error{INVALID_REQUEST}` |
-| **Message granularity** | Per-message (raw MCAP message records, decompressed from source chunks); batched ~512 KB / ~50 ms; oversized messages become singleton batches up to `max_message_bytes` (16 MB) |
-| **Payload encoding** | Per-message `RAW`/`ZSTD`/`LZ4` (wire-level, independent of source MCAP chunk compression); server compresses when payload > 4 KB. Reserved future: batch-level `body_encoding`. |
+| **Message granularity** | Batch-body: surviving messages marshaled as a `MessageBatchBody` (`repeated Message`) per ~512 KB / ~50 ms batch and compressed as one ZSTD frame; oversized singletons (`body_encoding=NONE`) up to `max_message_bytes` (16 MB) |
+| **Payload encoding** | Batch-body `ZSTD` (one-shot per batch, no cross-flush context; `MessageBatch.body_encoding`), independent of source MCAP chunk compression. Per-message `RAW`/`ZSTD` retained only for `body_encoding=NONE` singletons; `LZ4` inbound-decode only. |
 | **File-boundary tracking** | `source_file_id` on every batch; no separate boundaries map |
 | **Resume** | Producer/consumer split; retain buffer (256 seqs / 64 MB) backpressures producer; `SessionAck` prunes; consumer detaches on WS drop, re-binds on `OpenResume`; 60 s expiry |
 | **WS lifecycle** | Closes after each session (or dialog dismissal); no cross-session state |

@@ -728,7 +728,55 @@ func Compare(orig, rebuilt []Record) []Mismatch {
 	}
 	return miss
 }
+
+// Filter narrows a record slice to a requested (topics, [startNs,endNs]) selection.
+// The driver MUST call this on the ORIGINAL records for topic-subset / time-range
+// cases BEFORE Compare — otherwise a correct subset download reads as a length
+// mismatch. endNs is exclusive; pass startNs==endNs to disable time filtering, and
+// topics==nil to disable topic filtering.
+func Filter(in []Record, topics map[string]bool, startNs, endNs uint64) []Record {
+	var out []Record
+	for _, r := range in {
+		if topics != nil && !topics[r.Topic] {
+			continue
+		}
+		if endNs > startNs && (r.LogTime < startNs || r.LogTime >= endNs) {
+			continue
+		}
+		out = append(out, r)
+	}
+	return out
+}
+
+// OverDelivered returns any reconstructed record OUTSIDE the requested (topics,
+// [startNs,endNs]) selection — i.e. the server shipped something it should have
+// filtered out (a mis-sliced/fabricated batch-body record, or a filtering bug).
+// Compare catches under-delivery and content drift; OverDelivered is the affirmative
+// half of the filtering gate and MUST be empty on every backend.
+func OverDelivered(rebuilt []Record, topics map[string]bool, startNs, endNs uint64) []Record {
+	var bad []Record
+	for _, r := range rebuilt {
+		if topics != nil && !topics[r.Topic] {
+			bad = append(bad, r)
+			continue
+		}
+		if endNs > startNs && (r.LogTime < startNs || r.LogTime >= endNs) {
+			bad = append(bad, r)
+		}
+	}
+	return bad
+}
 ```
+
+> **Filtering-correctness gate (batch-body compression).** For topic-subset / time-range
+> cases the driver MUST `Filter(orig, …)` to the requested selection before `Compare`, and
+> MUST assert `OverDelivered(rebuilt, …)` is empty — `Compare` catches under-delivery and
+> content drift, `OverDelivered` catches the *over*-delivery a mis-sliced/fabricated batch
+> body could cause. Client-side (Plan B unit tests): a truncated/garbled `body`, a
+> `body_uncompressed_size` mismatch, and an unknown `body_encoding` must each fail cleanly
+> rather than silently corrupt; and a resume mid-stream must reproduce byte-identical
+> retained batches (the design-spec §6.4 one-shot-per-batch invariant — no cross-flush
+> compressor state — is what makes verbatim replay correct).
 
 - [ ] **Step 2: Unit test on synthetic in-memory MCAPs**
 

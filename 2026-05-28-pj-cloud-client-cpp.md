@@ -1437,30 +1437,66 @@ QFuture<Expected<wire::EosReason>> SessionClient::runSession(wire::OpenSessionRe
 void SessionClient::onIncoming(const wire::ServerMessage& msg) {
   if (msg.has_batch()) {
     const auto& batch = msg.batch();
-    for (const auto& m : batch.messages()) {
-      std::span<const std::byte> payload{reinterpret_cast<const std::byte*>(m.payload().data()), m.payload().size()};
-      Expected<std::span<const std::byte>> decoded = Expected<std::span<const std::byte>>::ok(payload);
-      if (m.payload_encoding() == wire::PAYLOAD_ENCODING_ZSTD) {
-        decoded = decompressor_.decompressZstd(payload);
-      } else if (m.payload_encoding() == wire::PAYLOAD_ENCODING_LZ4) {
-        decoded = decompressor_.decompressLz4(payload);
-      }
-      if (!decoded) {
-        promise_->addResult(Expected<wire::EosReason>::fail(decoded.error()));
-        promise_->finish();
-        dispatcher_->unsubscribe(subscription_id_);
-        return;
-      }
+
+    auto failBatch = [&](const QString& why) {
+      promise_->addResult(Expected<wire::EosReason>::fail(why));
+      promise_->finish();
+      dispatcher_->unsubscribe(subscription_id_);
+    };
+    // Emit one already-decoded message to the sink; returns false (after finishing the
+    // promise) on failure so the caller stops.
+    auto emit = [&](const wire::Message& m, std::span<const std::byte> payload) -> bool {
       if (auto r = sink_->writeMessage(m.topic_id(), m.schema_id(), m.log_time_ns(),
-                                       m.publish_time_ns(), decoded.value()); !r) {
-        promise_->addResult(Expected<wire::EosReason>::fail(r.error()));
-        promise_->finish();
-        dispatcher_->unsubscribe(subscription_id_);
+                                       m.publish_time_ns(), payload); !r) {
+        failBatch(r.error());
+        return false;
+      }
+      bytes_received_ += payload.size();
+      messages_received_++;
+      return true;
+    };
+
+    if (batch.body_encoding() == wire::BODY_ENCODING_ZSTD) {
+      // Default path: `body` is one self-contained ZSTD frame holding a marshaled
+      // MessageBatchBody. Decompress once, validate the size, then parse — protobuf
+      // framing is length-validated and ParseFromArray copies payloads, so nothing
+      // aliases the decompression scratch and inner records cannot run off the end.
+      std::span<const std::byte> body{reinterpret_cast<const std::byte*>(batch.body().data()), batch.body().size()};
+      auto decoded = decompressor_.decompressZstd(body);
+      if (!decoded) { failBatch(decoded.error()); return; }
+      if (decoded.value().size() != batch.body_uncompressed_size()) {
+        failBatch(QStringLiteral("batch body_uncompressed_size mismatch"));
         return;
       }
-      bytes_received_ += m.payload().size();
-      messages_received_++;
+      wire::MessageBatchBody mb;
+      if (!mb.ParseFromArray(decoded.value().data(), static_cast<int>(decoded.value().size()))) {
+        failBatch(QStringLiteral("corrupt MessageBatchBody"));
+        return;
+      }
+      for (const auto& m : mb.messages()) {  // inner payloads are RAW on this path
+        std::span<const std::byte> p{reinterpret_cast<const std::byte*>(m.payload().data()), m.payload().size()};
+        if (!emit(m, p)) return;
+      }
+    } else if (batch.body_encoding() == wire::BODY_ENCODING_NONE ||
+               batch.body_encoding() == wire::BODY_ENCODING_UNSPECIFIED) {
+      // Singleton / legacy fallback: messages ride in `messages`, per-message encoding.
+      for (const auto& m : batch.messages()) {
+        std::span<const std::byte> payload{reinterpret_cast<const std::byte*>(m.payload().data()), m.payload().size()};
+        Expected<std::span<const std::byte>> dec = Expected<std::span<const std::byte>>::ok(payload);
+        if (m.payload_encoding() == wire::PAYLOAD_ENCODING_ZSTD) {
+          dec = decompressor_.decompressZstd(payload);
+        } else if (m.payload_encoding() == wire::PAYLOAD_ENCODING_LZ4) {
+          dec = decompressor_.decompressLz4(payload);
+        }
+        if (!dec) { failBatch(dec.error()); return; }
+        if (!emit(m, dec.value())) return;
+      }
+    } else {
+      // Defensive parsing: never silently misinterpret an unknown body_encoding.
+      failBatch(QStringLiteral("unknown body_encoding"));
+      return;
     }
+
     last_received_seq_ = batch.seq();
     if (last_received_seq_ - last_acked_seq_ >= static_cast<uint64_t>(settings_.ack_batch_count)) {
       sendAck();
@@ -2136,7 +2172,11 @@ Expected<void> McapWriterSink::writeMessage(uint32_t topic_id, uint32_t /*schema
                                             int64_t log_time_ns, int64_t publish_time_ns,
                                             std::span<const std::byte> payload) {
   mcap::Message m;
-  m.channelId = channel_id_map_[topic_id];
+  auto it = channel_id_map_.find(topic_id);  // fail-closed: a topic_id absent from the session map
+  if (it == channel_id_map_.end()) {         // means a corrupt/out-of-subset record — never silently insert
+    return Expected<void>::fail(QStringLiteral("unknown topic_id %1 not in session map").arg(topic_id));
+  }
+  m.channelId = it->second;
   m.logTime = static_cast<uint64_t>(log_time_ns);
   m.publishTime = static_cast<uint64_t>(publish_time_ns);
   m.data = reinterpret_cast<const std::byte*>(payload.data());
