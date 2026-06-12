@@ -1,0 +1,8 @@
+[submodule "PJ4"]
+	path = PJ4
+	url = git@github.com:PlotJuggler/PJ4-cloud.git
+	branch = cloud
+[submodule "pj-official-plugins"]
+	path = pj-official-plugins
+	url = git@github.com:PlotJuggler/pj-official-plugins-cloud.git
+	branch = cloud

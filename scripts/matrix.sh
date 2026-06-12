@@ -107,9 +107,9 @@ readonly M8_EXPECT_FILES=8
 # ── paths (all absolute; cwd is reset between agent steps elsewhere) ──────────
 readonly REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 readonly SERVER_DIR="${REPO_ROOT}/server"
-readonly PLUGIN_DIR="${REPO_ROOT}/PJ4/pj-official-plugins"
-readonly CTEST_DIR="${PLUGIN_DIR}/build/toolbox_dexory_cloud/Release"
-readonly SDK_CLI="${CTEST_DIR}/toolbox_dexory_cloud/dexory-cloud-cli"
+readonly PLUGIN_DIR="${REPO_ROOT}/plugin/toolbox_dexory_cloud"
+readonly CTEST_DIR="${PLUGIN_DIR}/build"
+readonly SDK_CLI="${CTEST_DIR}/bin/dexory-cloud-cli"
 
 # ── harness server config (NEVER :8080 / :8081 / their PID files) ─────────────
 readonly MATRIX_PORT=8082
@@ -237,7 +237,7 @@ setup() {
   DEVPROBE="${SERVER_DIR}/bin/devprobe"
 
   [[ -x "${SDK_CLI}" ]] \
-    || fail "setup: dexory-cloud-cli missing at ${SDK_CLI} (build it: cd ${PLUGIN_DIR} && ./build.sh toolbox_dexory_cloud)"
+    || fail "setup: dexory-cloud-cli missing at ${SDK_CLI} (build it: ./build.sh (from the repo root))"
   [[ -d "${GROUND_TRUTH_DIR}" ]] || fail "setup: ground-truth originals dir ${GROUND_TRUTH_DIR} not present"
 
   rm -f "${MATRIX_DB}" "${MATRIX_DB}-wal" "${MATRIX_DB}-shm" 2>/dev/null || true

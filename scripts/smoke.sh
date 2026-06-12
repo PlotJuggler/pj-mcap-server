@@ -32,7 +32,7 @@
 # If the bucket is ever reseeded with different data, update these constants
 # HERE *and*, in lockstep:
 #   - the expectations baked into the C++ live test
-#     PJ4/pj-official-plugins/toolbox_dexory_cloud/tests/backend_connection_live_test.cpp
+#     plugin/toolbox_dexory_cloud/tests/backend_connection_live_test.cpp
 #     (its GroundTruthCatalog test pins: exactly 8 sequences, the 6 known topics
 #     of nissan_zala_50_zeg_1_0.mcap, imu==14904), and
 #   - the byte-level round-trip ORIGINAL used by step f, which is the SAME object
@@ -85,8 +85,8 @@ readonly NONE_TOPIC="/does/not/exist"
 readonly REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 readonly SERVER_DIR="${REPO_ROOT}/server"
 readonly COMPOSE_FILE="${REPO_ROOT}/infra/minio/docker-compose.yml"
-readonly PLUGIN_DIR="${REPO_ROOT}/PJ4/pj-official-plugins"
-readonly CTEST_DIR="${PLUGIN_DIR}/build/toolbox_dexory_cloud/Release"
+readonly PLUGIN_DIR="${REPO_ROOT}/plugin/toolbox_dexory_cloud"
+readonly CTEST_DIR="${PLUGIN_DIR}/build"
 
 # ── harness server config (NEVER :8080 / the user's PID file) ─────────────────
 readonly SMOKE_PORT=8081
@@ -327,7 +327,7 @@ PY
 step_cpp_tests() {
   log "step d: ensuring C++ plugin test build is current"
   [[ -f "${CTEST_DIR}/CTestTestfile.cmake" ]] \
-    || fail "cpp: test build dir not configured at ${CTEST_DIR} (run: cd ${PLUGIN_DIR} && ./build.sh toolbox_dexory_cloud with -DBUILD_TESTING=ON)"
+    || fail "cpp: test build dir not configured at ${CTEST_DIR} (run: ./build.sh (from the repo root) to build the connector plugin)"
   cmake --build "${CTEST_DIR}" -j >/dev/null 2>&1 \
     || fail "cpp: incremental cmake --build failed in ${CTEST_DIR}"
 
@@ -343,7 +343,7 @@ step_cpp_tests() {
   # Confirm the gating actually fires when the env is absent: run the live test
   # binary directly with no env and require gtest to report SKIPPED (and zero
   # PASSED). This guards against the gate silently becoming a no-op.
-  local live_bin="${CTEST_DIR}/toolbox_dexory_cloud/toolbox_dexory_cloud_backend_live_test"
+  local live_bin="${CTEST_DIR}/bin/toolbox_dexory_cloud_backend_live_test"
   [[ -x "${live_bin}" ]] || fail "cpp: live test binary missing at ${live_bin}"
   local hermetic_out
   hermetic_out="$(env -u DEXORY_CLOUD_LIVE_URL "${live_bin}" 2>&1)" || true
@@ -407,7 +407,7 @@ step_cpp_tests() {
 # ─────────────────────────────────────────────────────────────────────────────
 step_cli_spotcheck() {
   log "step e1: C++ SDK CLI spot check (hello + list + topics for ${EXPECT_S3_KEY})"
-  local sdk_cli="${CTEST_DIR}/toolbox_dexory_cloud/dexory-cloud-cli"
+  local sdk_cli="${CTEST_DIR}/bin/dexory-cloud-cli"
   [[ -x "${sdk_cli}" ]] || fail "cli: dexory-cloud-cli missing at ${sdk_cli} (built by step d's cmake --build)"
 
   local hello_out
@@ -505,7 +505,7 @@ step_roundtrip() {
   local mcapdiff="${SERVER_DIR}/bin/mcapdiff"
   local mcaptopics="${SERVER_DIR}/bin/mcaptopics"
   local probe="${SERVER_DIR}/bin/devprobe"
-  local sdk_cli="${CTEST_DIR}/toolbox_dexory_cloud/dexory-cloud-cli"
+  local sdk_cli="${CTEST_DIR}/bin/dexory-cloud-cli"
   [[ -x "${mcapdiff}" ]]   || fail "roundtrip: mcapdiff binary missing at ${mcapdiff}"
   [[ -x "${mcaptopics}" ]] || fail "roundtrip: mcaptopics binary missing at ${mcaptopics}"
   [[ -x "${probe}" ]]      || fail "roundtrip: devprobe binary missing at ${probe}"
@@ -741,7 +741,7 @@ step_restart_persistence() {
 step_tag_flow() {
   log "step h: tag flow (set -> visible -> survives forced reindex -> unset -> gone)"
   local probe="${SERVER_DIR}/bin/devprobe"
-  local sdk_cli="${CTEST_DIR}/toolbox_dexory_cloud/dexory-cloud-cli"
+  local sdk_cli="${CTEST_DIR}/bin/dexory-cloud-cli"
   [[ -x "${probe}" ]] || fail "tag: devprobe binary missing at ${probe}"
 
   local target_id

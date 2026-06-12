@@ -46,7 +46,7 @@ launch_app() {  # $1 = port like :8084
     cat <<EOF
 
   Backend ready:  $url   (log: $LOGFILE)
-  Headless check: PJ4/pj-official-plugins/build/toolbox_dexory_cloud/Release/toolbox_dexory_cloud/dexory-cloud-cli --url $url list
+  Headless check: plugin/toolbox_dexory_cloud/build/bin/dexory-cloud-cli --url $url list
   GUI:            run './run.sh ${TARGET}' in a desktop terminal (this run was non-interactive/--no-gui)
   Stop:           make server-stop
 EOF
