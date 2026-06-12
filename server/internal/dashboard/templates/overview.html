@@ -1,0 +1,29 @@
+{{define "content"}}
+<hgroup>
+  <h2>Overview</h2>
+  <p>Server uptime: {{.Uptime}}</p>
+</hgroup>
+<section>
+  <h3>Server</h3>
+  <table>
+    <tr><th>Version</th><td>{{.ServerVersion}}</td></tr>
+    <tr><th>Backend</th><td>{{.Backend}}</td></tr>
+    <tr><th>Bucket</th><td>{{.Bucket}}</td></tr>
+  </table>
+</section>
+<section>
+  <h3>Catalog</h3>
+  <table>
+    <tr><th>Files indexed</th><td>{{.FileCount}}</td></tr>
+    <tr><th>Total size</th><td>{{.TotalSizeHuman}}</td></tr>
+  </table>
+</section>
+<section>
+  <h3>Indexer</h3>
+  <p>Last run: {{.IndexerLastRun}} {{if .IndexerLastErr}}<mark>error: {{.IndexerLastErr}}</mark>{{end}}</p>
+</section>
+<section>
+  <h3>Sessions</h3>
+  <p>Active: {{.SessionCount}}</p>
+</section>
+{{end}}

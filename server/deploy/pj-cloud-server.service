@@ -1,0 +1,56 @@
+# systemd unit for a bare-metal pj-cloud-server deploy (Plan A Task 36).
+#
+# INSTALL
+#   sudo install -m0755 pj-cloud-server /usr/local/bin/pj-cloud-server
+#   sudo install -d -o pjcloud -g pjcloud /var/lib/pj-cloud      # catalog DB dir
+#   sudo install -D -m0640 config.example.yaml /etc/pj-cloud/config.yaml
+#   sudo install -D -m0600 /dev/null /etc/pj-cloud/server.env    # then edit it
+#   sudo cp pj-cloud-server.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now pj-cloud-server
+#
+# SECRETS go in /etc/pj-cloud/server.env (referenced by EnvironmentFile), e.g.:
+#   PJ_CLOUD_TOKEN=<shared-bearer-token>
+#   PJ_CLOUD_S3_ACCESS_KEY=...
+#   PJ_CLOUD_S3_SECRET_KEY=...
+#   PJ_CLOUD_DASHBOARD_PASSWORD=...
+#   PJ_CLOUD_TLS_CERT=/etc/pj-cloud/server.crt   # optional (with KEY) => TLS
+#   PJ_CLOUD_TLS_KEY=/etc/pj-cloud/server.key
+# config.yaml's ${ENV} refs are expanded from this same environment at load.
+#
+# Create the service user once:
+#   sudo useradd --system --no-create-home --shell /usr/sbin/nologin pjcloud
+
+[Unit]
+Description=PJ Cloud Connector server (MCAP-over-WebSocket)
+Documentation=https://github.com/  # internal: see 2026-05-28-pj-cloud-connector-design.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pjcloud
+Group=pjcloud
+EnvironmentFile=/etc/pj-cloud/server.env
+# --config supplies storage/session/dashboard tuning; flags/env override.
+ExecStart=/usr/local/bin/pj-cloud-server --config /etc/pj-cloud/config.yaml
+Restart=on-failure
+RestartSec=2s
+# Graceful shutdown: the server traps SIGTERM (drains sessions, checkpoints WAL).
+KillSignal=SIGTERM
+TimeoutStopSec=15s
+
+# Hardening: the server only needs to read the bucket over the network, write its
+# SQLite catalog under /var/lib/pj-cloud, and read its config/certs.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/pj-cloud
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target

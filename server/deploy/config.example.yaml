@@ -1,0 +1,55 @@
+# pj-cloud-server example config (Plan A Task 36 / design spec §8.6).
+# Field names match config.go exactly; ${ENV_VAR} refs are expanded at load.
+#
+# Run plaintext for dev by omitting server.tls; set BOTH cert and key for TLS
+# (wss:// + https dashboard). A self-signed localhost pair is produced by
+# scripts/gen-dev-cert.sh.
+
+server:
+  listen: ":8443"
+  tls:
+    cert: /etc/pj-cloud/server.crt
+    key:  /etc/pj-cloud/server.key
+
+auth:
+  bearer_token: ${PJ_CLOUD_TOKEN}        # set the env var; do NOT inline secrets
+
+format: mcap                              # v1 supports only "mcap"
+
+# storage is a TAGGED UNION: this slice ships the s3 backend (Minio / AWS S3).
+storage:
+  s3:
+    bucket: recordings
+    region: us-east-1
+    prefix: ""                            # optional key prefix
+    endpoint: http://minio:9000           # uncomment/edit for self-hosted S3 / Minio
+    access_key: ${PJ_CLOUD_S3_ACCESS_KEY} # optional static creds (Minio dev)
+    secret_key: ${PJ_CLOUD_S3_SECRET_KEY}
+
+catalog:
+  db_path: /var/lib/pj-cloud/catalog.db
+
+indexer:
+  poll_interval: 5m
+  startup_scan: true
+
+session:
+  max_concurrent: 16
+  retain_after_disconnect: 60s
+  retain_max_seqs: 256
+  retain_max_bytes: 67108864             # 64 MB
+  max_batch_bytes: 524288                # 512 KB
+  max_batch_age: 50ms
+  max_message_bytes: 16777216           # 16 MB
+  compress_threshold_bytes: 4096
+  body_zstd_level: 3
+
+dashboard:
+  enabled: true
+  basic_auth:
+    username: admin
+    password: ${PJ_CLOUD_DASHBOARD_PASSWORD}   # empty env var DISABLES the dashboard
+
+metrics:
+  enabled: true
+  require_auth: false                    # /metrics unauthenticated by default

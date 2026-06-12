@@ -1,0 +1,35 @@
+# The "end" endpoint of the PJ Cloud Connector: a local S3-compatible store.
+# Identifier pins match Plan C (2026-05-28-pj-cloud-integration.md): bucket
+# `recordings`, credentials admin/password123, API :9000, console :9001.
+# Synthetic MCAP data is seeded later (Plan C Task 2 `gen-fixtures`); for now
+# this just provides a healthy bucket the future server/indexer can poll.
+services:
+  minio:
+    image: minio/minio:RELEASE.2024-06-13T22-53-53Z
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: admin
+      MINIO_ROOT_PASSWORD: password123
+    ports: ["9000:9000", "9001:9001"]
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  minio-init:
+    image: minio/mc:RELEASE.2024-06-12T14-34-03Z
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      sh -c "
+        mc alias set local http://minio:9000 admin password123 &&
+        mc mb -p local/recordings &&
+        echo 'minio ready: bucket recordings exists'
+      "
+
+volumes:
+  minio-data:

@@ -1,0 +1,182 @@
+name: ci
+
+# Plan A Task 46 (unit + race + no-cloud-sdk-leak + {s3,gcs} integration matrix)
+# and Task 46a (the {s3,gcs} legs over fake-gcs/Minio), adapted to the AS-BUILT
+# repo: the Go wire bindings are CHECKED IN (server/internal/wire/pj_cloud), so CI
+# NEVER runs protoc / `make proto` / `make build` — it consumes the committed
+# bindings directly via `go build` / `go test`. The shell smoke/matrix gates
+# CANNOT run here (they hard-require the on-disk ground-truth corpus + the C++
+# plugin build); the integration legs are instead the synthetic-fixture in-process
+# Go harness (`-tags=ci_integration`, internal/ws), seeded into Minio (s3) /
+# fake-gcs (gcs) service containers.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# One in-flight run per ref; a new push cancels the previous run.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# No paths-ignore: docs-only changes still run the cheap jobs (the seam grep +
+# unit suite are fast and must never be skipped by a docs edit).
+
+env:
+  GOTOOLCHAIN: local   # go.mod says `go 1.23`; never download a newer toolchain.
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+          cache: true
+          cache-dependency-path: server/go.sum
+      - name: go vet
+        run: cd server && go vet ./...
+      - name: gofmt (must be empty)
+        run: |
+          cd server
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "gofmt found unformatted files:"; echo "$unformatted"; exit 1
+          fi
+      - name: go test
+        run: cd server && go test ./... -count=1
+
+  race:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+          cache: true
+          cache-dependency-path: server/go.sum
+      - name: go test -race
+        run: cd server && go test ./... -race -count=1
+
+  seam:
+    # Anti-drift (unified-plan §7 risk 1): ONLY internal/storage may import a cloud
+    # SDK. Plus a "wire frozen" compile check — the committed bindings must still
+    # build (CI consumes them; it must never regenerate them with a system protoc).
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+          cache: true
+          cache-dependency-path: server/go.sum
+      - name: no cloud SDK outside internal/storage
+        run: |
+          cd server
+          if grep -rEl 'aws-sdk-go-v2|cloud\.google\.com/go/storage' --include='*.go' internal \
+               | grep -v '^internal/storage/'; then
+            echo "cloud SDK imported outside internal/storage"; exit 1
+          fi
+          echo "seam OK: cloud SDK confined to internal/storage"
+      - name: committed wire bindings compile (no protoc regenerate)
+        run: cd server && go build ./internal/wire/...
+
+  integration:
+    # Plan A Task 46/46a: the {s3,gcs} integration matrix. fail-fast:false +
+    # BOTH legs REQUIRED — a gcs-only failure blocks merges exactly like an
+    # s3-only failure (the gcs impl is real as of Slice 11; not a placeholder).
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [s3, gcs]
+    env:
+      PJ_CLOUD_BACKEND: ${{ matrix.backend }}
+      PJ_CLOUD_CI_BUCKET: ci-fixtures
+    # Both emulators run as service containers; each leg seeds + uses only its own.
+    services:
+      minio:
+        image: minio/minio:RELEASE.2024-06-13T22-53-53Z
+        env:
+          MINIO_ROOT_USER: ciadmin
+          MINIO_ROOT_PASSWORD: cipassword123
+        ports:
+          - 9000:9000
+        options: >-
+          --health-cmd "mc ready local || exit 1"
+          --health-interval 3s
+          --health-timeout 3s
+          --health-retries 20
+      fakegcs:
+        image: fsouza/fake-gcs-server:1.49.2
+        ports:
+          - 4443:4443
+        options: >-
+          --health-cmd "wget -q -O - http://localhost:4443/storage/v1/b || exit 1"
+          --health-interval 3s
+          --health-timeout 3s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+          cache: true
+          cache-dependency-path: server/go.sum
+
+      - name: generate synthetic fixtures
+        run: |
+          mkdir -p "$RUNNER_TEMP/fixtures"
+          cd server && go run ./cmd/gen-ci-fixtures -out "$RUNNER_TEMP/fixtures" -manifest
+
+      # ── S3 leg seed: create bucket + upload fixtures via the mc image ────────
+      - name: seed Minio (s3 leg)
+        if: matrix.backend == 's3'
+        run: |
+          docker run --rm --network host \
+            -v "$RUNNER_TEMP/fixtures:/fixtures:ro" \
+            --entrypoint /bin/sh minio/mc:RELEASE.2024-06-12T14-34-03Z -c '
+              set -e
+              mc alias set local http://localhost:9000 ciadmin cipassword123
+              mc mb -p local/ci-fixtures
+              for f in /fixtures/*.mcap; do mc cp -q "$f" "local/ci-fixtures/$(basename "$f")"; done
+              echo "seeded:"; mc ls local/ci-fixtures
+            '
+
+      # ── GCS leg seed: create bucket + upload fixtures via the JSON media API ─
+      - name: seed fake-gcs (gcs leg)
+        if: matrix.backend == 'gcs'
+        run: |
+          host="http://localhost:4443"
+          code="$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+            "$host/storage/v1/b?project=pj-cloud-ci" \
+            -H 'Content-Type: application/json' -d '{"name":"ci-fixtures"}')"
+          case "$code" in 200|201|409) ;; *) echo "bucket create http $code"; exit 1;; esac
+          for f in "$RUNNER_TEMP"/fixtures/*.mcap; do
+            base="$(basename "$f")"
+            code="$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+              "$host/upload/storage/v1/b/ci-fixtures/o?uploadType=media&name=$base" \
+              -H 'Content-Type: application/octet-stream' --data-binary "@$f")"
+            [ "$code" = "200" ] || { echo "upload $base http $code"; exit 1; }
+            echo "uploaded $base"
+          done
+
+      - name: integration (${{ matrix.backend }})
+        env:
+          # s3 knobs (ignored by the gcs leg) — the harness reads these for Minio.
+          PJ_CLOUD_S3_ENDPOINT: http://localhost:9000
+          PJ_CLOUD_S3_ACCESS_KEY: ciadmin
+          PJ_CLOUD_S3_SECRET_KEY: cipassword123
+          # gcs knob (ignored by the s3 leg) — the SDK auto-points at the emulator.
+          STORAGE_EMULATOR_HOST: ${{ matrix.backend == 'gcs' && 'localhost:4443' || '' }}
+        run: |
+          cd server
+          go test -tags=ci_integration -count=1 -v \
+            -run TestCIIntegration_Backend ./internal/ws/

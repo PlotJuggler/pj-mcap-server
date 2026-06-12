@@ -1,0 +1,24 @@
+{{define "content"}}
+<h2>Indexer</h2>
+<table>
+  <tr><th>Last run</th><td>{{.LastRun}}</td></tr>
+  <tr><th>Duration</th><td>{{.LastDurationMs}} ms</td></tr>
+  <tr><th>Scanned</th><td>{{.LastScanned}}</td></tr>
+  <tr><th>New</th><td>{{.LastNew}}</td></tr>
+  <tr><th>Reindexed</th><td>{{.LastReindexed}}</td></tr>
+  <tr><th>Unchanged</th><td>{{.LastUnchanged}}</td></tr>
+  <tr><th>Failed</th><td>{{.LastFailed}}</td></tr>
+  {{if .LastErr}}<tr><th>Last error</th><td><mark>{{.LastErr}}</mark></td></tr>{{end}}
+</table>
+{{if .RecentErrors}}
+<h3>Recent failures</h3>
+<table>
+  <thead><tr><th>S3 key</th><th>When</th><th>Error</th></tr></thead>
+  <tbody>
+  {{range .RecentErrors}}<tr><td>{{.Key}}</td><td>{{.When}}</td><td>{{.Err}}</td></tr>{{end}}
+  </tbody>
+</table>
+{{else}}
+<p><em>No recent indexer failures.</em></p>
+{{end}}
+{{end}}

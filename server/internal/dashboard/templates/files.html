@@ -1,0 +1,18 @@
+{{define "content"}}
+<h2>Files ({{.Count}})</h2>
+<table>
+  <thead><tr><th>S3 key</th><th>Recorded</th><th>Size</th><th>Messages</th><th>Topics</th></tr></thead>
+  <tbody>
+  {{range .Files}}
+    <tr>
+      <td><a href="/dashboard/files/{{.ID}}">{{.S3Key}}</a></td>
+      <td>{{.StartHuman}} → {{.EndHuman}}</td>
+      <td>{{.SizeHuman}}</td>
+      <td>{{.MessageCount}}</td>
+      <td>{{.TopicCount}}</td>
+    </tr>
+  {{end}}
+  </tbody>
+</table>
+{{if .NextPage}}<p><a href="/dashboard/files?page={{.NextPage}}">Next →</a></p>{{end}}
+{{end}}

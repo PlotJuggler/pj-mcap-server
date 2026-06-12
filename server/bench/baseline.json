@@ -1,0 +1,8 @@
+{
+  "key": "nissan_zala_90_country_road_2_0.mcap",
+  "iterations": 3,
+  "mb_per_sec": 15.548812523994966,
+  "payload_bytes_per_iteration": 12372704,
+  "note": "localhost lower-bound; server+Minio+client co-resident. 200 MB/s reference-machine gate is a separate M2a SOW item. Regression floor = 30% of this.",
+  "recorded_at": "2026-06-05T15:27:54Z"
+}

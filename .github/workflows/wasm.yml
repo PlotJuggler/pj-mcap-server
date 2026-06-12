@@ -1,0 +1,74 @@
+name: wasm-compile
+
+# Unified plan M2c-DEX "WASM bonus" + risk 8: "Keep WASM a demo (not gating)
+# deliverable; add a compile-to-WASM CI job; ... surface the constraints rather
+# than asserting unmodified." This job COMPILES the as-built protocol/decode core
+# (the dependency-light, socket-free units that genuinely belong in a future
+# browser build) to WebAssembly and runs the decode-core smoke under node, so the
+# WASM path "cannot silently rot".
+#
+# NON-GATING BY CONSTRUCTION: this is a SEPARATE workflow, never added to branch
+# protection's required checks. A wasm break must never block a merge — its sole
+# purpose is rot-detection of the compile path (the WASM browser DEMO itself is
+# M2 scope and lives in the EXTERNAL PJ4-WASM UI work stream, not this repo).
+#
+# It does NOT touch the native plugin build, the smoke/matrix/ctest gates, or the
+# Go server CI (those stay exactly as ci.yml defines them). See
+# PJ4/pj-official-plugins/toolbox_dexory_cloud/wasm/README.md for the full
+# transport / TLS / protobuf / zstd constraint write-up.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# One in-flight run per ref; a new push cancels the previous run.
+concurrency:
+  group: wasm-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  wasm-compile:
+    runs-on: ubuntu-latest
+    # Whole job is dominated by the (tiny, sub-second) compile; the emsdk action
+    # caches its toolchain. A generous bound that still trips on a hang.
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      # Pinned emsdk. The dev box uses a newer emsdk (5.x); the decode-core API
+      # surface (zstddeclib + std + the pure headers) is stable across these, so
+      # CI need not match the dev box exactly. version pinned per conancenter's
+      # newest emsdk (3.1.73). The action caches the toolchain across runs.
+      - name: setup emscripten
+        uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: 3.1.73
+          actions-cache-folder: emsdk-cache
+
+      - name: emcc version
+        run: emcc --version
+
+      # The native ZSTD encoder used to generate the round-trip test frame: the
+      # runner ships system libzstd; the build script falls back to it (with the
+      # vendored 1.5.7 header) when the conan 1.5.7 package is absent — which it
+      # is in CI. The DECODER under test is the vendored 1.5.7 amalgamation.
+      - name: ensure native libzstd (for the test-frame encoder)
+        run: sudo apt-get update && sudo apt-get install -y libzstd-dev
+
+      - name: build + run the wasm decode-core smoke
+        run: |
+          cd PJ4/pj-official-plugins/toolbox_dexory_cloud/wasm
+          ./build.sh
+
+      - name: upload .wasm artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dexory-cloud-wasm-decode-core
+          path: |
+            PJ4/pj-official-plugins/toolbox_dexory_cloud/wasm/build/dexory_cloud_wasm_smoke.wasm
+            PJ4/pj-official-plugins/toolbox_dexory_cloud/wasm/build/dexory_cloud_wasm_smoke.js
+          if-no-files-found: warn

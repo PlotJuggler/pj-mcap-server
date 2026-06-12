@@ -1,0 +1,138 @@
+name: bench
+
+# Plan C Task 7 Step 2 (nightly bench), adapted to the AS-BUILT repo. The plan's
+# version built a Qt CLI + docker-compose stack + a real-corpus fixture; NONE of
+# that exists here (the transport is in-process Go; the wire bindings are checked
+# in; the heavy corpus is the on-disk ground-truth set, NOT in the repo). So this
+# workflow runs the AS-BUILT bench surface instead:
+#
+#   * the `bench`-tagged BENCHMARKS in server/bench (BenchmarkCompressionCPU and
+#     BenchmarkBackpressureLatency — Plan A Task 45) are IN-PROCESS and need no
+#     server / no Minio / no corpus, so they run here directly and carry the
+#     nightly signal.
+#   * the two corpus-dependent TESTS in server/bench (TestThroughputGate,
+#     TestStorageParity) are deliberately NOT run: they require the real
+#     ground-truth corpus object seeded into a `recordings` bucket, which is not
+#     available in CI. `-run='^$'` selects ZERO tests so they are skipped (not
+#     hard-failed) — the soft-gate contract.
+#
+# SOFT GATE: this workflow fails ONLY on a build/run ERROR. It NEVER fails on a
+# speed regression — the bench numbers + a generous comparison vs
+# server/bench/baseline.json are reported to the log and uploaded as an artifact
+# for a human to eyeball. (The 80 MB/s / 200 ms p99 figures in baseline.json are
+# reference-machine criteria; a cgroup-limited GitHub runner is not comparable.)
+
+on:
+  schedule:
+    - cron: "0 6 * * *"   # daily 06:00 UTC
+  workflow_dispatch:
+
+# The emulators are brought up so the bench env is wired exactly like the
+# integration leg; the in-process benches don't need them, but seeding keeps the
+# workflow a faithful service-container mirror of ci.yml for future corpus runs.
+env:
+  GOTOOLCHAIN: local   # go.mod says `go 1.23`; never download a newer toolchain.
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    services:
+      minio:
+        image: minio/minio:RELEASE.2024-06-13T22-53-53Z
+        env:
+          MINIO_ROOT_USER: ciadmin
+          MINIO_ROOT_PASSWORD: cipassword123
+        ports:
+          - 9000:9000
+        options: >-
+          --health-cmd "mc ready local || exit 1"
+          --health-interval 3s
+          --health-timeout 3s
+          --health-retries 20
+      fakegcs:
+        image: fsouza/fake-gcs-server:1.49.2
+        ports:
+          - 4443:4443
+        options: >-
+          --health-cmd "wget -q -O - http://localhost:4443/storage/v1/b || exit 1"
+          --health-interval 3s
+          --health-timeout 3s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+          cache: true
+          cache-dependency-path: server/go.sum
+
+      # Synthetic fixtures (same generator the integration leg seeds) — uploaded
+      # so the bench env is a faithful mirror of ci.yml; the in-process benches
+      # below do not read them, but a future corpus-bearing run would.
+      - name: generate synthetic fixtures
+        run: |
+          mkdir -p "$RUNNER_TEMP/fixtures"
+          cd server && go run ./cmd/gen-ci-fixtures -out "$RUNNER_TEMP/fixtures"
+
+      - name: seed Minio (bench bucket)
+        run: |
+          docker run --rm --network host \
+            -v "$RUNNER_TEMP/fixtures:/fixtures:ro" \
+            --entrypoint /bin/sh minio/mc:RELEASE.2024-06-12T14-34-03Z -c '
+              set -e
+              mc alias set local http://localhost:9000 ciadmin cipassword123
+              mc mb -p local/bench-fixtures
+              for f in /fixtures/*.mcap; do mc cp -q "$f" "local/bench-fixtures/$(basename "$f")"; done
+              echo "seeded:"; mc ls local/bench-fixtures
+            '
+
+      - name: seed fake-gcs (bench bucket)
+        run: |
+          host="http://localhost:4443"
+          code="$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+            "$host/storage/v1/b?project=pj-cloud-bench" \
+            -H 'Content-Type: application/json' -d '{"name":"bench-fixtures"}')"
+          case "$code" in 200|201|409) ;; *) echo "bucket create http $code"; exit 1;; esac
+          for f in "$RUNNER_TEMP"/fixtures/*.mcap; do
+            base="$(basename "$f")"
+            code="$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+              "$host/upload/storage/v1/b/bench-fixtures/o?uploadType=media&name=$base" \
+              -H 'Content-Type: application/octet-stream' --data-binary "@$f")"
+            [ "$code" = "200" ] || { echo "upload $base http $code"; exit 1; }
+          done
+
+      # Run the in-process bench-tagged BENCHMARKS only (-run='^$' skips the
+      # corpus-dependent Tests). -json gives a structured stream; we also tee the
+      # human log so the grep-able machine lines (BENCH_*, STORAGE_PARITY_*) are
+      # captured in the artifact. A non-zero here means a BUILD/RUN error — that
+      # is the only hard-fail condition (soft-gate on speed).
+      - name: run in-process benchmarks
+        run: |
+          cd server
+          set -o pipefail
+          go test -tags=bench -bench=. -benchmem -run='^$' -count=1 -v ./bench/... \
+            2>&1 | tee "$RUNNER_TEMP/bench.log"
+
+      # Soft compare vs the committed baseline: report-only, never fail on speed.
+      # We surface the baseline alongside the run so a human (or a future
+      # tolerance check) can compare; a parse/compare hiccup must not fail the job.
+      - name: soft compare vs baseline (report-only)
+        if: always()
+        run: |
+          echo "=== committed baseline (server/bench/baseline.json) ==="
+          cat server/bench/baseline.json || echo "(no baseline.json)"
+          echo "=== machine-readable bench lines from this run ==="
+          grep -E 'BENCH|MBPS|ns/op|allocs/op|_P50_|_P99_' "$RUNNER_TEMP/bench.log" || \
+            echo "(no machine-readable bench lines captured)"
+          echo "NOTE: soft gate — speed numbers are reported, never gated. The job"
+          echo "fails only on a build/run error above."
+
+      - name: upload bench results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-results
+          path: ${{ runner.temp }}/bench.log
+          if-no-files-found: warn
+          retention-days: 30
