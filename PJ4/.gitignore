@@ -1,0 +1,14 @@
+build/
+.qt/
+.cache/
+compile_commands.json
+CMakeUserPresets.json
+.vscode/
+.idea/
+*.user
+/aqtinstall.log
+/.qt
+.worktrees/
+
+# superpowers brainstorming / planning process artifacts (local, not tracked)
+docs/superpowers/

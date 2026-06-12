@@ -1,0 +1,35 @@
+exclude: ^.vscode/|^deps/|^build/|^3rdparty/
+repos:
+
+  # Standard hooks
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.5.0
+    hooks:
+      - id: check-added-large-files
+        # pj_base/abi/baseline.abi is an intentionally-tracked reference
+        # dump (~1.1 MB of XML from abidw) used by the ABI drift gate.
+        # It is refreshed via `cmake --build . --target abi_update_baseline`.
+        exclude: ^pj_base/abi/
+      - id: check-ast
+      - id: check-case-conflict
+      - id: check-merge-conflict
+      - id: check-symlinks
+      - id: check-xml
+      - id: check-yaml
+        exclude: .gitlab-ci.yml
+        args: ['--allow-multiple-documents']
+      - id: debug-statements
+      - id: end-of-file-fixer
+        exclude_types: [svg]
+      - id: mixed-line-ending
+      - id: trailing-whitespace
+        exclude_types: [svg]
+      - id: fix-byte-order-marker
+
+  # CPP hooks
+  - repo: https://github.com/pre-commit/mirrors-clang-format
+    rev: v22.1.0
+    hooks:
+      - id: clang-format
+        types_or: [c++, c, proto]
+        args: ['-fallback-style=none', '-i']

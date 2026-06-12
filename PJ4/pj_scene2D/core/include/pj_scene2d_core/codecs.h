@@ -1,0 +1,145 @@
+#pragma once
+// Copyright 2026 Davide Faconti
+// SPDX-License-Identifier: MPL-2.0
+
+#include <cstddef>
+#include <cstdint>
+#include <memory>
+
+#include "pj_scene2d_core/codec_pipeline.h"
+
+namespace PJ {
+
+/// Upper bound on decoded image dimensions, enforced BEFORE allocating a pixel
+/// buffer from header-declared geometry. Decoders consume untrusted bytes (files,
+/// network); a crafted header can declare enormous dimensions that would drive a
+/// multi-gigabyte value-initialized allocation (or std::bad_alloc). 100 MP
+/// comfortably covers any real camera/video frame (8K is ~33 MP) while bounding
+/// the worst case.
+inline constexpr int64_t kMaxImagePixels = 100'000'000;
+
+/// True when (width, height) is a positive image size whose pixel count is within
+/// kMaxImagePixels. Computed in 64-bit so the product cannot overflow.
+[[nodiscard]] inline bool imageDimensionsWithinLimit(int width, int height) noexcept {
+  return width > 0 && height > 0 && static_cast<int64_t>(width) * static_cast<int64_t>(height) <= kMaxImagePixels;
+}
+
+enum class ImageContainer : uint8_t {
+  kUnknown,
+  kJpeg,
+  kPng,
+};
+
+/// Sniff the self-describing image container carried by a byte payload. PNG uses
+/// the full 8-byte signature, not only "\x89PNG": a shorter match can confuse
+/// raw/Bayer buffers with compressed containers and route them to the wrong path.
+[[nodiscard]] inline ImageContainer sniffImageContainer(const uint8_t* data, size_t size) noexcept {
+  if (data == nullptr) {
+    return ImageContainer::kUnknown;
+  }
+  if (size >= 3 && data[0] == 0xFF && data[1] == 0xD8 && data[2] == 0xFF) {
+    return ImageContainer::kJpeg;
+  }
+  if (size >= 8 && data[0] == 0x89 && data[1] == 0x50 && data[2] == 0x4E && data[3] == 0x47 && data[4] == 0x0D &&
+      data[5] == 0x0A && data[6] == 0x1A && data[7] == 0x0A) {
+    return ImageContainer::kPng;
+  }
+  return ImageContainer::kUnknown;
+}
+
+/// JPEG → RGB888 via turbojpeg.
+class JpegCodec : public CodecStage {
+ public:
+  JpegCodec();
+  ~JpegCodec() override;
+  JpegCodec(const JpegCodec&) = delete;
+  JpegCodec& operator=(const JpegCodec&) = delete;
+  JpegCodec(JpegCodec&&) = delete;
+  JpegCodec& operator=(JpegCodec&&) = delete;
+
+  Expected<DecodedFrame> decode(const DecodedFrame& input) const override;
+
+ private:
+  void* tj_ = nullptr;
+};
+
+/// PNG → RGB888 (8-bit) or RGBA8888 (with alpha) or Mono16 (16-bit grayscale).
+/// Preserves Mono16 for downstream stages (e.g. Mono16ToGrayscale).
+class PngCodec : public CodecStage {
+ public:
+  Expected<DecodedFrame> decode(const DecodedFrame& input) const override;
+};
+
+/// Mono16 → RGB888 grayscale. Normalizes non-zero samples to [min, max].
+/// Zero samples are treated as invalid and remain black for all mono16 images.
+/// Input must be kMono16 with pixels->size() >= width*height*2.
+class Mono16ToGrayscale : public CodecStage {
+ public:
+  Expected<DecodedFrame> decode(const DecodedFrame& input) const override;
+};
+
+/// Pass-through for display-ready frames, Mono16 → RGB888 grayscale when needed.
+class NormalizeMono16 : public CodecStage {
+ public:
+  Expected<DecodedFrame> decode(const DecodedFrame& input) const override;
+
+ private:
+  Mono16ToGrayscale mono16_to_grayscale_;
+};
+
+/// JPEG/PNG byte decoder cascade. The output may still be Mono16.
+class ImageDecodeCascade : public CodecStage {
+ public:
+  Expected<DecodedFrame> decode(const DecodedFrame& input) const override;
+
+ private:
+  JpegCodec jpeg_;
+  PngCodec png_;
+};
+
+/// JPEG/PNG auto-dispatch followed by Mono16 normalization when needed.
+class AutoImageCodec : public CodecStage {
+ public:
+  Expected<DecodedFrame> decode(const DecodedFrame& input) const override;
+
+ private:
+  ImageDecodeCascade decode_;
+  NormalizeMono16 normalize_;
+};
+
+/// Bayer color-filter-array pattern, named by the top-left 2x2 tile.
+enum class BayerPattern : uint8_t {
+  kRGGB,
+  kGRBG,
+  kGBRG,
+  kBGGR,
+};
+
+/// Bayer mosaic → RGB888 demosaic. Input must be a kMono8 frame whose pixels
+/// hold the raw CFA mosaic (one sample per pixel). The constructor selects the
+/// CFA pattern. Missing channels are filled by averaging the same-channel
+/// samples in the 3x3 neighbourhood (clamped at edges).
+class BayerDecode : public CodecStage {
+ public:
+  explicit BayerDecode(BayerPattern pattern) : pattern_(pattern) {}
+
+  Expected<DecodedFrame> decode(const DecodedFrame& input) const override;
+
+ private:
+  BayerPattern pattern_;
+};
+
+/// Mono8 class IDs → RGB888 false-color. Each class ID (0-255) maps to
+/// a distinct hue. Input must be kMono8 with pixels->size() >= width*height.
+/// Designed for the planned segmentation layer; not yet wired into any pipeline
+/// (no production constructor call).
+class SegmentationPalette : public CodecStage {
+ public:
+  Expected<DecodedFrame> decode(const DecodedFrame& input) const override;
+};
+
+// --- Pipeline builders ---
+
+std::unique_ptr<CodecPipeline> makeJpegPipeline();  ///< JpegCodec only (raw JPEG input)
+
+}  // namespace PJ

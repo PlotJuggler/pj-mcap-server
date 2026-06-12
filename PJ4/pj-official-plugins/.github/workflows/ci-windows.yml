@@ -1,0 +1,65 @@
+name: CI Windows
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-windows-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    # Pinned: windows-latest migrated to the VS18/MSVC 14.5x image, where the
+    # libsodium/1.0.20 Conan recipe fails to build from source (MSB8052: default
+    # toolset 14.44 is incompatible with the v145 platform toolset its bundled
+    # vs2022 solution selects). windows-2022 is the last known-green image.
+    # Revert to windows-latest once libsodium's recipe supports v145 or we move
+    # off the 1.0.20 pin. See follow-up infra issue.
+    runs-on: windows-2022
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Conan
+        uses: conan-io/setup-conan@v1.3.0
+        with:
+          cache_packages: true
+
+      - name: Install cmake and ninja
+        run: pip install cmake ninja
+
+      - name: Set up MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Acquire plotjuggler_sdk
+        # Cloudsmith publishes only a Linux binary, so Windows builds core from source.
+        # ensure_core.sh builds it from the pinned extern/plotjuggler_core submodule
+        # with no cloudsmith remote configured, so a cloudsmith outage can never break
+        # the Windows build. Runs after the MSVC env is set up so conan can compile it.
+        shell: bash
+        run: |
+          conan profile detect --force
+          scripts/ensure_core.sh
+
+      - name: Build & Test
+        shell: bash
+        run: |
+          conan install . --output-folder=build --build=missing -s build_type=Release \
+            -s compiler.cppstd=20 -c tools.cmake.cmaketoolchain:generator=Ninja \
+            -o "cpython/*:shared=True"
+
+          cmake -S . -B build/Release -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE=build/conan_toolchain.cmake \
+            -DCMAKE_PREFIX_PATH=build \
+            -DCMAKE_BUILD_TYPE=Release
+          cmake --build build/Release --config Release
+          ctest --test-dir build/Release -V --output-on-failure
