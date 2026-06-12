@@ -5,8 +5,20 @@
 | Date | 2026-05-28 |
 | Status | Draft — pending user review |
 | Owner | Davide Faconti |
-| Repo (new) | `pj-cloud/` (separate from PJ4) |
+| Repo (new) | `pj-cloud/` (separate from PJ4) — **see LOCAL AMENDMENT below** |
 | Future PJ4 integration | `PJ4/pj_plugins/pj_cloud/` (deferred; separate spec) |
+
+> **Local grounding (this machine — read before executing anything).**
+> **[LOCAL AMENDMENT 2026-06-04]** The implementation repo is **this repo**
+> (`/home/gn/ws/PJ4_Server_Template/pj-mcap-server`): every `pj-cloud/<path>` in this spec
+> maps to `<repo-root>/<path>`; do **not** create a separate `pj-cloud/` repo.
+> **Mandatory reference codebases — always reuse these for PJ4/SDK/plugin context:**
+> `/home/gn/ws/PJ4` (the PlotJuggler 4 app + `plotjuggler_sdk/`; read its `CLAUDE.md` and
+> `PJ4_PLAN.md` first), `/home/gn/ws/PJ4/pj-official-plugins` (plugin build/shape
+> conventions; closest analogs `data_load_mcap`, `data_stream_foxglove_bridge`,
+> `data_stream_pj_bridge`), and `/home/gn/ws/PJ4/pj-official-plugins/toolbox_mosaico`
+> (the dialog/worker/Lua-query design the PJ4 plugin plan lifts — note the underscore).
+> Verified key paths live in this repo's `CLAUDE.md` § "Reference codebases".
 
 ## 1. Summary
 

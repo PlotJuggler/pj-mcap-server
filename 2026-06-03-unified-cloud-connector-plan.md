@@ -6,6 +6,18 @@
 | **Status** | Draft for review — user decisions of 2026-06-03 applied (see §8 "Resolved") |
 | **Owner** | Davide Faconti |
 
+> **Local grounding (this machine — read before executing anything).**
+> **[LOCAL AMENDMENT 2026-06-04]** The implementation repo is **this repo**
+> (`/home/gn/ws/PJ4_Server_Template/pj-mcap-server`): every `pj-cloud/<path>` in this plan
+> maps to `<repo-root>/<path>`; do **not** create a separate `pj-cloud/` repo (this
+> supersedes §4's "sibling to PJ4" framing on this machine).
+> **Mandatory reference codebases — always reuse these for PJ4/SDK/plugin context:**
+> `/home/gn/ws/PJ4` (app + `plotjuggler_sdk/`; read its `CLAUDE.md` + `PJ4_PLAN.md`
+> first), `/home/gn/ws/PJ4/pj-official-plugins` (plugin conventions; analogs
+> `data_load_mcap`, `data_stream_foxglove_bridge`, `data_stream_pj_bridge`), and
+> `/home/gn/ws/PJ4/pj-official-plugins/toolbox_mosaico` (the Mosaico design §3.3 reuses).
+> Verified key paths: this repo's `CLAUDE.md` § "Reference codebases".
+>
 > **How to read this document.** This plan supersedes nothing; it *unifies* and, in a few enumerated places, *revises* the existing canonical sources: the design spec `2026-05-28-pj-cloud-connector-design.md`, Plan A `2026-05-28-pj-cloud-server-v1.md`, Plan B `2026-05-28-pj-cloud-client-cpp.md`, Plan C `2026-05-28-pj-cloud-integration.md`, and the commercial proposal `2026-06-01-dexory-proposal.md`. Every place this plan *revises* a source is called out inline with **[REVISES …]**. Section 8 separates the decisions already **resolved** (2026-06-03) from those that **still require the user** (mostly commercial) before execution.
 
 ---
@@ -111,7 +123,7 @@ What v1 delivers and what it does not:
 
 ## 4. Repo / module layout — ONE repo, sibling to PJ4
 
-One new repo `pj-cloud/`, sibling to `PJ4/` (not a subdirectory of the `mcap_server` design workspace). Go server and CMake/Qt client share `proto/pj_cloud.proto`; generated bindings are checked in so consumers need no `protoc`. **[REVISES Plan A]** Task 13 `s3reader` is promoted/renamed to `internal/storage` with the `BlobStore` interface extracted and a GCS sibling added; **[ADDS]** `internal/format` (one MCAP `FormatCodec`) and `internal/authn`; everything else keeps the spec §4 layout.
+One new repo `pj-cloud/`, sibling to `PJ4/` (not a subdirectory of the `mcap_server` design workspace). **[LOCAL AMENDMENT 2026-06-04: on this machine the implementation lives in THIS repo, `/home/gn/ws/PJ4_Server_Template/pj-mcap-server`, with the `pj-cloud/` layout below mapped onto the repo root — see the grounding note at the top.]** Go server and CMake/Qt client share `proto/pj_cloud.proto`; generated bindings are checked in so consumers need no `protoc`. **[REVISES Plan A]** Task 13 `s3reader` is promoted/renamed to `internal/storage` with the `BlobStore` interface extracted and a GCS sibling added; **[ADDS]** `internal/format` (one MCAP `FormatCodec`) and `internal/authn`; everything else keeps the spec §4 layout.
 
 ```
 pj-cloud/                                      # NEW REPO, sibling to PJ4/ (PRIVATE; Dexory team granted access — proposal line 112)

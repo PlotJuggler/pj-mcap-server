@@ -2,6 +2,20 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development or superpowers:executing-plans. Steps use checkbox (`- [ ]`) syntax.
 
+> **Local grounding (this machine — read before executing anything).**
+> **[LOCAL AMENDMENT 2026-06-04]** The implementation repo is **this repo**
+> (`/home/gn/ws/PJ4_Server_Template/pj-mcap-server`): every `pj-cloud/<path>` in this plan
+> maps to `<repo-root>/<path>`; do **not** create a separate `pj-cloud/` repo.
+> **Mandatory reference codebases — always reuse these for PJ4/SDK/plugin context:**
+> `/home/gn/ws/PJ4` (app + `plotjuggler_sdk/`; read its `CLAUDE.md` + `PJ4_PLAN.md`
+> first; `client-core`'s conventions follow `plotjuggler_core` style and its
+> Widgets-free rule mirrors `pj_runtime`'s), `/home/gn/ws/PJ4/pj-official-plugins`
+> (plugin conventions; `data_load_mcap/contrib/mcap/` vendors a full MCAP writer usable
+> as a `McapWriterSink` reference), and
+> `/home/gn/ws/PJ4/pj-official-plugins/toolbox_mosaico` (the dialog/worker design the
+> deferred Plan D lifts on top of this plan's `client-core`). Verified key paths: this
+> repo's `CLAUDE.md` § "Reference codebases".
+
 **Goal:** Build the Qt C++ test client for the PJ Cloud Connector — a Qt-aware static library (`client-core`) that speaks the wire protocol from [Plan A](./2026-05-28-pj-cloud-server-v1.md), plus a CLI driver (`pjcloud-cli`) that exercises the catalog + session APIs and round-trips streamed data back into a local MCAP file. The library is shaped so the future PJ4 plugin can lift it in unchanged.
 
 **Architecture:** Two CMake targets in `pj-cloud/`:
@@ -12,7 +26,7 @@
 
 **Depends on:** Plan A's `proto/pj_cloud.proto` (canonical wire schema, single source of truth).
 
-**Spec reference:** [`docs/superpowers/specs/2026-05-28-pj-cloud-connector-design.md`](../specs/2026-05-28-pj-cloud-connector-design.md) — §9 (Client design).
+**Spec reference:** [`2026-05-28-pj-cloud-connector-design.md`](./2026-05-28-pj-cloud-connector-design.md) — §9 (Client design).
 
 ---
 
@@ -149,7 +163,7 @@ cmake_layout
 - [ ] **Step 3: Smoke-test Conan install**
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server
 conan profile detect --force
 conan install . --output-folder=build --build=missing -s compiler.cppstd=20
 ```
@@ -285,7 +299,7 @@ class Expected<void> {
 Create stub source files so the library builds:
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud/client-core
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server/client-core
 mkdir -p src tests
 for f in CloudConnection MessageDispatcher CatalogClient SessionClient Decompression; do
   echo "// stub — filled by later tasks" > src/${f}.cpp
@@ -301,7 +315,7 @@ Create `pj-cloud/client-core/tests/CMakeLists.txt`:
 Configure + build:
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server
 cmake -B build -DCMAKE_TOOLCHAIN_FILE=build/conan_toolchain.cmake
 cmake --build build -j$(nproc) --target client-core
 ```
@@ -582,7 +596,7 @@ TEST(EnvelopeRoundTrip, HelloResponseBackendCapabilities) {
 - [ ] **Step 4: Build + run the test**
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server
 cmake --build build --target client-core-tests -j$(nproc)
 ctest --test-dir build -V
 ```
@@ -815,7 +829,7 @@ void MessageDispatcher::fail(const QString& reason) {
 - [ ] **Step 4: Build + run**
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server
 cmake --build build -j$(nproc) --target client-core-tests
 ctest --test-dir build -V
 ```
@@ -1046,7 +1060,7 @@ add_executable(client-core-tests
 - [ ] **Step 3: Build + run**
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server
 cmake --build build -j$(nproc) --target client-core-tests
 ctest --test-dir build -V
 ```
@@ -1289,7 +1303,7 @@ Expected<std::span<const std::byte>> Decompressor::decompressLz4(std::span<const
 - [ ] **Step 4: Build + run**
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server
 cmake --build build -j$(nproc) --target client-core-tests
 ctest --test-dir build -V
 ```
@@ -1562,7 +1576,7 @@ add_executable(client-core-tests
 - [ ] **Step 4: Build + run**
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server
 cmake --build build -j$(nproc) --target client-core-tests
 ctest --test-dir build -V
 ```
@@ -1772,7 +1786,7 @@ add_library(client-core STATIC
 - [ ] **Step 4: Build + run the test**
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server
 cmake -B build -DCMAKE_TOOLCHAIN_FILE=build/conan_toolchain.cmake
 cmake --build build -j$(nproc) --target client-core-tests
 ctest --test-dir build -V -R SessionKeyTest
@@ -1934,7 +1948,7 @@ int dispatch(const CliEnv& env, const QStringList& positional, QCoreApplication&
 Create stubs:
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud/client-cli/src
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server/client-cli/src
 for c in List Show Tag Download Debug; do
   cat > ${c}Command.cpp <<EOF
 #include "CommandDispatch.h"
@@ -1964,13 +1978,13 @@ rm DownloadCommand_tmp.cpp DebugCommand_tmp.cpp
 Also stub `McapWriterSink.cpp` (filled in Task 11):
 
 ```bash
-echo "// stub — filled by Task 11" > /home/davide/ws_plotjuggler/pj-cloud/client-cli/src/McapWriterSink.cpp
+echo "// stub — filled by Task 11" > /home/gn/ws/PJ4_Server_Template/pj-mcap-server/client-cli/src/McapWriterSink.cpp
 ```
 
 - [ ] **Step 4: Build the binary**
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server
 cmake --build build -j$(nproc) --target pjcloud-cli
 ./build/client-cli/pjcloud-cli --help
 ```

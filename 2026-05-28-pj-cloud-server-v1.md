@@ -2,13 +2,26 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+> **Local grounding (this machine — read before executing anything).**
+> **[LOCAL AMENDMENT 2026-06-04]** The implementation repo is **this repo**
+> (`/home/gn/ws/PJ4_Server_Template/pj-mcap-server`, already `git init`'d on `main`):
+> every `pj-cloud/<path>` in this plan maps to `<repo-root>/<path>`; do **not** create a
+> separate `pj-cloud/` repo (Task 1 Step 1 is amended accordingly).
+> **Mandatory reference codebases — always reuse these for PJ4/SDK/plugin context:**
+> `/home/gn/ws/PJ4` (app + `plotjuggler_sdk/`; read its `CLAUDE.md` + `PJ4_PLAN.md`
+> first), `/home/gn/ws/PJ4/pj-official-plugins` (plugin conventions; `data_load_mcap`
+> shows today's MCAP handling and vendors a full MCAP writer under `contrib/mcap/`), and
+> `/home/gn/ws/PJ4/pj-official-plugins/toolbox_mosaico` (the dialog/worker design the
+> deferred PJ4 plugin lifts). Verified key paths: this repo's `CLAUDE.md`
+> § "Reference codebases".
+
 **Goal:** Build the Go server backing the PJ Cloud Connector v1 spec — single static binary serving an MCAP catalog from S3 with WebSocket streaming of selected `(files × topics × time-range)` sessions, plus a read-only HTTP admin dashboard, all validated by Go-internal integration tests over the wire protocol.
 
 **Architecture:** Single Go binary, five subsystems on one TCP listener — Catalog (WS RPC + SQLite reads), Session (WS streaming + S3 fetcher with producer/consumer split for reconnect-and-resume), Indexer (background S3 poller), Dashboard (HTML), Health/Metrics. SQLite WAL + single catalog-writer goroutine for serialized writes. Protobuf-framed binary WS for everything.
 
 **Tech Stack:** Go 1.23, [`mcap-go`](https://github.com/foxglove/mcap/tree/main/go), [`aws-sdk-go-v2`](https://github.com/aws/aws-sdk-go-v2), [`nhooyr.io/websocket`](https://nhooyr.io/websocket), [`modernc.org/sqlite`](https://gitlab.com/cznic/sqlite) (pure-Go, no cgo), [`google.golang.org/protobuf`](https://pkg.go.dev/google.golang.org/protobuf), [`prometheus/client_golang`](https://github.com/prometheus/client_golang), `html/template` + [pico.css](https://picocss.com/), [`klauspost/compress/zstd`](https://github.com/klauspost/compress), [`pierrec/lz4/v4`](https://github.com/pierrec/lz4).
 
-**Spec reference:** [`docs/superpowers/specs/2026-05-28-pj-cloud-connector-design.md`](../specs/2026-05-28-pj-cloud-connector-design.md)
+**Spec reference:** [`2026-05-28-pj-cloud-connector-design.md`](./2026-05-28-pj-cloud-connector-design.md)
 
 ---
 
@@ -127,15 +140,18 @@ This plan (`2026-05-28-pj-cloud-server-v1.md`) has been amended **in place** to 
 - Create: `pj-cloud/LICENSE`
 - Create: `pj-cloud/Makefile`
 
-- [ ] **Step 1: Create the new repo directory and initialize git**
+- [ ] **Step 1: Verify the implementation repo exists and is on `main`**
 
-Run from `/home/davide/ws_plotjuggler/`:
+**[LOCAL AMENDMENT 2026-06-04]** On this machine the implementation repo already exists: it is
+`/home/gn/ws/PJ4_Server_Template/pj-mcap-server` (this very repo, already `git init`'d on
+branch `main`, holding the design docs at its root). Do **NOT** `mkdir pj-cloud` / `git init`.
+Every `pj-cloud/<path>` reference in this plan maps to `<repo-root>/<path>`.
 
 ```bash
-mkdir -p pj-cloud && cd pj-cloud && git init -b main
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server && git rev-parse --abbrev-ref HEAD
 ```
 
-Expected: `Initialized empty Git repository in /home/davide/ws_plotjuggler/pj-cloud/.git/`
+Expected: `main`
 
 - [ ] **Step 2: Write `.gitignore`**
 
@@ -183,7 +199,7 @@ Create `pj-cloud/README.md`:
 ````markdown
 # pj-cloud
 
-Self-hosted server + Qt C++ test client serving MCAP recordings from an S3 bucket to PlotJuggler clients. See [design spec](../PJ4/docs/superpowers/specs/2026-05-28-pj-cloud-connector-design.md).
+Self-hosted server + Qt C++ test client serving MCAP recordings from an S3 bucket to PlotJuggler clients. See [design spec](./2026-05-28-pj-cloud-connector-design.md).
 
 ## Layout
 
@@ -296,7 +312,7 @@ clean:
 - [ ] **Step 6: First commit**
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server
 git add .gitignore README.md LICENSE Makefile
 git commit -m "chore: bootstrap pj-cloud repository skeleton"
 ```
@@ -315,7 +331,7 @@ Expected: `master (root-commit) <hash>] chore: bootstrap pj-cloud repository ske
 - [ ] **Step 1: Initialize the Go module**
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud/server
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server/server
 go mod init pj-cloud/server
 ```
 
@@ -348,7 +364,7 @@ func main() {
 - [ ] **Step 4: Verify the skeleton builds**
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud/server
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server/server
 go build ./cmd/pj-cloud-server
 ./pj-cloud-server
 ```
@@ -358,7 +374,7 @@ Expected stdout: `pj-cloud-server: not yet wired (see plan task 36)`
 - [ ] **Step 5: Commit**
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server
 rm server/pj-cloud-server                       # delete the just-built binary
 git add server/go.mod server/cmd/pj-cloud-server/main.go
 git commit -m "chore(server): initialize Go module with placeholder main"
@@ -675,7 +691,7 @@ message Error {
 - [ ] **Step 2: Sanity-check the proto with `protoc` (no codegen yet)**
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server
 protoc -I=proto --descriptor_set_out=/dev/null proto/pj_cloud.proto && echo "proto syntactically valid"
 ```
 
@@ -686,7 +702,7 @@ Expected: `proto syntactically valid`
 This is the pin-before-codegen check from unified-plan §3.1/M0. Run these greps; each must print exactly the expected line(s):
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server
 # (a) HelloResponse carries BackendCapabilities (the M0 addition).
 grep -nE 'supports_file_hierarchy|metadata_key_vocabulary' proto/pj_cloud.proto
 # (a') ZERO *new* storage-specific message fields: M0 must not ADD any storage
@@ -720,7 +736,7 @@ Expected:
 - [ ] **Step 4: Commit**
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server
 git add proto/pj_cloud.proto
 git commit -m "feat(proto): canonical pj_cloud wire schema + BackendCapabilities + flat ListFiles metadata (M0)"
 ```
@@ -737,7 +753,7 @@ git commit -m "feat(proto): canonical pj_cloud wire schema + BackendCapabilities
 - [ ] **Step 1: Add the protobuf runtime dependency**
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud/server
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server/server
 go get google.golang.org/protobuf@v1.34.2
 ```
 
@@ -746,7 +762,7 @@ Expected: `go: added google.golang.org/protobuf v1.34.2`
 - [ ] **Step 2: Install `protoc-gen-go` and run codegen via Makefile**
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server
 GOBIN=$(go env GOPATH)/bin go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.34.2
 make proto
 ls server/internal/wire/pj_cloud/
@@ -827,7 +843,7 @@ func TestOpenSessionOneofDiscrimination(t *testing.T) {
 - [ ] **Step 4: Run the test**
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud/server
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server/server
 go test ./internal/wire/...
 ```
 
@@ -836,7 +852,7 @@ Expected: `PASS  ok  pj-cloud/server/internal/wire`
 - [ ] **Step 5: Commit**
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server
 git add server/go.mod server/go.sum server/internal/wire/
 git commit -m "feat(server): generate Go bindings for pj_cloud.proto"
 ```
@@ -851,7 +867,7 @@ git commit -m "feat(server): generate Go bindings for pj_cloud.proto"
 - [ ] **Step 1: Add YAML dependency**
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud/server
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server/server
 go get gopkg.in/yaml.v3@v3.0.1
 ```
 
@@ -1060,7 +1076,7 @@ func (c Config) Validate() error {
 - [ ] **Step 3: Build to verify it compiles**
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud/server
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server/server
 go build ./internal/config
 ```
 
@@ -1069,7 +1085,7 @@ Expected: (no output → success)
 - [ ] **Step 4: Commit**
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server
 git add server/go.mod server/go.sum server/internal/config/config.go
 git commit -m "feat(server): add config types, defaults, env expansion, validation"
 ```
@@ -1232,7 +1248,7 @@ func contains(s, sub string) bool {
 - [ ] **Step 2: Run tests; verify all pass**
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud/server
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server/server
 go test ./internal/config/... -v
 ```
 
@@ -1276,7 +1292,7 @@ catalog:
 ```
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud/server
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server/server
 go test ./internal/config/... -run 'Load|Validate' -v
 ```
 
@@ -1285,7 +1301,7 @@ Expected: `TestLoad_FullyPopulated`, `TestLoad_GCSOnly`, and every `TestValidate
 - [ ] **Step 4: Commit**
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server
 git add server/internal/config/config_test.go
 git commit -m "test(server): cover config Expand/Load/Validate + s3/gcs tagged-union (M0)"
 ```
@@ -1302,7 +1318,7 @@ git commit -m "test(server): cover config Expand/Load/Validate + s3/gcs tagged-u
 - [ ] **Step 1: Add SQLite driver dependency**
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud/server
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server/server
 go get modernc.org/sqlite@v1.34.1
 ```
 
@@ -1587,14 +1603,14 @@ func (e *boomError) Error() string { return e.msg }
 - [ ] **Step 5: Run tests + commit**
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud/server
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server/server
 go test ./internal/catalog/...
 ```
 
 Expected: `ok  pj-cloud/server/internal/catalog`
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server
 git add server/go.mod server/go.sum server/internal/catalog/
 git commit -m "feat(catalog): SQLite store with writer goroutine + schema migration"
 ```
@@ -1718,7 +1734,7 @@ func unixNs(t time.Time) int64 { return t.UnixNano() }
 - [ ] **Step 2: Run tests; verify they fail with "undefined: UpsertFile" etc.**
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud/server
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server/server
 go test ./internal/catalog/...
 ```
 
@@ -1871,7 +1887,7 @@ func boolToInt(b bool) int {
 - [ ] **Step 4: Run tests; verify they pass**
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud/server
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server/server
 go test ./internal/catalog/... -v
 ```
 
@@ -1880,7 +1896,7 @@ Expected: every `TestUpsertFile*` and `TestGetFile*` reports `--- PASS`.
 - [ ] **Step 5: Commit**
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server
 git add server/internal/catalog/files.go server/internal/catalog/files_test.go
 git commit -m "feat(catalog): file UpsertFile/GetFile with id-stable in-place updates"
 ```
@@ -1970,7 +1986,7 @@ func TestListTopicsForFile_Empty(t *testing.T) {
 - [ ] **Step 2: Verify failure**
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud/server
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server/server
 go test ./internal/catalog/...
 ```
 
@@ -2046,7 +2062,7 @@ func ListTopicsForFile(ctx context.Context, s *Store, fileID uint64) ([]TopicRec
 - [ ] **Step 4: Run tests, confirm pass**
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud/server
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server/server
 go test ./internal/catalog/... -v
 ```
 
@@ -2055,7 +2071,7 @@ Expected: all topic tests `--- PASS`.
 - [ ] **Step 5: Commit**
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server
 git add server/internal/catalog/topics.go server/internal/catalog/topics_test.go
 git commit -m "feat(catalog): topic ReplaceTopicsForFile + ListTopicsForFile"
 ```
@@ -2122,7 +2138,7 @@ func TestReplaceEmbeddedTags_RemovesAbsent(t *testing.T) {
 - [ ] **Step 2: Verify failure**
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud/server
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server/server
 go test ./internal/catalog/... -run Tags
 ```
 
@@ -2209,7 +2225,7 @@ var _ = time.Now
 - [ ] **Step 4: Run tests**
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud/server
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server/server
 go test ./internal/catalog/... -run Tags -v
 ```
 
@@ -2218,7 +2234,7 @@ Expected: pass.
 - [ ] **Step 5: Commit**
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server
 git add server/internal/catalog/tags.go server/internal/catalog/tags_test.go
 git commit -m "feat(catalog): embedded tag CRUD + EffectiveTags view"
 ```
@@ -2317,7 +2333,7 @@ func TestPreserveOverrideAcrossReindex(t *testing.T) {
 - [ ] **Step 2: Run tests; verify failure**
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud/server
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server/server
 go test ./internal/catalog/... -run Override
 ```
 
@@ -2372,7 +2388,7 @@ func MaskEmbedded(ctx context.Context, s *Store, fileID uint64, key string) erro
 - [ ] **Step 4: Run + verify all tag tests pass**
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud/server
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server/server
 go test ./internal/catalog/... -v
 ```
 
@@ -2381,7 +2397,7 @@ Expected: all tag tests `--- PASS`, including `TestPreserveOverrideAcrossReindex
 - [ ] **Step 5: Commit**
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server
 git add server/internal/catalog/tags.go server/internal/catalog/tags_test.go
 git commit -m "feat(catalog): override SetOverride/UnsetOverride/MaskEmbedded"
 ```
@@ -2550,7 +2566,7 @@ func stringID(prefix string, n int) string {
 - [ ] **Step 2: Verify failure**
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud/server
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server/server
 go test ./internal/catalog/... -run Filter
 ```
 
@@ -2744,7 +2760,7 @@ var _ = sql.ErrNoRows
 - [ ] **Step 4: Run tests**
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud/server
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server/server
 go test ./internal/catalog/... -v
 ```
 
@@ -2790,7 +2806,7 @@ func TestFileSummary_FlatMetadata(t *testing.T) {
 ```
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud/server
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server/server
 go test ./internal/catalog/... -run 'Filter|FlatMetadata' -v
 ```
 
@@ -2799,7 +2815,7 @@ Expected: all pass incl. `TestFileSummary_FlatMetadata`.
 - [ ] **Step 6: Commit**
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server
 git add server/internal/catalog/filter.go server/internal/catalog/filter_test.go
 git commit -m "feat(catalog): FilterFiles predicates + pagination + FlatMetadata for flat-tags wire shape"
 ```
@@ -2815,7 +2831,7 @@ git commit -m "feat(catalog): FilterFiles predicates + pagination + FlatMetadata
 - [ ] **Step 1: Add S3 SDK dependency**
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud/server
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server/server
 go get github.com/aws/aws-sdk-go-v2@v1.30.3
 go get github.com/aws/aws-sdk-go-v2/service/s3@v1.58.0
 go get github.com/aws/aws-sdk-go-v2/config@v1.27.27
@@ -2999,7 +3015,7 @@ func TestReader_Size_CachesHead(t *testing.T) {
 - [ ] **Step 4: Run tests**
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud/server
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server/server
 go test ./internal/s3reader/... -v
 ```
 
@@ -3008,7 +3024,7 @@ Expected: pass.
 - [ ] **Step 5: Commit**
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server
 git add server/go.mod server/go.sum server/internal/s3reader/
 git commit -m "feat(s3reader): ReaderAt over Range GET with HeadSize caching"
 ```
@@ -3220,7 +3236,7 @@ import (
 - [ ] **Step 3: Run tests, verify retry logic**
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud/server
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server/server
 go test ./internal/s3reader/... -v -run Retry
 ```
 
@@ -3229,7 +3245,7 @@ Expected: `TestRetry_TransientThenSuccess` and `TestRetry_PermanentNoRetry` PASS
 - [ ] **Step 4: Commit**
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server
 git add server/internal/s3reader/
 git commit -m "feat(s3reader): AWS SDK adapter with transient/permanent retry policy"
 ```
@@ -3413,7 +3429,7 @@ func (e *fakeHTTPErr) Err() error                     { return errors.New("fake"
 - [ ] **Step 3: Verify failure**
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud/server
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server/server
 go test ./internal/storage/... -run Classify
 ```
 
@@ -3709,14 +3725,14 @@ func (f *bsFetcher) Fetch(ctx context.Context, key string) ([]byte, int64, error
 - [ ] **Step 7: Run + commit**
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud/server
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server/server
 go test ./internal/storage/... -v
 ```
 
 Expected: `TestClassify_TransientVsPermanent/*` and `TestClassify_NetworkIsTransient` PASS.
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server
 git add server/internal/storage/
 git commit -m "feat(storage): BlobStore seam + S3 impl + factory + indexer adapters (M1a)"
 ```
@@ -3734,7 +3750,7 @@ git commit -m "feat(storage): BlobStore seam + S3 impl + factory + indexer adapt
 - [ ] **Step 1: Add the GCS SDK dependency**
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud/server
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server/server
 go get cloud.google.com/go/storage@v1.43.0
 go get google.golang.org/api/option@v0.190.0
 go get google.golang.org/api/iterator@v0.190.0
@@ -3799,7 +3815,7 @@ func (e *googleAPIErr) HTTPCode() int   { return e.code }
 - [ ] **Step 3: Verify failure**
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud/server
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server/server
 go test ./internal/storage/... -run GCS
 ```
 
@@ -4002,14 +4018,14 @@ func retryWith(ctx context.Context, fn func(ctx context.Context) error, classify
 - [ ] **Step 5: Run + commit**
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud/server
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server/server
 go test ./internal/storage/... -v
 ```
 
 Expected: `TestGCS_ObjectInfoUsesGeneration`, `TestGCS_ClassifyErrors`, and all S3 tests PASS.
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server
 git add server/go.mod server/go.sum server/internal/storage/
 git commit -m "feat(storage): GCS BlobStore impl (Generation/Updated change-detect; ADC baseline) (M1b)"
 ```
@@ -4028,7 +4044,7 @@ git commit -m "feat(storage): GCS BlobStore impl (Generation/Updated change-dete
 - [ ] **Step 1: Add mcap-go dependency**
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud/server
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server/server
 go get github.com/foxglove/mcap/go/mcap@latest
 ```
 
@@ -4203,7 +4219,7 @@ func TestExtractor_BasicFile(t *testing.T) {
 - [ ] **Step 4: Verify failure**
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud/server
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server/server
 go test ./internal/indexer/...
 ```
 
@@ -4308,14 +4324,14 @@ func messageIndexesPresent(info *mcap.Info) bool {
 ```
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud/server
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server/server
 go test ./internal/indexer/... -v
 ```
 
 Expected: `TestExtractor_BasicFile` PASS.
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server
 git add server/go.mod server/go.sum server/internal/indexer/extractor.go server/internal/indexer/extractor_test.go server/internal/testhelpers/fixtures.go
 git commit -m "feat(indexer): extract FileRecord+topics+embedded tags from MCAP summary"
 ```
@@ -4465,7 +4481,7 @@ func TestMCAP_ExtractAndIterate(t *testing.T) {
 - [ ] **Step 4: Verify failure**
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud/server
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server/server
 go test ./internal/format/...
 ```
 
@@ -4859,14 +4875,14 @@ func (w wsIndexLoader) Load(ctx context.Context, file catalog.FileRecord) (sessi
 - [ ] **Step 7: Run + commit**
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud/server
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server/server
 go test ./internal/format/... -v
 ```
 
 Expected: `TestMCAP_ExtractAndIterate` PASS.
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server
 git add server/internal/format/ server/internal/session/codec_io.go server/internal/session/plan.go
 git commit -m "feat(format): FormatCodec seam + MCAP impl (Extract/PlanChunks/Iterate) + NewCodec (M1a)"
 ```
@@ -4995,7 +5011,7 @@ func openCatalogStore(t *testing.T) *catalog.Store {
 - [ ] **Step 2: Verify failure**
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud/server
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server/server
 go test ./internal/indexer/... -run Scanner
 ```
 
@@ -5177,14 +5193,14 @@ var _ = errors.New // import used in some test helpers
 - [ ] **Step 4: Run + commit**
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud/server
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server/server
 go test ./internal/indexer/... -v
 ```
 
 Expected: pass.
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server
 git add server/internal/indexer/
 git commit -m "feat(indexer): Scanner.RunOnce — list S3 + diff + index new/changed"
 ```
@@ -5335,14 +5351,14 @@ func (l *Loop) Status() (lastRun time.Time, lastErr error, stats RunStats) {
 - [ ] **Step 3: Run + commit**
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud/server
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server/server
 go test ./internal/indexer/... -v
 ```
 
 Expected: pass.
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server
 git add server/internal/indexer/loop.go server/internal/indexer/loop_test.go
 git commit -m "feat(indexer): Loop with warm-start + interval ticker"
 ```
@@ -5447,7 +5463,7 @@ func TestBuildPlan_TopicAbsentDropped(t *testing.T) {
 - [ ] **Step 2: Verify failure**
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud/server
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server/server
 go test ./internal/session/...
 ```
 
@@ -5589,14 +5605,14 @@ func BuildPlan(ctx context.Context, files []catalog.FileRecord, indexes []FileCh
 - [ ] **Step 4: Run + commit**
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud/server
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server/server
 go test ./internal/session/... -v
 ```
 
 Expected: pass.
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server
 git add server/internal/session/plan.go server/internal/session/plan_test.go
 git commit -m "feat(session): BuildPlan with file-overlap validation + chunk intersection"
 ```
@@ -5683,7 +5699,7 @@ func TestRetain_NextBlocksUntilAppend(t *testing.T) {
 - [ ] **Step 2: Verify failure**
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud/server
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server/server
 go test ./internal/session/... -run Retain
 ```
 
@@ -5809,14 +5825,14 @@ func (r *RetainBuffer) Len() int {
 - [ ] **Step 4: Run + commit**
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud/server
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server/server
 go test ./internal/session/... -run Retain -v
 ```
 
 Expected: all retain tests pass.
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server
 git add server/internal/session/retain.go server/internal/session/retain_test.go
 git commit -m "feat(session): RetainBuffer with bounded queue + backpressure + Prune"
 ```
@@ -5834,7 +5850,7 @@ git commit -m "feat(session): RetainBuffer with bounded queue + backpressure + P
 - [ ] **Step 1: Add ZSTD dependency**
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud/server
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server/server
 go get github.com/klauspost/compress/zstd@v1.17.9
 ```
 
@@ -6191,14 +6207,14 @@ func protoSize(m *pb.Message) int {
 - [ ] **Step 4: Run + commit**
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud/server
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server/server
 go test ./internal/session/... -run Producer -v
 ```
 
 Expected: pass.
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server
 git add server/go.mod server/go.sum server/internal/session/producer.go server/internal/session/producer_test.go
 git commit -m "feat(session): Producer — S3 chunk → batch → RetainBuffer.Append"
 ```
@@ -6442,14 +6458,14 @@ func (c *Consumer) lastSeqSent() uint64 {
 - [ ] **Step 3: Run + commit**
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud/server
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server/server
 go test ./internal/session/... -run Consumer -v
 ```
 
 Expected: pass.
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server
 git add server/internal/session/consumer.go server/internal/session/consumer_test.go
 git commit -m "feat(session): Consumer — drain retain → WS + ack + periodic Progress + Eos"
 ```
@@ -6693,14 +6709,14 @@ func (r *Registry) ActiveCount() int {
 - [ ] **Step 3: Run + commit**
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud/server
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server/server
 go test ./internal/session/... -run Registry -v
 ```
 
 Expected: pass.
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server
 git add server/internal/session/registry.go server/internal/session/registry_test.go
 git commit -m "feat(session): Registry with detach/reattach/cancel + eviction timer"
 ```
@@ -6837,14 +6853,14 @@ func NewStreamError(subID uint64, code pb.ErrorCode, msg, details string) *pb.Se
 - [ ] **Step 3: Run + commit**
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud/server
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server/server
 go test ./internal/wire/... -v
 ```
 
 Expected: all wire tests pass.
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server
 git add server/internal/wire/envelope.go server/internal/wire/envelope_test.go
 git commit -m "feat(wire): envelope encode/decode + Error helpers with truncation"
 ```
@@ -6860,7 +6876,7 @@ git commit -m "feat(wire): envelope encode/decode + Error helpers with truncatio
 - [ ] **Step 1: Add websocket dependency**
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud/server
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server/server
 go get nhooyr.io/websocket@v1.8.11
 ```
 
@@ -7071,14 +7087,14 @@ func (s *Server) maxFrameSize() int64 {
 - [ ] **Step 4: Run + commit**
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud/server
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server/server
 go test ./internal/ws/... -run Server -v
 ```
 
 Expected: pass.
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server
 git add server/go.mod server/go.sum server/internal/ws/server.go server/internal/ws/server_test.go
 git commit -m "feat(ws): server with HTTP upgrade + Hello-gated auth"
 ```
@@ -7130,7 +7146,7 @@ func TestBearerToken_WrongFails(t *testing.T) {
 - [ ] **Step 2: Verify failure**
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud/server
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server/server
 go test ./internal/authn/...
 ```
 
@@ -7181,7 +7197,7 @@ func (b *bearerToken) Verify(ctx context.Context, token, remoteAddr string) (str
 - [ ] **Step 4: Run authn tests**
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud/server
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server/server
 go test ./internal/authn/... -v
 ```
 
@@ -7229,14 +7245,14 @@ Add `"pj-cloud/server/internal/authn"` to the import block. Update the Task 24 t
 - [ ] **Step 6: Run ws + authn, then commit**
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud/server
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server/server
 go test ./internal/authn/... ./internal/ws/... -run 'Bearer|Server' -v
 ```
 
 Expected: authn tests PASS; `TestServer_RejectsBadToken` still PASS (now via the seam).
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server
 git add server/internal/authn/ server/internal/ws/server.go server/internal/ws/server_test.go
 git commit -m "feat(authn): ClientAuthenticator seam + NewBearerToken; route WS auth gate through it (M1a)"
 ```
@@ -7431,14 +7447,14 @@ func (c *conn) SendBulk(m *pb.ServerMessage) bool {
 - [ ] **Step 3: Run + commit**
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud/server
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server/server
 go test ./internal/ws/... -run Conn -v
 ```
 
 Expected: pass.
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server
 git add server/internal/ws/conn.go server/internal/ws/conn_test.go
 git commit -m "feat(ws): connection with priority + bulk write channels"
 ```
@@ -7608,14 +7624,14 @@ func TestDispatcher_RoutesList(t *testing.T) {
 - [ ] **Step 3: Run + commit**
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud/server
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server/server
 go test ./internal/ws/... -run Dispatcher -v
 ```
 
 Expected: pass.
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server
 git add server/internal/ws/dispatcher.go server/internal/ws/dispatcher_test.go
 git commit -m "feat(ws): Dispatcher routes ClientMessage variants to Catalog/Session handlers"
 ```
@@ -7848,14 +7864,14 @@ func tagsToProto(tags []catalog.EffectiveTag) []*pb.Tag {
 - [ ] **Step 3: Run + commit**
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud/server
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server/server
 go test ./internal/ws/... -run Catalog -v
 ```
 
 Expected: pass.
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server
 git add server/internal/ws/handlers_catalog.go server/internal/ws/handlers_catalog_test.go
 git commit -m "feat(ws): catalog handlers ListFiles/GetFile/UpdateTags"
 ```
@@ -8175,14 +8191,14 @@ func TestSessionHandler_OpenFreshHappy(t *testing.T) {
 - [ ] **Step 3: Run + commit**
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud/server
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server/server
 go test ./internal/ws/... -run Session -v
 ```
 
 Expected: pass.
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server
 git add server/internal/ws/handlers_session.go server/internal/ws/handlers_session_test.go
 git commit -m "feat(ws): SessionHandler.OpenFresh — plan + register + spawn producer/consumer"
 ```
@@ -8263,12 +8279,12 @@ func TestSessionHandler_OpenResumeNotFound(t *testing.T) {
 - [ ] **Step 3: Run + commit**
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud/server
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server/server
 go test ./internal/ws/... -run OpenResume -v
 ```
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server
 git add server/internal/ws/handlers_session.go server/internal/ws/handlers_session_test.go
 git commit -m "feat(ws): SessionHandler.OpenResume — reattach + prune + new consumer"
 ```
@@ -8345,12 +8361,12 @@ func TestSessionHandler_AckForwardsToChannel(t *testing.T) {
 - [ ] **Step 3: Run + commit**
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud/server
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server/server
 go test ./internal/ws/... -run "Cancel|Ack" -v
 ```
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server
 git add server/internal/ws/handlers_session.go server/internal/ws/handlers_session_test.go
 git commit -m "feat(ws): SessionHandler Cancel + Ack"
 ```
@@ -8495,12 +8511,12 @@ func topicSet(m map[string]struct{}) []string {
 - [ ] **Step 3: Run + commit**
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud/server
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server/server
 go test ./internal/session/... -run Production -v
 ```
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server
 git add server/internal/session/production_io.go server/internal/session/production_io_test.go
 git commit -m "feat(session): production ChunkReader + ChunkIter wired to S3 + mcap-go"
 ```
@@ -8520,7 +8536,7 @@ git commit -m "feat(session): production ChunkReader + ChunkIter wired to S3 + m
 - [ ] **Step 1: Vendor pico.css**
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud/server
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server/server
 mkdir -p internal/dashboard/static internal/dashboard/templates
 curl -L -o internal/dashboard/static/pico.min.css https://unpkg.com/@picocss/pico@2.0.6/css/pico.min.css
 ```
@@ -8823,12 +8839,12 @@ func setupMux(t *testing.T) *http.ServeMux {
 ```
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud/server
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server/server
 go test ./internal/dashboard/... -v
 ```
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server
 git add server/internal/dashboard/
 git commit -m "feat(dashboard): scaffolding, BasicAuth, overview page, pico.css embed"
 ```
@@ -8989,12 +9005,12 @@ func (h *pageHandler) recentFailures(ctx context.Context) ([]map[string]string, 
 - [ ] **Step 3: Run + commit**
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud/server
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server/server
 go test ./internal/dashboard/... -v
 ```
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server
 git add server/internal/dashboard/
 git commit -m "feat(dashboard): files / sessions / indexer pages"
 ```
@@ -9010,7 +9026,7 @@ git commit -m "feat(dashboard): files / sessions / indexer pages"
 - [ ] **Step 1: Add Prometheus dep**
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud/server
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server/server
 go get github.com/prometheus/client_golang/prometheus@v1.20.0
 go get github.com/prometheus/client_golang/prometheus/promhttp@v1.20.0
 ```
@@ -9094,7 +9110,7 @@ func PrometheusHandler(reg *prometheus.Registry) http.Handler {
 - [ ] **Step 4: Commit**
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server
 git add server/go.mod server/go.sum server/internal/metrics/
 git commit -m "feat(metrics): Prometheus counters + /health + /metrics handlers"
 ```
@@ -9334,7 +9350,7 @@ The production `Lister`/`Fetcher` are NOT defined in `indexer`; they are `storag
 - [ ] **Step 3 (M1a): Build, then assert the no-cloud-SDK-outside-storage rule**
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server
 make build
 # Anti-drift guard (unified-plan §7 risk 1): only internal/storage may import a cloud SDK.
 cd server && ! grep -rEl 'aws-sdk-go-v2|cloud\.google\.com/go/storage' \
@@ -9443,7 +9459,7 @@ metrics:
 - [ ] **Step 3: Smoke-test Docker build**
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server
 make docker
 docker images | grep pj-cloud-server
 ```
@@ -9468,7 +9484,7 @@ git commit -m "feat(deploy): distroless Dockerfile + config.example.yaml"
 - [ ] **Step 1: Add testcontainers dep**
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud/server
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server/server
 go get github.com/testcontainers/testcontainers-go@v0.32.0
 go get github.com/testcontainers/testcontainers-go/modules/minio@v0.32.0
 ```
@@ -9655,7 +9671,7 @@ func (c *TestClient) Send(msg *pb.ClientMessage) error {
 - [ ] **Step 4: Commit**
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server
 git add server/go.mod server/go.sum server/internal/testhelpers/minio.go server/integration_test/helpers.go
 git commit -m "test: Minio testcontainer + Go-internal wire-protocol client"
 ```
@@ -9905,14 +9921,14 @@ import (
 - [ ] **Step 4: Run + commit**
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud/server
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server/server
 go test -tags=integration ./integration_test/... -run E2E_SessionCompletes -v
 ```
 
 Expected: pass (will take ~30s due to Minio start).
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server
 git add server/integration_test/
 git commit -m "test(e2e): single-file session lifecycle COMPLETE against Minio"
 ```
@@ -9980,12 +9996,12 @@ func TestE2E_OverlappingFilesRejected(t *testing.T) {
 - [ ] **Step 2: Run + commit**
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud/server
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server/server
 go test -tags=integration ./integration_test/... -run OverlappingFiles -v
 ```
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server
 git add server/integration_test/lifecycle_test.go
 git commit -m "test(e2e): overlapping files rejected with INVALID_REQUEST"
 ```
@@ -10046,12 +10062,12 @@ func TestE2E_CancelMidStream(t *testing.T) {
 - [ ] **Step 2: Run + commit**
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud/server
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server/server
 go test -tags=integration ./integration_test/... -run CancelMidStream -v
 ```
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server
 git add server/integration_test/lifecycle_test.go
 git commit -m "test(e2e): cancel mid-stream yields Eos CANCELLED"
 ```
@@ -10144,12 +10160,12 @@ func TestE2E_ResumeAfterDisconnect(t *testing.T) {
 - [ ] **Step 2: Run + commit**
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud/server
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server/server
 go test -tags=integration ./integration_test/... -run ResumeAfterDisconnect -v
 ```
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server
 git add server/integration_test/resume_test.go
 git commit -m "test(e2e): resume after disconnect continues from last_seq"
 ```
@@ -10214,12 +10230,12 @@ func StartServerForTestWithRetain(t *testing.T, m *testhelpers.MinioHandle, reta
 - [ ] **Step 2: Run + commit**
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud/server
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server/server
 go test -tags=integration ./integration_test/... -run RetainExpiry -v
 ```
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server
 git add server/integration_test/resume_test.go server/integration_test/helpers.go
 git commit -m "test(e2e): expired retain yields RESUME_NOT_POSSIBLE"
 ```
@@ -10290,12 +10306,12 @@ func hasTag(tags []*pb.Tag, k, v string, isOverride bool) bool {
 - [ ] **Step 2: Run + commit**
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud/server
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server/server
 go test -tags=integration ./integration_test/... -run TagOverride -v
 ```
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server
 git add server/integration_test/lifecycle_test.go
 git commit -m "test(e2e): tag override + unset flows"
 ```
@@ -10367,12 +10383,12 @@ func TestE2E_HealthAndMetricsUnauthenticated(t *testing.T) {
 - [ ] **Step 2: Run + commit**
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud/server
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server/server
 go test -tags=integration ./integration_test/... -run "Dashboard|Health" -v
 ```
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server
 git add server/integration_test/dashboard_test.go
 git commit -m "test(e2e): dashboard auth + health + metrics endpoints"
 ```
@@ -10459,12 +10475,12 @@ Create `server/bench/baseline.json`:
 - [ ] **Step 3: Run + commit**
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud/server
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server/server
 go test -tags=bench -bench=. -benchmem -run=NONE ./bench/...
 ```
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server
 git add server/bench/
 git commit -m "bench: v1 streaming-throughput gate with committed baseline.json"
 ```
@@ -10549,7 +10565,7 @@ jobs:
 - [ ] **Step 2: Commit**
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server
 git add .github/workflows/ci.yml
 git commit -m "ci: unit + race + integration jobs"
 ```
@@ -10711,7 +10727,7 @@ The `fail-fast: false` + `matrix.backend: [s3, gcs]` from the Task 46 edit stay;
 - [ ] **Step 6: Run both legs locally + commit**
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server
 docker compose -f server/integration_test/docker-compose.yml up -d --wait minio fake-gcs
 cd server
 GCS_EMULATOR_HOST=http://localhost:4443/storage/v1/ go test -tags=integration -count=1 ./integration_test/... -v
@@ -10720,7 +10736,7 @@ GCS_EMULATOR_HOST=http://localhost:4443/storage/v1/ go test -tags=integration -c
 Expected: each lifecycle/overlap/cancel/resume test shows BOTH `--- PASS: .../s3` and `--- PASS: .../gcs` sub-tests; identical assertions on both legs.
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server
 git add server/integration_test/ server/bench/storage_parity_test.go .github/workflows/ci.yml deploy/docker-compose.yml
 git commit -m "test(integration): parameterize component suite over {s3,gcs}; fake-gcs service; storage-parity bench; activate CI gcs leg (M1b)"
 ```

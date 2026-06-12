@@ -1,12 +1,64 @@
 # Plan D — PJ Cloud Connector: PlotJuggler 4 DataSource plugin (`pj_cloud`)
 
+> **Local grounding (this machine — read before executing anything).**
+> **[LOCAL AMENDMENT 2026-06-04]** The `pj-cloud/` implementation repo on this machine is
+> `/home/gn/ws/PJ4_Server_Template/pj-mcap-server` (Plans A–C build there).
+> **Mandatory reference codebases — always reuse these for PJ4/SDK/plugin context:**
+> - `/home/gn/ws/PJ4` — the PlotJuggler 4 app workspace (read its `CLAUDE.md` +
+>   `PJ4_PLAN.md` first). The SDK headers §0 cites live under
+>   `/home/gn/ws/PJ4/plotjuggler_sdk/` — e.g.
+>   `pj_base/include/pj_base/sdk/data_source_patterns.hpp` (`FileSourceBase`),
+>   `pj_base/include/pj_base/sdk/data_source_host_views.hpp` (`ParserBindingRequest`,
+>   `ensureParserBinding`, `pushMessage` + the payload-lifetime contract),
+>   `pj_base/include/pj_base/sdk/data_source_plugin_base.hpp`
+>   (`PJ_DATA_SOURCE_PLUGIN`; the class must be **default-constructible**).
+> - `/home/gn/ws/PJ4/pj-official-plugins` — plugin build/shape conventions
+>   (`PLUGIN_DEVELOPMENT.md`, `porting_guide.md`, `SDK_VERSION` — read it live, currently
+>   `0.6.0`); on this machine it lives **inside** `PJ4/`, not as a sibling.
+> - `/home/gn/ws/PJ4/pj-official-plugins/toolbox_mosaico` — the plugin this plan lifts
+>   (note the **underscore**): `src/mosaico_dialog.{hpp,cpp}`, `src/fetch_worker.{hpp,cpp}`,
+>   `src/query/`, `src/settings_store.hpp`, `src/server_history.h`, `src/tls_utils.h`,
+>   `ui/mosaico_panel.ui`; the seams swapped out are `MosaicoClient` (Arrow Flight) and
+>   `src/arrow_ingest.*`.
+> - Caveat: in-repo streaming plugins (`data_stream_foxglove_bridge`, `data_stream_pj_bridge`)
+>   use **ixwebsocket**; this plugin deliberately links the Qt-WebSockets-based
+>   `client-core` instead — don't "normalize" that.
+> Verified key paths: this repo's `CLAUDE.md` § "Reference codebases".
+>
+> **[INTERIM ARTIFACT 2026-06-04]** A UI-shell predecessor of this plugin already exists
+> in the **vendored** tree: `<repo>/PJ4/pj-official-plugins/toolbox_dexory_cloud/` — a
+> 1:1 Mosaico copy (Toolbox shape, Arrow/mosaico_sdk stripped, inert transport stub).
+> See `2026-06-04-two-endpoints-approach.md`. When this plan executes, either migrate
+> that shell to the `FileSourceBase` DataSource shape specified here, or record a
+> reviewed amendment keeping the Toolbox shape — do not build a second parallel dialog.
+>
+> **[AMENDMENT 2026-06-04 — EXECUTED, shape revised to `StreamSourceBase`]** The
+> migration shipped (Slice 4), but **§0 note 1's `FileSourceBase` choice proved
+> unreachable in the real host**: the file-open flow is 100% extension-gated
+> (`pj_app/src/FileLoader.cpp:141-149`; `plugin_runtime_catalog.cpp:311-321`
+> `findSourcesForExtension` requires FINITE_IMPORT **and** a matching
+> `file_extensions` entry — a finite-import source without extensions can never be
+> invoked, and no `launchCustomOpenDialog`/URI hook exists, per note 3). The
+> **invocable** non-file shape is `StreamSourceBase` (`streamSources()` →
+> `MainWindow::refreshStreamingCombo()` → LeftPanel Streaming combo — the proven
+> foxglove-bridge path; the borrowed-dialog flow is family-agnostic,
+> `DialogPresenter.cpp:49-78`). Implemented: `PjCloudSource : PJ::StreamSourceBase`
+> (`kCapabilityDelegatedIngest|kCapabilityHasDialog`), bounded download auto-stops via
+> `requestStop(kStopped)` at `Eos{COMPLETE}`; `RawMcapForwardingDriver` per Task 4 with
+> the binding convention copied verbatim from `data_load_mcap/mcap_source.cpp:169-186`.
+> **ASSUMPTION A1 RESOLVED:** `parser_encoding="ros2msg"` for cdr+ros2msg sources;
+> pinned by tests against real schema bytes. Tasks 1/2/4 are effectively done in
+> `toolbox_dexory_cloud` (dir name kept); remaining Plan D scope: SessionCache (Task 5),
+> qtkeychain AuthProvider (Task 6), hierarchy browser (8), tag editing (9), GUI
+> resume (10), docs (12).
+
 > **Status: DEFERRED — Milestone 2b (M2b).** Planned in full now; built only after the
 > M1 PoC is approved. This is the **third client artifact** of the PJ Cloud Connector:
 > Plan B ([`2026-05-28-pj-cloud-client-cpp.md`](./2026-05-28-pj-cloud-client-cpp.md))
 > ships the Widgets-free `client-core` static lib + `pjcloud-cli`; **Plan D lifts that
 > `client-core` UNCHANGED into a PlotJuggler 4 DataSource plugin** and reuses the
 > conceptual design of the existing `toolbox_mosaico` plugin
-> (`/home/davide/ws_plotjuggler/pj-official-plugins/toolbox_mosaico`).
+> (`/home/gn/ws/PJ4/pj-official-plugins/toolbox_mosaico`).
 >
 > **Canonical references:** design spec §9 (client design)
 > [`2026-05-28-pj-cloud-connector-design.md`](./2026-05-28-pj-cloud-connector-design.md);
@@ -24,7 +76,7 @@
 ## 0. Grounding notes — corrections against the design spec (READ FIRST)
 
 These are load-bearing facts verified against the **real PJ4 SDK headers** under
-`/home/davide/ws_plotjuggler/PJ4/plotjuggler_sdk/`. Where the design spec names an API that
+`/home/gn/ws/PJ4/plotjuggler_sdk/`. Where the design spec names an API that
 does not exist in the SDK, the plan uses the closest **real** entry point and flags the gap
 as an explicit assumption (per the grounding rule: an explicit assumption is acceptable; an
 invented API is not).

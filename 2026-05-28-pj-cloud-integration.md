@@ -2,6 +2,18 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development or superpowers:executing-plans. Steps use checkbox (`- [ ]`) syntax.
 
+> **Local grounding (this machine — read before executing anything).**
+> **[LOCAL AMENDMENT 2026-06-04]** The implementation repo is **this repo**
+> (`/home/gn/ws/PJ4_Server_Template/pj-mcap-server`): every `pj-cloud/<path>` in this plan
+> maps to `<repo-root>/<path>`; do **not** create a separate `pj-cloud/` repo.
+> **Mandatory reference codebases — always reuse these for PJ4/SDK/plugin context:**
+> `/home/gn/ws/PJ4` (app + `plotjuggler_sdk/`; read its `CLAUDE.md` + `PJ4_PLAN.md`
+> first), `/home/gn/ws/PJ4/pj-official-plugins` (plugin conventions;
+> `data_load_mcap/contrib/mcap/` vendors a full MCAP reader+writer useful for fixture
+> and diff work), and `/home/gn/ws/PJ4/pj-official-plugins/toolbox_mosaico` (the
+> Mosaico design the deferred PJ4 plugin lifts). Verified key paths: this repo's
+> `CLAUDE.md` § "Reference codebases".
+
 **Goal:** Build the end-to-end correctness harness for PJ Cloud: a deterministic MCAP fixture matrix, a `docker-compose` orchestration that boots **Minio AND `fake-gcs-server`** + the Go server + the Qt C++ CLI, and a round-trip test that, **for each backend in `{s3, gcs}`**, downloads each fixture and asserts the reconstructed MCAP is **logically equal** on `(topic, log_time, payload, publish_time, schema name/encoding/data)` to the original. This is the v1 gate that catches any wire-format / protocol / decode mismatch between server and client — **on either backend.** A **GCS-only failure blocks a merge exactly like an S3-only failure.** This plan also adds an Asensus **GCE deployment smoke** (real ADC, persistent-disk catalog survives a VM restart) as a scheduled/manual checklist.
 
 **Architecture:** All integration code lives under `pj-cloud/integration-tests/`. The fixture generator is a small Go program that produces deterministic MCAPs covering the design dimensions (compression, payload size, multi-file stitching, embedded tags, time-range edge cases). The test driver is a Go program (because Go has both `mcap-go` and good subprocess control for the CLI) that orchestrates the matrix **parameterized over backend in `{s3, gcs}`**: upload fixtures into the chosen backend's bucket → exec `pjcloud-cli session download` against a server configured for that backend → diff against original. The two backends differ **only** in which storage service the server is pointed at (Minio for `s3`, `fake-gcs-server` for `gcs`); assertions and shared code are identical. The v1 benchmark gate from the spec is added as a sibling target with a committed `baseline.json`, and now includes a **cross-backend storage-parity microbench**.
@@ -13,7 +25,7 @@
 - Plan B's `pjcloud-cli` binary — built but not deployed.
 - The canonical `proto/pj_cloud.proto` (generated bindings in both).
 
-**Spec reference:** [`docs/superpowers/specs/2026-05-28-pj-cloud-connector-design.md`](../specs/2026-05-28-pj-cloud-connector-design.md) — §11 (Testing strategy), Layer 3 + Layer 4.
+**Spec reference:** [`2026-05-28-pj-cloud-connector-design.md`](./2026-05-28-pj-cloud-connector-design.md) — §11 (Testing strategy), Layer 3 + Layer 4.
 
 ---
 
@@ -83,7 +95,7 @@ pj-cloud/                                  # (existing from Plans A + B)
 - [ ] **Step 1: Module init**
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud/integration-tests
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server/integration-tests
 go mod init pj-cloud/integration-tests
 go get github.com/foxglove/mcap/go/mcap@latest
 go get github.com/minio/minio-go/v7@v7.0.74
@@ -259,7 +271,7 @@ metrics:
 - [ ] **Step 4: Smoke-test BOTH backend legs of the compose stack**
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud/integration-tests
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server/integration-tests
 
 # --- s3 leg (Minio) ---
 SERVER_CONFIG=./server-config.s3.yaml docker-compose up -d --build
@@ -466,7 +478,7 @@ func buildShortBurst() []byte {
 - [ ] **Step 2: Generate the corpus + check size**
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud/integration-tests
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server/integration-tests
 go run ./cmd/gen-fixtures --out fixtures
 du -sh fixtures/
 ```
@@ -841,7 +853,7 @@ func buildDifferentPayload(t *testing.T) []byte {
 - [ ] **Step 3: Run + commit**
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud/integration-tests
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server/integration-tests
 go test ./internal/diff/... -v
 ```
 
@@ -989,7 +1001,7 @@ func UploadDirGCS(ctx context.Context, bucket, dir string) error {
 Add the imports to `upload.go` (`gcs "cloud.google.com/go/storage"`, `"google.golang.org/api/option"`) and fetch the dep:
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud/integration-tests
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server/integration-tests
 go get cloud.google.com/go/storage@latest
 go get google.golang.org/api/option@latest
 ```
@@ -1363,7 +1375,7 @@ func BenchmarkGetRangeParity(b *testing.B) {
 Run it locally against a live stack (both emulators must be up):
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud/integration-tests
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server/integration-tests
 SERVER_CONFIG=./server-config.s3.yaml docker-compose up -d --build
 go test -tags=bench -bench=BenchmarkGetRangeParity -benchmem -count=1 -v ./bench/...
 docker-compose down -v
@@ -1633,7 +1645,7 @@ echo "ALL GCE SMOKE CHECKS PASSED"
 Mark it executable:
 
 ```bash
-chmod +x /home/davide/ws_plotjuggler/pj-cloud/integration-tests/scripts/gce_smoke.sh
+chmod +x /home/gn/ws/PJ4_Server_Template/pj-mcap-server/integration-tests/scripts/gce_smoke.sh
 ```
 
 - [ ] **Step 2: The scheduled GCE self-hosted-runner workflow**
@@ -1785,7 +1797,7 @@ at least once before declaring the GCS drop-in proven (unified-plan §6 "Manual/
 We cannot run the real smoke off-VM, but we can confirm the script and workflow are well-formed:
 
 ```bash
-cd /home/davide/ws_plotjuggler/pj-cloud/integration-tests
+cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server/integration-tests
 bash -n scripts/gce_smoke.sh && echo "script: syntax ok"
 python3 -c "import yaml,sys; yaml.safe_load(open('../.github/workflows/gce-smoke.yml')); print('workflow: yaml ok')"
 ```
