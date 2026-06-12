@@ -306,13 +306,33 @@ Any agent doing design or implementation work here **must** ground itself in the
 local codebases first. Do not guess SDK/plugin APIs — read the real headers. Paths below
 were verified on this machine on 2026-06-04.
 
-**Working tree vs pristine reference.** PJ4 + pj-official-plugins are **vendored into
-this repo at `PJ4/`** (source-only; `.qt` is a gitignored symlink, `build/` outputs are
-gitignored). **All PJ4/plugin modifications happen in the vendored tree**
-(`/home/gn/ws/PJ4_Server_Template/pj-mcap-server/PJ4/...`). The original
-`/home/gn/ws/PJ4` is the pristine upstream — read it for reference, **never modify it**.
-The section below describes the tree's contents; every path exists identically in both
-copies (cited with the pristine prefix; substitute `<repo>/PJ4` when editing).
+**Vendoring model — version-pinned PRIVATE fork submodules (2026-06-13).** PJ4, its
+nested `plotjuggler_sdk`, and `pj-official-plugins` are **git submodules** of this repo,
+each pinned to the `cloud` branch of a **private** fork under the PlotJuggler org (never
+public — see [[private-repos-only]]):
+
+| Path | Submodule → fork @ branch | Upstream base |
+|---|---|---|
+| `PJ4/` | `PlotJuggler/PJ4-cloud` @ `cloud` | `PlotJuggler/PJ4` @ `37a6aea` |
+| `PJ4/plotjuggler_sdk/` (nested) | `PlotJuggler/plotjuggler_sdk-cloud` @ `cloud` | `PlotJuggler/plotjuggler_sdk` @ `9003e55` (v0.7.0) |
+| `pj-official-plugins/` (**sibling** of `PJ4/`) | `PlotJuggler/pj-official-plugins-cloud` @ `cloud` | `PlotJuggler/pj-official-plugins` @ `317ea24` |
+
+Each `cloud` branch = `upstream-base + our-delta`; `git log <upstream-base>..cloud` in a
+fork is exactly our changes (`git submodule status` records the pinned commit). The
+**connector plugin lives in THIS repo** at `plugin/toolbox_dexory_cloud/` — it builds
+standalone against the forked SDK Conan package (0.7.1), NOT inside the plugins submodule.
+The original `/home/gn/ws/PJ4` is the pristine upstream — read it for reference, **never
+modify it**. The reference section below cites pristine `/home/gn/ws/PJ4/...` paths for
+reading; when **editing**, edit the submodule copy at `<repo>/PJ4/...` (or
+`<repo>/pj-official-plugins/...`).
+
+**Editing a vendored tree:** edit inside the submodule, commit to the fork's `cloud`
+branch, push, then `git add <submodule>` here to bump the pointer. **Sync to a new
+mainstream release:** `cd <submodule> && git fetch upstream && git merge <new-tag>` on
+`cloud`, push, bump the pointer. A fresh clone needs `git submodule update --init
+--recursive` + read access to the private forks (deploy key / token for CI). Migration
+rollback tags: `_pre_rewire` (after the plugin relocation, before the submodule swap),
+`_pre_submodule` (before everything).
 
 ### 1. `/home/gn/ws/PJ4` — the PlotJuggler 4 application workspace
 
@@ -510,19 +530,26 @@ multi-topic recordings) + `gen-3d-fixture` (one /tf + pointcloud recording for t
 # END endpoint: local S3 (bucket `recordings`; console :9001, admin/password123)
 cd infra/minio && docker compose up -d
 
-# START endpoint: build the Dexory Cloud plugin in the vendored tree
-cd PJ4/pj-official-plugins && ./build.sh toolbox_dexory_cloud
+# START endpoint: build the connector plugin (standalone, in THIS repo).
+# Easiest: ./build.sh from the repo root builds server + SDK pkg + official
+# plugins (from the fork) + the connector + the app, and stages the .so. Or just
+# the connector:
+cd plugin/toolbox_dexory_cloud \
+  && conan install . --output-folder=build --build=missing -s compiler.cppstd=20 \
+  && cmake -B build -DCMAKE_TOOLCHAIN_FILE=build/conan_toolchain.cmake -DCMAKE_BUILD_TYPE=Release \
+  && cmake --build build -j"$(nproc)"   # -> plugin/toolbox_dexory_cloud/build/bin/
 
-# Run PJ4 — ALWAYS the VENDORED app (its run.sh auto-loads the vendored plugins
-# from pj-official-plugins/build/all/Release/bin). NEVER `cd /home/gn/ws/PJ4 &&
-# ./run.sh`: that is the PRISTINE app, which carries NONE of the vendored
-# host-side changes (SDK tail slots, RangeSlider markers, widget bindings, …) —
-# the plugin .so still loads there, so plugin features appear while host
-# features silently vanish, which looks like "nothing changed".
+# Run PJ4 — ALWAYS the VENDORED app (the PJ4/ submodule; its run.sh auto-loads
+# plugins from the sibling ../pj-official-plugins/build/all/Release/bin). NEVER
+# `cd /home/gn/ws/PJ4 && ./run.sh`: that is the PRISTINE app, which carries NONE
+# of the host-side changes (SDK tail slots, RangeSlider markers, widget
+# bindings, …) — the plugin .so still loads there, so plugin features appear
+# while host features silently vanish, which looks like "nothing changed".
 cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server/PJ4 && ./run.sh
-# After a host edit: rebuild the vendored app (./build.sh in that dir).
-# After a plugin edit: also cp the .so from build/toolbox_dexory_cloud/Release/bin
-# to build/all/Release/bin (run.sh's default plugin dir) so both copies match.
+# After a host edit (in the PJ4/ submodule): rebuild the vendored app (./build.sh
+# in PJ4/), and commit the edit to the PJ4-cloud fork's `cloud` branch.
+# After a connector edit: rebuild plugin/toolbox_dexory_cloud and re-stage its .so
+# into ../pj-official-plugins/build/all/Release/bin (the root ./build.sh does this).
 ```
 
 Render the proposal `*.md` → self-contained `*.html`:

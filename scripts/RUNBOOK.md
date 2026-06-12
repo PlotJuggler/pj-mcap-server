@@ -66,9 +66,9 @@ never touch it.
   bench corpus legs. The shell gates do **not** auto-seed; bring up
   `infra/minio` (`docker compose up -d`) and upload the `nissan_zala_*.mcap`
   corpus before running them.
-- **The C++ CLI** built (`cd PJ4/pj-official-plugins && ./build.sh toolbox_dexory_cloud`)
-  for smoke/matrix — they shell out to `dexory-cloud-cli`. (smoke/matrix build it
-  on demand if missing.)
+- **The C++ CLI** built (`./build.sh` from the repo root, or a standalone
+  `conan install` + `cmake` in `plugin/toolbox_dexory_cloud`) for smoke/matrix —
+  they shell out to `dexory-cloud-cli`. (smoke/matrix incrementally rebuild it.)
 
 `make ci-integration` and the in-process bench microbenches need **only** Docker
 + Go (no corpus, no CLI) — they are the parts that run in GitHub CI.
@@ -84,7 +84,7 @@ lockstep whenever the `recordings` bucket is reseeded with a different corpus:
    - `EXPECT_FILE_COUNT=8`
    - `EXPECT_S3_KEY="nissan_zala_50_zeg_1_0.mcap"`
    - `EXPECT_IMU_MSGS=14904` (the `…/imu` topic count in that file)
-2. `PJ4/pj-official-plugins/toolbox_dexory_cloud/tests/backend_connection_live_test.cpp`
+2. `plugin/toolbox_dexory_cloud/tests/backend_connection_live_test.cpp`
    — the C++ live-test constants the GUI's exact `BackendConnection` asserts:
    - `kExpectedSequenceCount = 8`
    - `kKnownSequence = "nissan_zala_50_zeg_1_0.mcap"`

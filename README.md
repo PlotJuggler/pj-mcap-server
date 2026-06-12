@@ -13,8 +13,8 @@ session — with reconnect-resume and a repeat-fetch cache.
 |---|---|
 | `proto/pj_cloud.proto` | Canonical wire schema (WS + Protobuf envelope) |
 | `server/` | Go server: SQLite catalog, indexer, session streaming, tag editing |
-| `PJ4/` | Vendored PlotJuggler 4 working tree (source-only) |
-| `PJ4/pj-official-plugins/toolbox_dexory_cloud/` | The "Dexory Cloud" toolbox plugin + `dexory-cloud-cli` |
+| `PJ4/`, `pj-official-plugins/` | PlotJuggler 4 + plugins, as version-pinned **private fork submodules** (clone with `--recursive`) |
+| `plugin/toolbox_dexory_cloud/` | The "Dexory Cloud" toolbox plugin + `dexory-cloud-cli` (builds standalone) |
 | `infra/minio/` | Local S3 (Minio) — the storage endpoint for development |
 | `scripts/smoke.sh` | `make smoke` — the end-to-end regression gate |
 | `*.md` (root) | Design spec, plans, M1 report + **demo runbook** |
@@ -37,7 +37,7 @@ you can test fully **headless** without it.
 ./run.sh
 
 # 3a. Headless check — list the catalog through the real client
-PJ4/pj-official-plugins/build/toolbox_dexory_cloud/Release/toolbox_dexory_cloud/dexory-cloud-cli \
+plugin/toolbox_dexory_cloud/build/bin/dexory-cloud-cli \
   --url ws://localhost:8080 list
 
 # 3b. Or the GUI — launch PlotJuggler, open the "Dexory Cloud" panel, connect to
