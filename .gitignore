@@ -5,4 +5,10 @@ PJ4/pj-official-plugins/build/
 PJ4/.cache/
 PJ4/pj-official-plugins/*/CMakeUserPresets.json
 PJ4/pj-official-plugins/.cpm-cache/
+
+# Relocated connector plugin (plugin/toolbox_dexory_cloud): build + conan artifacts
+plugin/toolbox_dexory_cloud/build/
+plugin/toolbox_dexory_cloud/CMakeUserPresets.json
+plugin/toolbox_dexory_cloud/.cpm-cache/
+
 server/bin/

@@ -1,3 +1,41 @@
+# ---------------------------------------------------------------------------
+# Standalone build scaffolding.
+#
+# This connector plugin lives in pj-mcap-server (the cloud-connector repo) and
+# is built STANDALONE against the plotjuggler_sdk Conan package — it is no
+# longer a subdirectory of pj-official-plugins. The project setup, warning
+# flags, plotjuggler_sdk + GTest discovery, output dir, and enable_testing()
+# below were previously provided by the plugins repo's top-level CMakeLists;
+# we replicate the minimum this plugin needs.
+# ---------------------------------------------------------------------------
+cmake_minimum_required(VERSION 3.22)
+project(toolbox_dexory_cloud LANGUAGES CXX)
+
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
+if(MSVC)
+  set(PJ_WARNING_FLAGS /W4 /WX /permissive-)
+else()
+  set(PJ_WARNING_FLAGS
+    -Wall -Wextra -Werror -Wshadow -Wnon-virtual-dtor -Wold-style-cast
+    -Wcast-qual -Wconversion -Woverloaded-virtual -Wpedantic)
+endif()
+
+find_package(GTest REQUIRED)
+find_package(plotjuggler_sdk CONFIG REQUIRED COMPONENTS base plugin_sdk plugin_host)
+
+set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/bin)
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/bin)
+# include(CTest) (not bare enable_testing()) so BUILD_TESTING defaults ON — the
+# plugin's test block is gated behind if(BUILD_TESTING), which the plugins-repo
+# parent used to satisfy via its own include(CTest).
+include(CTest)
+
+# ---------------------------------------------------------------------------
+# Plugin definition (original, unchanged from the in-tree build).
+# ---------------------------------------------------------------------------
 find_package(nlohmann_json REQUIRED)
 find_package(fmt REQUIRED)
 find_package(lua REQUIRED)
@@ -13,8 +51,8 @@ find_package(ixwebsocket REQUIRED)
 find_package(zstd REQUIRED)
 find_package(lz4 REQUIRED)
 
-include(${CMAKE_CURRENT_LIST_DIR}/../cmake/EmbedUi.cmake)
-include(${CMAKE_CURRENT_LIST_DIR}/../cmake/EmbedManifest.cmake)
+include(${CMAKE_CURRENT_LIST_DIR}/cmake/EmbedUi.cmake)
+include(${CMAKE_CURRENT_LIST_DIR}/cmake/EmbedManifest.cmake)
 
 # ---------------------------------------------------------------------------
 # Canonical wire protocol codegen.
@@ -25,7 +63,7 @@ include(${CMAKE_CURRENT_LIST_DIR}/../cmake/EmbedManifest.cmake)
 # the build tree, then compile the .pb.cc into the plugin. The generated header
 # lands in generated/ (already on the plugin include path below).
 # ---------------------------------------------------------------------------
-set(DEXORY_CLOUD_PROTO ${CMAKE_CURRENT_SOURCE_DIR}/../../../proto/pj_cloud.proto)
+set(DEXORY_CLOUD_PROTO ${CMAKE_CURRENT_SOURCE_DIR}/../../proto/pj_cloud.proto)
 set(DEXORY_CLOUD_PROTO_OUT_DIR ${CMAKE_CURRENT_BINARY_DIR}/generated)
 file(MAKE_DIRECTORY ${DEXORY_CLOUD_PROTO_OUT_DIR})
 
@@ -33,7 +71,7 @@ protobuf_generate(
   LANGUAGE        cpp
   OUT_VAR         DEXORY_CLOUD_PROTO_SRCS
   PROTOS          ${DEXORY_CLOUD_PROTO}
-  IMPORT_DIRS     ${CMAKE_CURRENT_SOURCE_DIR}/../../../proto
+  IMPORT_DIRS     ${CMAKE_CURRENT_SOURCE_DIR}/../../proto
   PROTOC_OUT_DIR  ${DEXORY_CLOUD_PROTO_OUT_DIR}
 )
 
@@ -138,7 +176,7 @@ pj_emit_plugin_manifest(toolbox_dexory_cloud_plugin
 # MCAP_IMPLEMENTATION lives in tools/session_download.cpp. (Chosen over the conan
 # mcap/2.1.1 package: it is already vendored + proven in data_load_mcap and links
 # the same LZ4/zstd static targets, so no new conan dependency is introduced.)
-set(DEXORY_CLOUD_VENDORED_MCAP ${CMAKE_CURRENT_SOURCE_DIR}/../data_load_mcap/contrib)
+set(DEXORY_CLOUD_VENDORED_MCAP ${CMAKE_CURRENT_SOURCE_DIR}/third_party)
 
 add_executable(dexory-cloud-cli
   tools/dexory_cloud_cli.cpp
