@@ -24,10 +24,14 @@ echo "==> [1/4] Building the Go server + dev tools (server/bin/)"
     && go build -o bin/gen-3d-fixture   ./cmd/gen-3d-fixture )
 echo "    server -> server/bin/pj-cloud-server"
 
-echo "==> [2/4] Ensuring the plotjuggler_sdk Conan package (0.7.1)"
+echo "==> [2/4] Ensuring the plotjuggler_sdk Conan package"
 # The SDK is a submodule (PJ4/plotjuggler_sdk); the official plugins + the
-# connector both require plotjuggler_sdk/0.7.1. Create it from source if absent.
-if ! conan list "plotjuggler_sdk/0.7.1" 2>/dev/null | grep -q "plotjuggler_sdk/0.7.1"; then
+# connector both require it. Derive the version from the SDK recipe (single
+# source of truth) so a version bump never needs a build.sh edit, and create
+# the package from source if absent.
+SDK_VER="$(grep -oP 'version\s*=\s*"\K[^"]+' "$ROOT/PJ4/plotjuggler_sdk/conanfile.py" | head -1)"
+echo "    plotjuggler_sdk/$SDK_VER"
+if ! conan list "plotjuggler_sdk/$SDK_VER" 2>/dev/null | grep -q "plotjuggler_sdk/$SDK_VER"; then
   ( cd "$ROOT/PJ4/plotjuggler_sdk" && conan create . --build=missing )
 fi
 
@@ -45,18 +49,19 @@ if [ -f "$PLUGIN_SO" ] && [ -d "$PLUGIN_DST" ]; then
 fi
 
 echo "==> [4/4] Building the PlotJuggler 4 app"
-if [ -d "$ROOT/PJ4/.qt/6.8.3/gcc_64" ]; then
+# PJ4 builds against Qt 6.11.1 (install_qt6.sh is the single source of truth for
+# the version). The app's own build.sh checks/installs it; here we just gate on
+# whether SOME Qt is present so headless-only machines skip the GUI cleanly.
+if [ -d "$ROOT/PJ4/.qt/6.11.1/gcc_64" ]; then
   ( cd "$ROOT/PJ4" && ./build.sh )
 else
   cat <<EOF
-    SKIPPED — Qt 6.8.3 is not installed (the GUI is the only part that needs it).
+    SKIPPED — Qt 6.11.1 is not installed (the GUI is the only part that needs it).
     The server + plugin above are built and you can already test headless via the CLI.
     To build the GUI, do this one-time setup, then re-run ./build.sh:
 
       sudo apt-get install -y docker.io libva-dev libdrm-dev
-      pip install aqtinstall
-      aqt install-qt linux desktop 6.8.3 linux_gcc_64 \\
-        --modules qtcharts qtwebsockets --outputdir "$ROOT/PJ4/.qt"
+      ( cd "$ROOT/PJ4" && ./install_qt6.sh )   # installs Qt 6.11.1 into PJ4/.qt
 EOF
 fi
 

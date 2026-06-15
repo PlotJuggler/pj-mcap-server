@@ -313,14 +313,14 @@ public — see [[private-repos-only]]):
 
 | Path | Submodule → fork @ branch | Upstream base |
 |---|---|---|
-| `PJ4/` | `PlotJuggler/PJ4-cloud` @ `cloud` | `PlotJuggler/PJ4` @ `37a6aea` |
-| `PJ4/plotjuggler_sdk/` (nested) | `PlotJuggler/plotjuggler_sdk-cloud` @ `cloud` | `PlotJuggler/plotjuggler_sdk` @ `9003e55` (v0.7.0) |
-| `pj-official-plugins/` (**sibling** of `PJ4/`) | `PlotJuggler/pj-official-plugins-cloud` @ `cloud` | `PlotJuggler/pj-official-plugins` @ `317ea24` |
+| `PJ4/` | `PlotJuggler/PJ4-cloud` @ `cloud` | `PlotJuggler/PJ4` @ `a19d49e` (Qt 6.11.1) |
+| `PJ4/plotjuggler_sdk/` (nested) | `PlotJuggler/plotjuggler_sdk-cloud` @ `cloud` | `PlotJuggler/plotjuggler_sdk` @ `8f485e5` (v0.8.0) |
+| `pj-official-plugins/` (**sibling** of `PJ4/`) | `PlotJuggler/pj-official-plugins-cloud` @ `cloud` | `PlotJuggler/pj-official-plugins` @ `bb0ebd5` |
 
 Each `cloud` branch = `upstream-base + our-delta`; `git log <upstream-base>..cloud` in a
 fork is exactly our changes (`git submodule status` records the pinned commit). The
 **connector plugin lives in THIS repo** at `plugin/toolbox_dexory_cloud/` — it builds
-standalone against the forked SDK Conan package (0.7.1), NOT inside the plugins submodule.
+standalone against the forked SDK Conan package (0.8.1), NOT inside the plugins submodule.
 The original `/home/gn/ws/PJ4` is the pristine upstream — read it for reference, **never
 modify it**. The reference section below cites pristine `/home/gn/ws/PJ4/...` paths for
 reading; when **editing**, edit the submodule copy at `<repo>/PJ4/...` (or
@@ -362,7 +362,7 @@ The product this connector ultimately plugs into. Read first:
   - `pj_base/include/pj_base/sdk/plugin_data_api.hpp` — direct-ingest write API
     (`ensureTopic`/`ensureField`/`appendRecord`); NOT used by `pj_cloud` (delegated
     ingest), listed for orientation.
-- Build: `./build.sh` (Conan 2 + CMake, Qt 6.8.3 from `.qt/`), run via `./run.sh`
+- Build: `./build.sh` (Conan 2 + CMake, Qt 6.11.1 from `.qt/` via `install_qt6.sh`), run via `./run.sh`
   (defaults plugin discovery to `pj-official-plugins/build`).
 
 ### 2. `/home/gn/ws/PJ4/pj-official-plugins` — the official plugin collection
@@ -373,10 +373,10 @@ How real PJ4 plugins are shaped, built, and shipped. **Note: on this machine it 
 - `CLAUDE.md`, `PLUGIN_DEVELOPMENT.md`, `porting_guide.md` — plugin shapes
   (self-parsing vs delegating DataSource, MessageParser catalog pattern), data-write
   rules, mechanical-translation policy.
-- `SDK_VERSION` — single source of truth for the SDK pin (currently `0.6.1`, a
-  local-fork bump carrying the Slice 16 parser-ingest tail slots; the package is
-  `conan create`d from the in-tree `PJ4/plotjuggler_sdk`, NOT the extern
-  submodule — a fresh machine must run that once before plugin builds); every
+- `SDK_VERSION` — single source of truth for the SDK pin (currently `0.8.1`, a
+  local-fork bump = mainstream v0.8.0 + the parser-ingest tail slots; the package
+  is `conan create`d from the in-tree `PJ4/plotjuggler_sdk`, NOT the extern
+  submodule — `./build.sh` does this automatically if the package is absent); every
   plugin's `conanfile.py` reads it live. Never hardcode the SDK version.
 - Build: `./build.sh [plugin_dir]` (Conan 2 + CMake, C++20, `-Wall -Wextra -Werror`…).
   CMake helpers: `pj_embed_ui` / `pj_embed_manifest` (local `cmake/`),
