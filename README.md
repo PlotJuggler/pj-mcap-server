@@ -17,7 +17,8 @@ session — with reconnect-resume and a repeat-fetch cache.
 | `plugin/toolbox_dexory_cloud/` | The "Dexory Cloud" toolbox plugin + `dexory-cloud-cli` (builds standalone) |
 | `infra/minio/` | Local S3 (Minio) — the storage endpoint for development |
 | `scripts/smoke.sh` | `make smoke` — the end-to-end regression gate |
-| `*.md` (root) | Design spec, plans, M1 report + **demo runbook** |
+| `arch/` | Design spec, plans, M1 report + **demo runbook** (the markdown docs) |
+| `docs/` | Rendered, viewable docs (HTML) — incl. the plain-English walkthrough + proposal |
 
 ## Quick start — self-contained, no cloud account or private data
 
@@ -73,7 +74,6 @@ Run the full regression gate (maintainer; needs the pinned corpus): `make smoke`
 
 ## Documentation
 
-- **Demo walkthrough:** `2026-06-05-m1-demo-runbook.md` (step-by-step, copy-paste commands)
-- **M1 report:** `2026-06-05-dexory-m1-report.md` (what was built / verified / open items)
+- **How it works (plain English, with diagrams):** `docs/2026-06-15-how-it-works-explained.html`
 - **Agent/developer handbook:** `CLAUDE.md` (as-built state, amendments, conventions)
-- **Design spec + plans:** `2026-05-28-*.md`, `2026-06-03-*.md`, `2026-06-04-two-endpoints-approach.md`
+- **Design spec + plans:** `arch/2026-05-28-*.md`, `arch/2026-06-03-*.md`, `arch/2026-06-04-two-endpoints-approach.md`

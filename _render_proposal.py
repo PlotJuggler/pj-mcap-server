@@ -13,8 +13,8 @@ from pathlib import Path
 import markdown
 
 ROOT = Path(__file__).parent
-IN_PATH = ROOT / "2026-06-01-dexory-proposal.md"
-OUT_PATH = ROOT / "2026-06-01-dexory-proposal.html"
+IN_PATH = ROOT / "arch" / "2026-06-01-dexory-proposal.md"
+OUT_PATH = ROOT / "docs" / "2026-06-01-dexory-proposal.html"
 
 CSS = r"""
 :root {

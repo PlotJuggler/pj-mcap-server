@@ -19,7 +19,7 @@ originally written for a separate `pj-cloud/` repo at
 rewritten to this repo, and Plan A Task 1 Step 1 was amended — do **not** `git init` a
 new repo).
 
-## Current approach (2026-06-04): two endpoints first — see `2026-06-04-two-endpoints-approach.md`
+## Current approach (2026-06-04): two endpoints first — see `arch/2026-06-04-two-endpoints-approach.md`
 
 The active build order stands up the pipeline's two **ends** before the middle:
 
@@ -94,9 +94,8 @@ The active build order stands up the pipeline's two **ends** before the middle:
    smoke step d gains the resume-live leg; 26 tests. **Slice 9 (M1 pack)** —
    104-MCAP scale validated on the isolated `recordings-scale` bucket (cold
    ~1.7s, warm 0 re-extracts in ms, pagination/filters/round-trips/overlap at
-   scale); deliverables at root: `2026-06-05-dexory-m1-report.md` (fact-checked),
-   `2026-06-05-m1-demo-runbook.md` (dry-run-verified), the closure report, and
-   scale tooling `server/cmd/{mcaptopics,paginate}`.
+   scale); the M1 deliverables (report, demo runbook, closure report — since
+   removed from arch/) plus scale tooling `server/cmd/{mcaptopics,paginate}`.
    **Slice 10 (M2a hardening + verification deepening) DONE (2026-06-05):**
    both flagged server defects fixed failing-first — post-resume Eos totals
    exact (33670; per-seq cumulative ledger on `SessionState`,
@@ -177,7 +176,7 @@ The active build order stands up the pipeline's two **ends** before the middle:
    (origin still sits at the pre-implementation docs commit 1e344c6); a
    push publishes the entire implementation history — nothing to reconcile.
    **Slice 13 (audit-gap closure, 11 items) DONE (2026-06-06):** the
-   `2026-06-06-full-plan-audit.md` left.local list minus WASM. A1 LICENSE
+   full-plan audit's left.local list minus WASM. A1 LICENSE
    (MIT — pinned verbatim by Plan A Task 1 Step 4); A14 shared
    `storage.retryWith` (50–800ms, permanent short-circuits,
    ctx-cancel-aware) now wraps ALL 6 S3+GCS call bodies + retry/classify
@@ -298,7 +297,7 @@ The active build order stands up the pipeline's two **ends** before the middle:
 
 **Plugin-shape note:** the endpoint plugin is a Toolbox (like Mosaico) for now; Plan D
 specifies a DataSource shape for the final integration — reconcile at plumbing time
-(recorded in `2026-06-04-two-endpoints-approach.md`).
+(recorded in `arch/2026-06-04-two-endpoints-approach.md`).
 
 ## Reference codebases (MANDATORY context — always reuse these)
 
@@ -422,30 +421,30 @@ Arrow ingest (`src/arrow_ingest.*`) → raw-record forwarding to host MessagePar
 
 ## Documents (read in this order)
 
-0. `2026-06-04-two-endpoints-approach.md` — **the ACTIVE execution approach** (endpoints
+0. `arch/2026-06-04-two-endpoints-approach.md` — **the ACTIVE execution approach** (endpoints
    first, then plumbing; vendored-tree rules; the Toolbox-vs-DataSource reconciliation note).
-1. `2026-05-28-pj-cloud-connector-design.md` — **the canonical design spec (single source
+1. `arch/2026-05-28-pj-cloud-connector-design.md` — **the canonical design spec (single source
    of truth).** 14 sections: architecture, repo layout, catalog/SQLite model, wire protocol,
    Go server design, Qt client design, failure/resume, testing strategy, phased build order.
    The plans below all reference this spec and must not contradict it.
-2. `2026-06-03-unified-cloud-connector-plan.md` — **the unified plan** (Dexory S3 +
+2. `arch/2026-06-03-unified-cloud-connector-plan.md` — **the unified plan** (Dexory S3 +
    Asensus GCS, one codebase): the six abstraction seams (`BlobStore`, `FormatCodec`,
    `ClientAuthenticator`, …), milestones M0/M1a/M1b/M1c/M2a/M2b/M2c, testing matrix,
    risks, resolved + open commercial items. Where it **[REVISES …]** a source doc, it wins.
-3. `2026-05-28-pj-cloud-server-v1.md` — **Plan A**: Go server, 46 tasks + letter-suffixed
+3. `arch/2026-05-28-pj-cloud-server-v1.md` — **Plan A**: Go server, 46 tasks + letter-suffixed
    seam tasks (14a storage, 14b GCS, 15a format, 24a authn, 46a CI matrix), `- [ ]` checkboxes.
-4. `2026-05-28-pj-cloud-client-cpp.md` — **Plan B**: Qt C++ test client (`client-core` lib +
+4. `arch/2026-05-28-pj-cloud-client-cpp.md` — **Plan B**: Qt C++ test client (`client-core` lib +
    `client-cli` exe), tasks 1–14 + 8a (SessionKey). Depends on Plan A's `proto/pj_cloud.proto`.
-5. `2026-05-28-pj-cloud-integration.md` — **Plan C**: cross-language E2E correctness
+5. `arch/2026-05-28-pj-cloud-integration.md` — **Plan C**: cross-language E2E correctness
    harness (Docker + Minio + fake-gcs + round-trip MCAP logical diff), tasks 1–9 + 8a
    (GCE smoke). Depends on the binaries from A & B.
-6. `2026-06-03-pj-cloud-pj4-plugin.md` — **Plan D (DEFERRED, M2b)**: the PJ4 DataSource
+6. `arch/2026-06-03-pj-cloud-pj4-plugin.md` — **Plan D (DEFERRED, M2b)**: the PJ4 DataSource
    plugin lifting `client-core` + the Mosaico dialog design. Read its §0 grounding notes —
    they correct spec assumptions against the **real** SDK headers (e.g. no
    `launchCustomOpenDialog`, no URI-scheme hook).
-7. `2026-06-01-dexory-proposal.{md,html,pdf}` — the commercial proposal. `*.md` is the
+7. `arch/2026-06-01-dexory-proposal.md` (source) + the rendered `docs/2026-06-01-dexory-proposal.{html,pdf}` — the commercial proposal. `*.md` is the
    source; `*.html` and `*.pdf` are generated artifacts (do not hand-edit them).
-   (`pj-cloud-connector-overview.html` is likewise a generated overview artifact.)
+   (`docs/pj-cloud-connector-overview.html` is likewise a generated overview artifact.)
 
 `proto/pj_cloud.proto` (defined in Plan A) is the **canonical wire schema** shared by all
 plans — treat it as the single source of truth for the protocol. The **Go** bindings are
@@ -559,7 +558,7 @@ python3 _render_proposal.py          # needs the `markdown` pip package
 ```
 
 PDF is then produced from that HTML with headless Chrome
-(`google-chrome --headless --print-to-pdf=2026-06-01-dexory-proposal.pdf 2026-06-01-dexory-proposal.html`).
+(`google-chrome --headless --print-to-pdf=docs/2026-06-01-dexory-proposal.pdf docs/2026-06-01-dexory-proposal.html`).
 Editing the proposal = edit the `.md`, re-run the script, regenerate the PDF.
 
 ### Once implementation lands in this repo (per the plans)
