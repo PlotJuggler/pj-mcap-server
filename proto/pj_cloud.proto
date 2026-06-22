@@ -17,6 +17,7 @@ message ClientMessage {
     OpenSessionRequest open_session  = 14;
     CancelSession      cancel        = 15;
     SessionAck         ack           = 16;
+    GetVocabularyRequest get_vocabulary = 17;   // filter vocabulary (dimensions + tag facets)
   }
 }
 
@@ -33,6 +34,7 @@ message ServerMessage {
     Progress             progress       = 16;
     Eos                  eos            = 17;
     Error                error          = 18;
+    GetVocabularyResponse get_vocabulary = 19;  // filter vocabulary response
   }
 }
 
@@ -88,6 +90,68 @@ message FileFilter {
   repeated string topics_any_of  = 2;      // file must have at least one of these
   repeated TagPredicate tag_all  = 3;      // file must satisfy all
   repeated TagPredicate tag_any  = 4;      // file must satisfy at least one (if non-empty)
+
+  // Dimension selection (catalog-vocabulary-rpc.md V1/V5): ids picked from the most
+  // recent GetVocabularyResponse (same-session handles). proto3 `optional` = explicit
+  // presence (0 is a valid id). The strict hierarchy means a set robot_id already
+  // implies its site+customer; the server ANDs whatever is present, so the deepest is
+  // sufficient. source_id is an INDEPENDENT flat dimension, ANDed in alongside.
+  optional uint64 customer_id = 5;
+  optional uint64 site_id     = 6;
+  optional uint64 robot_id    = 7;
+  optional uint64 source_id   = 8;
+}
+
+// GetVocabulary returns the FILTER VOCABULARY (catalog-vocabulary-rpc.md): the
+// strict customer->site->robot hierarchy (cascading comboboxes), the flat source
+// dimension, and the flat tag facets. Small + bounded — sent once, cached by the
+// client, re-fetched on an explicit refresh. Built from the dimension tables + a
+// tag-facet query; no `files` scan for the tree.
+message GetVocabularyRequest {}                    // no args today; reserved for future scoping
+
+message GetVocabularyResponse {
+  repeated DimCustomer customers = 1;              // hierarchical dimensions (tree)
+  repeated DimSource   sources   = 2;              // flat normalized dimension (V7)
+  repeated TagFacet    tags      = 3;              // flat EAV facets
+}
+
+// Hierarchical dimensions — a strict tree so illegal states are unrepresentable
+// (a robot lives INSIDE its site node). Filtered by id (V1).
+message DimCustomer {
+  uint64 id              = 1;                      // session handle (valid for THIS connection)
+  string name            = 2;
+  uint64 file_count      = 3;                      // files under this customer (UX; 0 if unset)
+  repeated DimSite sites = 4;
+}
+message DimSite {
+  uint64 id                = 1;
+  string name              = 2;
+  uint64 file_count        = 3;
+  repeated DimRobot robots = 4;
+}
+message DimRobot {
+  uint64 id         = 1;
+  string name       = 2;
+  uint64 file_count = 3;
+  // (DimRobot date bounds DEFERRED — V6; additive later)
+}
+
+// Flat NORMALIZED dimension: source (independent single combo, V7).
+message DimSource {
+  uint64 id         = 1;
+  string name       = 2;                           // e.g. "ros-bags", "synthetic"
+  uint64 file_count = 3;
+}
+
+// Flat tag facets (independent key -> {values}). High-cardinality keys are dropped
+// (cardinality cap, V4) — they remain filterable via free-text/Lua.
+message TagFacet {
+  string key                    = 1;               // e.g. "mission", "quality"
+  repeated TagFacetValue values = 2;
+}
+message TagFacetValue {
+  string value      = 1;                           // a STRING (tags have no ids)
+  uint64 file_count = 2;                           // UX; 0 if unset
 }
 
 message ListFilesRequest {

@@ -212,6 +212,25 @@ func aurynFilterFiles(ctx context.Context, s *Store, args FilterArgs) ([]FileSum
 		clauses = append(clauses, "f.end_time_ns >= ? AND f.start_time_ns <= ?")
 		params = append(params, args.RecordedBetween.StartNs, args.RecordedBetween.EndNs)
 	}
+	// Dimension predicates (direct indexed lookups on the denormalized FK columns).
+	// The strict hierarchy makes the deepest set id sufficient, but the server ANDs
+	// every present id (redundant-but-harmless); source_id is independent.
+	if args.CustomerID != nil {
+		clauses = append(clauses, "f.customer_id = ?")
+		params = append(params, *args.CustomerID)
+	}
+	if args.SiteID != nil {
+		clauses = append(clauses, "f.site_id = ?")
+		params = append(params, *args.SiteID)
+	}
+	if args.RobotID != nil {
+		clauses = append(clauses, "f.robot_id = ?")
+		params = append(params, *args.RobotID)
+	}
+	if args.SourceID != nil {
+		clauses = append(clauses, "f.source_id = ?")
+		params = append(params, *args.SourceID)
+	}
 	if len(args.TopicsAnyOf) > 0 {
 		ph := strings.TrimSuffix(strings.Repeat("?,", len(args.TopicsAnyOf)), ",")
 		clauses = append(clauses, fmt.Sprintf(`EXISTS (

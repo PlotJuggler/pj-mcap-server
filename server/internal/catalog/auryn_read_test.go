@@ -69,18 +69,11 @@ func TestRebuildHiveKey(t *testing.T) {
 	}
 }
 
-// buildMinimalAurynDB writes a small DB matching the auryn schema (the subset the
-// reader queries) so the auryn read path is covered hermetically — no Python. The
-// real schema is validated separately by the crosslang test; this guards the Go
-// SQL + the cross-language byte contracts.
-func buildMinimalAurynDB(t *testing.T, path string) {
-	t.Helper()
-	db, err := sql.Open("sqlite", fmt.Sprintf("file:%s?_pragma=journal_mode(WAL)&_pragma=foreign_keys(ON)", path))
-	if err != nil {
-		t.Fatalf("open: %v", err)
-	}
-	defer db.Close()
-	ddl := []string{
+// aurynSchemaDDL is the subset of the auryn schema the Go reader queries, used to
+// build hermetic test DBs (no Python). The real schema is validated separately by
+// the crosslang test; this guards the Go SQL + the cross-language byte contracts.
+func aurynSchemaDDL() []string {
+	return []string{
 		`CREATE TABLE schema_version (id INTEGER PRIMARY KEY CHECK (id=1), version INTEGER NOT NULL)`,
 		fmt.Sprintf(`INSERT INTO schema_version(id,version) VALUES (1,%d)`, SchemaVersion),
 		`CREATE TABLE customers (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE)`,
@@ -105,6 +98,30 @@ func buildMinimalAurynDB(t *testing.T, path string) {
 			UNION ALL
 			SELECT e.file_id,e.key,e.value,0 FROM tags_embedded e
 			LEFT JOIN tags_override o ON (o.file_id=e.file_id AND o.key=e.key) WHERE o.file_id IS NULL`,
+	}
+}
+
+// openAurynTestDB opens a fresh DB and applies aurynSchemaDDL; the caller inserts data.
+func openAurynTestDB(t *testing.T, path string) *sql.DB {
+	t.Helper()
+	db, err := sql.Open("sqlite", fmt.Sprintf("file:%s?_pragma=journal_mode(WAL)&_pragma=foreign_keys(ON)", path))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	for _, s := range aurynSchemaDDL() {
+		if _, err := db.Exec(s); err != nil {
+			t.Fatalf("ddl %q: %v", s, err)
+		}
+	}
+	return db
+}
+
+// buildMinimalAurynDB writes a one-file DB for the reader tests.
+func buildMinimalAurynDB(t *testing.T, path string) {
+	t.Helper()
+	db := openAurynTestDB(t, path)
+	defer db.Close()
+	ddl := []string{
 		// dimensions
 		`INSERT INTO customers(id,name) VALUES (1,'dexory')`,
 		`INSERT INTO sites(id,customer_id,name) VALUES (1,1,'london')`,

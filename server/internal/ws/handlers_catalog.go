@@ -45,6 +45,11 @@ func (h *CatalogHandler) ListFiles(ctx context.Context, req *pb.ListFilesRequest
 		for _, t := range f.GetTagAny() {
 			args.TagAny = append(args.TagAny, catalog.TagKV{Key: t.GetKey(), Value: t.GetValue()})
 		}
+		// Dimension selection (proto3 optional => presence via the pointer field).
+		args.CustomerID = f.CustomerId
+		args.SiteID = f.SiteId
+		args.RobotID = f.RobotId
+		args.SourceID = f.SourceId
 	}
 	files, next, err := catalog.FilterFiles(ctx, h.Store, args)
 	if err != nil {
@@ -135,6 +140,39 @@ func (h *CatalogHandler) UpdateTags(ctx context.Context, req *pb.UpdateTagsReque
 		return nil, err
 	}
 	return &pb.UpdateTagsResponse{EffectiveTags: tagsToProto(tags)}, nil
+}
+
+// GetVocabulary returns the filter vocabulary (catalog-vocabulary-rpc.md): the
+// strict customer->site->robot tree, the flat source dimension, and the tag facets.
+// Built from the dimension tables; empty on the legacy Go-schema store.
+func (h *CatalogHandler) GetVocabulary(ctx context.Context, _ *pb.GetVocabularyRequest) (*pb.GetVocabularyResponse, error) {
+	v, err := catalog.GetVocabulary(ctx, h.Store)
+	if err != nil {
+		return nil, fmt.Errorf("vocabulary: %w", err)
+	}
+	resp := &pb.GetVocabularyResponse{}
+	for _, c := range v.Customers {
+		pc := &pb.DimCustomer{Id: c.ID, Name: c.Name, FileCount: c.FileCount}
+		for _, st := range c.Sites {
+			ps := &pb.DimSite{Id: st.ID, Name: st.Name, FileCount: st.FileCount}
+			for _, r := range st.Robots {
+				ps.Robots = append(ps.Robots, &pb.DimRobot{Id: r.ID, Name: r.Name, FileCount: r.FileCount})
+			}
+			pc.Sites = append(pc.Sites, ps)
+		}
+		resp.Customers = append(resp.Customers, pc)
+	}
+	for _, src := range v.Sources {
+		resp.Sources = append(resp.Sources, &pb.DimSource{Id: src.ID, Name: src.Name, FileCount: src.FileCount})
+	}
+	for _, f := range v.Tags {
+		pf := &pb.TagFacet{Key: f.Key}
+		for _, val := range f.Values {
+			pf.Values = append(pf.Values, &pb.TagFacetValue{Value: val.Value, FileCount: val.FileCount})
+		}
+		resp.Tags = append(resp.Tags, pf)
+	}
+	return resp, nil
 }
 
 // errFileNotFound carries the file id so the connState layer can map it to

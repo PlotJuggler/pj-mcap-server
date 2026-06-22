@@ -210,6 +210,34 @@ func assertAurynReader(t *testing.T, st *Store, fixtures []hiveFixture) {
 		}
 	}
 
+	// GetVocabulary over the Python-built DB: the tree matches the fixtures'
+	// dimensions (customers test+acme; test has site lab with robots r1,r2; acme
+	// has hq with r9; one source 'synthetic').
+	vocab, err := GetVocabulary(ctx, st)
+	if err != nil {
+		t.Fatalf("GetVocabulary: %v", err)
+	}
+	custNames := map[string]VocabCustomer{}
+	for _, c := range vocab.Customers {
+		custNames[c.Name] = c
+	}
+	if _, ok := custNames["test"]; !ok {
+		t.Fatalf("vocab customers missing 'test': %v", vocab.Customers)
+	}
+	if _, ok := custNames["acme"]; !ok {
+		t.Fatalf("vocab customers missing 'acme': %v", vocab.Customers)
+	}
+	testCust := custNames["test"]
+	if len(testCust.Sites) != 1 || testCust.Sites[0].Name != "lab" {
+		t.Fatalf("'test' sites = %+v, want [lab]", testCust.Sites)
+	}
+	if len(testCust.Sites[0].Robots) != 2 {
+		t.Fatalf("'test/lab' robots = %d, want 2 (r1,r2)", len(testCust.Sites[0].Robots))
+	}
+	if len(vocab.Sources) != 1 || vocab.Sources[0].Name != "synthetic" {
+		t.Fatalf("vocab sources = %+v, want [synthetic]", vocab.Sources)
+	}
+
 	// A topics-any-of filter narrows to files carrying that topic. Pick the first
 	// topic of fixture[0] and assert every returned file actually contains it.
 	probe := fixtures[0].spec.Topics[0].Topic

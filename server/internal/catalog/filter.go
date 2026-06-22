@@ -25,6 +25,16 @@ type FilterArgs struct {
 	TagAny          []TagKV
 	Limit           int
 	PageToken       string
+
+	// Dimension selection (auryn reader only; catalog-vocabulary-rpc.md). nil =
+	// unset (proto3 optional presence). The strict hierarchy means the deepest set
+	// id is sufficient; the server ANDs whatever is present. source_id is an
+	// independent flat dimension. The legacy Go-schema FilterFiles IGNORES these
+	// (it has no dimension columns); only aurynFilterFiles applies them.
+	CustomerID *uint64
+	SiteID     *uint64
+	RobotID    *uint64
+	SourceID   *uint64
 }
 
 // FileSummary is the lightweight per-file shape returned by FilterFiles. It

@@ -1,6 +1,13 @@
 # Catalog Filter Vocabulary RPC — Design
 
-**Status:** Decisions LOCKED (2026-06-22, V1–V7 with Davide). Codex review pending.
+**Status:** Decisions LOCKED (V1–V7). **SERVER SIDE IMPLEMENTED — M3 (2026-06-23):**
+proto (`GetVocabulary` RPC + `FileFilter` dimension fields), Go bindings, the
+`catalog.GetVocabulary` builder (tree + flat source + tag facets with the cap), the
+dimension filter predicates in `aurynFilterFiles`, and the WS handler/dispatch are
+all landed + tested (hermetic + cross-language). **DEFERRED — the C++ client facet
+UI** (§9: replace the `comboPrefix` hack with the cascading comboboxes): a
+client-plugin effort needing the C++/SDK toolchain; the server RPC unblocks it.
+Reviewed by Claude + Codex at the M3 boundary.
 **Scope:** the wire design for **filtering the catalog** by a strict
 customer→site→robot hierarchy plus flat tags, and the RPC that ships the
 filter vocabulary to the client. Depends on the auryn dimension schema (see
@@ -242,25 +249,35 @@ deliberate asymmetry from principle 2: dimensions filter by id, tags by string.
 
 ---
 
-## 6. Server implementation sketch (Go reader over the auryn schema)
+## 6. Server implementation (Go reader over the auryn schema — `vocabulary.go`)
 
-- **Tree:** read the three dimension tables and assemble nested messages —
-  `SELECT id,name FROM customers`, `… FROM sites WHERE customer_id=?`, `… FROM
-  robots WHERE site_id=?` (or one ordered join). No `files` scan for structure.
-- **Counts (optional):** `SELECT customer_id,count(*) FROM files GROUP BY
-  customer_id` (and per site/robot) — indexed, cheap. Fold into the nodes.
+- **Tree:** read the dimension tables and assemble nested messages — but **each
+  dimension SELECT is `EXISTS`-gated against `files`** (`… FROM customers c WHERE
+  EXISTS(SELECT 1 FROM files WHERE customer_id=c.id)`, likewise sites/robots/
+  sources). This **prunes ORPHAN lookup rows**: the auryn builder leaves
+  dimension rows behind on delete/rename by design (no GC), so an ungated read
+  would surface stale `file_count=0` ghost nodes. A dimension is shown iff a file
+  references it; the gates stay mutually consistent because `files` carries all
+  four FKs denormalized.
+- **Counts:** `SELECT customer_id,count(*) FROM files GROUP BY customer_id` (and
+  per site/robot/source). **Indexing caveat:** only `customer_id` is index-backed
+  today (it leads the composite `UNIQUE`); `site_id`/`robot_id`/`source_id`-only
+  GROUP BYs and filters **scan `files`**. Fine at the v1 corpus; covering indexes
+  (`files(robot_id,id)`, …) are a deferred auryn-schema add for lake scale (needs a
+  SchemaVersion bump). `file_count` **counts all files incl. `has_error=1`**
+  (consistent with the filter path).
 - **Tag facets:** `SELECT key, value, count(*) FROM tags_effective GROUP BY
-  key, value`, grouped into `TagFacet`s, **dropping keys whose distinct-value
-  count exceeds the cap of 50** (§8). GROUNDING (from Plan A/D): embedded tags are
-  sourced from the **MCAP footer `pj.user_tags` only** — there is NO S3/GCS
-  object-custom-metadata / `Head` path. So the `TagFacet` value-space is
-  legitimately *footer tags ∪ override keys* (`tags_effective`); do not expect a
-  Head-metadata source.
-- **Sources (flat):** `SELECT id,name FROM sources` (+ `GROUP BY source_id`
-  count) — one standalone combo.
-- **Dimension filter:** `WHERE files.robot_id=? [AND files.site_id=? AND
-  files.customer_id=?] [AND files.source_id=?]` — direct indexed lookups on the
-  denormalized FK columns on `files`.
+  key, value`, grouped into `TagFacet`s, **dropping keys with > 50 distinct
+  values** (the cap, §8: `len(values) > TagFacetCap` → exactly 50 kept, 51
+  dropped). GROUNDING: embedded tags come from the **MCAP footer `pj.user_tags`
+  only** — no S3/GCS object-metadata / `Head` path; the value-space is *footer
+  tags ∪ override keys* (`tags_effective`).
+- **Sources (flat):** `SELECT id,name FROM sources` (EXISTS-gated) + the
+  `source_id` count — one standalone combo.
+- **Dimension filter:** `WHERE files.customer_id=? [AND files.site_id=? AND
+  files.robot_id=?] [AND files.source_id=?]` — the present (proto3 `optional`) ids
+  are ANDed on the denormalized FK columns (`customer_id` index-backed; the rest
+  scan today, see the caveat above).
 
 ---
 

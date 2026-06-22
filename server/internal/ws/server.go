@@ -340,6 +340,11 @@ func (c *connState) dispatch(ctx context.Context, msg *pb.ClientMessage) {
 			return
 		}
 		c.handleUpdateTags(ctx, reqID, payload.UpdateTags)
+	case *pb.ClientMessage_GetVocabulary:
+		if !c.requireAuth(reqID) {
+			return
+		}
+		c.handleGetVocabulary(ctx, reqID, payload.GetVocabulary)
 	default:
 		c.sendError(reqID, 0, pb.ErrorCode_ERROR_INVALID_REQUEST, "empty or unknown payload", "")
 	}
@@ -435,6 +440,22 @@ func (c *connState) handleListFiles(ctx context.Context, reqID uint64, req *pb.L
 	c.conn.SendPriority(&pb.ServerMessage{
 		RequestId: reqID,
 		Payload:   &pb.ServerMessage_ListFiles{ListFiles: resp},
+	})
+}
+
+func (c *connState) handleGetVocabulary(ctx context.Context, reqID uint64, req *pb.GetVocabularyRequest) {
+	resp, err := c.catalogHandler().GetVocabulary(ctx, req)
+	if err != nil {
+		// GetVocabulary takes no client-supplied fields, so a failure is an internal
+		// DB fault, not a bad request.
+		c.sendError(reqID, 0, pb.ErrorCode_ERROR_INTERNAL, "GetVocabulary failed", err.Error())
+		return
+	}
+	c.h.log.Info("ws: GetVocabulary served", "remote", c.remote, "request_id", reqID,
+		"customers", len(resp.GetCustomers()), "sources", len(resp.GetSources()), "tag_facets", len(resp.GetTags()))
+	c.conn.SendPriority(&pb.ServerMessage{
+		RequestId: reqID,
+		Payload:   &pb.ServerMessage_GetVocabulary{GetVocabulary: resp},
 	})
 }
 
