@@ -1,15 +1,11 @@
 #!/usr/bin/env bash
-# run.sh — start the connector's Go server for a named TARGET and (interactively)
-# launch PlotJuggler against it.
+# run.sh — start the connector's Go server for a named TARGET.
 #
 #   ./run.sh                    same as --dexory_minio
 #   ./run.sh --dexory_minio     LOCAL: Minio (S3) + synthetic recordings + server on :8080.
 #   ./run.sh --dexory_aws       Dexory staging bucket on AWS S3 (config.dexory-staging.yaml, :8084).
 #   ./run.sh --asensus_google   Asensus bucket on Google Cloud Storage (config.asensus-staging.yaml).
 #   ./run.sh <path/to.yaml>     power user: any S3/GCS server config file.
-#
-#   Add --no-gui to bring up the backend only (no PlotJuggler). The GUI is also
-#   skipped automatically when run non-interactively (output piped/redirected).
 #
 # Idempotent: if the target's server is ALREADY running it is reused; if a server
 # for a DIFFERENT target is running it is stopped and replaced.
@@ -42,33 +38,18 @@ start_server() {  # args = pj-cloud-server flags. Detached so it survives this s
 
 launch_app() {  # $1 = port like :8084
   local url="ws://localhost${1}"
-  if [ "$NO_GUI" = 1 ] || ! [ -t 1 ]; then
-    cat <<EOF
+  cat <<EOF
 
   Backend ready:  $url   (log: $LOGFILE)
-  Headless check: plugin/toolbox_dexory_cloud/build/bin/dexory-cloud-cli --url $url list
-  GUI:            run './run.sh ${TARGET}' in a desktop terminal (this run was non-interactive/--no-gui)
+  CLI check:      plugin/toolbox_dexory_cloud/build/bin/dexory-cloud-cli --url $url list
   Stop:           make server-stop
 EOF
-    return
-  fi
-  if [ ! -x "$ROOT/PJ4/build/pj_app/pj_app" ]; then
-    echo "  Backend up at $url, but the GUI isn't built — run ./build.sh, then re-run."; return
-  fi
-  if [ -z "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]; then
-    echo "  Backend up at $url; no display detected — connect a client, or run on a desktop."; return
-  fi
-  echo
-  echo "==> Backend ready at $url.  Launching PlotJuggler —"
-  echo "    open the 'Dexory Cloud' panel and connect to  $url"
-  exec "$ROOT/PJ4/run.sh"
 }
 
 # ---------------- parse args ----------------
-TARGET=""; NO_GUI=0
+TARGET=""
 for a in "$@"; do
   case "$a" in
-    --no-gui|--headless) NO_GUI=1 ;;
     -h|--help) usage; exit 0 ;;
     *) if [ -z "$TARGET" ]; then TARGET="$a"; else echo "ERROR: unexpected argument '$a'"; usage; exit 2; fi ;;
   esac
