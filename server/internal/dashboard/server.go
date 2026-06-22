@@ -245,22 +245,17 @@ func (h *pageHandler) catalogStats(ctx context.Context) (int64, int64) {
 }
 
 func (h *pageHandler) recentFailures(ctx context.Context) ([]map[string]string, error) {
-	rows, err := h.deps.Store.DB().QueryContext(ctx,
-		`SELECT s3_key, failed_at, error_text FROM indexer_failures ORDER BY failed_at DESC LIMIT 20`)
+	// catalog.RecentFailures branches to catalog_failures (auryn read-only store)
+	// or indexer_failures (legacy Go store) — the dashboard surfaces either (§4.5).
+	fails, err := catalog.RecentFailures(ctx, h.deps.Store, 20)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	var out []map[string]string
-	for rows.Next() {
-		var key, msg string
-		var when int64
-		if err := rows.Scan(&key, &when, &msg); err != nil {
-			return nil, err
-		}
-		out = append(out, map[string]string{"Key": key, "When": nsHuman(when), "Err": msg})
+	out := make([]map[string]string, 0, len(fails))
+	for _, f := range fails {
+		out = append(out, map[string]string{"Key": f.Key, "When": nsHuman(f.WhenNs), "Err": f.ErrText})
 	}
-	return out, rows.Err()
+	return out, nil
 }
 
 func nsHuman(ns int64) string {
