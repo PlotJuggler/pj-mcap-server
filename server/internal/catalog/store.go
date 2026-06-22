@@ -57,6 +57,13 @@ type Store struct {
 	closeMu sync.RWMutex
 	closed  bool
 
+	// readOnly marks a Store opened via OpenReadOnly: no writer goroutine runs
+	// (writeCh/closeDone are nil), Write fails fast with ErrReadOnly, and Close
+	// only closes the DB handle. This is the auryn-migration read path — the
+	// Python builder is the sole writer, the Go server reads (catalog-migration
+	// plan §2.1).
+	readOnly bool
+
 	// metrics + log, if set, drive per-write-job panic recovery (spec §8.1).
 	// Set once via SetObservability right after Open; nil-safe (the Guard skips
 	// the counter when metrics is nil and logs to slog.Default() when log is nil).
@@ -164,7 +171,13 @@ func (s *Store) runJob(job writeJob) {
 // cancelled). All catalog writes go through this entry point. Each job runs in
 // its OWN transaction (no batching); a slow extract is NOT inside the tx (the
 // indexer extracts before calling Write).
+//
+// A read-only Store (OpenReadOnly) has no writer goroutine; Write returns
+// ErrReadOnly immediately.
 func (s *Store) Write(ctx context.Context, fn WriteFn) error {
+	if s.readOnly {
+		return ErrReadOnly
+	}
 	// Hold the read lock across the enqueue so Close cannot flip closed + shut the
 	// channel between the guard check and the send (which would panic). The lock is
 	// released before waiting on done so a slow write never blocks Close.
@@ -195,7 +208,8 @@ func (s *Store) DB() *sql.DB { return s.db }
 
 // Close stops the writer and closes the database. It is idempotent: a second
 // Close (a shutdown race) is a no-op rather than a double-close panic. After
-// Close, Write returns ErrStoreClosed.
+// Close, Write returns ErrStoreClosed (or ErrReadOnly on a read-only Store,
+// which checks readOnly first).
 func (s *Store) Close() error {
 	s.closeMu.Lock()
 	if s.closed {
@@ -203,6 +217,12 @@ func (s *Store) Close() error {
 		return nil
 	}
 	s.closed = true
+	// A read-only Store has no writer goroutine (writeCh/closeDone are nil): just
+	// close the DB. Closing a nil channel / receiving from nil would panic/block.
+	if s.readOnly {
+		s.closeMu.Unlock()
+		return s.db.Close()
+	}
 	close(s.writeCh)
 	s.closeMu.Unlock()
 

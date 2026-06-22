@@ -24,9 +24,37 @@ import (
 	"pj-cloud/server/internal/genmcap"
 )
 
+// hiveKeyFor lays a spec out under a deterministic Hive-partitioned key
+// (catalog-migration plan §5.1: dev == prod key shape). The dimensions are
+// derived from the spec index so the set is byte-stable across runs AND exercises
+// multiple robots/dates — enough for the auryn builder's dimension extraction and
+// the cross-language read proof. The layout:
+//
+//	customer=test/customer_site=lab/robot=r{1|2}/source=synthetic/date=2026-06-2{2|3}/<spec.Key>
+//
+// 1 customer, 1 site, 2 robots, 1 source, 2 dates — strict hierarchy, varied leaves.
+func hiveKeyFor(spec genmcap.FileSpec, i int) string {
+	robot := fmt.Sprintf("r%d", i%2+1)
+	date := "2026-06-22"
+	if i%2 == 1 {
+		date = "2026-06-23"
+	}
+	return filepath.Join(
+		"customer=test",
+		"customer_site=lab",
+		"robot="+robot,
+		"source=synthetic",
+		"date="+date,
+		spec.Key,
+	)
+}
+
 func main() {
 	out := flag.String("out", "", "output directory for the synthetic MCAP fixtures (required)")
 	manifest := flag.Bool("manifest", false, "print a JSON manifest of the fixtures to stdout")
+	hive := flag.Bool("hive", false, "lay fixtures out under Hive-partitioned keys "+
+		"(customer=/customer_site=/robot=/source=/date=/<name>.mcap) so the auryn builder "+
+		"extracts dimensions; default is the flat layout")
 	flag.Parse()
 
 	if *out == "" {
@@ -48,8 +76,16 @@ func main() {
 	}
 	var mf []fileManifest
 
-	for _, spec := range specs {
-		path := filepath.Join(*out, spec.Key)
+	for i, spec := range specs {
+		rel := spec.Key
+		if *hive {
+			rel = hiveKeyFor(spec, i)
+		}
+		path := filepath.Join(*out, rel)
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			fmt.Fprintf(os.Stderr, "gen-ci-fixtures: mkdir %q: %v\n", filepath.Dir(path), err)
+			os.Exit(1)
+		}
 		f, err := os.Create(path)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "gen-ci-fixtures: create %q: %v\n", path, err)
@@ -65,7 +101,7 @@ func main() {
 			os.Exit(1)
 		}
 		mf = append(mf, fileManifest{
-			Key:           spec.Key,
+			Key:           rel,
 			StartNs:       spec.StartNs,
 			EndNs:         spec.EndNs(),
 			TotalMessages: spec.TotalMessages(),
