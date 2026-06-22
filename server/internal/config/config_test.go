@@ -30,6 +30,28 @@ func TestDefaults(t *testing.T) {
 	if c.Metrics.RequireAuth {
 		t.Errorf("default metrics should be unauthenticated")
 	}
+	if c.Catalog.ExternalBuilder {
+		t.Errorf("default external_builder should be false (legacy in-process indexer)")
+	}
+}
+
+// TestLoad_ExternalBuilder: the auryn cutover flag round-trips through YAML.
+func TestLoad_ExternalBuilder(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "cfg.yaml")
+	if err := os.WriteFile(path, []byte("catalog:\n  db_path: /tmp/x.db\n  external_builder: true\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !c.Catalog.ExternalBuilder {
+		t.Fatalf("external_builder should be true from YAML")
+	}
+	if c.Catalog.DBPath != "/tmp/x.db" {
+		t.Fatalf("db_path = %q, want /tmp/x.db", c.Catalog.DBPath)
+	}
 }
 
 // TestLoad_TLSDashboardMetrics: the spec §8.6 field names round-trip through YAML.

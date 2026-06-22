@@ -35,6 +35,7 @@ func main() {
 		listen       = flag.String("listen", "", "listen address (overrides config; default :8080)")
 		logLevel     = flag.String("log-level", "info", "log level: debug|info|warn|error")
 		dbPath       = flag.String("db", "", "SQLite catalog DB path (overrides config / PJ_CLOUD_DB; default /tmp/pj-cloud-catalog.db)")
+		externalBld  = flag.Bool("external-builder", false, "auryn cutover: open the catalog READ-ONLY (Python builder is the sole writer) and do not run the Go indexer (overrides config / PJ_CLOUD_EXTERNAL_BUILDER)")
 		pollInterval = flag.Duration("poll-interval", 0, "indexer poll interval (overrides config; e.g. 3s — used by the smoke harness)")
 		tlsCert      = flag.String("tls-cert", "", "TLS cert path (overrides config / PJ_CLOUD_TLS_CERT; set with -tls-key to serve TLS)")
 		tlsKey       = flag.String("tls-key", "", "TLS key path (overrides config / PJ_CLOUD_TLS_KEY)")
@@ -63,6 +64,12 @@ func main() {
 	}
 	if *pollInterval > 0 {
 		cfg.Indexer.PollInterval = *pollInterval
+	}
+	// External-builder (read-only) mode: -external-builder flag wins, else env.
+	if *externalBld {
+		cfg.Catalog.ExternalBuilder = true
+	} else if env := os.Getenv("PJ_CLOUD_EXTERNAL_BUILDER"); env == "1" || env == "true" {
+		cfg.Catalog.ExternalBuilder = true
 	}
 	// TLS: -tls-cert/-tls-key flags win, else PJ_CLOUD_TLS_* env, else config.
 	if *tlsCert != "" {
@@ -106,15 +113,28 @@ func main() {
 		os.Exit(1)
 	}
 
-	// SQLite-WAL catalog store (Plan A Tasks 7-12). File ids are stable rowids
-	// that survive restart for unchanged keys.
-	store, err := catalog.Open(ctx, cfg.Catalog.DBPath)
-	if err != nil {
-		log.Error("catalog: open SQLite store failed", "db", cfg.Catalog.DBPath, "err", err)
-		os.Exit(1)
+	// SQLite-WAL catalog store. EXTERNAL-BUILDER mode (the auryn cutover, §2.7)
+	// opens READ-ONLY: the Python mcap_catalog builder is the sole writer and the
+	// Go indexer does not run. Legacy mode opens read-write with the in-process
+	// indexer. File ids are stable rowids that survive restart for unchanged keys.
+	var store *catalog.Store
+	if cfg.Catalog.ExternalBuilder {
+		store, err = catalog.OpenReadOnly(ctx, cfg.Catalog.DBPath)
+		if err != nil {
+			log.Error("catalog: open SQLite store (read-only) failed — has the Python builder run?",
+				"db", cfg.Catalog.DBPath, "err", err)
+			os.Exit(1)
+		}
+		log.Info("catalog: opened SQLite store READ-ONLY (external builder)", "db", cfg.Catalog.DBPath)
+	} else {
+		store, err = catalog.Open(ctx, cfg.Catalog.DBPath)
+		if err != nil {
+			log.Error("catalog: open SQLite store failed", "db", cfg.Catalog.DBPath, "err", err)
+			os.Exit(1)
+		}
+		log.Info("catalog: opened SQLite store", "db", cfg.Catalog.DBPath)
 	}
 	defer func() { _ = store.Close() }()
-	log.Info("catalog: opened SQLite store", "db", cfg.Catalog.DBPath)
 
 	// Indexer: reconcile the bucket into the store. Warm-start (synchronous) serves
 	// existing rows with no re-extract for unchanged (etag,size,last_modified);
@@ -153,14 +173,22 @@ func main() {
 	store.SetObservability(mx, log)
 	loop.Metrics = mx
 
-	log.Info("indexer: starting (warm-start + poll)", "backend", backendName, "bucket", bucketName,
-		"endpoint", endpointName, "poll_interval", cfg.Indexer.PollInterval)
-	// Pass the long-lived ctx: the warm-start scan is internally bounded by
-	// WarmStartTimeout, but the background ticker must outlive that window and
-	// poll until shutdown.
-	if startErr := loop.Start(ctx); startErr != nil {
-		log.Error("indexer: warm-start failed", "err", startErr)
-		os.Exit(1)
+	// The Go indexer runs ONLY in legacy (read-write) mode. In external-builder
+	// mode the Python builder owns the catalog, so the loop is constructed (for the
+	// dashboard's "never run" status) but never started — the A+ warmer + the
+	// catalog-freshness updater below are the read-only equivalents.
+	if !cfg.Catalog.ExternalBuilder {
+		log.Info("indexer: starting (warm-start + poll)", "backend", backendName, "bucket", bucketName,
+			"endpoint", endpointName, "poll_interval", cfg.Indexer.PollInterval)
+		// Pass the long-lived ctx: the warm-start scan is internally bounded by
+		// WarmStartTimeout, but the background ticker must outlive that window and
+		// poll until shutdown.
+		if startErr := loop.Start(ctx); startErr != nil {
+			log.Error("indexer: warm-start failed", "err", startErr)
+			os.Exit(1)
+		}
+	} else {
+		log.Info("indexer: DISABLED (external-builder read-only mode); Python builder owns the catalog")
 	}
 
 	// A+ background chunk-index warmer (catalog-migration §3.2): pre-fill the shared

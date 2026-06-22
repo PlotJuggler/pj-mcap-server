@@ -37,6 +37,13 @@ type CatalogConfig struct {
 	// /tmp/pj-cloud-catalog.db; smoke + tests use their own temp paths. The -db
 	// flag / PJ_CLOUD_DB env override it (main.go).
 	DBPath string `yaml:"db_path"`
+
+	// ExternalBuilder selects the auryn cutover mode (catalog-migration §2.7): when
+	// true the server opens the catalog READ-ONLY (the Python mcap_catalog builder
+	// is the sole writer) and does NOT start the Go indexer. Default false keeps the
+	// legacy in-process indexer + read-write catalog. The -external-builder flag /
+	// PJ_CLOUD_EXTERNAL_BUILDER env override it (main.go).
+	ExternalBuilder bool `yaml:"external_builder"`
 }
 
 type ServerConfig struct {
