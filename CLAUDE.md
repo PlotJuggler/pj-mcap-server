@@ -10,8 +10,9 @@ self-hosted server + client that serves MCAP recordings from a cloud bucket to
 PlotJuggler-class clients on demand.
 
 This repo (`pj-mcap-server`, a git repo on branch `main`) holds the design spec, the
-implementation plans, the commercial proposal, **the vendored PJ4 working tree**
-(`PJ4/`), and the first implementation artifacts. **[LOCAL DECISION 2026-06-04]** The
+implementation plans, the commercial proposal, the **Go server + connector plugin**
+implementation, and (2026-06-22) the **vendored auryn Python catalog builder** (the
+`mcap_catalog/` submodule). **[LOCAL DECISION 2026-06-04]** The
 implementation code goes **in this repo**: every `pj-cloud/<path>` reference in the
 plans maps to `/home/gn/ws/PJ4_Server_Template/pj-mcap-server/<path>` (the plans were
 originally written for a separate `pj-cloud/` repo at
@@ -19,7 +20,24 @@ originally written for a separate `pj-cloud/` repo at
 rewritten to this repo, and Plan A Task 1 Step 1 was amended — do **not** `git init` a
 new repo).
 
-## Current approach (2026-06-04): two endpoints first — see `arch/2026-06-04-two-endpoints-approach.md`
+## Current focus (2026-06-22): the catalog migration — START HERE for execution
+
+The implementation (Slices 1–16) is built and green. The **active forward work** is the
+**catalog migration**: replace the Go-written catalog/indexer with the **auryn Python
+builder** (now vendored as the **`mcap_catalog/`** submodule) writing an improved SQLite
+schema; the Go server becomes a **read-only catalog reader + UNCHANGED streamer**, and the
+client gains a `GetVocabulary` filter RPC (cascading customer→site→robot + source + tag
+facets). Decisions are LOCKED.
+
+- **Execution specs (in `docs/`, self-contained):** `docs/auryn-catalog-migration-plan.md`
+  (PREPARED FOR EXECUTION — read its "Execution entry point") + `docs/catalog-vocabulary-rpc.md`
+  (the filter RPC, locked V1–V7) + `docs/gce-deploy-smoke.md` (the real-bucket gate runbook).
+- **Where the two sides live:** Python builder = `mcap_catalog/` (submodule); Go reader +
+  streamer = `server/`.
+- **Team rule:** technical decisions are cross-checked with a standing Codex instance
+  before they're locked.
+
+## Approach (2026-06-04, historical): two endpoints first, then plumbing
 
 The active build order stands up the pipeline's two **ends** before the middle:
 
@@ -295,15 +313,23 @@ The active build order stands up the pipeline's two **ends** before the middle:
    recorded clarification stands — `{s3,gcs}` dual-leg gate text in
    unified-plan M1c is Asensus-M1b scope, not a Dexory M1 gate.
 
-**Plugin-shape note:** the endpoint plugin is a Toolbox (like Mosaico) for now; Plan D
-specifies a DataSource shape for the final integration — reconcile at plumbing time
-(recorded in `arch/2026-06-04-two-endpoints-approach.md`).
+**Plugin-shape note:** the endpoint plugin is a Toolbox (like Mosaico) — settled by
+Slice 16 (the host parser-delegation tail slots let a Toolbox reach the full parser
+pipeline, so no DataSource shape is needed).
 
 ## Reference codebases (MANDATORY context — always reuse these)
 
 Any agent doing design or implementation work here **must** ground itself in these
 local codebases first. Do not guess SDK/plugin APIs — read the real headers. Paths below
 were verified on this machine on 2026-06-04.
+
+> **[STALE — corrected 2026-06-22]** The `PJ4/`, `plotjuggler_sdk/`, and
+> `pj-official-plugins/` submodules described just below were **REMOVED from this repo**
+> (commit `82a8c2f`). PJ4 + the plugins are now managed **externally** as sibling
+> checkouts (e.g. `~/ws_plotjuggler/PJ4-cloud`); the connector plugin builds standalone at
+> `plugin/toolbox_dexory_cloud/` against the SDK Conan package (now **0.11.0**, not 0.8.1).
+> The **only submodule of this repo today is `mcap_catalog/`** (the auryn Python catalog
+> builder). The table below is retained only as a historical reference to the fork structure.
 
 **Vendoring model — version-pinned PRIVATE fork submodules (2026-06-13).** PJ4, its
 nested `plotjuggler_sdk`, and `pj-official-plugins` are **git submodules** of this repo,
@@ -421,36 +447,37 @@ Arrow ingest (`src/arrow_ingest.*`) → raw-record forwarding to host MessagePar
 
 ## Documents (read in this order)
 
-0. `arch/2026-06-04-two-endpoints-approach.md` — **the ACTIVE execution approach** (endpoints
-   first, then plumbing; vendored-tree rules; the Toolbox-vs-DataSource reconciliation note).
-1. `arch/2026-05-28-pj-cloud-connector-design.md` — **the canonical design spec (single source
-   of truth).** 14 sections: architecture, repo layout, catalog/SQLite model, wire protocol,
-   Go server design, Qt client design, failure/resume, testing strategy, phased build order.
-   The plans below all reference this spec and must not contradict it.
+**Current plans (in `docs/` — the up-to-date forward work):**
+- `docs/auryn-catalog-migration-plan.md` — the active migration: replace the Go
+  catalog/indexer with the Python `auryn` builder + a new SQLite schema; the Go server
+  becomes a **read-only catalog reader + unchanged streamer**. Locked decisions, 6 work
+  blocks, sub-decisions D1–D4, risk register.
+- `docs/catalog-vocabulary-rpc.md` — the `GetVocabulary` filter-RPC design: a strict
+  cascading customer→site→robot tree + flat `source` + tag facets, filtered server-side;
+  resolves the migration's D3.
+- `docs/gce-deploy-smoke.md` — the Asensus GCE/ADC deploy-smoke runbook (the pending
+  real-bucket M1 gate).
+
+**Canonical references (kept in `arch/`):**
+1. `arch/2026-05-28-pj-cloud-connector-design.md` — **the canonical design spec (single
+   source of truth).** 14 sections: architecture, repo layout, catalog/SQLite model, wire
+   protocol, Go server design, Qt client design, failure/resume, testing, phased build order.
 2. `arch/2026-06-03-unified-cloud-connector-plan.md` — **the unified plan** (Dexory S3 +
    Asensus GCS, one codebase): the six abstraction seams (`BlobStore`, `FormatCodec`,
-   `ClientAuthenticator`, …), milestones M0/M1a/M1b/M1c/M2a/M2b/M2c, testing matrix,
-   risks, resolved + open commercial items. Where it **[REVISES …]** a source doc, it wins.
-3. `arch/2026-05-28-pj-cloud-server-v1.md` — **Plan A**: Go server, 46 tasks + letter-suffixed
-   seam tasks (14a storage, 14b GCS, 15a format, 24a authn, 46a CI matrix), `- [ ]` checkboxes.
-4. `arch/2026-05-28-pj-cloud-client-cpp.md` — **Plan B**: Qt C++ test client (`client-core` lib +
-   `client-cli` exe), tasks 1–14 + 8a (SessionKey). Depends on Plan A's `proto/pj_cloud.proto`.
-5. `arch/2026-05-28-pj-cloud-integration.md` — **Plan C**: cross-language E2E correctness
-   harness (Docker + Minio + fake-gcs + round-trip MCAP logical diff), tasks 1–9 + 8a
-   (GCE smoke). Depends on the binaries from A & B.
-6. `arch/2026-06-03-pj-cloud-pj4-plugin.md` — **Plan D (DEFERRED, M2b)**: the PJ4 DataSource
-   plugin lifting `client-core` + the Mosaico dialog design. Read its §0 grounding notes —
-   they correct spec assumptions against the **real** SDK headers (e.g. no
-   `launchCustomOpenDialog`, no URI-scheme hook).
-7. `arch/2026-06-01-dexory-proposal.md` (source) + the rendered `docs/2026-06-01-dexory-proposal.{html,pdf}` — the commercial proposal. `*.md` is the
-   source; `*.html` and `*.pdf` are generated artifacts (do not hand-edit them).
-   (`docs/pj-cloud-connector-overview.html` is likewise a generated overview artifact.)
+   `ClientAuthenticator`, …), milestones M0–M2c, testing matrix, risks, open commercial items.
+3. `arch/2026-06-01-dexory-proposal.md` — the commercial proposal / SOW (source `*.md`;
+   the rendered html/pdf are generated artifacts — do not hand-edit).
 
-`proto/pj_cloud.proto` (defined in Plan A) is the **canonical wire schema** shared by all
-plans — treat it as the single source of truth for the protocol. The **Go** bindings are
-checked in (`server/internal/wire/pj_cloud/`); the **C++** bindings are generated at
-build time by the Conan protoc (never the system protoc — version must match the
-linked libprotobuf).
+NOTE: the per-component implementation plans (Plan A Go server, Plan B Qt client, Plan C
+integration, Plan D PJ4 plugin) and the 2026-06-04 two-endpoints approach doc were ARCHIVED
+and removed once their work landed (Slices 1–16) — recover from git history if ever needed.
+The narrative "Plan A/B/C/D Task N" references throughout this file are historical pointers
+to that completed work.
+
+`proto/pj_cloud.proto` is the **canonical wire schema** — treat it as the single source of
+truth for the protocol. The **Go** bindings are checked in (`server/internal/wire/pj_cloud/`);
+the **C++** bindings are generated at build time by the Conan protoc (never the system
+protoc — version must match the linked libprotobuf).
 
 ## The headless SDK harness — the regression gate (2026-06-04)
 
