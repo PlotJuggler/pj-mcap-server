@@ -112,8 +112,12 @@ func UpsertFile(ctx context.Context, s *Store, rec FileRecord) (uint64, bool, er
 	return uint64(newID), created, nil
 }
 
-// GetFile returns the FileRecord with the given id, or ErrFileNotFound.
+// GetFile returns the FileRecord with the given id, or ErrFileNotFound. A
+// read-only Store (OpenReadOnly) resolves against the auryn schema.
 func GetFile(ctx context.Context, s *Store, id uint64) (FileRecord, error) {
+	if s.readOnly {
+		return aurynGetFile(ctx, s, id)
+	}
 	var (
 		rec FileRecord
 		has int

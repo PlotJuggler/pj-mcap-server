@@ -41,7 +41,11 @@ func ReplaceTopicsForFile(ctx context.Context, s *Store, fileID uint64, topics [
 }
 
 // ListTopicsForFile returns all topics for the given file in name-sorted order.
+// A read-only Store (OpenReadOnly) reconstructs them from the auryn topic_set.
 func ListTopicsForFile(ctx context.Context, s *Store, fileID uint64) ([]TopicRecord, error) {
+	if s.readOnly {
+		return aurynListTopicsForFile(ctx, s, fileID)
+	}
 	rows, err := s.DB().QueryContext(ctx,
 		`SELECT name, schema_name, schema_encoding, message_count
 		 FROM topics WHERE file_id = ? ORDER BY name`, fileID)

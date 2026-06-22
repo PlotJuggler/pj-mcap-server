@@ -47,7 +47,11 @@ type FileSummary struct {
 // row id, which is stable across reindexes (UpsertFile guarantees id stability).
 //
 // Returns (files, nextPageToken, error). nextPageToken is empty when exhausted.
+// A read-only Store (OpenReadOnly) filters against the auryn schema.
 func FilterFiles(ctx context.Context, s *Store, args FilterArgs) ([]FileSummary, string, error) {
+	if s.readOnly {
+		return aurynFilterFiles(ctx, s, args)
+	}
 	limit := args.Limit
 	if limit <= 0 {
 		limit = 200

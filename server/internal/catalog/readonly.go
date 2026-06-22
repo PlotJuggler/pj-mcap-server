@@ -13,7 +13,10 @@ import (
 // is handed carries a different version, so a catalog written by an incompatible
 // builder can never be silently mis-served. BUMP BOTH SIDES IN LOCKSTEP on any
 // change to a table/column the Go reader reads.
-const SchemaVersion = 1
+//
+// v2 (M2): tags_embedded/tags_override/tags_effective override layer +
+// files.chunk_count.
+const SchemaVersion = 2
 
 // ErrReadOnly is returned by Write on a Store opened via OpenReadOnly. Under the
 // auryn migration the Python builder is the sole writer; the Go server reads.

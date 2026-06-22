@@ -45,11 +45,15 @@ CREATE TABLE IF NOT EXISTS tags_override (
 );
 CREATE INDEX IF NOT EXISTS idx_tags_override_kv ON tags_override(key, value);
 
+-- UNION ALL (not UNION): the two SELECTs are disjoint on (file_id, key) by
+-- construction — the first yields only override keys, the second only embedded
+-- keys with NO override — so dedup is wasted work. Kept identical to the auryn
+-- schema's view so the two languages' tags_effective cannot drift.
 CREATE VIEW IF NOT EXISTS tags_effective AS
 SELECT file_id, key, value, 1 AS is_override
 FROM tags_override
 WHERE value IS NOT NULL
-UNION
+UNION ALL
 SELECT e.file_id, e.key, e.value, 0 AS is_override
 FROM tags_embedded e
 LEFT JOIN tags_override o ON (o.file_id = e.file_id AND o.key = e.key)

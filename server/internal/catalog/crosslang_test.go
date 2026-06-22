@@ -121,6 +121,129 @@ func TestCrossLang_PythonBuilds_GoReads(t *testing.T) {
 		t.Fatalf("joined dims = (%s/%s/%s/%s), want (acme/hq/r9/synthetic)",
 			customer, site, robot, source)
 	}
+
+	// 6. The AURYN READER (FilterFiles / GetFile / ListTopicsForFile over the
+	//    OpenReadOnly store) produces correct wire data — the M2 query rewrite.
+	assertAurynReader(t, st, fixtures)
+}
+
+// assertAurynReader drives the read-only reader functions (which branch to the
+// auryn-schema queries) and checks they reproduce each fixture's wire facts:
+// rebuilt s3_key, summed message_count, topic_count/topics, etag, and a working
+// topics-any-of filter.
+func assertAurynReader(t *testing.T, st *Store, fixtures []hiveFixture) {
+	t.Helper()
+	ctx := context.Background()
+
+	// FilterFiles (no predicates) returns all fixtures with derived facts.
+	files, next, err := FilterFiles(ctx, st, FilterArgs{})
+	if err != nil {
+		t.Fatalf("FilterFiles: %v", err)
+	}
+	if next != "" {
+		t.Fatalf("unexpected next page token %q (only %d files)", next, len(fixtures))
+	}
+	if len(files) != len(fixtures) {
+		t.Fatalf("FilterFiles returned %d, want %d", len(files), len(fixtures))
+	}
+	byKey := map[string]FileSummary{}
+	for _, f := range files {
+		byKey[f.S3Key] = f
+	}
+	for _, fx := range fixtures {
+		f, ok := byKey[fx.key] // s3_key was rebuilt from dimensions == the Hive key
+		if !ok {
+			t.Fatalf("FilterFiles missing rebuilt s3_key %q; got keys %v", fx.key, keysOf(byKey))
+		}
+		if f.MessageCount != fx.spec.TotalMessages() {
+			t.Fatalf("%s message_count = %d, want %d (summed from topic_counts)",
+				fx.key, f.MessageCount, fx.spec.TotalMessages())
+		}
+		if int(f.TopicCount) != len(fx.spec.Topics) {
+			t.Fatalf("%s topic_count = %d, want %d", fx.key, f.TopicCount, len(fx.spec.Topics))
+		}
+		// chunk_count crosses the language boundary: the Python builder wrote it
+		// from MCAP Statistics.chunk_count; the fixtures are chunked+summarized, so
+		// the Go reader must see a non-zero count.
+		if f.ChunkCount == 0 {
+			t.Fatalf("%s chunk_count = 0, want > 0 (chunked fixture)", fx.key)
+		}
+
+		// GetFile round-trips s3_key + etag + counts.
+		rec, err := GetFile(ctx, st, f.ID)
+		if err != nil {
+			t.Fatalf("GetFile(%d): %v", f.ID, err)
+		}
+		if rec.S3Key != fx.key {
+			t.Fatalf("GetFile s3_key = %q, want %q", rec.S3Key, fx.key)
+		}
+		if rec.S3ETag == "" {
+			t.Fatalf("GetFile %s: empty etag", fx.key)
+		}
+		if rec.MessageCount != fx.spec.TotalMessages() || rec.StartTimeNs != fx.spec.StartNs {
+			t.Fatalf("GetFile %s: msgs=%d start=%d, want msgs=%d start=%d",
+				fx.key, rec.MessageCount, rec.StartTimeNs, fx.spec.TotalMessages(), fx.spec.StartNs)
+		}
+
+		// ListTopicsForFile reconstructs the topic set + per-topic counts.
+		topics, err := ListTopicsForFile(ctx, st, f.ID)
+		if err != nil {
+			t.Fatalf("ListTopicsForFile(%d): %v", f.ID, err)
+		}
+		if len(topics) != len(fx.spec.Topics) {
+			t.Fatalf("%s: %d topics, want %d", fx.key, len(topics), len(fx.spec.Topics))
+		}
+		wantCounts := map[string]uint64{}
+		for _, ts := range fx.spec.Topics {
+			wantCounts[ts.Topic] = uint64(ts.MessageCount)
+		}
+		var summed uint64
+		for _, tr := range topics {
+			if wc, ok := wantCounts[tr.Name]; !ok || wc != tr.MessageCount {
+				t.Fatalf("%s topic %q count=%d, want %d (present=%v)",
+					fx.key, tr.Name, tr.MessageCount, wc, ok)
+			}
+			summed += tr.MessageCount
+		}
+		if summed != fx.spec.TotalMessages() {
+			t.Fatalf("%s: topic counts sum to %d, want %d", fx.key, summed, fx.spec.TotalMessages())
+		}
+	}
+
+	// A topics-any-of filter narrows to files carrying that topic. Pick the first
+	// topic of fixture[0] and assert every returned file actually contains it.
+	probe := fixtures[0].spec.Topics[0].Topic
+	filtered, _, err := FilterFiles(ctx, st, FilterArgs{TopicsAnyOf: []string{probe}})
+	if err != nil {
+		t.Fatalf("FilterFiles(topics_any_of=%q): %v", probe, err)
+	}
+	if len(filtered) == 0 {
+		t.Fatalf("topics_any_of=%q returned no files, expected >=1", probe)
+	}
+	for _, f := range filtered {
+		topics, err := ListTopicsForFile(ctx, st, f.ID)
+		if err != nil {
+			t.Fatalf("ListTopicsForFile(%d): %v", f.ID, err)
+		}
+		found := false
+		for _, tr := range topics {
+			if tr.Name == probe {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("file %d returned by topics_any_of=%q does not contain it", f.ID, probe)
+		}
+	}
+}
+
+func keysOf(m map[string]FileSummary) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	return out
 }
 
 // requireBuilder resolves the mcap_catalog submodule dir and skips (not fails)

@@ -10,6 +10,23 @@ Python builder is vendored in this repo as the **`mcap_catalog/`** submodule.
 > §13 build order where it still applies. Keep `make smoke` / `make matrix` green
 > at every task boundary.
 
+### Execution status (2026-06-22 — UNDER EXECUTION)
+
+- **M1 DONE** (§1.0/§1.2/§2.1/§5.1): `schema_version` interlock (Python writer +
+  Go `OpenReadOnly`, both fail-fast), `--once` builder mode, `gen-ci-fixtures
+  -hive` (additive), `CATALOG_CONTRACT.md`, build-tagged `crosslang` proof.
+- **M2 DONE (reader half)** (§1.1/§2.2/§2.3/§2.4 → **schema v2**): tag-override
+  layer ported to Python (`tags_embedded`/`tags_override`/`tags_effective` +
+  `update_tags`); `files.chunk_count`; the Go auryn-schema reader (`auryn_read.go`
+  — `FilterFiles`/`GetFile`/`ListTopicsForFile`/caps + `topic_counts` varint
+  decode + `rebuildHiveKey`) routed via the `s.readOnly` branch so handlers are
+  unchanged. Hermetic + `crosslang` + real-bucket proven.
+- **DEFERRED to M6 — the cutover** (kept green by landing WITH the harness flip):
+  §2.6 delete the Go indexer/writer, §2.7 flip `main.go` to `OpenReadOnly`, §5.3
+  migrate smoke/matrix/CI to the Python builder, and **D2** (tag-edit write path).
+  Rationale: §9 sequences harness (5) after reader (2); the destructive flip can't
+  precede the harness migration without turning `make smoke` red.
+
 ### Execution entry point (read this first)
 
 - **Python builder (sole writer):** the **`mcap_catalog/`** submodule = the auryn

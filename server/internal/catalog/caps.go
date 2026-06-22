@@ -87,6 +87,9 @@ func DistinctMetadataKeys(ctx context.Context, s *Store) ([]string, error) {
 // nissan corpus. Derived from s3_key (the OBJECT key), NOT topic names — topics
 // like /nissan/gps/imu contain '/' but are out of scope.
 func HasHierarchicalKey(ctx context.Context, s *Store) (bool, error) {
+	if s.readOnly {
+		return aurynHasHierarchicalKey(ctx, s)
+	}
 	var one int
 	row := s.DB().QueryRowContext(ctx,
 		`SELECT 1 FROM files WHERE s3_key LIKE '%/%' LIMIT 1`)
