@@ -77,7 +77,7 @@ class ParserIngestDriver {
 
  private:
   PJ::ToolboxRuntimeHostView runtime_{};
-  PJ::DataSourceRuntimeHostView ingest_{};
+  PJ::ParserIngestHostView ingest_{};
   std::uint32_t source_id_ = 0;
   bool active_ = false;
   std::unordered_map<std::uint32_t, IngestTopic> topics_;

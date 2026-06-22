@@ -126,7 +126,7 @@ void ParserIngestDriver::finalize() {
     return;
   }
   active_ = false;
-  ingest_ = PJ::DataSourceRuntimeHostView{};
+  ingest_ = PJ::ParserIngestHostView{};
   (void)runtime_.releaseParserIngest(source_id_);
 }
 
