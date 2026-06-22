@@ -50,6 +50,7 @@ find_package(ixwebsocket REQUIRED)
 # (zstd::libzstd_static + LZ4::lz4_static).
 find_package(zstd REQUIRED)
 find_package(lz4 REQUIRED)
+find_package(mcap REQUIRED)
 
 include(${CMAKE_CURRENT_LIST_DIR}/cmake/EmbedUi.cmake)
 include(${CMAKE_CURRENT_LIST_DIR}/cmake/EmbedManifest.cmake)
@@ -171,13 +172,6 @@ pj_emit_plugin_manifest(toolbox_dexory_cloud_plugin
 # is testable without the Qt GUI. It compiles the transport units + generated
 # proto directly (the plugin .so does not export them). Plain C++ — no Qt.
 # ----------------------------------------------------------------------------
-# The vendored Foxglove MCAP writer (data_load_mcap/contrib/mcap/writer.{hpp,inl})
-# reconstructs the streamed session as a local MCAP. Header-only; the single
-# MCAP_IMPLEMENTATION lives in tools/session_download.cpp. (Chosen over the conan
-# mcap/2.1.1 package: it is already vendored + proven in data_load_mcap and links
-# the same LZ4/zstd static targets, so no new conan dependency is introduced.)
-set(DEXORY_CLOUD_VENDORED_MCAP ${CMAKE_CURRENT_SOURCE_DIR}/third_party)
-
 add_executable(dexory-cloud-cli
   tools/dexory_cloud_cli.cpp
   tools/session_download.cpp
@@ -196,14 +190,8 @@ target_include_directories(dexory-cloud-cli PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/src/core
   ${DEXORY_CLOUD_PROTO_OUT_DIR}
 )
-# The vendored MCAP headers are not held to our lint bar (SYSTEM include).
-target_include_directories(dexory-cloud-cli SYSTEM PRIVATE ${DEXORY_CLOUD_VENDORED_MCAP})
-# The transport units transitively include the generated pj_cloud.pb.h, whose
-# inline accessors trip -Wconversion (size_type -> int). That header is codegen,
-# not held to our lint bar (the plugin target relaxes the same flag for the same
-# reason). session_download.cpp pulls in the vendored MCAP writer.inl, which also
-# trips -Wconversion / -Wold-style-cast. The CLI's own translation unit keeps the
-# full strict flags.
+# The transport units and mcap headers trip -Wconversion / -Wold-style-cast
+# (codegen + upstream headers not held to our lint bar).
 set_source_files_properties(
   src/backend_connection.cpp
   src/wire_mapping.cpp
@@ -217,6 +205,7 @@ target_link_libraries(dexory-cloud-cli PRIVATE
   nlohmann_json::nlohmann_json
   zstd::libzstd_static
   LZ4::lz4_static
+  mcap::mcap
 )
 
 # ----------------------------------------------------------------------------

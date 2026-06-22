@@ -36,8 +36,10 @@ class ToolboxDexoryCloudConan(ConanFile):
         # LZ4 inbound-decode (the v1 server never emits LZ4, but the client must
         # decode it per spec §6.4). Pinned to match data_load_mcap, which links
         # the same zstd::libzstd_static + LZ4::lz4_static targets.
-        "zstd/1.5.7",
-        "lz4/1.10.0",
+        "zstd/1.5.5",
+        "lz4/1.9.4",
+        # MCAP writer for the CLI's session-download tool (header-only).
+        "mcap/2.1.1",
     )
     # Build-context protobuf so the conan protoc (6.33.5) lands on the build
     # PATH and protobuf_generate()'s `find_program(protoc)` resolves to it,
