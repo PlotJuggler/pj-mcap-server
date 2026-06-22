@@ -10,6 +10,17 @@
   <tr><th>Failed</th><td>{{.LastFailed}}</td></tr>
   {{if .LastErr}}<tr><th>Last error</th><td><mark>{{.LastErr}}</mark></td></tr>{{end}}
 </table>
+{{if .CatalogBuild}}
+<h3>Catalog build (Python builder)</h3>
+<table>
+  <tr><th>Build id</th><td>{{.CatalogBuild.BuildID}}</td></tr>
+  <tr><th>Last build</th><td>{{.CatalogBuild.When}}</td></tr>
+  <tr><th>Files scanned</th><td>{{.CatalogBuild.Scanned}}</td></tr>
+  <tr><th>Files failed</th><td>{{.CatalogBuild.Failed}}</td></tr>
+  <tr><th>Outcome</th><td>{{.CatalogBuild.Outcome}}</td></tr>
+  <tr><th>Builder version</th><td>{{.CatalogBuild.Version}}</td></tr>
+</table>
+{{end}}
 {{if .RecentErrors}}
 <h3>Recent failures</h3>
 <table>

@@ -16,7 +16,8 @@ import (
 //
 // v2 (M2): tags_embedded/tags_override/tags_effective override layer +
 // files.chunk_count.
-const SchemaVersion = 2
+// v3 (M6): build_metadata table (catalog-freshness / swap-detection).
+const SchemaVersion = 3
 
 // ErrReadOnly is returned by Write on a Store opened via OpenReadOnly. Under the
 // auryn migration the Python builder is the sole writer; the Go server reads.

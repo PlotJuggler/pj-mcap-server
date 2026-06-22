@@ -238,6 +238,19 @@ func assertAurynReader(t *testing.T, st *Store, fixtures []hiveFixture) {
 		t.Fatalf("vocab sources = %+v, want [synthetic]", vocab.Sources)
 	}
 
+	// build_metadata (v3): the Python builder's record_build stamped it at the end
+	// of the reconcile; Go's GetBuildInfo reads it back (the cross-language v3 path).
+	bi, err := GetBuildInfo(ctx, st)
+	if err != nil {
+		t.Fatalf("GetBuildInfo: %v", err)
+	}
+	if !bi.Present || bi.BuildID != 1 || bi.LastBuildNs <= 0 ||
+		bi.FilesScanned != int64(len(fixtures)) || bi.FilesFailed != 0 ||
+		bi.Outcome != "ok" || bi.BuilderVersion == "" {
+		t.Fatalf("build_metadata = %+v, want present/build_id=1/scanned=%d/failed=0/ok/version!=''",
+			bi, len(fixtures))
+	}
+
 	// A topics-any-of filter narrows to files carrying that topic. Pick the first
 	// topic of fixture[0] and assert every returned file actually contains it.
 	probe := fixtures[0].spec.Topics[0].Topic

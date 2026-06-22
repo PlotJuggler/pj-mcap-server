@@ -94,6 +94,7 @@ func aurynSchemaDDL() []string {
 		`CREATE TABLE tags_embedded (file_id INTEGER NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY(file_id,key)) WITHOUT ROWID`,
 		`CREATE TABLE tags_override (file_id INTEGER NOT NULL, key TEXT NOT NULL, value TEXT, updated_at INTEGER NOT NULL, PRIMARY KEY(file_id,key)) WITHOUT ROWID`,
 		`CREATE TABLE catalog_failures (s3_key TEXT NOT NULL PRIMARY KEY, failed_at_ns INTEGER NOT NULL, error_text TEXT NOT NULL)`,
+		`CREATE TABLE build_metadata (id INTEGER PRIMARY KEY CHECK (id=1), build_id INTEGER NOT NULL, last_build_ns INTEGER NOT NULL, files_scanned INTEGER NOT NULL, files_failed INTEGER NOT NULL, build_outcome TEXT NOT NULL, builder_version TEXT NOT NULL)`,
 		`CREATE VIEW tags_effective AS
 			SELECT file_id,key,value,1 AS is_override FROM tags_override WHERE value IS NOT NULL
 			UNION ALL

@@ -228,6 +228,18 @@ func (h *pageHandler) renderIndexer(w http.ResponseWriter, r *http.Request) {
 	data["LastFailed"] = stats.Failed
 	data["LastErr"] = errorString(lastErr)
 	data["RecentErrors"] = rows
+	// Catalog-freshness panel (§6.5): the Python builder's build_metadata, when the
+	// server reads an auryn catalog (read-only). Absent on the legacy in-process path.
+	if bi, err := catalog.GetBuildInfo(r.Context(), h.deps.Store); err == nil && bi.Present {
+		data["CatalogBuild"] = map[string]string{
+			"BuildID": strconv.FormatInt(bi.BuildID, 10),
+			"When":    nsHuman(bi.LastBuildNs),
+			"Scanned": strconv.FormatInt(bi.FilesScanned, 10),
+			"Failed":  strconv.FormatInt(bi.FilesFailed, 10),
+			"Outcome": bi.Outcome,
+			"Version": bi.BuilderVersion,
+		}
+	}
 	h.exec(w, h.tpl.indexer, data)
 }
 

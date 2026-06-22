@@ -53,6 +53,14 @@ type Metrics struct {
 	ChunkIndexWarmedTotal prometheus.Counter
 	ChunkIndexWarmSkipped prometheus.Counter
 	ChunkIndexWarmErrors  prometheus.Counter
+
+	// Catalog freshness (catalog-migration §6.5): mirrors the Python builder's
+	// build_metadata so monitoring sees catalog staleness once the writer is
+	// out-of-process. All 0 on the legacy in-process path (no build_metadata).
+	CatalogBuildID            prometheus.Gauge
+	CatalogLastBuildTimestamp prometheus.Gauge // unix seconds of the last build
+	CatalogFilesScanned       prometheus.Gauge
+	CatalogFilesFailed        prometheus.Gauge
 }
 
 // New builds the collector set on a fresh Registry and registers them. The
@@ -104,6 +112,18 @@ func New() *Metrics {
 		ChunkIndexWarmErrors: prometheus.NewCounter(
 			prometheus.CounterOpts{Name: "pj_cloud_chunkindex_warm_errors_total", Help: "Per-file chunk-index warm failures (the sweep continues)."},
 		),
+		CatalogBuildID: prometheus.NewGauge(
+			prometheus.GaugeOpts{Name: "pj_cloud_catalog_build_id", Help: "Monotonic id of the last completed catalog build (Python builder)."},
+		),
+		CatalogLastBuildTimestamp: prometheus.NewGauge(
+			prometheus.GaugeOpts{Name: "pj_cloud_catalog_last_build_timestamp_seconds", Help: "Unix time of the last completed catalog build."},
+		),
+		CatalogFilesScanned: prometheus.NewGauge(
+			prometheus.GaugeOpts{Name: "pj_cloud_catalog_files_scanned", Help: "Files seen by the last catalog build."},
+		),
+		CatalogFilesFailed: prometheus.NewGauge(
+			prometheus.GaugeOpts{Name: "pj_cloud_catalog_files_failed", Help: "Files quarantined by the last catalog build."},
+		),
 	}
 	reg.MustRegister(
 		m.PanicTotal,
@@ -112,8 +132,21 @@ func New() *Metrics {
 		m.IndexerRunsTotal, m.IndexerFailuresTotal, m.IndexerFilesIndexed,
 		m.BytesSentTotal, m.MessagesSentTotal, m.FetchedBytesTotal,
 		m.ChunkIndexWarmedTotal, m.ChunkIndexWarmSkipped, m.ChunkIndexWarmErrors,
+		m.CatalogBuildID, m.CatalogLastBuildTimestamp, m.CatalogFilesScanned, m.CatalogFilesFailed,
 	)
 	return m
+}
+
+// SetCatalogFreshness mirrors a build_metadata snapshot onto the pj_cloud_catalog_*
+// gauges (catalog-migration §6.5). Nil-safe; a not-present snapshot leaves them 0.
+func (m *Metrics) SetCatalogFreshness(buildID, lastBuildNs, scanned, failed int64) {
+	if m == nil {
+		return
+	}
+	m.CatalogBuildID.Set(float64(buildID))
+	m.CatalogLastBuildTimestamp.Set(float64(lastBuildNs) / 1e9)
+	m.CatalogFilesScanned.Set(float64(scanned))
+	m.CatalogFilesFailed.Set(float64(failed))
 }
 
 // Registry exposes the underlying prometheus.Registry for the /metrics handler.

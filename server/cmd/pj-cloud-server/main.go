@@ -178,6 +178,34 @@ func main() {
 		}
 	}()
 
+	// Catalog-freshness updater (§6.5): mirror the Python builder's build_metadata
+	// onto the pj_cloud_catalog_* gauges so monitoring sees staleness once the
+	// writer is out-of-process. No-op (gauges stay 0) on the legacy in-process
+	// indexer path (GetBuildInfo returns not-present).
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		refresh := func() {
+			bi, err := catalog.GetBuildInfo(ctx, store)
+			if err != nil {
+				log.Warn("catalog freshness read failed", "err", err)
+				return
+			}
+			if bi.Present {
+				mx.SetCatalogFreshness(bi.BuildID, bi.LastBuildNs, bi.FilesScanned, bi.FilesFailed)
+			}
+		}
+		refresh()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				refresh()
+			}
+		}
+	}()
+
 	// Session/streaming subsystem: registry (concurrency cap + retain-after-
 	// disconnect eviction) wired to the same store/codec/storage. Cancel/evict
 	// discards the retain buffer and unblocks any parked producer.
