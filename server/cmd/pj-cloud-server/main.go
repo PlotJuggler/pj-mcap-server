@@ -25,6 +25,7 @@ import (
 	"pj-cloud/server/internal/metrics"
 	"pj-cloud/server/internal/session"
 	"pj-cloud/server/internal/storage"
+	"pj-cloud/server/internal/warm"
 	"pj-cloud/server/internal/ws"
 )
 
@@ -161,6 +162,21 @@ func main() {
 		log.Error("indexer: warm-start failed", "err", startErr)
 		os.Exit(1)
 	}
+
+	// A+ background chunk-index warmer (catalog-migration §3.2): pre-fill the shared
+	// cache from the catalog so a download's plan phase is an in-memory hit. Runs
+	// AFTER the indexer warm-start (so on the live path it finds the cache hot and
+	// skips); read-only, so it is the cache's warm source once the Go indexer is
+	// gone (auryn cutover). Background — never blocks serving.
+	warmer := &warm.Warmer{
+		Store: store, Codec: codec, Blob: bs, Cache: idxCache,
+		Concurrency: 4, Log: log, Metrics: mx,
+	}
+	go func() {
+		if werr := warmer.Run(ctx); werr != nil {
+			log.Warn("chunk-index warmer: list failed", "err", werr)
+		}
+	}()
 
 	// Session/streaming subsystem: registry (concurrency cap + retain-after-
 	// disconnect eviction) wired to the same store/codec/storage. Cancel/evict

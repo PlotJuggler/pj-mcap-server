@@ -46,6 +46,13 @@ type Metrics struct {
 	// store across all sessions (the producer fetch budget; the ground truth the
 	// estimated_chunk_bytes pre-flight is asserted against in the component test).
 	FetchedBytesTotal prometheus.Counter
+
+	// Chunk-index background warmer accounting (catalog-migration §3.2). Warmed =
+	// files whose chunk index was loaded into the cache; Skipped = already-cached
+	// hits; Errors = per-file load failures (a poison file never aborts the sweep).
+	ChunkIndexWarmedTotal prometheus.Counter
+	ChunkIndexWarmSkipped prometheus.Counter
+	ChunkIndexWarmErrors  prometheus.Counter
 }
 
 // New builds the collector set on a fresh Registry and registers them. The
@@ -88,6 +95,15 @@ func New() *Metrics {
 		FetchedBytesTotal: prometheus.NewCounter(
 			prometheus.CounterOpts{Name: "pj_cloud_fetched_bytes_total", Help: "Total chunk-record bytes fetched from the blob store."},
 		),
+		ChunkIndexWarmedTotal: prometheus.NewCounter(
+			prometheus.CounterOpts{Name: "pj_cloud_chunkindex_warmed_total", Help: "Files whose chunk index the background warmer loaded into the cache."},
+		),
+		ChunkIndexWarmSkipped: prometheus.NewCounter(
+			prometheus.CounterOpts{Name: "pj_cloud_chunkindex_warm_skipped_total", Help: "Files the warmer skipped because the chunk index was already cached."},
+		),
+		ChunkIndexWarmErrors: prometheus.NewCounter(
+			prometheus.CounterOpts{Name: "pj_cloud_chunkindex_warm_errors_total", Help: "Per-file chunk-index warm failures (the sweep continues)."},
+		),
 	}
 	reg.MustRegister(
 		m.PanicTotal,
@@ -95,6 +111,7 @@ func New() *Metrics {
 		m.WSConnectionsActive, m.WSConnectionsTotal,
 		m.IndexerRunsTotal, m.IndexerFailuresTotal, m.IndexerFilesIndexed,
 		m.BytesSentTotal, m.MessagesSentTotal, m.FetchedBytesTotal,
+		m.ChunkIndexWarmedTotal, m.ChunkIndexWarmSkipped, m.ChunkIndexWarmErrors,
 	)
 	return m
 }

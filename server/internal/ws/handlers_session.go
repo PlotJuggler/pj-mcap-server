@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"golang.org/x/sync/errgroup"
+	"golang.org/x/sync/singleflight"
 
 	"pj-cloud/server/internal/catalog"
 	"pj-cloud/server/internal/config"
@@ -52,21 +53,72 @@ type SessionDeps struct {
 	// (a file not yet indexed) falls back to a direct codec read + cache fill.
 	// Nil => no caching (every plan reads storage).
 	IdxCache *format.ChunkIndexCache
+
+	// idxSF dedupes concurrent COLD loads of the same (key,etag): a stitched
+	// multi-file open + the background warmer + parallel sessions can all miss the
+	// same file at once; without this each would issue its own WAN summary read.
+	// singleflight collapses them to ONE load (the rest wait + share the result).
+	// Zero-value usable.
+	idxSF singleflight.Group
 }
 
-// cachedChunkIndex returns the chunk index for (key,etag) from IdxCache,
-// loading + caching it on a miss.
+// chunkIndexLoadTimeout bounds a single detached chunk-index load (the storage
+// layer has no HTTP client timeout, so a black-holed WAN read would otherwise
+// strand the singleflight leader goroutine — and every later opener of the same
+// file — forever). Generous: a summary read is normally sub-second; this only
+// fires on a hung connection, after which the file self-heals.
+const chunkIndexLoadTimeout = 2 * time.Minute
+
+// cachedChunkIndex returns the chunk index for (key,etag) from IdxCache, loading +
+// caching it on a miss. Concurrent cold misses of the same file are collapsed to a
+// single codec read via singleflight (3.1).
 func (d *SessionDeps) cachedChunkIndex(
 	ctx context.Context, key, etag string, fileID uint64) (session.FileChunkIndex, error) {
+	if d.IdxCache == nil {
+		// No cache: a single direct load (the singleflight+Put+re-Get dance below
+		// would otherwise do two WAN reads on a nil cache — Put/Get are no-ops).
+		return d.Codec.ChunkIndex(ctx, d.Blob, key, fileID)
+	}
 	if idx, ok := d.IdxCache.Get(key, etag, fileID); ok {
 		return idx, nil
 	}
-	idx, err := d.Codec.ChunkIndex(ctx, d.Blob, key, fileID)
-	if err != nil {
-		return session.FileChunkIndex{}, err
+	// Dedup the load: one leader fetches + caches, the rest wait + share. The
+	// leader runs detached from any single caller's cancellation
+	// (context.WithoutCancel) so a bailing leader doesn't fail the waiters; DoChan +
+	// a per-caller select lets each waiter still bail on its OWN ctx.
+	sfKey := key + "|" + etag
+	ch := d.idxSF.DoChan(sfKey, func() (interface{}, error) {
+		// Detach from any single caller's cancellation (WithoutCancel) BUT keep a
+		// bound: WithoutCancel also drops the deadline, so a hung WAN summary read
+		// would otherwise strand this goroutine forever. The per-load timeout caps it.
+		loadCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), chunkIndexLoadTimeout)
+		defer cancel()
+		idx, err := d.Codec.ChunkIndex(loadCtx, d.Blob, key, fileID)
+		if err != nil {
+			return session.FileChunkIndex{}, err
+		}
+		d.IdxCache.Put(key, etag, idx)
+		return idx, nil
+	})
+	select {
+	case res := <-ch:
+		if res.Err != nil {
+			return session.FileChunkIndex{}, res.Err
+		}
+		// The cache restamps for THIS caller's fileID. On the rare race where the
+		// entry was already evicted between Put and this Get, load directly.
+		if idx, ok := d.IdxCache.Get(key, etag, fileID); ok {
+			return idx, nil
+		}
+		idx, err := d.Codec.ChunkIndex(ctx, d.Blob, key, fileID)
+		if err != nil {
+			return session.FileChunkIndex{}, err
+		}
+		d.IdxCache.Put(key, etag, idx)
+		return idx, nil
+	case <-ctx.Done():
+		return session.FileChunkIndex{}, ctx.Err()
 	}
-	d.IdxCache.Put(key, etag, idx)
-	return idx, nil
 }
 
 // producerOpts maps the config block onto the session engine's ProducerOpts.
