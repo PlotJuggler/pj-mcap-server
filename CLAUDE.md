@@ -20,22 +20,30 @@ originally written for a separate `pj-cloud/` repo at
 rewritten to this repo, and Plan A Task 1 Step 1 was amended — do **not** `git init` a
 new repo).
 
-## Current focus (2026-06-22): the catalog migration — START HERE for execution
+## Current state (2026-07-06): the catalog migration is COMPLETE
 
-The implementation (Slices 1–16) is built and green. The **active forward work** is the
-**catalog migration**: replace the Go-written catalog/indexer with the **auryn Python
-builder** (now vendored as the **`mcap_catalog/`** submodule) writing an improved SQLite
-schema; the Go server becomes a **read-only catalog reader + UNCHANGED streamer**, and the
-client gains a `GetVocabulary` filter RPC (cascading customer→site→robot + source + tag
-facets). Decisions are LOCKED.
+**The auryn catalog migration (M1–M6 incl. the full M6 tail) is DONE and pushed.** The
+production architecture is a **two-process system**: the Python **`mcap_catalog/`**
+builder (submodule) is the SOLE catalog writer (schema v3, atomic publish via temp+rename,
+`--tag-socket` tag-edit IPC, `--no-watch` rescan-only daemon mode) and the Go server is a
+**pure read-only catalog reader + unchanged streamer** — `catalog.OpenReadOnly` is the
+ONLY constructor, `internal/indexer/` and every catalog write API are DELETED (−2k LOC),
+`UpdateTags` forwards over a unix-socket IPC to the builder (key-addressed; rowids
+renumber across rebuilds), and the server detects an atomically-published rebuild by
+(dev,inode) file identity and reopens live (`ReopenIfSwapped`, 30s tick; all multi-query
+reads are generation-pinned). `-external-builder`/`-poll-interval` are deprecated no-ops.
+`CATALOG_CONTRACT.md` (§9 publish/reopen, §10 tag IPC; byte-identical copies in `docs/`
+and `mcap_catalog/`) is the cross-language contract — schema/IPC changes MUST update it.
 
-- **Execution specs (in `docs/`, self-contained):** `docs/auryn-catalog-migration-plan.md`
-  (PREPARED FOR EXECUTION — read its "Execution entry point") + `docs/catalog-vocabulary-rpc.md`
-  (the filter RPC, locked V1–V7) + `docs/gce-deploy-smoke.md` (the real-bucket gate runbook).
-- **Where the two sides live:** Python builder = `mcap_catalog/` (submodule); Go reader +
-  streamer = `server/`.
+- **Remaining follow-ups:** `matrix.sh` migration (fail-fasts with exit 2 today; needs the
+  `jkk_dataset02` corpus machine); GitHub CI activation (needs a read-only deploy key on
+  the private `AurynRobotics/mcap_server` submodule as the `MCAP_CATALOG_DEPLOY_KEY`
+  secret, plus the push decision); the C++ facet UI (client-side `GetVocabulary` —
+  `docs/catalog-vocabulary-rpc.md`); real-bucket GCE smoke (`docs/gce-deploy-smoke.md`);
+  builder gaps by design: `derive_tags()` stub, GCS Pub/Sub discovery, `file_metrics`.
 - **Team rule:** technical decisions are cross-checked with a standing Codex instance
-  before they're locked.
+  before they're locked; milestone boundaries get adversarial review (Codex + Claude —
+  this caught ~35 real defects across the M6 tail).
 
 ## Approach (2026-06-04, historical): two endpoints first, then plumbing
 
@@ -448,10 +456,10 @@ Arrow ingest (`src/arrow_ingest.*`) → raw-record forwarding to host MessagePar
 ## Documents (read in this order)
 
 **Current plans (in `docs/` — the up-to-date forward work):**
-- `docs/auryn-catalog-migration-plan.md` — the active migration: replace the Go
-  catalog/indexer with the Python `auryn` builder + a new SQLite schema; the Go server
-  becomes a **read-only catalog reader + unchanged streamer**. Locked decisions, 6 work
-  blocks, sub-decisions D1–D4, risk register.
+- `docs/auryn-catalog-migration-plan.md` — the catalog migration plan (**EXECUTED —
+  all blocks complete 2026-07-06**; kept as the design record). `docs/CATALOG_CONTRACT.md`
+  is the LIVE cross-language contract (schema v3, publish/reopen §9, tag IPC §10;
+  byte-identical copy in `mcap_catalog/` — always update both).
 - `docs/catalog-vocabulary-rpc.md` — the `GetVocabulary` filter-RPC design: a strict
   cascading customer→site→robot tree + flat `source` + tag facets, filtered server-side;
   resolves the migration's D3.
@@ -484,24 +492,30 @@ protoc — version must match the linked libprotobuf).
 **All backend (server) work MUST keep `make smoke` green — run it before declaring any
 slice done.** The harness proves the whole pipeline without the GUI:
 
-- `make smoke` (= `scripts/smoke.sh`): ensures Minio is up + bucket seeded → builds and
-  starts its **own** server on **:8081** (never touches the interactive `:8080`
-  instance; always reaps its server on exit) → Go `devprobe` ground-truth assertions →
-  plugin ctest twice (hermetic: live tests **skip**, error tests pass; live: everything
-  runs and passes) → CLI spot checks through **both** client stacks (the C++
-  `dexory-cloud-cli` — the exact `BackendConnection` the GUI uses — and `devprobe`).
-  Final line `SMOKE PASS` / `SMOKE FAIL: <step>`; exit code matches.
-- `make matrix` (= `scripts/matrix.sh`): the deeper, slower machine-local gate
-  (own server on **:8082**; hard-requires the `/home/gn/ws/jkk_dataset02`
-  originals). Legs m1–m8: half-topics (23930), none-matching (0),
-  outside-range (0), boundary-spanning stitched window (29461), 8-file FULL
-  stitch (337861 — the corpus-bound reading of the spec §11 “10-file” cell;
-  monotonicity via `mcaptopics --monotonic`), 4 parallel sessions
-  (each mcapdiff-clean), duplicate-seq exit 2 + overlap rejection, and
-  **m8 = the GCS dual-leg** (fake-gcs :4443 via `infra/fake-gcs/`, seeded
-  with the same 8 keys; both client stacks; warm-start 0 re-extracts;
-  anti-drift — a GCS-only failure fails the matrix). Final line
-  `MATRIX PASS` / `MATRIX FAIL: <leg>`.
+- `make smoke` (= `scripts/smoke.sh`): fully self-contained, proves the TWO-PROCESS
+  production shape — generates a deterministic **synthetic Hive-keyed corpus** (8 files,
+  `gen-ci-fixtures -hive -hive-big` + `gen-3d-fixture`) into a dedicated `smoke-hive`
+  Minio bucket → starts the **Python builder daemon** (`--no-watch --tag-socket`, venv)
+  as sole writer → starts its **own** Go server on **:8081** with `-tag-ipc-socket`
+  (never touches the interactive instance; reaps BOTH processes on exit) → oracle
+  assertions **self-derived at runtime** via `mcaptopics` on the local originals (no
+  hardcoded counts; only the C++ live gtests pin the deterministic synthetic values) →
+  plugin ctest hermetic+live → both client stacks → 7 mcapdiff round-trip legs →
+  server-restart persistence by (dev,inode) → step h: tag edit through the IPC that
+  **survives a `--once --rebuild` mid-run** (atomic publish + live `ReopenIfSwapped` +
+  `tags_override` carry-forward). Final line `SMOKE PASS` / `SMOKE FAIL: <step>`.
+  **Prereq:** the builder venv at `~/.venvs/pj-catalog` (bootstrap:
+  `python3 -m venv ~/.venvs/pj-catalog && ~/.venvs/pj-catalog/bin/pip install
+  boto3==1.43.40 google-cloud-storage==3.12.0 mcap==1.4.0 watchdog==6.0.0`).
+- `scripts/ci-integration.sh` (needs `PJ_CI_BUILDER_PYTHON=~/.venvs/pj-catalog/bin/python3`):
+  the local mirror of the CI integration legs — Python builder `--once` over both
+  `{s3, gcs}` emulator legs + the `scripts/sabotage-check.sh` quarantine red-team.
+  Final line `CI-INTEGRATION PASS`.
+- `make matrix` (= `scripts/matrix.sh`): **PENDING MIGRATION — fail-fasts with exit 2**
+  and a clear message. It depended on the deleted in-process Go indexer and its
+  real-corpus pins need the `/home/gn/ws/jkk_dataset02` machine; the legacy leg
+  definitions (m1–m8) are retained in the script as the migration starting point.
+  Do not "fix" it piecemeal — migrate it to the Python-builder pipeline like smoke.
 - `dexory-cloud-cli` (built by `./build.sh toolbox_dexory_cloud`, lands under
   `build/toolbox_dexory_cloud/Release/toolbox_dexory_cloud/`): `hello` / `list [--json]`
   / `topics <sequence> [--json]` / `download <seq…> [--topics …] [--time-range …]
@@ -527,16 +541,19 @@ easy to forget). Use these unless you have a reason not to:
 ./build.sh   # builds server + dev tools (server/bin/, direct `go build` — NO protoc
              # needed, the wire bindings are checked in) + the plugin (+ the GUI app
              # if Qt is installed; otherwise it prints the one-time Qt install command).
-./run.sh [--dexory_minio]  # LOCAL (the default): docker compose up Minio -> SEED synthetic MCAPs INTO
-             # `recordings` IFF the bucket is empty (your own corpus is never clobbered) -> server on :8080.
-./run.sh --dexory_aws      # Dexory staging bucket (AWS S3): no Minio/seed; -config config.dexory-staging.yaml,
-             # :8084, AWS_PROFILE auto-defaults to dexory-staging. First scan ~1s/file over WAN (synchronous).
-./run.sh --asensus_google  # Asensus GCS: -config config.asensus-staging.yaml (TEMPLATE — refuses with guidance
-             # until you replace the REPLACE_ME bucket/prefix), :8085, creds = ADC. (Plan A 14b GCS leg / Asensus M1b.)
-./run.sh <config.yaml>     # power-user escape hatch: any S3/GCS server config.
-             # ONE server at a time (shared /tmp/pj-cloud-server.{pid,log}); `make server-stop` to switch targets.
-             # Stop LOCAL Minio too: `(cd infra/minio && docker compose down)`. Targets validated 2026-06-12
-             # (dexory_aws = 34 real sequences on :8084; dexory_minio = local corpus on :8080; asensus_google = template-guard).
+./run.sh [--dexory_minio]  # LOCAL (the default): Minio up -> seed synthetic Hive-keyed MCAPs IFF the
+             # bucket is empty -> PYTHON BUILDER daemon first (sole writer + tag-edit IPC on
+             # /tmp/pj-cloud-tag.sock; waits for build_metadata, 'ok' OR 'partial' both count)
+             # -> Go server on :8080 (read-only, -tag-ipc-socket).
+./run.sh --dexory_aws      # Dexory staging bucket (AWS S3): config.dexory-staging.yaml, :8084.
+./run.sh --asensus_google  # Asensus GCS: config.asensus-staging.yaml (REPLACE_ME template guard), :8085, ADC.
+./run.sh <config.yaml>     # power-user escape hatch: any S3/GCS server config (this is how to use a
+             # non-default port when :8080 is taken).
+             # TWO processes, ONE backend at a time (/tmp/pj-cloud-{server,builder}.{pid,log});
+             # `make server-stop` reaps BOTH. Stop LOCAL Minio too: (cd infra/minio && docker compose down).
+             # Reuse checks are pidfile-based: a FOREIGN listener on the port (this machine runs
+             # Guacamole on :8080!) is a clear hard error, never a false "Backend ready".
+             # Builder venv required: ~/.venvs/pj-catalog (see the smoke section for the pinned bootstrap).
 ```
 
 Seeding is a new tool, **`server/cmd/seed`** (`go build -o bin/seed ./cmd/seed`): a tiny
@@ -610,13 +627,25 @@ in batches so the client can show already-received data while the rest downloads
 **not** real-time pacing. Supports reconnect-and-resume (short retain window) and
 cancel-mid-stream.
 
-- **Go server** — one static binary, five subsystems on one TCP listener: Catalog
-  (WS RPC + SQLite reads, WAL + single writer goroutine), Session (WS streaming + storage
-  fetcher with producer/consumer split for resume), Indexer (background storage poller),
-  Dashboard (read-only HTML + Prometheus `/metrics` + `/health`). Pure-Go SQLite (no cgo).
-  Storage/format/auth go through the unified plan's seams: `BlobStore` (S3 + GCS impls),
-  `FormatCodec` (one MCAP impl), `ClientAuthenticator` (bearer token). Only
-  `internal/storage` may import a cloud SDK.
+- **Two-process backend** (the "one static binary" property is GONE — M6):
+  - **Python `mcap_catalog` builder** (submodule; sole SQLite writer): discovers bucket
+    objects (S3 SQS events / rescan; `--no-watch` = rescan-only), extracts MCAP
+    footer/summary metadata (1–2 range-GETs), writes the auryn schema (v3: Hive
+    dimensions, topic-set dedup, `tags_effective` override layer, `catalog_failures`
+    quarantine, `build_metadata` freshness), publishes rebuilds ATOMICALLY (temp +
+    checkpoint-gate + rename; `tags_override` carried forward), and serves the tag-edit
+    IPC on a unix socket (bounded, deadline-checked, single-writer-queued).
+  - **Go server** (read-only reader + streamer), subsystems on one TCP listener: Catalog
+    (WS RPC; `OpenReadOnly` ONLY — pool pinned to one verified connection, (dev,inode)
+    swap detection + `ReopenIfSwapped`, generation-pinned multi-query reads), Session
+    (WS streaming, producer/consumer split for resume — UNCHANGED by the migration),
+    tag-IPC forwarder (`internal/tagipc`; `UpdateTags` is key-addressed, capability =
+    IPC configured), chunk-index warmer, Dashboard (HTML + Prometheus + `/health`,
+    catalog freshness + quarantine). Pure-Go SQLite (no cgo). Seams unchanged:
+    `BlobStore` (S3 + GCS), `FormatCodec` (MCAP), `ClientAuthenticator`. Only
+    `internal/storage` may import a cloud SDK. The tag socket bypasses WS bearer auth —
+    the Go layer is the auth boundary (deploy mounts the socket volume into only the
+    two processes; never on NFS/EFS — SQLite WAL).
 - **Qt C++ client** — `client-core` owns the WS/protocol/decompression and exposes a
   `SessionSink` seam; `client-cli`'s `McapWriterSink` reconstructs the streamed session as a
   local MCAP file. **`client-core` is deliberately Widgets-free so the PJ4 DataSource
