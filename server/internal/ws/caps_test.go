@@ -15,25 +15,34 @@ import (
 	"pj-cloud/server/internal/catalog"
 )
 
+// newWSTestServer stands up a dev-anonymous WS handler over a caller-supplied,
+// already-opened *catalog.Store (writable or read-only) and returns the ws://
+// URL. Shared by every test file that needs a specific store shape (freshly
+// seeded, auryn read-only, …) fronted by the real handler/mux/httptest
+// scaffolding, so that scaffolding is written exactly once.
+func newWSTestServer(t *testing.T, store *catalog.Store) string {
+	t.Helper()
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	h := NewHandler(store, "", log)
+	mux := http.NewServeMux()
+	mux.Handle("/api/ws", h)
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return "ws" + strings.TrimPrefix(srv.URL, "http") + "/api/ws"
+}
+
 // newCapsTestServer stands up a dev-anonymous WS handler over a catalog the
 // caller seeds via the returned *catalog.Store. This lets the BackendCapabilities
 // derivation be exercised against a KNOWN set of object keys / tags, unlike the
 // empty-catalog auth tests.
 func newCapsTestServer(t *testing.T) (string, *catalog.Store) {
 	t.Helper()
-	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	cat, err := catalog.Open(context.Background(), filepath.Join(t.TempDir(), "catalog.db"))
 	if err != nil {
 		t.Fatalf("catalog.Open: %v", err)
 	}
 	t.Cleanup(func() { _ = cat.Close() })
-
-	h := NewHandler(cat, "", log)
-	mux := http.NewServeMux()
-	mux.Handle("/api/ws", h)
-	srv := httptest.NewServer(mux)
-	t.Cleanup(srv.Close)
-	return "ws" + strings.TrimPrefix(srv.URL, "http") + "/api/ws", cat
+	return newWSTestServer(t, cat), cat
 }
 
 func capsSeedFile(t *testing.T, s *catalog.Store, key string) uint64 {

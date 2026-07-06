@@ -206,6 +206,14 @@ func (s *Store) Write(ctx context.Context, fn WriteFn) error {
 // use this for writes (would race with the writer goroutine).
 func (s *Store) DB() *sql.DB { return s.db }
 
+// ReadOnly reports whether this Store was opened via OpenReadOnly (the
+// auryn-migration read path: no writer goroutine runs, and Write always fails
+// with ErrReadOnly). Callers outside this package use it to gate
+// write-dependent capabilities — e.g. the ws Hello handler advertises
+// tag_edit_supported=false over a read-only catalog — without reaching into
+// the unexported field.
+func (s *Store) ReadOnly() bool { return s.readOnly }
+
 // Close stops the writer and closes the database. It is idempotent: a second
 // Close (a shutdown race) is a no-op rather than a double-close panic. After
 // Close, Write returns ErrStoreClosed (or ErrReadOnly on a read-only Store,

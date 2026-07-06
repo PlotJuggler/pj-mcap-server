@@ -60,6 +60,13 @@ const (
 	readLimit = 8 << 20 // 8 MiB
 )
 
+// readOnlyTagEditMessage is the single operator-facing message for "tag
+// editing is unavailable because the catalog is read-only (external-builder
+// mode)". Both handleUpdateTags call sites that reject on catalog.ErrReadOnly
+// (the fast-path pre-check and the defense-in-depth branch below it) send
+// this exact string, so the two sites can't drift apart.
+const readOnlyTagEditMessage = "tag editing is disabled: the catalog is read-only (external-builder mode)"
+
 // Handler serves the WS protocol against the SQLite catalog Store + (optionally)
 // a session subsystem. When sess is nil the session arms (14/15/16) return
 // INVALID_REQUEST — used by the catalog-browse-only configuration / tests.
@@ -405,8 +412,14 @@ func (c *connState) handleHello(reqID uint64, hello *pb.Hello) {
 			HelloResponse: &pb.HelloResponse{
 				ServerVersion: serverVersion,
 				Capabilities: &pb.Capabilities{
-					ResumeSupported:  true,
-					TagEditSupported: true,
+					ResumeSupported: true,
+					// tag_edit_supported mirrors the catalog's write-ability: over a
+					// Store opened via OpenReadOnly (auryn-migration external-builder
+					// mode) Write always fails with catalog.ErrReadOnly, so advertising
+					// true here would let a client open an "Edit Tags" UI that is
+					// guaranteed to fail at runtime. See handleUpdateTags's ErrReadOnly
+					// branch for the matching wire-error path.
+					TagEditSupported: !c.h.store.ReadOnly(),
 				},
 				Backend: &pb.BackendCapabilities{
 					SupportsFileHierarchy: hierarchy,
@@ -482,11 +495,27 @@ func (c *connState) handleGetFile(ctx context.Context, reqID uint64, req *pb.Get
 }
 
 func (c *connState) handleUpdateTags(ctx context.Context, reqID uint64, req *pb.UpdateTagsRequest) {
+	// Fast-path: reject before touching CatalogHandler at all. An UpdateTags
+	// with EMPTY set_tags/unset_keys performs zero writes downstream (the loops
+	// below just don't iterate), so without this check it would read back
+	// EffectiveTags and return success even on a read-only store — an
+	// inconsistent capability story given tag_edit_supported=false. The
+	// errors.Is(err, catalog.ErrReadOnly) branch below stays as a backstop for
+	// any future write path that bubbles the same error.
+	if c.h.store.ReadOnly() {
+		c.sendError(reqID, 0, pb.ErrorCode_ERROR_INVALID_REQUEST, readOnlyTagEditMessage, catalog.ErrReadOnly.Error())
+		return
+	}
+
 	resp, err := c.catalogHandler().UpdateTags(ctx, req)
 	if err != nil {
 		var nf errFileNotFound
 		if errors.As(err, &nf) {
 			c.sendError(reqID, 0, pb.ErrorCode_ERROR_NOT_FOUND, nf.Error(), "")
+			return
+		}
+		if errors.Is(err, catalog.ErrReadOnly) {
+			c.sendError(reqID, 0, pb.ErrorCode_ERROR_INVALID_REQUEST, readOnlyTagEditMessage, err.Error())
 			return
 		}
 		c.sendError(reqID, 0, pb.ErrorCode_ERROR_INVALID_REQUEST, "UpdateTags failed", err.Error())

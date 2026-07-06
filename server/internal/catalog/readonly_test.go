@@ -58,6 +58,31 @@ func TestOpenReadOnly_HappyPath(t *testing.T) {
 	}
 }
 
+// TestStore_ReadOnly proves the exported accessor mirrors how the Store was
+// opened, so callers outside the package (the ws Hello handler) can gate a
+// capability on it without reaching into the unexported field.
+func TestStore_ReadOnly(t *testing.T) {
+	roPath := filepath.Join(t.TempDir(), "ro.db")
+	writeStampedDB(t, roPath, SchemaVersion)
+	ro, err := OpenReadOnly(context.Background(), roPath)
+	if err != nil {
+		t.Fatalf("OpenReadOnly: %v", err)
+	}
+	defer ro.Close()
+	if !ro.ReadOnly() {
+		t.Error("Store opened via OpenReadOnly: ReadOnly() = false, want true")
+	}
+
+	rw, err := Open(context.Background(), filepath.Join(t.TempDir(), "rw.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer rw.Close()
+	if rw.ReadOnly() {
+		t.Error("Store opened via Open: ReadOnly() = true, want false")
+	}
+}
+
 func TestOpenReadOnly_VersionMismatch(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "catalog.db")
 	writeStampedDB(t, path, SchemaVersion+1)
