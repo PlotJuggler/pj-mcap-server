@@ -109,15 +109,3 @@ func TestCatalogHandler_GetVocabulary(t *testing.T) {
 		t.Fatalf("tags missing mission=inv facet: %+v", resp.GetTags())
 	}
 }
-
-func TestCatalogHandler_GetVocabulary_LegacyEmpty(t *testing.T) {
-	// On a legacy (read-write Go-schema) store, the vocabulary is empty, not an error.
-	h := &CatalogHandler{Store: openCatalogStore(t)}
-	resp, err := h.GetVocabulary(context.Background(), &pb.GetVocabularyRequest{})
-	if err != nil {
-		t.Fatalf("GetVocabulary (legacy): %v", err)
-	}
-	if len(resp.GetCustomers()) != 0 || len(resp.GetSources()) != 0 || len(resp.GetTags()) != 0 {
-		t.Fatalf("legacy vocabulary should be empty, got %+v", resp)
-	}
-}

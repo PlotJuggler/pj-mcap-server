@@ -15,7 +15,7 @@ import (
 //   - slow: every GetRange sleeps `delay` (a WAN-shaped plan-build)
 //   - broken: every storage call fails (the bucket is unreachable)
 //
-// Both are armed AFTER the indexer scan so cataloging stays instant.
+// Both are armed AFTER the fixture-build scan so cataloging stays instant.
 type gateBlob struct {
 	inner  memBlobStore
 	delay  time.Duration
@@ -62,7 +62,7 @@ func TestOpenSession_DoesNotBlockCatalogRPCsOnTheSameConnection(t *testing.T) {
 	c.hello()
 	id := c.fileID(t, zegTestKey)
 
-	ts.idxCache.Clear()   // force a COLD plan (the indexer scan pre-warmed it)
+	ts.idxCache.Clear()   // force a COLD plan (the fixture-build scan pre-warmed it)
 	blob.slow.Store(true) // WAN-shaped from here on
 
 	c.send(&pb.ClientMessage{RequestId: 10, Payload: &pb.ClientMessage_OpenSession{

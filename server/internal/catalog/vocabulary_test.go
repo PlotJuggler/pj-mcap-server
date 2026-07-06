@@ -279,19 +279,3 @@ func TestAurynFilterFiles_DimensionPredicates(t *testing.T) {
 		t.Fatalf("CustomerID=1 + SourceID=2 => %d files, want 0", len(got))
 	}
 }
-
-// Legacy store path returns an empty vocabulary (no dimension tables).
-func TestGetVocabulary_LegacyEmpty(t *testing.T) {
-	store, err := Open(context.Background(), filepath.Join(t.TempDir(), "legacy.db"))
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	defer store.Close()
-	v, err := GetVocabulary(context.Background(), store)
-	if err != nil {
-		t.Fatalf("GetVocabulary (legacy): %v", err)
-	}
-	if len(v.Customers) != 0 || len(v.Sources) != 0 || len(v.Tags) != 0 {
-		t.Fatalf("legacy vocabulary should be empty, got %+v", v)
-	}
-}

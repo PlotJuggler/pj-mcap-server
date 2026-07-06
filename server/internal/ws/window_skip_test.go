@@ -66,20 +66,22 @@ func genFile(t *testing.T, key string, startSec int64) []byte {
 	return buf.Bytes()
 }
 
-// The indexer pre-warms the chunk-index cache from its scan, so OpenSession's
-// PLAN phase must do ZERO storage reads for an already-indexed file. Proven by
-// requesting a topic that doesn't exist: the plan loads the (cached) index,
-// finds nothing, and streams no bodies — so the file is never read from
-// storage at all. Without the pre-warm the plan would read the summary first.
+// The test fixture (buildAurynCatalog, standing in for the external Python
+// builder's own scan) pre-warms the chunk-index cache when it builds the
+// catalog, so OpenSession's PLAN phase must do ZERO storage reads for an
+// already-indexed file. Proven by requesting a topic that doesn't exist: the
+// plan loads the (cached) index, finds nothing, and streams no bodies — so
+// the file is never read from storage at all. Without the pre-warm the plan
+// would read the summary first.
 func TestOpenSession_PrewarmedPlanReadsNoStorage(t *testing.T) {
 	files := map[string][]byte{"only.mcap": genFile(t, "only.mcap", 5000)}
 	counter := newPerKeyCountingBlob(memBlobStore{data: files})
-	ts := newTestServerWithBlob(t, counter, defaultTestSessionCfg()) // scan pre-warms the cache
+	ts := newTestServerWithBlob(t, counter, defaultTestSessionCfg()) // fixture build pre-warms the cache
 	c := dialClient(t, ts.url)
 	c.hello()
 	id := c.fileID(t, "only.mcap")
 
-	counter.reset() // ignore the indexer scan reads
+	counter.reset() // ignore the fixture-build scan reads
 
 	// A topic that doesn't exist -> empty plan -> no chunk bodies. The only
 	// possible storage read would be the chunk-index summary, which the
@@ -121,7 +123,7 @@ func TestOpenSession_WindowSkipsNonOverlappingFiles(t *testing.T) {
 	idB := c.fileID(t, "b.mcap")
 	idC := c.fileID(t, "c.mcap")
 
-	counter.reset() // ignore the indexer scan + ListFiles reads
+	counter.reset() // ignore the fixture-build scan + ListFiles reads
 
 	// Window strictly inside file b ([2000s, 2010s]); a/c don't intersect it.
 	c.send(&pb.ClientMessage{RequestId: 30, Payload: &pb.ClientMessage_OpenSession{

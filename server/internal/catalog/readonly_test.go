@@ -51,35 +51,23 @@ func TestOpenReadOnly_HappyPath(t *testing.T) {
 	if name != "dexory" {
 		t.Fatalf("customer name = %q, want dexory", name)
 	}
-
-	// Write must fail fast on a read-only store (no writer goroutine).
-	if err := st.Write(context.Background(), func(*sql.Tx) error { return nil }); !errors.Is(err, ErrReadOnly) {
-		t.Fatalf("Write on RO store = %v, want ErrReadOnly", err)
-	}
 }
 
-// TestStore_ReadOnly proves the exported accessor mirrors how the Store was
-// opened, so callers outside the package (the ws Hello handler) can gate a
-// capability on it without reaching into the unexported field.
-func TestStore_ReadOnly(t *testing.T) {
-	roPath := filepath.Join(t.TempDir(), "ro.db")
-	writeStampedDB(t, roPath, SchemaVersion)
-	ro, err := OpenReadOnly(context.Background(), roPath)
+// TestOpenReadOnly_CloseIsIdempotent guards that a second Close on a read-only
+// Store is a no-op, not a double-close panic/error (the writer's equivalent
+// pin, TestStoreCloseIsIdempotent, was deleted with the writer).
+func TestOpenReadOnly_CloseIsIdempotent(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "catalog.db")
+	writeStampedDB(t, path, SchemaVersion)
+	st, err := OpenReadOnly(context.Background(), path)
 	if err != nil {
 		t.Fatalf("OpenReadOnly: %v", err)
 	}
-	defer ro.Close()
-	if !ro.ReadOnly() {
-		t.Error("Store opened via OpenReadOnly: ReadOnly() = false, want true")
+	if err := st.Close(); err != nil {
+		t.Fatalf("first Close: %v", err)
 	}
-
-	rw, err := Open(context.Background(), filepath.Join(t.TempDir(), "rw.db"))
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	defer rw.Close()
-	if rw.ReadOnly() {
-		t.Error("Store opened via Open: ReadOnly() = true, want false")
+	if err := st.Close(); err != nil {
+		t.Errorf("second Close: want nil, got %v", err)
 	}
 }
 

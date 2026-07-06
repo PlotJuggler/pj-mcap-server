@@ -1,9 +1,14 @@
 // handlers_catalog.go implements the catalog half of the WS protocol against
-// the SQLite-WAL Store (Plan A Task 27): ListFiles (with FileFilter predicates +
-// pagination), GetFile (summary + topics + effective tags), and UpdateTags
-// (set/unset override rows). The pure CatalogHandler methods return the proto
-// responses (unit-testable, lifted from Plan A); connState's handle* methods
-// (server.go) call them and route the result/error onto the priority channel.
+// the read-only SQLite-WAL Store (Plan A Task 27): ListFiles (with FileFilter
+// predicates + pagination), GetFile (summary + topics + effective tags), and
+// GetVocabulary. The pure CatalogHandler methods return the proto responses
+// (unit-testable, lifted from Plan A); connState's handle* methods (server.go)
+// call them and route the result/error onto the priority channel.
+//
+// UpdateTags has NO local implementation here (catalog-migration §2.6): the
+// catalog is always read-only, so a tag edit can only ever be forwarded to the
+// Python builder's tag-edit IPC endpoint — see connState.handleUpdateTags /
+// handleUpdateTagsForwarded in server.go.
 //
 // FLAT METADATA CONTRACT (slice decision, documented): the ListFiles flat
 // metadata map per file = DERIVED entries (s3_key, size_bytes, message_count,
@@ -100,45 +105,6 @@ func (h *CatalogHandler) GetFile(ctx context.Context, req *pb.GetFileRequest) (*
 		})
 	}
 	return resp, nil
-}
-
-// UpdateTags applies set_tags (SetOverride) and unset_keys (MaskEmbedded when an
-// embedded tag exists with that key, else UnsetOverride — the proto's "delete
-// override; or NULL-mask if embedded had it" rule), then returns the post-update
-// effective view. The file must exist (NOT_FOUND otherwise).
-func (h *CatalogHandler) UpdateTags(ctx context.Context, req *pb.UpdateTagsRequest) (*pb.UpdateTagsResponse, error) {
-	if _, err := catalog.GetFile(ctx, h.Store, req.GetFileId()); err != nil {
-		if errors.Is(err, catalog.ErrFileNotFound) {
-			return nil, errFileNotFound{id: req.GetFileId()}
-		}
-		return nil, err
-	}
-	for _, t := range req.GetSetTags() {
-		if err := catalog.SetOverride(ctx, h.Store, req.GetFileId(), t.GetKey(), t.GetValue()); err != nil {
-			return nil, err
-		}
-	}
-	for _, k := range req.GetUnsetKeys() {
-		hasEmbedded, err := catalog.HasEmbeddedTag(ctx, h.Store, req.GetFileId(), k)
-		if err != nil {
-			return nil, err
-		}
-		if hasEmbedded {
-			// NULL-mask so the embedded value does not re-surface.
-			if err := catalog.MaskEmbedded(ctx, h.Store, req.GetFileId(), k); err != nil {
-				return nil, err
-			}
-		} else {
-			if err := catalog.UnsetOverride(ctx, h.Store, req.GetFileId(), k); err != nil {
-				return nil, err
-			}
-		}
-	}
-	tags, err := catalog.EffectiveTags(ctx, h.Store, req.GetFileId())
-	if err != nil {
-		return nil, err
-	}
-	return &pb.UpdateTagsResponse{EffectiveTags: tagsToProto(tags)}, nil
 }
 
 // GetVocabulary returns the filter vocabulary (catalog-vocabulary-rpc.md): the

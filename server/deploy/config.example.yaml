@@ -29,9 +29,9 @@ storage:
 catalog:
   db_path: /var/lib/pj-cloud/catalog.db
 
-indexer:
-  poll_interval: 5m
-  startup_scan: true
+# indexer: removed in M6 §2.6 — the in-process Go catalog writer/indexer this
+# tuned no longer exists; the catalog is built by the external Python
+# mcap_catalog builder and served read-only.
 
 session:
   max_concurrent: 16

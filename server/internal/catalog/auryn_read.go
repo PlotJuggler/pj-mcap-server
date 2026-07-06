@@ -9,13 +9,12 @@ import (
 	"strings"
 )
 
-// auryn_read.go is the READ-ONLY query side over the auryn (Python-builder) schema
-// (catalog-migration plan §2.3/§2.4). The public reader functions (FilterFiles,
-// GetFile, ListTopicsForFile, HasHierarchicalKey) branch to these when the Store
-// was opened via OpenReadOnly (s.readOnly), so the WS handlers are UNCHANGED and
-// the M6 cutover is just catalog.Open -> catalog.OpenReadOnly in main.go. The
-// legacy Go-schema queries (files.go / filter.go / topics.go) remain for the
-// still-live indexer-fed path until that cutover.
+// auryn_read.go is the READ-ONLY query side over the auryn (Python-builder)
+// schema (catalog-migration plan §2.3/§2.4). The public reader functions
+// (FilterFiles, GetFile, ListTopicsForFile, HasHierarchicalKey in files.go /
+// filter.go / topics.go / caps.go) delegate straight to these — the M6 cutover
+// (§2.6) deleted the legacy Go-writer schema + queries these used to branch
+// away from, so OpenReadOnly is now the only way a Store is ever opened.
 //
 // The auryn schema differs structurally: dimensions are normalized FK ids (the
 // object key is REBUILT from them, §5/D1), per-file message counts are a packed

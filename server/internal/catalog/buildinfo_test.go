@@ -76,15 +76,3 @@ func TestGetBuildInfo_QueryErrorPropagates(t *testing.T) {
 		t.Fatal("GetBuildInfo on a malformed build_metadata = nil err, want a propagated query error")
 	}
 }
-
-func TestGetBuildInfo_LegacyNotPresent(t *testing.T) {
-	st, err := Open(context.Background(), filepath.Join(t.TempDir(), "legacy.db"))
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	defer st.Close()
-	bi, err := GetBuildInfo(context.Background(), st)
-	if err != nil || bi.Present {
-		t.Fatalf("legacy GetBuildInfo = (%+v, %v), want not-present + nil", bi, err)
-	}
-}

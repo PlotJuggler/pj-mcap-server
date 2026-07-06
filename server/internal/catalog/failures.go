@@ -12,17 +12,13 @@ type Failure struct {
 	ErrText string
 }
 
-// RecentFailures returns the most recent quarantine rows, newest first. On the
-// auryn (read-only) store this reads the builder's `catalog_failures`; on the
-// legacy Go store it reads `indexer_failures`. Both carry (key, when, error).
+// RecentFailures returns the most recent quarantine rows, newest first, reading
+// the builder's `catalog_failures` (key, when, error).
 func RecentFailures(ctx context.Context, s *Store, limit int) ([]Failure, error) {
 	if limit <= 0 {
 		limit = 20
 	}
-	q := `SELECT s3_key, failed_at, error_text FROM indexer_failures ORDER BY failed_at DESC LIMIT ?`
-	if s.readOnly {
-		q = `SELECT s3_key, failed_at_ns, error_text FROM catalog_failures ORDER BY failed_at_ns DESC LIMIT ?`
-	}
+	q := `SELECT s3_key, failed_at_ns, error_text FROM catalog_failures ORDER BY failed_at_ns DESC LIMIT ?`
 	rows, err := s.DB().QueryContext(ctx, q, limit)
 	if err != nil {
 		return nil, err

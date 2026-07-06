@@ -6,16 +6,13 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
-	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
-	"pj-cloud/server/internal/catalog"
 	"pj-cloud/server/internal/config"
 	"pj-cloud/server/internal/format"
-	"pj-cloud/server/internal/indexer"
 	"pj-cloud/server/internal/metrics"
 	"pj-cloud/server/internal/session"
 	"pj-cloud/server/internal/storage"
@@ -61,31 +58,17 @@ func newTestServerWithMetrics(t *testing.T, blob storage.BlobStore, cfg config.S
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	mx := metrics.New()
 
-	cat, err := catalog.Open(context.Background(), filepath.Join(t.TempDir(), "catalog.db"))
-	if err != nil {
-		t.Fatalf("catalog.Open: %v", err)
-	}
-	cat.SetObservability(mx, log)
-	t.Cleanup(func() { _ = cat.Close() })
-
-	scanner := &indexer.Scanner{
-		Store:  cat,
-		Lister: indexer.NewBlobStoreLister(blob),
-		// nil cache: this test counts plan-phase GetRange calls to arm a
-		// producer panic, so it must NOT pre-warm (which would skip plan reads).
-		Extractor: indexer.NewCodecExtractor(blob, codec, nil),
-		Log:       log,
-	}
-	if _, err := scanner.RunOnce(context.Background()); err != nil {
-		t.Fatalf("indexer scan: %v", err)
-	}
+	// nil idxCache: this test counts plan-phase GetRange calls to arm a
+	// producer panic, so the fixture must NOT pre-warm the cache (which would
+	// skip the plan-time reads at OpenSession time).
+	cat, hiveBlob := buildAurynCatalog(t, context.Background(), blob, codec, nil)
 
 	reg := session.NewRegistry(session.RegistryOpts{
 		MaxConcurrent:         cfg.MaxConcurrent,
 		RetainAfterDisconnect: cfg.RetainAfterDisconnect,
 	})
 	reg.SetOnEvict(func(*session.SessionState) { mx.SessionsActive.Dec() })
-	deps := &SessionDeps{Store: cat, Codec: codec, Blob: blob, Registry: reg, Cfg: cfg, Log: log, Metrics: mx}
+	deps := &SessionDeps{Store: cat, Codec: codec, Blob: hiveBlob, Registry: reg, Cfg: cfg, Log: log, Metrics: mx}
 	h := NewHandlerWithSession(cat, "", log, deps)
 	h.SetMetrics(mx)
 
@@ -99,7 +82,7 @@ func newTestServerWithMetrics(t *testing.T, blob storage.BlobStore, cfg config.S
 		url:      "ws" + strings.TrimPrefix(srv.URL, "http") + "/api/ws",
 		cat:      cat,
 		reg:      reg,
-		store:    blob,
+		store:    hiveBlob,
 	}, mx
 }
 

@@ -2,11 +2,13 @@
 // (design spec §8.5). Same Go binary, same TCP listener, same TLS cert. Routes:
 //
 //	GET /                      -> 302 /dashboard/
-//	GET /dashboard/            -> overview (server stats, indexer status, sessions)
+//	GET /dashboard/            -> overview (server stats, catalog size, sessions)
 //	GET /dashboard/files       -> paginated file list (reuses catalog.FilterFiles)
 //	GET /dashboard/files/{id}  -> file detail (topics + both tag layers)
 //	GET /dashboard/sessions    -> active sessions (registry snapshot)
-//	GET /dashboard/indexer     -> indexer status + recent indexer_failures
+//	GET /dashboard/indexer     -> catalog build-freshness (Python builder) + recent quarantine failures
+//	                              (route name kept as "indexer" for URL stability; the Go
+//	                              in-process indexer it originally reported on is gone, §2.6)
 //	GET /static/{file}         -> pico.css (go:embed)
 //
 // Auth: HTTP Basic, configured via dashboard.basic_auth; the dashboard is
@@ -27,7 +29,6 @@ import (
 	"time"
 
 	"pj-cloud/server/internal/catalog"
-	"pj-cloud/server/internal/indexer"
 	"pj-cloud/server/internal/session"
 )
 
@@ -41,7 +42,6 @@ var staticFS embed.FS
 // catalog.Store + session.Registry the WS handlers use (spec §8.5).
 type Deps struct {
 	Store         *catalog.Store
-	Indexer       *indexer.Loop
 	Sessions      *session.Registry
 	StartedAt     time.Time
 	ServerVersion string
@@ -142,15 +142,12 @@ func (h *pageHandler) base(title string) map[string]any {
 
 func (h *pageHandler) renderOverview(w http.ResponseWriter, r *http.Request) {
 	fileCount, totalSize := h.catalogStats(r.Context())
-	lastRun, lastErr, _ := h.deps.Indexer.Status()
 	data := h.base("Overview")
 	data["Uptime"] = time.Since(h.deps.StartedAt).Round(time.Second).String()
 	data["Backend"] = h.deps.Backend
 	data["Bucket"] = h.deps.Bucket
 	data["FileCount"] = fileCount
 	data["TotalSizeHuman"] = humanBytes(totalSize)
-	data["IndexerLastRun"] = lastRunString(lastRun)
-	data["IndexerLastErr"] = errorString(lastErr)
 	data["SessionCount"] = h.deps.Sessions.ActiveCount()
 	h.exec(w, h.tpl.overview, data)
 }
@@ -215,21 +212,18 @@ func (h *pageHandler) renderSessions(w http.ResponseWriter, _ *http.Request) {
 	h.exec(w, h.tpl.sessions, data)
 }
 
+// renderIndexer serves /dashboard/indexer — retained as the catalog-freshness +
+// quarantine page (route/method name kept for URL stability) now that the Go
+// indexer is gone: the Python mcap_catalog builder is the sole writer, so there
+// is no in-process run/duration/scanned/new/reindexed/unchanged/failed status to
+// show here anymore. What remains is exactly what still applies to a read-only
+// reader: the builder's build_metadata freshness snapshot (§6.5) and the
+// catalog's quarantined-file list (§4.5).
 func (h *pageHandler) renderIndexer(w http.ResponseWriter, r *http.Request) {
-	lastRun, lastErr, stats := h.deps.Indexer.Status()
 	rows, _ := h.recentFailures(r.Context())
-	data := h.base("Indexer")
-	data["LastRun"] = lastRunString(lastRun)
-	data["LastDurationMs"] = stats.Duration.Milliseconds()
-	data["LastScanned"] = stats.Scanned
-	data["LastNew"] = stats.NewFiles
-	data["LastReindexed"] = stats.Reindexed
-	data["LastUnchanged"] = stats.Unchanged
-	data["LastFailed"] = stats.Failed
-	data["LastErr"] = errorString(lastErr)
+	data := h.base("Catalog")
 	data["RecentErrors"] = rows
-	// Catalog-freshness panel (§6.5): the Python builder's build_metadata, when the
-	// server reads an auryn catalog (read-only). Absent on the legacy in-process path.
+	// Catalog-freshness panel (§6.5): the Python builder's build_metadata.
 	if bi, err := catalog.GetBuildInfo(r.Context(), h.deps.Store); err == nil && bi.Present {
 		data["CatalogBuild"] = map[string]string{
 			"BuildID": strconv.FormatInt(bi.BuildID, 10),
@@ -257,8 +251,9 @@ func (h *pageHandler) catalogStats(ctx context.Context) (int64, int64) {
 }
 
 func (h *pageHandler) recentFailures(ctx context.Context) ([]map[string]string, error) {
-	// catalog.RecentFailures branches to catalog_failures (auryn read-only store)
-	// or indexer_failures (legacy Go store) — the dashboard surfaces either (§4.5).
+	// catalog.RecentFailures reads catalog_failures — the Python builder's
+	// quarantine table (§4.5); the legacy Go-writer indexer_failures path is
+	// gone (§2.6).
 	fails, err := catalog.RecentFailures(ctx, h.deps.Store, 20)
 	if err != nil {
 		return nil, err
@@ -275,13 +270,6 @@ func nsHuman(ns int64) string {
 		return "—"
 	}
 	return time.Unix(0, ns).UTC().Format(time.RFC3339)
-}
-
-func lastRunString(t time.Time) string {
-	if t.IsZero() {
-		return "never"
-	}
-	return t.UTC().Format(time.RFC3339)
 }
 
 func humanBytes(n int64) string {
@@ -303,11 +291,4 @@ func humanBytes(n int64) string {
 	default:
 		return fmt.Sprintf("%d B", n)
 	}
-}
-
-func errorString(err error) string {
-	if err == nil {
-		return ""
-	}
-	return err.Error()
 }

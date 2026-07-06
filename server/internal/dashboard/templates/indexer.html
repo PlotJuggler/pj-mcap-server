@@ -1,15 +1,5 @@
 {{define "content"}}
-<h2>Indexer</h2>
-<table>
-  <tr><th>Last run</th><td>{{.LastRun}}</td></tr>
-  <tr><th>Duration</th><td>{{.LastDurationMs}} ms</td></tr>
-  <tr><th>Scanned</th><td>{{.LastScanned}}</td></tr>
-  <tr><th>New</th><td>{{.LastNew}}</td></tr>
-  <tr><th>Reindexed</th><td>{{.LastReindexed}}</td></tr>
-  <tr><th>Unchanged</th><td>{{.LastUnchanged}}</td></tr>
-  <tr><th>Failed</th><td>{{.LastFailed}}</td></tr>
-  {{if .LastErr}}<tr><th>Last error</th><td><mark>{{.LastErr}}</mark></td></tr>{{end}}
-</table>
+<h2>Catalog</h2>
 {{if .CatalogBuild}}
 <h3>Catalog build (Python builder)</h3>
 <table>
@@ -30,6 +20,6 @@
   </tbody>
 </table>
 {{else}}
-<p><em>No recent indexer failures.</em></p>
+<p><em>No recent catalog quarantine failures.</em></p>
 {{end}}
 {{end}}

@@ -10,8 +10,8 @@ import (
 )
 
 // Guard runs fn inside a defer-recover wrapper scoped to one unit of work (one
-// WS connection, one session producer/consumer, one indexer iteration, one
-// catalog-writer job — spec §8.1). On a recovered panic it:
+// WS connection, one session producer/consumer, one chunk-index warmer sweep
+// — spec §8.1). On a recovered panic it:
 //
 //	(a) logs the stack with slog.Error (scope + the panic value);
 //	(b) increments pj_cloud_panic_total{scope};

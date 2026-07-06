@@ -4,9 +4,10 @@
 // with slog.Error and increment pj_cloud_panic_total{scope}).
 //
 // The collectors live on a process-wide Registry built by New(); the server
-// wires the natural increment points (ws connections, sessions, indexer runs,
-// catalog writer) by calling the typed helpers. Tests may construct a fresh
-// Registry to assert counter movement in isolation.
+// wires the natural increment points (ws connections, sessions, streaming
+// throughput, the chunk-index warmer, catalog freshness/reopen) by calling the
+// typed helpers. Tests may construct a fresh Registry to assert counter
+// movement in isolation.
 package metrics
 
 import (
@@ -32,11 +33,6 @@ type Metrics struct {
 	// WSConnectionsActive / WSConnectionsTotal track WebSocket connections.
 	WSConnectionsActive prometheus.Gauge
 	WSConnectionsTotal  prometheus.Counter
-
-	// Indexer run accounting.
-	IndexerRunsTotal     prometheus.Counter
-	IndexerFailuresTotal prometheus.Counter
-	IndexerFilesIndexed  prometheus.Counter
 
 	// Streaming throughput accounting (server -> client).
 	BytesSentTotal    prometheus.Counter
@@ -102,15 +98,6 @@ func New() *Metrics {
 		WSConnectionsTotal: prometheus.NewCounter(
 			prometheus.CounterOpts{Name: "pj_cloud_ws_connections_total", Help: "Total WebSocket connections accepted."},
 		),
-		IndexerRunsTotal: prometheus.NewCounter(
-			prometheus.CounterOpts{Name: "pj_cloud_indexer_runs_total", Help: "Total indexer poll cycles completed."},
-		),
-		IndexerFailuresTotal: prometheus.NewCounter(
-			prometheus.CounterOpts{Name: "pj_cloud_indexer_failures_total", Help: "Indexer cycles that ended with an error."},
-		),
-		IndexerFilesIndexed: prometheus.NewCounter(
-			prometheus.CounterOpts{Name: "pj_cloud_indexer_files_indexed_total", Help: "Files newly indexed or reindexed by the indexer."},
-		),
 		BytesSentTotal: prometheus.NewCounter(
 			prometheus.CounterOpts{Name: "pj_cloud_bytes_sent_total", Help: "Total session payload bytes sent to clients."},
 		),
@@ -158,7 +145,6 @@ func New() *Metrics {
 		m.PanicTotal,
 		m.SessionsActive, m.SessionsTotal,
 		m.WSConnectionsActive, m.WSConnectionsTotal,
-		m.IndexerRunsTotal, m.IndexerFailuresTotal, m.IndexerFilesIndexed,
 		m.BytesSentTotal, m.MessagesSentTotal, m.FetchedBytesTotal,
 		m.ChunkIndexWarmedTotal, m.ChunkIndexWarmSkipped, m.ChunkIndexWarmErrors,
 		m.CatalogBuildID, m.CatalogLastBuildTimestamp, m.CatalogFilesScanned, m.CatalogFilesFailed,

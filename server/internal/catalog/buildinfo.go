@@ -9,7 +9,7 @@ import (
 // BuildInfo is the catalog-freshness snapshot the Python builder stamps at the end
 // of each reconcile (catalog-migration plan §6.5). It replaces the in-process
 // indexer-run signals orphaned by moving the writer out of process. Present is
-// false on the legacy (read-write Go) store or before the first build.
+// false before the first build (build_metadata exists but has no row=1 yet).
 type BuildInfo struct {
 	Present bool
 	// BuildID is a monotonic freshness/confirmation counter (bumps each completed
@@ -26,13 +26,10 @@ type BuildInfo struct {
 	BuilderVersion string
 }
 
-// GetBuildInfo reads build_metadata from the auryn catalog. On the legacy Go store
-// (no build_metadata) or before the first build it returns Present=false (not an
-// error), so callers (dashboard, metrics) work on both paths.
+// GetBuildInfo reads build_metadata from the auryn catalog. Before the first
+// build it returns Present=false (not an error), so callers (dashboard,
+// metrics) can render a "no build yet" state.
 func GetBuildInfo(ctx context.Context, s *Store) (BuildInfo, error) {
-	if !s.readOnly {
-		return BuildInfo{}, nil // legacy store has no build_metadata
-	}
 	var bi BuildInfo
 	err := s.DB().QueryRowContext(ctx,
 		`SELECT build_id, last_build_ns, files_scanned, files_failed, build_outcome, builder_version

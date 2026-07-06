@@ -1,10 +1,12 @@
-// Command pj-cloud-server is the PJ Cloud Connector server: it indexes MCAP
-// recordings in an S3/Minio bucket into a SQLite-WAL catalog and serves the
-// Hello / ListFiles / GetFile / UpdateTags catalog RPCs plus the session
-// streaming path over one WebSocket.
+// Command pj-cloud-server is the PJ Cloud Connector server: it serves the
+// Hello / ListFiles / GetFile / GetVocabulary / UpdateTags catalog RPCs plus
+// the session streaming path over one WebSocket, reading a SQLite catalog the
+// Python mcap_catalog builder writes (the Go catalog writer + in-process
+// indexer were retired in the M6 catalog-migration cutover — see
+// docs/CATALOG_CONTRACT.md).
 //
 // Layout follows Plan A (cmd/pj-cloud-server + internal/{config,storage,format,
-// catalog,indexer,session,ws,wire}).
+// catalog,session,ws,wire}).
 package main
 
 import (
@@ -21,7 +23,6 @@ import (
 	"pj-cloud/server/internal/config"
 	"pj-cloud/server/internal/dashboard"
 	"pj-cloud/server/internal/format"
-	"pj-cloud/server/internal/indexer"
 	"pj-cloud/server/internal/metrics"
 	"pj-cloud/server/internal/session"
 	"pj-cloud/server/internal/storage"
@@ -32,13 +33,19 @@ import (
 
 func main() {
 	var (
-		configPath   = flag.String("config", "", "path to YAML config (optional; defaults match infra/minio)")
-		listen       = flag.String("listen", "", "listen address (overrides config; default :8080)")
-		logLevel     = flag.String("log-level", "info", "log level: debug|info|warn|error")
-		dbPath       = flag.String("db", "", "SQLite catalog DB path (overrides config / PJ_CLOUD_DB; default /tmp/pj-cloud-catalog.db)")
-		externalBld  = flag.Bool("external-builder", false, "auryn cutover: open the catalog READ-ONLY (Python builder is the sole writer) and do not run the Go indexer (overrides config / PJ_CLOUD_EXTERNAL_BUILDER)")
+		configPath = flag.String("config", "", "path to YAML config (optional; defaults match infra/minio)")
+		listen     = flag.String("listen", "", "listen address (overrides config; default :8080)")
+		logLevel   = flag.String("log-level", "info", "log level: debug|info|warn|error")
+		dbPath     = flag.String("db", "", "SQLite catalog DB path (overrides config / PJ_CLOUD_DB; default /tmp/pj-cloud-catalog.db)")
+		// externalBld / poll-interval are DEPRECATED NO-OPS (catalog-migration §2.6):
+		// external-builder read-only mode is now the server's ONLY mode (the Go
+		// catalog writer + in-process indexer are deleted), so there is nothing left
+		// to opt into and no indexer poll loop left to tune. Both flags are kept,
+		// accepted, and ignored (with a startup warning) purely so an existing
+		// launch script or config.yaml that still sets them does not fail to start.
+		externalBld  = flag.Bool("external-builder", false, "DEPRECATED no-op: external-builder read-only mode is now the only mode (overrides config / PJ_CLOUD_EXTERNAL_BUILDER)")
 		tagIPCSocket = flag.String("tag-ipc-socket", "", "D2: UNIX socket of the Python catalog builder's tag-edit IPC endpoint (overrides config / PJ_CLOUD_TAG_IPC_SOCKET; empty disables tag-edit forwarding)")
-		pollInterval = flag.Duration("poll-interval", 0, "indexer poll interval (overrides config; e.g. 3s — used by the smoke harness)")
+		pollInterval = flag.Duration("poll-interval", 0, "DEPRECATED no-op: the in-process indexer this tuned no longer exists")
 		tlsCert      = flag.String("tls-cert", "", "TLS cert path (overrides config / PJ_CLOUD_TLS_CERT; set with -tls-key to serve TLS)")
 		tlsKey       = flag.String("tls-key", "", "TLS key path (overrides config / PJ_CLOUD_TLS_KEY)")
 	)
@@ -64,14 +71,15 @@ func main() {
 	} else if env := os.Getenv("PJ_CLOUD_DB"); env != "" {
 		cfg.Catalog.DBPath = env
 	}
-	if *pollInterval > 0 {
-		cfg.Indexer.PollInterval = *pollInterval
+	// external-builder is now the only mode; the flag/env/config field are
+	// deprecated no-ops (see the flag doc above) — warn once if anything asked
+	// for the old opt-in, but do not act on it.
+	envExternalBld := os.Getenv("PJ_CLOUD_EXTERNAL_BUILDER")
+	if *externalBld || envExternalBld == "1" || envExternalBld == "true" || cfg.Catalog.ExternalBuilder {
+		log.Warn("external-builder is now the only mode; flag is deprecated")
 	}
-	// External-builder (read-only) mode: -external-builder flag wins, else env.
-	if *externalBld {
-		cfg.Catalog.ExternalBuilder = true
-	} else if env := os.Getenv("PJ_CLOUD_EXTERNAL_BUILDER"); env == "1" || env == "true" {
-		cfg.Catalog.ExternalBuilder = true
+	if *pollInterval != 0 {
+		log.Warn("-poll-interval is deprecated and ignored; the in-process indexer it tuned no longer exists")
 	}
 	// D2 tag-edit IPC socket: -tag-ipc-socket flag wins, else PJ_CLOUD_TAG_IPC_SOCKET
 	// env, else config/default (empty => forwarding stays off).
@@ -122,89 +130,31 @@ func main() {
 		os.Exit(1)
 	}
 
-	// SQLite-WAL catalog store. EXTERNAL-BUILDER mode (the auryn cutover, §2.7)
-	// opens READ-ONLY: the Python mcap_catalog builder is the sole writer and the
-	// Go indexer does not run. Legacy mode opens read-write with the in-process
-	// indexer. File ids are stable rowids that survive restart for unchanged keys.
-	var store *catalog.Store
-	if cfg.Catalog.ExternalBuilder {
-		store, err = catalog.OpenReadOnly(ctx, cfg.Catalog.DBPath)
-		if err != nil {
-			log.Error("catalog: open SQLite store (read-only) failed — has the Python builder run?",
-				"db", cfg.Catalog.DBPath, "err", err)
-			os.Exit(1)
-		}
-		log.Info("catalog: opened SQLite store READ-ONLY (external builder)", "db", cfg.Catalog.DBPath)
-	} else {
-		store, err = catalog.Open(ctx, cfg.Catalog.DBPath)
-		if err != nil {
-			log.Error("catalog: open SQLite store failed", "db", cfg.Catalog.DBPath, "err", err)
-			os.Exit(1)
-		}
-		log.Info("catalog: opened SQLite store", "db", cfg.Catalog.DBPath)
+	// SQLite-WAL catalog store: opened READ-ONLY (the Python mcap_catalog
+	// builder is the sole writer — the Go catalog writer + in-process indexer
+	// were deleted in the M6 catalog-migration cutover, §2.6). File ids are
+	// stable rowids that survive a builder rescan for unchanged keys.
+	mx := metrics.New()
+	store, err := catalog.OpenReadOnly(ctx, cfg.Catalog.DBPath)
+	if err != nil {
+		log.Error("catalog: open SQLite store (read-only) failed — has the Python builder run?",
+			"db", cfg.Catalog.DBPath, "err", err)
+		os.Exit(1)
 	}
 	defer func() { _ = store.Close() }()
+	log.Info("catalog: opened SQLite store READ-ONLY (external builder)", "db", cfg.Catalog.DBPath)
+	log.Info("indexer: DISABLED (external-builder read-only mode); Python builder owns the catalog")
 
-	// Indexer: reconcile the bucket into the store. Warm-start (synchronous) serves
-	// existing rows with no re-extract for unchanged (etag,size,last_modified);
-	// then a background ticker polls. The change-detect re-extract preserves tag
-	// overrides; failures land in indexer_failures.
-	// The BlobStore already scopes every List to the configured base prefix
-	// (storage owns it; List returns full keys, GetRange/Head take full keys), so
-	// the scanner passes an EMPTY sub-prefix. Passing storagePrefix here too would
-	// double it (prefix+prefix) and match nothing — invisible to the empty-prefix
-	// smoke/matrix path, fatal the moment a real base prefix is configured.
-	// Shared chunk-index cache: the indexer pre-warms it from its scan (which
-	// already reads each file's summary), so a download's plan phase is a pure
-	// in-memory hit instead of re-reading every file's summary over WAN.
+	// Shared chunk-index cache: starts empty (there is no in-process scan to
+	// pre-warm it anymore); the A+ background warmer below fills it from the
+	// catalog, and any cache miss on the request path falls back to a direct
+	// codec read (see SessionDeps.cachedChunkIndex).
 	idxCache := format.NewChunkIndexCache(4096)
-	scanner := &indexer.Scanner{
-		Store:     store,
-		Lister:    indexer.NewBlobStoreLister(bs),
-		Extractor: indexer.NewCodecExtractor(bs, codec, idxCache),
-		Prefix:    "",
-		Log:       log,
-	}
-	loop := &indexer.Loop{
-		Scanner:          scanner,
-		Interval:         cfg.Indexer.PollInterval,
-		StartupScan:      cfg.Indexer.StartupScan,
-		Log:              log,
-		WarmStartTimeout: cfg.Indexer.WarmStartTimeout,
-	}
-
-	// Observability: metrics collectors + panic-recovery wiring (spec §8.1/§8.5).
-	// The metric set is process-wide; subsystems guard their goroutines through it.
-	// WIRE IT BEFORE loop.Start: the synchronous warm-start scan increments the
-	// indexer counters, so the metric set + store observability must be attached
-	// first or the startup files-indexed/run counts are lost.
-	mx := metrics.New()
-	store.SetObservability(mx, log)
-	loop.Metrics = mx
-
-	// The Go indexer runs ONLY in legacy (read-write) mode. In external-builder
-	// mode the Python builder owns the catalog, so the loop is constructed (for the
-	// dashboard's "never run" status) but never started — the A+ warmer + the
-	// catalog-freshness updater below are the read-only equivalents.
-	if !cfg.Catalog.ExternalBuilder {
-		log.Info("indexer: starting (warm-start + poll)", "backend", backendName, "bucket", bucketName,
-			"endpoint", endpointName, "poll_interval", cfg.Indexer.PollInterval)
-		// Pass the long-lived ctx: the warm-start scan is internally bounded by
-		// WarmStartTimeout, but the background ticker must outlive that window and
-		// poll until shutdown.
-		if startErr := loop.Start(ctx); startErr != nil {
-			log.Error("indexer: warm-start failed", "err", startErr)
-			os.Exit(1)
-		}
-	} else {
-		log.Info("indexer: DISABLED (external-builder read-only mode); Python builder owns the catalog")
-	}
 
 	// A+ background chunk-index warmer (catalog-migration §3.2): pre-fill the shared
-	// cache from the catalog so a download's plan phase is an in-memory hit. Runs
-	// AFTER the indexer warm-start (so on the live path it finds the cache hot and
-	// skips); read-only, so it is the cache's warm source once the Go indexer is
-	// gone (auryn cutover). Background — never blocks serving.
+	// cache from the catalog so a download's plan phase is an in-memory hit —
+	// the cache's ONLY warm source now that the Go indexer is gone. Background —
+	// never blocks serving.
 	warmer := &warm.Warmer{
 		Store: store, Codec: codec, Blob: bs, Cache: idxCache,
 		Concurrency: 4, Log: log, Metrics: mx,
@@ -217,13 +167,12 @@ func main() {
 
 	// Catalog-freshness updater (§6.5): mirror the Python builder's build_metadata
 	// onto the pj_cloud_catalog_* gauges so monitoring sees staleness once the
-	// writer is out-of-process. No-op (gauges stay 0) on the legacy in-process
-	// indexer path (GetBuildInfo returns not-present).
+	// writer is out-of-process.
 	//
 	// Same tick also drives the READER side of atomic-publish + reopen-on-swap
 	// (§6.2a; CATALOG_CONTRACT.md §9): ReopenIfSwapped is a no-op unless the
 	// Python builder's rebuild replaced the served DB file (a new inode) since
-	// the last check; on a legacy (read-write) store it is always (false, nil).
+	// the last check.
 	go func() {
 		ticker := time.NewTicker(30 * time.Second)
 		defer ticker.Stop()
@@ -287,7 +236,7 @@ func main() {
 		Cfg:      cfg.Session,
 		Log:      log,
 		Metrics:  mx,
-		IdxCache: idxCache, // pre-warmed by the indexer scan above
+		IdxCache: idxCache, // filled by the background warmer + on-demand cache misses
 	}
 	// Decrement the active-sessions gauge whenever a session leaves the registry
 	// (client Cancel or retain-window eviction — both go through Registry.Cancel,
@@ -297,9 +246,9 @@ func main() {
 	// WS handler on /api/ws, now with streaming + metrics wired.
 	handler := ws.NewHandlerWithSession(store, cfg.Auth.BearerToken, log, sessDeps)
 	handler.SetMetrics(mx)
-	// D2 tag-edit IPC forwarder (CATALOG_CONTRACT.md §10): only meaningful on a
-	// read-only (external-builder) store, but harmless to wire regardless — a
-	// writable store's UpdateTags path never consults it.
+	// D2 tag-edit IPC forwarder (CATALOG_CONTRACT.md §10): the only way
+	// UpdateTags can succeed now that the catalog is always read-only; a
+	// server with no socket configured rejects every UpdateTags outright.
 	if cfg.Catalog.TagIPCSocket != "" {
 		handler.SetTagIPC(tagipc.NewClient(cfg.Catalog.TagIPCSocket))
 		log.Info("catalog: tag-edit IPC forwarding enabled", "socket", cfg.Catalog.TagIPCSocket)
@@ -329,7 +278,6 @@ func main() {
 	if cfg.Dashboard.Active() {
 		if derr := dashboard.Register(mux, dashboard.Deps{
 			Store:         store,
-			Indexer:       loop,
 			Sessions:      registry,
 			StartedAt:     time.Now(),
 			ServerVersion: ws.ServerVersion(),

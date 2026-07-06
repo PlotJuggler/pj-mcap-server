@@ -5,9 +5,10 @@
 // summary read.
 //
 // It is READ-ONLY with respect to the catalog (the Python builder is the sole
-// writer post-cutover; pre-cutover the Go indexer already pre-warms during its
-// scan, so the warmer mostly finds the cache hot and skips). A per-file load
-// failure is counted and skipped — one poison file never aborts the sweep.
+// writer; the Go catalog writer + in-process indexer were deleted in the M6
+// cutover, so this warmer is the chunk-index cache's only warm source). A
+// per-file load failure is counted and skipped — one poison file never aborts
+// the sweep.
 package warm
 
 import (
@@ -68,7 +69,8 @@ func (w *Warmer) Run(ctx context.Context) error {
 			if gctx.Err() != nil {
 				return nil
 			}
-			// Already cached (e.g. the indexer warmed it) — skip the WAN read.
+			// Already cached (e.g. an earlier sweep, or an in-flight session's own
+			// cold-miss load) — skip the WAN read.
 			if _, ok := w.Cache.Get(e.Key, e.ETag, 0); ok {
 				skipped.Add(1)
 				w.inc(func(m *metrics.Metrics) { m.ChunkIndexWarmSkipped.Inc() })
@@ -77,12 +79,11 @@ func (w *Warmer) Run(ctx context.Context) error {
 			// ETag-trust contract (mirrors the session path's cachedChunkIndex,
 			// pre-dating this warmer): the load is by key and cached under the
 			// CATALOG etag without re-verifying storage's observed etag. The catalog
-			// etag is the trusted change-detect token, kept fresh by the indexer; a
-			// stale row is a transient window (until the next poll) that re-indexing
-			// closes by changing the etag (= a new cache key). Verifying per-load
-			// here would diverge the warmer from the session path and need a Codec
-			// signature change — out of scope. The warmer runs after the warm-start
-			// scan, so the catalog is fresh when it warms.
+			// etag is the trusted change-detect token, kept fresh by the Python
+			// builder's rescan; a stale row is a transient window (until the next
+			// rescan) that re-cataloging closes by changing the etag (= a new cache
+			// key). Verifying per-load here would diverge the warmer from the
+			// session path and need a Codec signature change — out of scope.
 			idx, err := w.Codec.ChunkIndex(gctx, w.Blob, e.Key, 0)
 			if err != nil {
 				// A poison file must NOT abort the sweep (return nil) — count + log.

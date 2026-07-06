@@ -2,8 +2,6 @@ package catalog
 
 import (
 	"context"
-	"database/sql"
-	"errors"
 	"sort"
 )
 
@@ -83,24 +81,9 @@ func DistinctMetadataKeys(ctx context.Context, s *Store) ([]string, error) {
 // HasHierarchicalKey reports whether ANY indexed object key contains a '/',
 // i.e. whether the bucket's keys form a prefix hierarchy. This is the live
 // derivation behind HelloResponse.backend.supports_file_hierarchy (Plan D
-// Task 8): true for Asensus/GCS prefix layouts, false for the flat Dexory/S3
-// nissan corpus. Derived from s3_key (the OBJECT key), NOT topic names — topics
-// like /nissan/gps/imu contain '/' but are out of scope.
+// Task 8). Every auryn object key is Hive-partitioned (rebuilt from
+// customer/site/robot/source/date + filename), so in practice this is simply
+// "does the catalog have any files at all" — see aurynHasHierarchicalKey.
 func HasHierarchicalKey(ctx context.Context, s *Store) (bool, error) {
-	if s.readOnly {
-		return aurynHasHierarchicalKey(ctx, s)
-	}
-	var one int
-	row := s.DB().QueryRowContext(ctx,
-		`SELECT 1 FROM files WHERE s3_key LIKE '%/%' LIMIT 1`)
-	err := row.Scan(&one)
-	switch {
-	case err == nil:
-		return true, nil
-	case errors.Is(err, sql.ErrNoRows):
-		// No '/'-bearing key => no hierarchy.
-		return false, nil
-	default:
-		return false, err
-	}
+	return aurynHasHierarchicalKey(ctx, s)
 }

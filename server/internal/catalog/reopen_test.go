@@ -323,7 +323,7 @@ func TestReopenIfSwapped_FailClosed(t *testing.T) {
 }
 
 // TestReopenIfSwapped_NoopUnchanged covers the (false, nil) no-op path on an
-// unchanged file, and proves a legacy writable Store never attempts a swap.
+// unchanged file.
 func TestReopenIfSwapped_NoopUnchanged(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "catalog.db")
@@ -338,18 +338,6 @@ func TestReopenIfSwapped_NoopUnchanged(t *testing.T) {
 	swapped, err := st.ReopenIfSwapped(context.Background())
 	if err != nil || swapped {
 		t.Fatalf("ReopenIfSwapped on unchanged file = (%v, %v), want (false, nil)", swapped, err)
-	}
-
-	rw, err := Open(context.Background(), filepath.Join(dir, "legacy.db"))
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	defer rw.Close()
-	for i := 0; i < 3; i++ {
-		swapped, err := rw.ReopenIfSwapped(context.Background())
-		if err != nil || swapped {
-			t.Fatalf("writable-store ReopenIfSwapped call %d = (%v, %v), want (false, nil) always", i, swapped, err)
-		}
 	}
 }
 

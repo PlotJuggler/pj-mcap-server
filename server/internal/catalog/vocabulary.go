@@ -61,7 +61,7 @@ type Vocabulary struct {
 }
 
 // GetVocabulary assembles the vocabulary from the auryn dimension tables + the tag
-// facet query. Returns an empty (non-nil) Vocabulary on a legacy Go-schema store.
+// facet query.
 //
 // Pins db := s.DB() ONCE and threads it through every phase below (B1 —
 // catalog-migration §6.2a review): the vocabulary is built from ~8 separate
@@ -70,11 +70,6 @@ type Vocabulary struct {
 // could otherwise pair one generation's file counts with another generation's
 // dimension rows.
 func GetVocabulary(ctx context.Context, s *Store) (*Vocabulary, error) {
-	if !s.readOnly {
-		// The live Go-schema path has no dimension tables. Return empty rather than
-		// erroring so the RPC is always answerable (no client uses it pre-cutover).
-		return &Vocabulary{}, nil
-	}
 	db := s.DB()
 
 	custCount, err := groupCount(ctx, db, "customer_id")

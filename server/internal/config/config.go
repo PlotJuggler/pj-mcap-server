@@ -38,20 +38,20 @@ type CatalogConfig struct {
 	// flag / PJ_CLOUD_DB env override it (main.go).
 	DBPath string `yaml:"db_path"`
 
-	// ExternalBuilder selects the auryn cutover mode (catalog-migration §2.7): when
-	// true the server opens the catalog READ-ONLY (the Python mcap_catalog builder
-	// is the sole writer) and does NOT start the Go indexer. Default false keeps the
-	// legacy in-process indexer + read-write catalog. The -external-builder flag /
-	// PJ_CLOUD_EXTERNAL_BUILDER env override it (main.go).
+	// ExternalBuilder is a DEPRECATED NO-OP (catalog-migration §2.6): the server
+	// now ALWAYS opens the catalog READ-ONLY (the Python mcap_catalog builder is
+	// the sole writer; the Go catalog writer + in-process indexer were deleted),
+	// so there is no other mode left to select. Kept only so an existing
+	// config.yaml that still sets it does not fail to start — main.go logs a
+	// deprecation warning and otherwise ignores it. The -external-builder flag /
+	// PJ_CLOUD_EXTERNAL_BUILDER env are the same deprecated no-op.
 	ExternalBuilder bool `yaml:"external_builder"`
 
 	// TagIPCSocket is the UNIX socket path of the Python catalog builder's
-	// tag-edit IPC endpoint (D2, CATALOG_CONTRACT.md §10). Default "" = off: a
-	// read-only (ExternalBuilder) store then rejects UpdateTags outright. When
-	// set, the WS UpdateTags handler forwards set/unset edits over this socket
-	// instead of rejecting them (still rejects if the store is writable — that
-	// path never needs forwarding). The -tag-ipc-socket flag / PJ_CLOUD_TAG_IPC_SOCKET
-	// env override it (main.go).
+	// tag-edit IPC endpoint (D2, CATALOG_CONTRACT.md §10). Default "" = off: the
+	// (always read-only) catalog then rejects UpdateTags outright. When set, the
+	// WS UpdateTags handler forwards set/unset edits over this socket instead.
+	// The -tag-ipc-socket flag / PJ_CLOUD_TAG_IPC_SOCKET env override it (main.go).
 	TagIPCSocket string `yaml:"tag_ipc_socket"`
 }
 
@@ -135,6 +135,11 @@ type GCSConfig struct {
 	CredentialsFile string `yaml:"credentials_file"` // optional, DEV ONLY (ADC is the baseline)
 }
 
+// IndexerConfig is a DEPRECATED NO-OP left over from the in-process Go
+// indexer, which was deleted in the M6 catalog-migration cutover (§2.6) along
+// with the Go catalog writer. Kept only so an existing config.yaml / the
+// `-poll-interval` flag (main.go) does not fail to start; nothing reads these
+// fields anymore.
 type IndexerConfig struct {
 	PollInterval time.Duration `yaml:"poll_interval"`
 	StartupScan  bool          `yaml:"startup_scan"`

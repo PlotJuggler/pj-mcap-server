@@ -55,8 +55,11 @@ type Codec interface {
 	// ChunkRef. It never reads chunk bodies.
 	ChunkIndex(ctx context.Context, bs storage.BlobStore, key string, fileID uint64) (FileChunkIndex, error)
 	// ExtractAndIndex produces BOTH the catalog summary and the streaming chunk
-	// index from a SINGLE summary read — the indexer uses it so its background
-	// scan pre-warms the chunk-index cache at no extra WAN cost.
+	// index from a SINGLE summary read — a background scanner (the retired Go
+	// in-process indexer; today, test fixtures standing in for the external
+	// Python builder's own scan) uses it to pre-warm the chunk-index cache at
+	// no extra WAN cost. The live server's own chunk-index pre-warm (M4,
+	// internal/warm) instead calls ChunkIndex directly.
 	ExtractAndIndex(ctx context.Context, bs storage.BlobStore, key string, fileID uint64) (FileSummary, FileChunkIndex, error)
 }
 

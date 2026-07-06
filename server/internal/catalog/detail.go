@@ -12,8 +12,7 @@ import "context"
 // or tags (or vice versa): wrong data, not just a transient error.
 //
 // GetFileDetail pins db := s.DB() ONCE and threads that single handle through
-// all three phases (routing through the existing readOnly/legacy branch
-// internally, exactly like the three functions it replaces), so the whole
+// all three phases, exactly like the three functions it replaces, so the whole
 // response is guaranteed to describe one generation.
 
 // GetFileDetail returns the file summary, its topics, and its effective tags in
@@ -24,25 +23,12 @@ import "context"
 func GetFileDetail(ctx context.Context, s *Store, fileID uint64) (FileRecord, []TopicRecord, []EffectiveTag, error) {
 	db := s.DB()
 
-	var (
-		rec FileRecord
-		err error
-	)
-	if s.readOnly {
-		rec, err = aurynGetFile(ctx, db, fileID)
-	} else {
-		rec, err = getFileLegacy(ctx, db, fileID)
-	}
+	rec, err := aurynGetFile(ctx, db, fileID)
 	if err != nil {
 		return FileRecord{}, nil, nil, err
 	}
 
-	var topics []TopicRecord
-	if s.readOnly {
-		topics, err = aurynListTopicsForFile(ctx, db, rec.ID)
-	} else {
-		topics, err = listTopicsLegacy(ctx, db, rec.ID)
-	}
+	topics, err := aurynListTopicsForFile(ctx, db, rec.ID)
 	if err != nil {
 		return FileRecord{}, nil, nil, err
 	}

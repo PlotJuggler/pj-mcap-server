@@ -6,7 +6,6 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -14,21 +13,18 @@ import (
 	"google.golang.org/protobuf/proto"
 	"nhooyr.io/websocket"
 
-	"pj-cloud/server/internal/catalog"
 	pb "pj-cloud/server/internal/wire/pj_cloud"
 )
 
 // newAuthTestServer stands up a catalog-only WS handler with the given shared
 // token ("" => dev-anonymous) over an httptest server. Auth happens at Hello
-// before any catalog/session work, so an empty catalog is sufficient.
+// before any catalog/session work, so the fixture catalog's actual content is
+// irrelevant here — openAurynReadStore (vocabulary_test.go) is reused as a
+// convenient, already-valid auryn store.
 func newAuthTestServer(t *testing.T, token string) string {
 	t.Helper()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	cat, err := catalog.Open(context.Background(), filepath.Join(t.TempDir(), "catalog.db"))
-	if err != nil {
-		t.Fatalf("catalog.Open: %v", err)
-	}
-	t.Cleanup(func() { _ = cat.Close() })
+	cat := openAurynReadStore(t)
 
 	h := NewHandler(cat, token, log)
 	mux := http.NewServeMux()

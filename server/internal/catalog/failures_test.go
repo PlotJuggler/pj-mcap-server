@@ -2,8 +2,6 @@ package catalog
 
 import (
 	"context"
-	"database/sql"
-	"fmt"
 	"path/filepath"
 	"testing"
 )
@@ -52,31 +50,5 @@ func TestRecentFailures_Auryn(t *testing.T) {
 	// limit caps the result.
 	if got, _ := RecentFailures(context.Background(), st, 1); len(got) != 1 || got[0].WhenNs != 300 {
 		t.Fatalf("limit=1 should return only the newest, got %+v", got)
-	}
-}
-
-func TestRecentFailures_Legacy(t *testing.T) {
-	st, err := Open(context.Background(), filepath.Join(t.TempDir(), "legacy.db"))
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	defer st.Close()
-	// Insert into the legacy indexer_failures table via the writer.
-	for i := 0; i < 3; i++ {
-		i := i
-		if err := st.Write(context.Background(), func(tx *sql.Tx) error {
-			_, err := tx.Exec(`INSERT INTO indexer_failures(s3_key, failed_at, error_text) VALUES (?,?,?)`,
-				fmt.Sprintf("k%d.mcap", i), int64(100*(i+1)), "boom")
-			return err
-		}); err != nil {
-			t.Fatalf("write failure %d: %v", i, err)
-		}
-	}
-	fails, err := RecentFailures(context.Background(), st, 20)
-	if err != nil {
-		t.Fatalf("RecentFailures (legacy): %v", err)
-	}
-	if len(fails) != 3 || fails[0].WhenNs != 300 {
-		t.Fatalf("legacy failures = %+v, want 3 newest-first", fails)
 	}
 }

@@ -1,39 +1,17 @@
 package ws
 
 import (
-	"context"
-	"path/filepath"
 	"testing"
 
-	"pj-cloud/server/internal/catalog"
 	pb "pj-cloud/server/internal/wire/pj_cloud"
 )
 
-// TestHello_TagEditSupported_WritableStore is a regression pin: the legacy
-// writable catalog (catalog.Open) still advertises tag_edit_supported=true —
-// UpdateTags actually works there, so the capability must not be gated off.
-func TestHello_TagEditSupported_WritableStore(t *testing.T) {
-	store, err := catalog.Open(context.Background(), filepath.Join(t.TempDir(), "catalog.db"))
-	if err != nil {
-		t.Fatalf("catalog.Open: %v", err)
-	}
-	t.Cleanup(func() { _ = store.Close() })
-
-	resp := helloRoundTrip(t, newWSTestServer(t, store), "")
-	hr := resp.GetHelloResponse()
-	if hr == nil {
-		t.Fatalf("expected HelloResponse, got %T (err=%v)", resp.GetPayload(), resp.GetError())
-	}
-	if !hr.GetCapabilities().GetTagEditSupported() {
-		t.Error("writable catalog must advertise tag_edit_supported=true")
-	}
-}
-
-// TestHello_TagEditSupported_ReadOnlyStore proves Hello no longer hardcodes
-// tag_edit_supported=true: over a catalog opened via OpenReadOnly (the
-// external-builder auryn migration mode, where Write always fails with
-// catalog.ErrReadOnly) it must advertise the capability as off, so clients
-// never offer an "Edit Tags" UI that is guaranteed to fail at runtime.
+// TestHello_TagEditSupported_ReadOnlyStore is a regression pin (catalog-
+// migration §2.6, replacing the old writable-store pin which no longer
+// applies now that the Go catalog writer is gone): the catalog is always
+// read-only, so with no tag-IPC forwarder configured, tag_edit_supported must
+// be false — clients must never offer an "Edit Tags" UI that is guaranteed to
+// fail at runtime.
 func TestHello_TagEditSupported_ReadOnlyStore(t *testing.T) {
 	store := openAurynReadStore(t)
 
@@ -49,14 +27,10 @@ func TestHello_TagEditSupported_ReadOnlyStore(t *testing.T) {
 
 // TestUpdateTags_ReadOnlyStore_WireError proves that even if a client ignores
 // (or predates) the tag_edit_supported=false advertisement and sends
-// UpdateTags anyway, the server maps catalog.ErrReadOnly to a clear
-// operator-facing wire Error instead of a generic "UpdateTags failed" — the
-// exact message (not just a substring) must name the read-only condition so
-// client-side logs/UI are actionable. Asserting the literal (rather than just
-// "contains read-only") also pins the mapping to the dedicated ErrReadOnly
-// branch: catalog.ErrReadOnly.Error() itself contains "read-only", so a
-// substring check alone would still pass via the generic fallback's details
-// even if the dedicated branch were deleted.
+// UpdateTags anyway (with no tag-IPC forwarder configured), the server
+// rejects it with a clear operator-facing wire Error instead of a generic
+// "UpdateTags failed" — the exact message (not just a substring) must name
+// the read-only condition so client-side logs/UI are actionable.
 func TestUpdateTags_ReadOnlyStore_WireError(t *testing.T) {
 	store := openAurynReadStore(t) // seeds files with ids 1 and 2
 	c := dialClient(t, newWSTestServer(t, store))
@@ -83,12 +57,11 @@ func TestUpdateTags_ReadOnlyStore_WireError(t *testing.T) {
 }
 
 // TestUpdateTags_ReadOnlyStore_EmptyMutation_WireError: an UpdateTags with
-// NEITHER set_tags NOR unset_keys must still be rejected on a read-only
-// store. Without a fast-path check, CatalogHandler.UpdateTags
-// verifies the file, loops zero times over both empty slices, performs no
-// writes, reads EffectiveTags, and returns success — so a client could "edit
-// tags" as a no-op even though tag_edit_supported=false, which is an
-// inconsistent (and confusing) capability story.
+// NEITHER set_tags NOR unset_keys must still be rejected when no tag-IPC
+// forwarder is configured — handleUpdateTags rejects on tagIPC==nil alone, so
+// an empty mutation can never "succeed" as a no-op even though
+// tag_edit_supported=false, which would otherwise be an inconsistent (and
+// confusing) capability story.
 func TestUpdateTags_ReadOnlyStore_EmptyMutation_WireError(t *testing.T) {
 	store := openAurynReadStore(t) // seeds files with ids 1 and 2
 	c := dialClient(t, newWSTestServer(t, store))

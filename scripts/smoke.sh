@@ -15,9 +15,10 @@
 #     DEDICATED bucket (never the interactive `recordings` bucket),
 #   - the Python catalog builder (--source s3 --no-watch, a rescan-only daemon)
 #     builds the SQLite catalog and serves a tag-edit IPC UNIX socket,
-#   - the Go server opens that catalog READ-ONLY (-external-builder) with NO
-#     indexer, and forwards UpdateTags over the tag-edit IPC socket
-#     (-tag-ipc-socket) instead of writing the catalog itself,
+#   - the Go server opens that catalog READ-ONLY (its only mode — the Go
+#     catalog writer + in-process indexer were deleted, M6 §2.6) and forwards
+#     UpdateTags over the tag-edit IPC socket (-tag-ipc-socket) instead of
+#     writing the catalog itself,
 #   - the Go-side discovery RPCs (Hello/ListFiles/GetFile) return numbers that
 #     CROSS-CHECK against an INDEPENDENT ORACLE — `mcaptopics` run directly on
 #     the local, pre-upload fixture files — never a hand-hardcoded constant,
@@ -596,7 +597,7 @@ step_server() {
   # with an empty api_key). `exec` so the server process REPLACES the subshell.
   ( cd "${SERVER_DIR}" && exec env -u PJ_CLOUD_TOKEN ./bin/pj-cloud-server \
       -config "${SMOKE_CONFIG}" -listen ":${SMOKE_PORT}" -db "${SMOKE_DB}" \
-      -external-builder -tag-ipc-socket "${TAG_SOCKET}" \
+      -tag-ipc-socket "${TAG_SOCKET}" \
       >>"${SMOKE_LOG}" 2>&1 ) &
   SMOKE_SERVER_PID=$!
 
@@ -1022,7 +1023,7 @@ step_restart_persistence() {
   : > "${SMOKE_LOG2}"
   ( cd "${SERVER_DIR}" && exec env -u PJ_CLOUD_TOKEN ./bin/pj-cloud-server \
       -config "${SMOKE_CONFIG}" -listen ":${SMOKE_PORT}" -db "${SMOKE_DB}" \
-      -external-builder -tag-ipc-socket "${TAG_SOCKET}" \
+      -tag-ipc-socket "${TAG_SOCKET}" \
       >>"${SMOKE_LOG2}" 2>&1 ) &
   SMOKE_SERVER_PID=$!
   if ! wait_http "http://localhost:${SMOKE_PORT}/health" 60; then

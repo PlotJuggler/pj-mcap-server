@@ -183,45 +183,6 @@ func TestUpdateTags_ReadOnlyIPCDown_WireError(t *testing.T) {
 	}
 }
 
-// TestUpdateTags_WritableStore_IgnoresTagIPC is test (d): a writable store
-// takes the local write path unconditionally, even when a tag-IPC client
-// happens to be configured (main.go wires it regardless of ExternalBuilder) —
-// the ReadOnly() check in handleUpdateTags must gate on the STORE, not on
-// whether tagIPC is set.
-func TestUpdateTags_WritableStore_IgnoresTagIPC(t *testing.T) {
-	store, err := catalog.Open(context.Background(), filepath.Join(t.TempDir(), "catalog.db"))
-	if err != nil {
-		t.Fatalf("catalog.Open: %v", err)
-	}
-	t.Cleanup(func() { _ = store.Close() })
-	id, _, _ := catalog.UpsertFile(context.Background(), store, catalog.FileRecord{
-		S3Key: "w.mcap", S3ETag: "e", S3LastModified: 1, SizeBytes: 1, StartTimeNs: 1, EndTimeNs: 2,
-	})
-
-	// A tag-IPC client that would fail loudly if ever dialed (no listener) —
-	// proves the writable path never even attempts to reach it.
-	badSock := filepath.Join(t.TempDir(), "unreachable.sock")
-	url := newWSTestServerWithTagIPC(t, store, tagipc.NewClient(badSock))
-
-	c := dialClient(t, url)
-	c.hello()
-	c.send(&pb.ClientMessage{
-		RequestId: 2,
-		Payload: &pb.ClientMessage_UpdateTags{UpdateTags: &pb.UpdateTagsRequest{
-			FileId:  id,
-			SetTags: []*pb.Tag{{Key: "verified", Value: "yes"}},
-		}},
-	})
-	resp := c.recv()
-	ut := resp.GetUpdateTags()
-	if ut == nil {
-		t.Fatalf("expected UpdateTagsResponse (local write path), got %T (err=%v)", resp.GetPayload(), resp.GetError())
-	}
-	if len(ut.GetEffectiveTags()) != 1 || ut.GetEffectiveTags()[0].GetKey() != "verified" {
-		t.Errorf("effective tags = %+v, want [{verified yes}]", ut.GetEffectiveTags())
-	}
-}
-
 // --- S2: mid-request generation swap ---------------------------------------
 //
 // TestUpdateTags_ReadOnlyWithIPC_RoundTrip above never swaps generations

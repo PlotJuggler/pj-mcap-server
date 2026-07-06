@@ -2,6 +2,7 @@ package warm
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"path/filepath"
@@ -12,7 +13,18 @@ import (
 	"pj-cloud/server/internal/format"
 	"pj-cloud/server/internal/metrics"
 	"pj-cloud/server/internal/storage"
+
+	_ "modernc.org/sqlite"
 )
+
+// warmFixtureKey is the rebuilt auryn s3_key for fixture file i (every warm_test
+// fixture shares one dimension tuple; only the filename varies) — the Warmer
+// pulls WarmEntries from the catalog and asks the codec for THIS key, so tests
+// must assert against it rather than the bare "k<i>" name the legacy Go-writer
+// fixture used directly as its (non-Hive) s3_key.
+func warmFixtureKey(i int) string {
+	return fmt.Sprintf("customer=t/customer_site=t/robot=t/source=t/date=2026-01-01/k%d.mcap", i)
+}
 
 // fakeCodec counts ChunkIndex calls per key and can fail selected keys.
 type fakeCodec struct {
@@ -47,23 +59,73 @@ func (f *fakeCodec) ExtractAndIndex(context.Context, storage.BlobStore, string, 
 	return format.FileSummary{}, format.FileChunkIndex{}, nil
 }
 
-// seedStore creates a legacy catalog store with n files (keys k0..k{n-1}).
+// seedStore creates an auryn-schema (v3) catalog store with n files (filenames
+// k0.mcap..k{n-1}.mcap under one shared dimension tuple; every file's etag is
+// "e"). warmFixtureKey(i) computes the rebuilt s3_key WarmEntries/the Warmer
+// will actually use for file i.
 func seedStore(t *testing.T, n int) *catalog.Store {
 	t.Helper()
-	s, err := catalog.Open(context.Background(), filepath.Join(t.TempDir(), "c.db"))
+	path := filepath.Join(t.TempDir(), "c.db")
+	db, err := sql.Open("sqlite", fmt.Sprintf("file:%s?_pragma=journal_mode(WAL)&_pragma=foreign_keys(ON)", path))
 	if err != nil {
-		t.Fatalf("catalog.Open: %v", err)
+		t.Fatalf("open %s: %v", path, err)
 	}
-	t.Cleanup(func() { _ = s.Close() })
-	for i := 0; i < n; i++ {
-		if _, _, err := catalog.UpsertFile(context.Background(), s, catalog.FileRecord{
-			S3Key: fmt.Sprintf("k%d", i), S3ETag: "e", S3LastModified: 1, SizeBytes: 1,
-			StartTimeNs: 1, EndTimeNs: 2, MessageCount: 1,
-		}); err != nil {
-			t.Fatalf("UpsertFile %d: %v", i, err)
+	ddl := []string{
+		fmt.Sprintf(`CREATE TABLE schema_version (id INTEGER PRIMARY KEY CHECK (id=1), version INTEGER NOT NULL);
+			INSERT INTO schema_version(id,version) VALUES (1,%d)`, catalog.SchemaVersion),
+		`CREATE TABLE customers (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE)`,
+		`CREATE TABLE sites (id INTEGER PRIMARY KEY, customer_id INTEGER NOT NULL, name TEXT NOT NULL)`,
+		`CREATE TABLE robots (id INTEGER PRIMARY KEY, site_id INTEGER NOT NULL, name TEXT NOT NULL)`,
+		`CREATE TABLE sources (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE)`,
+		`CREATE TABLE topic_names (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE)`,
+		`CREATE TABLE schemas (id INTEGER PRIMARY KEY, name TEXT NOT NULL, encoding TEXT NOT NULL)`,
+		`CREATE TABLE topic_sets (id INTEGER PRIMARY KEY, fingerprint TEXT NOT NULL UNIQUE)`,
+		`CREATE TABLE topic_set_members (set_id INTEGER NOT NULL, topic_id INTEGER NOT NULL, schema_id INTEGER NOT NULL, PRIMARY KEY(set_id,topic_id)) WITHOUT ROWID`,
+		`CREATE TABLE files (id INTEGER PRIMARY KEY, filename TEXT NOT NULL, etag TEXT NOT NULL, size_bytes INTEGER NOT NULL,
+			last_modified_ns INTEGER NOT NULL DEFAULT 0, cataloged_at_ns INTEGER NOT NULL DEFAULT 0,
+			customer_id INTEGER NOT NULL, site_id INTEGER NOT NULL, robot_id INTEGER NOT NULL, source_id INTEGER NOT NULL,
+			date TEXT NOT NULL, start_time_ns INTEGER NOT NULL, end_time_ns INTEGER NOT NULL,
+			chunk_count INTEGER NOT NULL DEFAULT 0, topic_set_id INTEGER NOT NULL, topic_counts BLOB NOT NULL,
+			has_error INTEGER NOT NULL DEFAULT 0)`,
+		`CREATE TABLE tags_embedded (file_id INTEGER NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY(file_id,key)) WITHOUT ROWID`,
+		`CREATE TABLE tags_override (file_id INTEGER NOT NULL, key TEXT NOT NULL, value TEXT, updated_at INTEGER NOT NULL, PRIMARY KEY(file_id,key)) WITHOUT ROWID`,
+		`CREATE VIEW tags_effective AS
+			SELECT file_id,key,value,1 AS is_override FROM tags_override WHERE value IS NOT NULL
+			UNION ALL
+			SELECT e.file_id,e.key,e.value,0 FROM tags_embedded e
+			LEFT JOIN tags_override o ON (o.file_id=e.file_id AND o.key=e.key) WHERE o.file_id IS NULL`,
+		`INSERT INTO customers(id,name) VALUES (1,'t')`,
+		`INSERT INTO sites(id,customer_id,name) VALUES (1,1,'t')`,
+		`INSERT INTO robots(id,site_id,name) VALUES (1,1,'t')`,
+		`INSERT INTO sources(id,name) VALUES (1,'t')`,
+		`INSERT INTO topic_names(id,name) VALUES (1,'/a')`,
+		`INSERT INTO schemas(id,name,encoding) VALUES (1,'S','ros2msg')`,
+		`INSERT INTO topic_sets(id,fingerprint) VALUES (1,'fp')`,
+		`INSERT INTO topic_set_members(set_id,topic_id,schema_id) VALUES (1,1,1)`,
+	}
+	for _, s := range ddl {
+		if _, err := db.Exec(s); err != nil {
+			t.Fatalf("ddl %q: %v", s, err)
 		}
 	}
-	return s
+	for i := 0; i < n; i++ {
+		if _, err := db.Exec(`INSERT INTO files
+			(id,filename,etag,size_bytes,customer_id,site_id,robot_id,source_id,date,start_time_ns,end_time_ns,chunk_count,topic_set_id,topic_counts)
+			VALUES (?,?,?,1,1,1,1,1,'2026-01-01',1,2,1,1,X'01')`,
+			i+1, fmt.Sprintf("k%d.mcap", i), "e"); err != nil {
+			t.Fatalf("insert file %d: %v", i, err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close writer handle: %v", err)
+	}
+
+	st, err := catalog.OpenReadOnly(context.Background(), path)
+	if err != nil {
+		t.Fatalf("OpenReadOnly: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	return st
 }
 
 func TestWarmer_WarmsAllThenSkips(t *testing.T) {
@@ -80,7 +142,7 @@ func TestWarmer_WarmsAllThenSkips(t *testing.T) {
 		t.Fatalf("cache len = %d, want 5", cache.Len())
 	}
 	for i := 0; i < 5; i++ {
-		if c := codec.callsFor(fmt.Sprintf("k%d", i)); c != 1 {
+		if c := codec.callsFor(warmFixtureKey(i)); c != 1 {
 			t.Fatalf("k%d codec calls = %d, want 1", i, c)
 		}
 	}
@@ -90,7 +152,7 @@ func TestWarmer_WarmsAllThenSkips(t *testing.T) {
 		t.Fatalf("Run 2: %v", err)
 	}
 	for i := 0; i < 5; i++ {
-		if c := codec.callsFor(fmt.Sprintf("k%d", i)); c != 1 {
+		if c := codec.callsFor(warmFixtureKey(i)); c != 1 {
 			t.Fatalf("k%d codec calls after re-warm = %d, want still 1 (skipped)", i, c)
 		}
 	}
@@ -98,7 +160,7 @@ func TestWarmer_WarmsAllThenSkips(t *testing.T) {
 
 func TestWarmer_PoisonFileDoesNotAbort(t *testing.T) {
 	store := seedStore(t, 4)
-	codec := newFakeCodec("k2") // k2 always fails
+	codec := newFakeCodec(warmFixtureKey(2)) // k2 always fails
 	cache := format.NewChunkIndexCache(64)
 	w := &Warmer{Store: store, Codec: codec, Blob: nil, Cache: cache, Concurrency: 2}
 
@@ -109,12 +171,12 @@ func TestWarmer_PoisonFileDoesNotAbort(t *testing.T) {
 	if cache.Len() != 3 {
 		t.Fatalf("cache len = %d, want 3 (k2 failed, others warmed)", cache.Len())
 	}
-	if _, ok := cache.Get("k2", "e", 0); ok {
+	if _, ok := cache.Get(warmFixtureKey(2), "e", 0); ok {
 		t.Fatal("k2 should NOT be cached (it failed)")
 	}
-	for _, k := range []string{"k0", "k1", "k3"} {
-		if _, ok := cache.Get(k, "e", 0); !ok {
-			t.Fatalf("%s should be cached", k)
+	for _, i := range []int{0, 1, 3} {
+		if _, ok := cache.Get(warmFixtureKey(i), "e", 0); !ok {
+			t.Fatalf("k%d should be cached", i)
 		}
 	}
 }

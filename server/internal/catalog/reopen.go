@@ -24,9 +24,6 @@ import (
 //     overwhelmingly common case.
 //
 // Behavior:
-//   - On a legacy (read-write, catalog.Open) Store: always (false, nil). There is
-//     nothing to swap — that Store owns the only writer and never points at a
-//     file some other process replaces.
 //   - Same (dev, inode) as last observed: (false, nil).
 //   - Different identity but the new file fails verification (wrong
 //     schema_version, unreadable, or the stat/open landed mid-swap and hit the
@@ -38,10 +35,6 @@ import (
 //     swapped to the new one, the stored identity is updated, the OLD handle is
 //     Close()d, and (true, nil) is returned.
 func (s *Store) ReopenIfSwapped(ctx context.Context) (swapped bool, err error) {
-	if !s.readOnly {
-		return false, nil
-	}
-
 	// Serialize swaps: at most one ReopenIfSwapped does the stat-compare-open-swap
 	// sequence at a time. The caller today is a single ticker goroutine, so this
 	// is a documented invariant rather than a live contention point.

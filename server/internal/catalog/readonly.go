@@ -19,12 +19,9 @@ import (
 //
 // v2 (M2): tags_embedded/tags_override/tags_effective override layer +
 // files.chunk_count.
-// v3 (M6): build_metadata table (catalog-freshness / swap-detection).
+// v3 (M6): build_metadata table (catalog freshness; NOT the swap-detection
+// mechanism — file identity is, see ReopenIfSwapped in reopen.go).
 const SchemaVersion = 3
-
-// ErrReadOnly is returned by Write on a Store opened via OpenReadOnly. Under the
-// auryn migration the Python builder is the sole writer; the Go server reads.
-var ErrReadOnly = errors.New("catalog: store is read-only (opened via OpenReadOnly)")
 
 // SchemaVersionError reports a cross-language catalog schema-version mismatch (or a
 // DB with no schema_version row at all — an unstamped / pre-contract DB). It is
@@ -51,24 +48,22 @@ func gotStr(got int64) string {
 }
 
 // OpenReadOnly opens an EXISTING catalog DB written by the Python mcap_catalog
-// builder, read-only, and verifies the cross-language contract version.
+// builder, read-only, and verifies the cross-language contract version. This is
+// the ONLY constructor: the catalog is never opened for writing from Go (the
+// Python builder is the sole writer — see the package doc). The DB must already
+// exist (mode=ro errors otherwise — that is the intended fail-fast: the builder
+// must have run first); this does NOT apply any schema (the auryn schema is
+// authoritative and owned entirely by the builder).
 //
-// Unlike Open it does NOT apply the embedded Go schema: the auryn schema is
-// authoritative, and running `CREATE TABLE IF NOT EXISTS` here would silently
-// diverge the two `files` definitions (the Go writer's columns differ from the
-// auryn writer's). The DB must already exist (mode=ro errors otherwise — that is
-// the intended fail-fast: the builder must have run first).
-//
-// The returned Store has no writer goroutine; Write returns ErrReadOnly and Close
-// only closes the DB handle. The Store also records the served path + the opened
-// file's (dev, inode) identity so ReopenIfSwapped (reopen.go) can later detect an
-// atomic-publish rebuild (CATALOG_CONTRACT.md §9) and reopen transparently.
+// The Store records the served path + the opened file's (dev, inode) identity so
+// ReopenIfSwapped (reopen.go) can later detect an atomic-publish rebuild
+// (CATALOG_CONTRACT.md §9) and reopen transparently.
 func OpenReadOnly(ctx context.Context, dbPath string) (*Store, error) {
 	db, ident, err := openVerified(ctx, dbPath)
 	if err != nil {
 		return nil, err
 	}
-	s := &Store{readOnly: true, dbPath: dbPath}
+	s := &Store{dbPath: dbPath}
 	s.dbPtr.Store(db)
 	s.identity.Store(&ident)
 	return s, nil

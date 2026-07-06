@@ -19,7 +19,6 @@ import (
 	"pj-cloud/server/internal/catalog"
 	"pj-cloud/server/internal/config"
 	"pj-cloud/server/internal/format"
-	"pj-cloud/server/internal/indexer"
 	"pj-cloud/server/internal/session"
 	"pj-cloud/server/internal/storage"
 	pb "pj-cloud/server/internal/wire/pj_cloud"
@@ -92,7 +91,10 @@ func newTestServer(t *testing.T, files map[string][]byte, cfg config.SessionConf
 
 // newTestServerWithBlob is newTestServer with the storage.BlobStore injected, so
 // tests can wrap it (e.g. the countingBlobStore for the estimate-5% gate). The
-// store must serve the same MCAP corpus the catalog scan + producer expect.
+// store must serve the same MCAP corpus the catalog fixture expects — see
+// buildAurynCatalog (auryn_fixture_test.go), which extracts every ".mcap" key
+// already present in blob and catalogs it for real (no in-process indexer
+// exists anymore to do this as a background scan).
 func newTestServerWithBlob(t *testing.T, blob storage.BlobStore, cfg config.SessionConfig) *testServer {
 	t.Helper()
 	codec, err := format.NewCodec("mcap")
@@ -101,28 +103,14 @@ func newTestServerWithBlob(t *testing.T, blob storage.BlobStore, cfg config.Sess
 	}
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 
-	cat, err := catalog.Open(context.Background(), filepath.Join(t.TempDir(), "catalog.db"))
-	if err != nil {
-		t.Fatalf("catalog.Open: %v", err)
-	}
-	t.Cleanup(func() { _ = cat.Close() })
-
 	idxCache := format.NewChunkIndexCache(1024)
-	scanner := &indexer.Scanner{
-		Store:     cat,
-		Lister:    indexer.NewBlobStoreLister(blob),
-		Extractor: indexer.NewCodecExtractor(blob, codec, idxCache),
-		Log:       log,
-	}
-	if _, err := scanner.RunOnce(context.Background()); err != nil {
-		t.Fatalf("indexer scan: %v", err)
-	}
+	cat, hiveBlob := buildAurynCatalog(t, context.Background(), blob, codec, idxCache)
 
 	reg := session.NewRegistry(session.RegistryOpts{
 		MaxConcurrent:         cfg.MaxConcurrent,
 		RetainAfterDisconnect: cfg.RetainAfterDisconnect,
 	})
-	deps := &SessionDeps{Store: cat, Codec: codec, Blob: blob, Registry: reg, Cfg: cfg, Log: log, IdxCache: idxCache}
+	deps := &SessionDeps{Store: cat, Codec: codec, Blob: hiveBlob, Registry: reg, Cfg: cfg, Log: log, IdxCache: idxCache}
 	h := NewHandlerWithSession(cat, "", log, deps)
 
 	mux := http.NewServeMux()
@@ -135,7 +123,7 @@ func newTestServerWithBlob(t *testing.T, blob storage.BlobStore, cfg config.Sess
 		url:      "ws" + strings.TrimPrefix(srv.URL, "http") + "/api/ws",
 		cat:      cat,
 		reg:      reg,
-		store:    blob,
+		store:    hiveBlob,
 		idxCache: idxCache,
 	}
 }
@@ -211,6 +199,11 @@ func (c *wsClient) hello() {
 	}
 }
 
+// fileID looks up a file by its LOGICAL (flat) key — the same key the caller
+// used to seed its memBlobStore/genFile map. Every test server's catalog is
+// auryn (buildAurynCatalog), which always reports the REBUILT Hive s3_key
+// (hiveKeyFor(key)), never the bare flat name — that translation happens here,
+// once, so call sites can keep using the flat key unchanged.
 func (c *wsClient) fileID(t *testing.T, key string) uint64 {
 	t.Helper()
 	c.send(&pb.ClientMessage{RequestId: 2, Payload: &pb.ClientMessage_ListFiles{ListFiles: &pb.ListFilesRequest{Limit: 1000}}})
@@ -219,12 +212,13 @@ func (c *wsClient) fileID(t *testing.T, key string) uint64 {
 	if lf == nil {
 		t.Fatalf("expected ListFilesResponse, got %T", resp.GetPayload())
 	}
+	want := hiveKeyFor(key)
 	for _, f := range lf.GetFiles() {
-		if f.GetS3Key() == key {
+		if f.GetS3Key() == want {
 			return f.GetId()
 		}
 	}
-	t.Fatalf("file %q not in listing", key)
+	t.Fatalf("file %q (hive key %q) not in listing", key, want)
 	return 0
 }
 

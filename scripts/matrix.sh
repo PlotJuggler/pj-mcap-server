@@ -4,18 +4,35 @@
 # the Go server's in-process indexer (`catalog.Open`, read-write) scanning a
 # Minio bucket of 8 real "nissan_zala_*" MCAPs from ${GROUND_TRUTH_DIR} below,
 # which do NOT exist on this machine (they live on the corpus machine this
-# harness was authored on). `scripts/smoke.sh` was migrated in the same change
-# that added this note to the NEW production shape (Python `mcap_catalog`
-# builder + Go server in `-external-builder` read-only mode, over a synthetic
-# Hive-keyed corpus) — see its header comment for the full architecture. This
-# script's migration to the same shape (and to a corpus this machine actually
-# has) is TRACKED SEPARATELY and intentionally NOT done here: it needs its own
-# design pass for the deeper legs (8-file stitch, 4-parallel sessions,
-# spans-boundary window) against a synthetic/self-contained corpus of
-# comparable scale, which `make smoke`'s 8-file synthetic Hive corpus does not
-# attempt to be (it is deliberately small — 6 DefaultSpecs files + the
-# high-volume bigSpec fixture + the 3D fixture; scale/depth is this script's
-# job, not smoke's). Run this only on the machine that has ${GROUND_TRUTH_DIR}.
+# harness was authored on). Worse: that in-process indexer (`catalog.Open`,
+# `internal/indexer`) plus its `-db`/`-poll-interval` server flags were DELETED
+# outright in the M6 §2.6 cutover (the server only opens the catalog read-only
+# now, written by the external Python `mcap_catalog` builder) — so this script
+# can no longer even start a working server, let alone reach its legs. Rather
+# than let it fail confusingly deep inside `setup()` (wrong file count, a
+# missing GROUND_TRUTH_DIR, or a flag the binary silently ignores),
+# it FAILS FAST below with a clear message and exit code 2, before touching
+# docker or building/starting anything. `scripts/smoke.sh` was migrated in the
+# same change that added this note to the NEW production shape (Python
+# `mcap_catalog` builder + Go server in `-external-builder` read-only mode,
+# over a synthetic Hive-keyed corpus) — see its header comment for the full
+# architecture. This script's migration to the same shape (and to a corpus
+# this machine actually has) is TRACKED SEPARATELY and intentionally NOT done
+# here: it needs its own design pass for the deeper legs (8-file stitch,
+# 4-parallel sessions, spans-boundary window) against a synthetic/self-
+# contained corpus of comparable scale, which `make smoke`'s 8-file synthetic
+# Hive corpus does not attempt to be (it is deliberately small — 6
+# DefaultSpecs files + the high-volume bigSpec fixture + the 3D fixture;
+# scale/depth is this script's job, not smoke's). The body below (setup +
+# legs m1-m8) is kept, UNREACHED, as the starting point for that migration —
+# it is not currently run by anything.
+# ─────────────────────────────────────────────────────────────────────────────
+cat >&2 <<'EOF'
+matrix.sh is pending migration to the Python-builder pipeline; it depended
+on the retired in-process Go indexer (§2.6) and cannot run against this
+server build; see scripts/smoke.sh for the migrated gate.
+EOF
+exit 2
 # ─────────────────────────────────────────────────────────────────────────────
 #
 # matrix.sh — the DEEPER, SLOWER end-to-end correctness gate for the PJ Cloud

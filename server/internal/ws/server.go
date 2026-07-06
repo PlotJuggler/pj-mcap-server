@@ -61,12 +61,14 @@ const (
 	readLimit = 8 << 20 // 8 MiB
 )
 
-// readOnlyTagEditMessage is the single operator-facing message for "tag
-// editing is unavailable because the catalog is read-only (external-builder
-// mode)". Both handleUpdateTags call sites that reject on catalog.ErrReadOnly
-// (the fast-path pre-check and the defense-in-depth branch below it) send
-// this exact string, so the two sites can't drift apart.
-const readOnlyTagEditMessage = "tag editing is disabled: the catalog is read-only (external-builder mode)"
+// readOnlyTagEditMessage is the operator-facing message for "tag editing is
+// unavailable: no tag-IPC forwarder is configured". The catalog is ALWAYS
+// read-only (the Python builder is the sole writer), so "the catalog is
+// read-only" is never the actionable fact here — every deployment is
+// read-only; what varies is whether catalog.tag_ipc_socket (-tag-ipc-socket /
+// PJ_CLOUD_TAG_IPC_SOCKET) points at a running builder's IPC endpoint. Name
+// that condition instead so an operator knows exactly what to configure.
+const readOnlyTagEditMessage = "tag editing is disabled: no tag-edit IPC socket is configured (catalog.tag_ipc_socket)"
 
 // tagIPCUnavailableMessage is the caller-facing message for a D2 forward
 // failure (busy, connection refused, timeout, ...) — CATALOG_CONTRACT.md §10:
@@ -441,16 +443,15 @@ func (c *connState) handleHello(reqID uint64, hello *pb.Hello) {
 				ServerVersion: serverVersion,
 				Capabilities: &pb.Capabilities{
 					ResumeSupported: true,
-					// tag_edit_supported mirrors the catalog's write-ability: over a
-					// Store opened via OpenReadOnly (auryn-migration external-builder
-					// mode) the LOCAL Write always fails with catalog.ErrReadOnly, so
-					// advertising true here would let a client open an "Edit Tags" UI
-					// that is guaranteed to fail at runtime — UNLESS a D2 tag-IPC
-					// forwarder is configured (c.h.tagIPC != nil), in which case edits
-					// DO work (forwarded to the Python builder over the UNIX socket,
-					// CATALOG_CONTRACT.md §10). See handleUpdateTags for the matching
-					// reject/forward branches.
-					TagEditSupported: !c.h.store.ReadOnly() || c.h.tagIPC != nil,
+					// tag_edit_supported: the catalog is always read-only (the Python
+					// builder is the sole writer), so a tag edit can only ever succeed
+					// when a D2 tag-IPC forwarder is configured (c.h.tagIPC != nil) —
+					// forwarded to the Python builder over the UNIX socket
+					// (CATALOG_CONTRACT.md §10). Advertising true with no forwarder
+					// configured would let a client open an "Edit Tags" UI that is
+					// guaranteed to fail at runtime. See handleUpdateTags for the
+					// matching reject/forward branches.
+					TagEditSupported: c.h.tagIPC != nil,
 				},
 				Backend: &pb.BackendCapabilities{
 					SupportsFileHierarchy: hierarchy,
@@ -525,48 +526,18 @@ func (c *connState) handleGetFile(ctx context.Context, reqID uint64, req *pb.Get
 	})
 }
 
+// handleUpdateTags is IPC-only: the catalog is always read-only (the Python
+// builder is the sole writer, catalog-migration §2.6), so an edit can only
+// ever be forwarded to the Python builder's tag-edit IPC endpoint. With no
+// forwarder configured, every UpdateTags is rejected outright — including an
+// EMPTY set_tags/unset_keys request, so tag_edit_supported=false is never
+// contradicted by a no-op "success".
 func (c *connState) handleUpdateTags(ctx context.Context, reqID uint64, req *pb.UpdateTagsRequest) {
-	// Fast-path: reject/forward before touching CatalogHandler at all. An
-	// UpdateTags with EMPTY set_tags/unset_keys performs zero writes downstream
-	// (the loops below just don't iterate), so without this check it would read
-	// back EffectiveTags and return success even on a read-only store — an
-	// inconsistent capability story given tag_edit_supported=false. The
-	// errors.Is(err, catalog.ErrReadOnly) branch below stays as a backstop for
-	// any future write path that bubbles the same error.
-	if c.h.store.ReadOnly() {
-		if c.h.tagIPC == nil {
-			c.sendError(reqID, 0, pb.ErrorCode_ERROR_INVALID_REQUEST, readOnlyTagEditMessage, catalog.ErrReadOnly.Error())
-			return
-		}
-		// D2: a tag-IPC forwarder is configured — forward the edit to the Python
-		// catalog builder instead of rejecting it (CATALOG_CONTRACT.md §10).
-		c.handleUpdateTagsForwarded(ctx, reqID, req)
+	if c.h.tagIPC == nil {
+		c.sendError(reqID, 0, pb.ErrorCode_ERROR_INVALID_REQUEST, readOnlyTagEditMessage, "")
 		return
 	}
-
-	resp, err := c.catalogHandler().UpdateTags(ctx, req)
-	if err != nil {
-		var nf errFileNotFound
-		if errors.As(err, &nf) {
-			c.sendError(reqID, 0, pb.ErrorCode_ERROR_NOT_FOUND, nf.Error(), "")
-			return
-		}
-		if errors.Is(err, catalog.ErrReadOnly) {
-			c.sendError(reqID, 0, pb.ErrorCode_ERROR_INVALID_REQUEST, readOnlyTagEditMessage, err.Error())
-			return
-		}
-		c.sendError(reqID, 0, pb.ErrorCode_ERROR_INVALID_REQUEST, "UpdateTags failed", err.Error())
-		return
-	}
-
-	c.h.log.Info("ws: UpdateTags served", "remote", c.remote, "request_id", reqID,
-		"file_id", req.GetFileId(), "set", len(req.GetSetTags()), "unset", len(req.GetUnsetKeys()),
-		"effective", len(resp.GetEffectiveTags()))
-
-	c.conn.SendPriority(&pb.ServerMessage{
-		RequestId: reqID,
-		Payload:   &pb.ServerMessage_UpdateTags{UpdateTags: resp},
-	})
+	c.handleUpdateTagsForwarded(ctx, reqID, req)
 }
 
 // handleUpdateTagsForwarded is the D2 forward path (CATALOG_CONTRACT.md §10):
