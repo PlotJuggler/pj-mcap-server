@@ -8,13 +8,14 @@
 // parser-ingest recorder (setRuntimeHostProvider). Decoded scalars NO LONGER
 // flow through the toolbox write API — the worker pushes raw payloads to the
 // (fake) ingest host via ParserIngestDriver, so correctness here is binding
-// fidelity + push counts against the pinned zeg_1 ground truth:
-//   - all 6 topics report pullFinished ok; exactly ONE parser-ingest context is
+// fidelity + push counts against the pinned synthetic ci_synth_big ground
+// truth (catalog-migration corpus, gen-ci-fixtures' bigSpec(), `-hive-big`):
+//   - all 3 topics report pullFinished ok; exactly ONE parser-ingest context is
 //     created AND released (finalize ran);
-//   - exactly 6 recorded bindings; the imu binding carries the verbatim ABI
+//   - exactly 3 recorded bindings; the imu binding carries the verbatim ABI
 //     fields (type "sensor_msgs/msg/Imu", encoding "ros2msg", non-empty schema
 //     text, the load-bearing parser_config_json "{}");
-//   - total pushes across all handles == 33670; the imu handle == 14904;
+//   - total pushes across all handles == 3000; the imu handle == 2000;
 //   - every push carries non-empty bytes. Per-handle timestamp ordering is NOT
 //     asserted — wire batches interleave, the wire does not guarantee it;
 //   - a cancel-mid-pull still releases the context (finalize on the cancel
@@ -48,16 +49,14 @@ namespace {
 const char* liveUrl() { return std::getenv("DEXORY_CLOUD_LIVE_URL"); }
 
 // Ground truth pinned in lockstep with smoke.sh + backend_connection_live_test.
-constexpr const char* kSeq = "nissan_zala_50_zeg_1_0.mcap";
-constexpr const char* kImuTopic = "/nissan/gps/duro/imu";
-constexpr std::uint64_t kTotalMessages = 33670;
-constexpr std::uint64_t kImuMessages = 14904;
+constexpr const char* kSeq =
+    "customer=test/customer_site=lab/robot=r1/source=synthetic/date=2026-06-24/ci_synth_big.mcap";
+constexpr const char* kImuTopic = "/imu";
+constexpr std::uint64_t kTotalMessages = 3000;
+constexpr std::uint64_t kImuMessages = 2000;
 
 const std::vector<std::string>& allTopics() {
-  static const std::vector<std::string> kTopics = {
-      "/nissan/gps/duro/imu",       "/nissan/gps/duro/current_pose", "/nissan/gps/duro/mag",
-      "/nissan/gps/duro/status_string", "/nissan/vehicle_speed",     "/nissan/vehicle_steering",
-  };
+  static const std::vector<std::string> kTopics = {"/clock", "/imu", "/odom"};
   return kTopics;
 }
 
@@ -140,7 +139,7 @@ TEST(DexoryCloudParserIngestLive, FullPullPushesGroundTruthCounts) {
   EXPECT_EQ(imu->config, "{}") << "parser_config_json must be the load-bearing non-empty {}";
 
   // Ground-truth push counts: every message of the sequence reached the host
-  // exactly once (33670 total; 14904 on the imu handle).
+  // exactly once (3000 total; 2000 on the imu handle).
   EXPECT_EQ(fake.pushes.size(), kTotalMessages);
   EXPECT_EQ(pj_ingest_test::pushesForTopic(fake, kImuTopic), kImuMessages);
 

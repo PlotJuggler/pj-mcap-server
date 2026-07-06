@@ -3,15 +3,18 @@
 //
 // LIVE test for the session/streaming download path through the REAL
 // BackendConnection (openSessionFresh + downloadSession). Requires a running
-// pj-cloud server seeded with the known Minio fixture set; gated on
-// DEXORY_CLOUD_LIVE_URL so the hermetic CI suite skips it:
+// pj-cloud server seeded with the synthetic Hive-keyed catalog-migration
+// fixture set; gated on DEXORY_CLOUD_LIVE_URL so the hermetic CI suite skips it:
 //
 //   DEXORY_CLOUD_LIVE_URL=ws://localhost:8082 ctest -R DexoryCloudSessionDownloadLive
 //
 // Ground truth (pinned in lockstep with scripts/smoke.sh + the catalog live
-// test): nissan_zala_50_zeg_1_0.mcap has 33670 messages total across 6 topics;
-// /nissan/vehicle_speed alone is 4513 messages. We assert the CLIENT-SIDE
-// received COUNT (and the server's Eos.total_messages_sent) match exactly.
+// test): gen-ci-fixtures' bigSpec() ("ci_synth_big.mcap", Hive key below,
+// `-hive-big`) has 3000 messages total across 3 topics (/clock 500, /odom 500,
+// /imu 2000); /imu alone is 2000 messages. We assert the CLIENT-SIDE received
+// COUNT (and the server's Eos.total_messages_sent) match exactly. Regenerate
+// with `gen-ci-fixtures -hive -hive-big -out DIR -manifest` if bigSpec ever
+// changes.
 
 #include <gtest/gtest.h>
 
@@ -29,19 +32,24 @@ namespace {
 
 const char* liveUrl() { return std::getenv("DEXORY_CLOUD_LIVE_URL"); }
 
-constexpr const char* kKnownSequence = "nissan_zala_50_zeg_1_0.mcap";
-constexpr std::uint64_t kTotalMessages = 33670;
-constexpr const char* kSpeedTopic = "/nissan/vehicle_speed";
-constexpr std::uint64_t kSpeedMessages = 4513;
+constexpr const char* kKnownSequence =
+    "customer=test/customer_site=lab/robot=r1/source=synthetic/date=2026-06-24/ci_synth_big.mcap";
+constexpr std::uint64_t kTotalMessages = 3000;
+// The "subset" topic downloaded alone (legacy name kSpeedTopic retained to
+// minimize churn; it now targets the synthetic /imu topic, 2000 of 3000 msgs).
+constexpr const char* kSpeedTopic = "/imu";
+constexpr std::uint64_t kSpeedMessages = 2000;
 
-// Slice 7 stitched ground truth (pinned in lockstep with scripts/smoke.sh +
-// backend_connection_live_test.cpp): two consecutive, time-disjoint nissan files
-// stitch into one continuous logical stream.
-constexpr const char* kStitchKeyA = "nissan_zala_50_zeg_2_0.mcap";
-constexpr std::uint64_t kStitchMessagesA = 43301;
-constexpr const char* kStitchKeyB = "nissan_zala_50_zeg_3_0.mcap";
-constexpr std::uint64_t kStitchMessagesB = 21731;
-constexpr std::uint64_t kStitchMessages = 65032;  // A + B
+// Stitched ground truth (pinned in lockstep with scripts/smoke.sh +
+// backend_connection_live_test.cpp): the target (bigSpec) and DefaultSpecs()[1]
+// "ci_synth_b.mcap" are time-disjoint synthetic files that stitch into one
+// continuous logical stream.
+constexpr const char* kStitchKeyA = kKnownSequence;  // ci_synth_big.mcap, 3000 msgs
+constexpr std::uint64_t kStitchMessagesA = 3000;
+constexpr const char* kStitchKeyB =
+    "customer=test/customer_site=lab/robot=r2/source=synthetic/date=2026-06-23/ci_synth_b.mcap";
+constexpr std::uint64_t kStitchMessagesB = 130;
+constexpr std::uint64_t kStitchMessages = 3130;  // A + B
 
 // Open a session for `topics` (empty = all) over the known sequence and drive
 // it to completion, counting messages client-side. Asserts the session opened.
@@ -74,8 +82,9 @@ dexory_cloud::SessionStats download(dexory_cloud::BackendConnection& conn, const
 
 }  // namespace
 
-// All-topics download of the known sequence: exactly 33670 messages received,
-// the stream completes, and the server's Eos.total_messages_sent agrees.
+// All-topics download of the known sequence: exactly 3000 messages received
+// (kTotalMessages), the stream completes, and the server's
+// Eos.total_messages_sent agrees.
 TEST(DexoryCloudSessionDownloadLive, AllTopicsCount) {
   const char* url = liveUrl();
   if (url == nullptr || *url == '\0') {
@@ -132,10 +141,11 @@ dexory_cloud::SessionStats downloadByTopic(dexory_cloud::BackendConnection& conn
   return conn.downloadSession(info, on_message);
 }
 
-// STITCHED two-file download (Slice 7): resolveFileIds({zeg_2, zeg_3}) -> 2 ids;
-// EXACTLY ONE OpenFresh session (singular by construction) carries the union;
-// the received count == 65032; and each topic's stitched count == the SUM of
-// that topic across both single-file downloads.
+// STITCHED two-file download (Slice 7): resolveFileIds({kStitchKeyA,
+// kStitchKeyB}) -> 2 ids; EXACTLY ONE OpenFresh session (singular by
+// construction) carries the union; the received count == kStitchMessages
+// (3130); and each topic's stitched count == the SUM of that topic across
+// both single-file downloads.
 TEST(DexoryCloudSessionDownloadLive, StitchedTwoFiles) {
   const char* url = liveUrl();
   if (url == nullptr || *url == '\0') {
@@ -231,7 +241,8 @@ TEST(DexoryCloudSessionDownloadLive, DebugVerbFirstN) {
   EXPECT_EQ(stats.error, "download aborted by sink") << "sink-abort carries the documented marker; got: " << stats.error;
 }
 
-// Topic-subset download: /nissan/vehicle_speed alone is exactly 4513 messages.
+// Topic-subset download: kSpeedTopic ("/imu") alone is exactly kSpeedMessages
+// (2000) messages.
 TEST(DexoryCloudSessionDownloadLive, SubsetTopicCount) {
   const char* url = liveUrl();
   if (url == nullptr || *url == '\0') {

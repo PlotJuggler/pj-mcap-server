@@ -1,4 +1,23 @@
 #!/usr/bin/env bash
+# ─────────────────────────────────────────────────────────────────────────────
+# PENDING MIGRATION (2026-07-06): this script still exercises the LEGACY path —
+# the Go server's in-process indexer (`catalog.Open`, read-write) scanning a
+# Minio bucket of 8 real "nissan_zala_*" MCAPs from ${GROUND_TRUTH_DIR} below,
+# which do NOT exist on this machine (they live on the corpus machine this
+# harness was authored on). `scripts/smoke.sh` was migrated in the same change
+# that added this note to the NEW production shape (Python `mcap_catalog`
+# builder + Go server in `-external-builder` read-only mode, over a synthetic
+# Hive-keyed corpus) — see its header comment for the full architecture. This
+# script's migration to the same shape (and to a corpus this machine actually
+# has) is TRACKED SEPARATELY and intentionally NOT done here: it needs its own
+# design pass for the deeper legs (8-file stitch, 4-parallel sessions,
+# spans-boundary window) against a synthetic/self-contained corpus of
+# comparable scale, which `make smoke`'s 8-file synthetic Hive corpus does not
+# attempt to be (it is deliberately small — 6 DefaultSpecs files + the
+# high-volume bigSpec fixture + the 3D fixture; scale/depth is this script's
+# job, not smoke's). Run this only on the machine that has ${GROUND_TRUTH_DIR}.
+# ─────────────────────────────────────────────────────────────────────────────
+#
 # matrix.sh — the DEEPER, SLOWER end-to-end correctness gate for the PJ Cloud
 # Connector. Where `make smoke` is the fast (~seconds) per-change regression gate,
 # `make matrix` exercises the spec §11 Layer-3/4 round-trip MATRIX: the session
@@ -41,14 +60,22 @@
 #       (warm-start works because ETag == GCS Generation). Reaps the GCS server +
 #       its DB; tears fake-gcs down IFF this leg started it.
 # ─────────────────────────────────────────────────────────────────────────────
-# PINNED GROUND TRUTH — these track the smoke.sh constants + the C++ live tests.
+# PINNED GROUND TRUTH — self-contained to THIS script and THIS legacy real
+# corpus (${GROUND_TRUTH_DIR}, the 8 "nissan_zala_*" MCAPs). These do NOT
+# track scripts/smoke.sh or the C++ live gtests (plugin/toolbox_dexory_cloud/
+# tests/*_live_test.cpp) — since the catalog-migration cutover (2026-07-06)
+# those run against an entirely different, synthetic Hive-keyed corpus
+# (server/internal/genmcap's deterministic generator) that has no relationship
+# to jkk_dataset02's file names/counts. Any historical claim of the two
+# tracking in lockstep is STALE and no longer true; treat matrix.sh's pins
+# below as independent of smoke/C++ ground truth.
 # All counts independently re-derived from the on-disk corpus on 2026-06-05:
 #   per-file: sagod 44416, zeg_1 33670, zeg_2 43301, zeg_3 21731, zeg_4 22311,
 #             country_road_1 46906, country_road_2 73704, mixed 51822  (Σ 337861)
 #   boundary window [1696578000000000000,1696578150000000000): zeg_2 18772 +
 #             zeg_3 10689 = 29461.
-# If the bucket is reseeded, update these HERE and in lockstep with scripts/smoke.sh
-# + the C++ live tests.
+# If the bucket is reseeded, update these HERE only — nothing else needs to
+# move in lockstep anymore.
 # ─────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 

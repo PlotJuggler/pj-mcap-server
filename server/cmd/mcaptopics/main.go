@@ -6,7 +6,10 @@
 // It uses the same foxglove/mcap reader as mcapdiff, counting messages by
 // channel topic so the numbers are derived from the actual records (not the
 // summary statistics), making it a strong cross-check of the server's catalog
-// extraction.
+// extraction. The report also includes start_ns/end_ns (the min/max observed
+// message log_time across the iterated records), an independent oracle for
+// a file's recorded time range — again derived from the raw message stream,
+// not read from the MCAP Statistics summary record.
 //
 // Usage:
 //
@@ -41,10 +44,17 @@ type topicCount struct {
 }
 
 type report struct {
-	Path         string       `json:"path"`
-	TopicCount   int          `json:"topic_count"`
-	MessageCount uint64       `json:"message_count"`
-	Topics       []topicCount `json:"topics"`
+	Path         string `json:"path"`
+	TopicCount   int    `json:"topic_count"`
+	MessageCount uint64 `json:"message_count"`
+	// StartNs/EndNs are the min/max observed message log_time across every
+	// iterated record (0/0 if the file has no messages) — an INDEPENDENT
+	// computation from the raw message stream, not a read of the MCAP
+	// Statistics summary record, so it cross-checks the server's own
+	// summary-derived start/end without sharing its data source.
+	StartNs uint64       `json:"start_ns"`
+	EndNs   uint64       `json:"end_ns"`
+	Topics  []topicCount `json:"topics"`
 }
 
 func main() {
@@ -85,6 +95,8 @@ func run() int {
 	var total uint64
 	var lastLogTime uint64
 	var haveLast bool
+	var minLogTime, maxLogTime uint64
+	var haveRange bool
 	nonMonotonic := false
 	for {
 		sch, ch, msg, err := it.NextInto(nil)
@@ -107,6 +119,17 @@ func run() int {
 			lastLogTime = msg.LogTime
 			haveLast = true
 		}
+		if !haveRange {
+			minLogTime, maxLogTime = msg.LogTime, msg.LogTime
+			haveRange = true
+		} else {
+			if msg.LogTime < minLogTime {
+				minLogTime = msg.LogTime
+			}
+			if msg.LogTime > maxLogTime {
+				maxLogTime = msg.LogTime
+			}
+		}
 		tc := counts[ch.Topic]
 		if tc == nil {
 			tc = &topicCount{Name: ch.Topic}
@@ -123,7 +146,7 @@ func run() int {
 		return 1
 	}
 
-	rep := report{Path: path, MessageCount: total}
+	rep := report{Path: path, MessageCount: total, StartNs: minLogTime, EndNs: maxLogTime}
 	for _, tc := range counts {
 		rep.Topics = append(rep.Topics, *tc)
 	}

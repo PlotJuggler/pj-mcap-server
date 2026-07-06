@@ -49,16 +49,57 @@ func hiveKeyFor(spec genmcap.FileSpec, i int) string {
 	)
 }
 
+// bigSpec is a single ADDITIONAL fixture (never part of DefaultSpecs — those
+// are shared, pinned CI/ci-integration ground truth; perturbing their counts
+// would ripple into unrelated gates). It exists for callers (the catalog-
+// migration smoke harness) that need a file with enough VOLUME to force
+// multiple WS session batches — DefaultSpecs' files are all well under the
+// default 512KiB max_batch_bytes threshold, so a resume/reconnect test that
+// forces a drop "after batch N>1" never finds enough batches to drop from.
+// 3000 messages * 2048 bytes ≈ 6MiB, comfortably >10 size-triggered batches.
+// Time-disjoint from every DefaultSpecs file (StartNs=8000s, past f_lz4's
+// 6000.29s end) and from the 3D fixture (StartNs=1.7e18s).
+func bigSpec() genmcap.FileSpec {
+	const sec = 1_000_000_000
+	return genmcap.FileSpec{
+		Key:          "ci_synth_big.mcap",
+		StartNs:      8000 * sec,
+		StepNs:       1_000_000, // 1ms
+		PayloadBytes: 2048,
+		ChunkSize:    256 * 1024,
+		Topics: []genmcap.TopicSpec{
+			{Topic: "/clock", SchemaName: "rosgraph_msgs/msg/Clock", SchemaEnc: "ros2msg", MessageCount: 500},
+			{Topic: "/odom", SchemaName: "nav_msgs/msg/Odometry", SchemaEnc: "ros2msg", MessageCount: 500},
+			{Topic: "/imu", SchemaName: "sensor_msgs/msg/Imu", SchemaEnc: "ros2msg", MessageCount: 2000},
+		},
+	}
+}
+
+// bigHiveKey is bigSpec's FIXED Hive key — a distinct robot/date from every
+// hiveKeyFor(spec, i) output so it never collides with the alternating
+// DefaultSpecs layout.
+const bigHiveKey = "customer=test/customer_site=lab/robot=r1/source=synthetic/date=2026-06-24/ci_synth_big.mcap"
+
 func main() {
 	out := flag.String("out", "", "output directory for the synthetic MCAP fixtures (required)")
 	manifest := flag.Bool("manifest", false, "print a JSON manifest of the fixtures to stdout")
 	hive := flag.Bool("hive", false, "lay fixtures out under Hive-partitioned keys "+
 		"(customer=/customer_site=/robot=/source=/date=/<name>.mcap) so the auryn builder "+
 		"extracts dimensions; default is the flat layout")
+	hiveBig := flag.Bool("hive-big", false, "requires -hive: ALSO write bigSpec(), a "+
+		"high-volume (~6MiB) fixture at a fixed Hive key for tests that need multiple "+
+		"WS session batches (e.g. reconnect-resume). No-op without -hive.")
 	flag.Parse()
 
 	if *out == "" {
 		fmt.Fprintln(os.Stderr, "gen-ci-fixtures: -out <dir> is required")
+		os.Exit(2)
+	}
+	// S5: validate every flag combination BEFORE writing a single fixture (or
+	// even creating -out) — a flag error must never leave a partially
+	// populated (or newly created, empty) output directory behind.
+	if *hiveBig && !*hive {
+		fmt.Fprintln(os.Stderr, "gen-ci-fixtures: -hive-big requires -hive")
 		os.Exit(2)
 	}
 	if err := os.MkdirAll(*out, 0o755); err != nil {
@@ -76,11 +117,7 @@ func main() {
 	}
 	var mf []fileManifest
 
-	for i, spec := range specs {
-		rel := spec.Key
-		if *hive {
-			rel = hiveKeyFor(spec, i)
-		}
+	writeOne := func(spec genmcap.FileSpec, rel string) {
 		path := filepath.Join(*out, rel)
 		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 			fmt.Fprintf(os.Stderr, "gen-ci-fixtures: mkdir %q: %v\n", filepath.Dir(path), err)
@@ -108,6 +145,18 @@ func main() {
 			Topics:        len(spec.Topics),
 		})
 		fmt.Fprintf(os.Stderr, "wrote %s (%d msgs, %d topics)\n", path, spec.TotalMessages(), len(spec.Topics))
+	}
+
+	for i, spec := range specs {
+		rel := spec.Key
+		if *hive {
+			rel = hiveKeyFor(spec, i)
+		}
+		writeOne(spec, rel)
+	}
+
+	if *hiveBig {
+		writeOne(bigSpec(), bigHiveKey)
 	}
 
 	if *manifest {

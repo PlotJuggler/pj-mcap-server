@@ -32,40 +32,53 @@ const char* liveUrl() {
   return std::getenv("DEXORY_CLOUD_LIVE_URL");
 }
 
-// Ground truth for the Minio fixture set (see CLAUDE.md / harness brief).
+// Ground truth for the catalog-migration synthetic Hive-keyed corpus (see
+// scripts/smoke.sh's "structural identifiers" comment block). The TARGET is
+// gen-ci-fixtures' bigSpec() (`-hive-big`, cmd/gen-ci-fixtures/main.go) — NOT
+// one of genmcap.DefaultSpecs() — because these live tests (specifically the
+// reconnect-resume legs) need enough VOLUME to force multiple WS session
+// batches; DefaultSpecs' files are all well under the 512KiB max_batch_bytes
+// default. Regenerate with:
+//   server/bin/gen-ci-fixtures -hive -hive-big -out DIR -manifest
+// The sequence NAME is the FULL Hive object key (s3_key rebuilt from
+// dimensions, catalog-migration §5) — bigSpec at a FIXED robot=r1/date=
+// 2026-06-24 (3 topics: /clock 500, /odom 500, /imu 2000 = 3000 total).
 constexpr int kExpectedSequenceCount = 8;
-constexpr const char* kKnownSequence = "nissan_zala_50_zeg_1_0.mcap";
-constexpr std::int64_t kImuMessageCount = 14904;
-constexpr const char* kImuTopic = "/nissan/gps/duro/imu";
+constexpr const char* kKnownSequence =
+    "customer=test/customer_site=lab/robot=r1/source=synthetic/date=2026-06-24/ci_synth_big.mcap";
+constexpr std::int64_t kImuMessageCount = 2000;
+constexpr const char* kImuTopic = "/imu";
 
-// Slice 7 stitched ground truth (pinned in lockstep with scripts/smoke.sh +
-// session_download_live_test.cpp): two consecutive, time-disjoint nissan files
-// stitch into one continuous logical stream of 65032 messages.
-constexpr const char* kStitchKeyA = "nissan_zala_50_zeg_2_0.mcap";
-constexpr std::int64_t kStitchMessagesA = 43301;
-constexpr const char* kStitchKeyB = "nissan_zala_50_zeg_3_0.mcap";
-constexpr std::int64_t kStitchMessagesB = 21731;
-constexpr std::int64_t kStitchMessages = 65032;  // A + B
+// Stitched ground truth (pinned in lockstep with scripts/smoke.sh +
+// session_download_live_test.cpp): the target (bigSpec) and DefaultSpecs()[1]
+// "ci_synth_b.mcap" are time-disjoint synthetic files that stitch into one
+// continuous logical stream.
+constexpr const char* kStitchKeyA = kKnownSequence;  // ci_synth_big.mcap, 3000 msgs
+constexpr std::int64_t kStitchMessagesA = 3000;
+constexpr const char* kStitchKeyB =
+    "customer=test/customer_site=lab/robot=r2/source=synthetic/date=2026-06-23/ci_synth_b.mcap";
+constexpr std::int64_t kStitchMessagesB = 130;
+constexpr std::int64_t kStitchMessages = 3130;  // A + B
 
 const std::vector<std::string> kKnownTopics = {
-    "/nissan/gps/duro/current_pose", "/nissan/gps/duro/imu",   "/nissan/gps/duro/mag",
-    "/nissan/gps/duro/status_string", "/nissan/vehicle_speed", "/nissan/vehicle_steering",
+    "/clock", "/imu", "/odom",
 };
 
-// B3 ground truth (Slice 14): the server's Hello handler now DERIVES
-// BackendCapabilities from the catalog (was hardcoded). Pinned in lockstep with
+// B3 ground truth (Slice 14): the server's Hello handler DERIVES
+// BackendCapabilities from the catalog. Pinned in lockstep with
 // server/internal/catalog/caps.go:
-//   - supports_file_hierarchy = (any s3_key contains '/'). The Dexory nissan
-//     corpus is FLAT (object keys like "nissan_zala_50_zeg_1_0.mcap", no '/'),
-//     so this stays false.
+//   - supports_file_hierarchy = (any s3_key contains '/'). The synthetic
+//     corpus is Hive-PARTITIONED (every key looks like
+//     "customer=.../customer_site=.../robot=.../source=.../date=.../name.mcap"),
+//     so this is now true (was false for the legacy flat nissan corpus).
 //   - metadata_key_vocabulary = the 8 constant DERIVED keys (caps.go
 //     derivedMetadataKeys) UNION the distinct tags_effective keys, sorted +
-//     de-duplicated. On a clean nissan bucket (no embedded MCAP tags) the
-//     vocabulary is exactly the 8 derived keys; during the smoke tag-flow (step
-//     h adds then removes a transient override tag) it can momentarily carry an
+//     de-duplicated. On a clean corpus (no embedded MCAP tags) the vocabulary
+//     is exactly the 8 derived keys; during the smoke tag-flow (step h adds
+//     then removes a transient override tag) it can momentarily carry an
 //     extra key. So we assert the DERIVED-KEY SUBSET is present + the list is
 //     sorted (resilient to transient tags), NOT exact equality.
-constexpr bool kExpectFileHierarchy = false;
+constexpr bool kExpectFileHierarchy = true;
 // caps.go derivedMetadataKeys, sorted — the stable floor of the vocabulary.
 const std::vector<std::string> kExpectDerivedVocabKeys = {
     "chunk_count", "duration_ns", "end_ns", "message_count", "s3_key", "size_bytes", "start_ns", "topic_count",
@@ -97,8 +110,8 @@ TEST(DexoryCloudBackendLive, ConnectListSequencesAndTopics) {
 
 // B3: the HelloResponse.backend (BackendCapabilities) the server advertises is
 // parsed and exposed via backendCapabilities(). The server now DERIVES these
-// from the catalog (Slice 14, caps.go), so assert the derived contract: flat
-// catalog (no hierarchy) for the Dexory nissan corpus, and a metadata
+// from the catalog (Slice 14, caps.go), so assert the derived contract: a
+// hierarchical (Hive-keyed) catalog for the synthetic corpus, and a metadata
 // vocabulary that (a) is sorted and (b) contains the constant derived-key set.
 // The subset+sorted form is resilient to the smoke tag-flow transiently adding
 // an override-tag key to the vocabulary (step h sets then unsets a tag).
@@ -117,7 +130,7 @@ TEST(DexoryCloudBackendLive, BackendCapabilities) {
   const auto caps = conn.backendCapabilities();
   ASSERT_TRUE(caps.has_value()) << "server advertised no BackendCapabilities (has_backend()==false)";
 
-  // Flat nissan corpus: no object key contains '/', so no hierarchy.
+  // Hive-keyed corpus: every object key contains '/', so hierarchy is supported.
   EXPECT_EQ(caps->supports_file_hierarchy, kExpectFileHierarchy)
       << "supports_file_hierarchy mismatch — derived from s3_key LIKE '%/%' (caps.go)";
 
@@ -136,9 +149,9 @@ TEST(DexoryCloudBackendLive, BackendCapabilities) {
   }
 }
 
-// Ground-truth assertions against the known Minio fixture set: exact sequence
-// count, the known nissan_zala_50 MCAP with its exact 6 topics, the imu topic's
-// exact message count, and a non-empty sequence metadata map carrying a
+// Ground-truth assertions against the known synthetic Minio fixture set: exact
+// sequence count, the known target MCAP with its exact topic set, the imu
+// topic's exact message count, and a non-empty sequence metadata map carrying a
 // "message_count" key.
 TEST(DexoryCloudBackendLive, GroundTruthCatalog) {
   const char* url = liveUrl();
@@ -171,7 +184,7 @@ TEST(DexoryCloudBackendLive, GroundTruthCatalog) {
   EXPECT_NE(known->user_metadata.find("message_count"), known->user_metadata.end())
       << "sequence metadata missing 'message_count' key";
 
-  // Exactly the 6 known topics, by name (order-independent).
+  // Exactly the 3 known topics, by name (order-independent).
   const auto topics = conn.listTopics(kKnownSequence);
   ASSERT_EQ(topics.size(), kKnownTopics.size())
       << "expected exactly " << kKnownTopics.size() << " topics in " << kKnownSequence;
@@ -198,9 +211,10 @@ TEST(DexoryCloudBackendLive, GroundTruthCatalog) {
   EXPECT_EQ(imu->message_count, kImuMessageCount) << "imu message_count mismatch";
 }
 
-// Slice 7 stitched ground truth: the two consecutive nissan files used by the
-// stitched download legs are present, time-disjoint and orderable, and carry the
-// exact per-file message counts (43301 + 21731 = 65032) in their metadata. These
+// Stitched ground truth: the two time-disjoint synthetic files used by the
+// stitched download legs (bigSpec's ci_synth_big.mcap + DefaultSpecs()[1]
+// ci_synth_b.mcap) are present, time-disjoint and orderable, and carry the
+// exact per-file message counts (3000 + 130 = 3130) in their metadata. These
 // constants are pinned in lockstep with scripts/smoke.sh + the session-download
 // live test; this asserts the catalog still matches before a stitched pull runs.
 TEST(DexoryCloudBackendLive, StitchedGroundTruth) {
@@ -236,14 +250,14 @@ TEST(DexoryCloudBackendLive, StitchedGroundTruth) {
   ASSERT_NE(a, nullptr) << "stitch key A '" << kStitchKeyA << "' not present";
   ASSERT_NE(b, nullptr) << "stitch key B '" << kStitchKeyB << "' not present";
 
-  EXPECT_EQ(msgCount(*a), kStitchMessagesA) << "zeg_2 message_count mismatch";
-  EXPECT_EQ(msgCount(*b), kStitchMessagesB) << "zeg_3 message_count mismatch";
+  EXPECT_EQ(msgCount(*a), kStitchMessagesA) << "ci_synth_big.mcap message_count mismatch";
+  EXPECT_EQ(msgCount(*b), kStitchMessagesB) << "ci_synth_b.mcap message_count mismatch";
   EXPECT_EQ(kStitchMessagesA + kStitchMessagesB, kStitchMessages);
 
   // Time-disjoint + orderable: one ends at or before the other starts (the
   // stitched pull requires pairwise non-overlapping, orderable ranges).
   const bool disjoint = (a->max_ts_ns <= b->min_ts_ns) || (b->max_ts_ns <= a->min_ts_ns);
-  EXPECT_TRUE(disjoint) << "zeg_2 / zeg_3 time ranges overlap — stitching would be rejected";
+  EXPECT_TRUE(disjoint) << "ci_synth_big.mcap / ci_synth_b.mcap time ranges overlap — stitching would be rejected";
 
   // Both resolve to file_ids in the order requested.
   ASSERT_FALSE(sequences.empty());

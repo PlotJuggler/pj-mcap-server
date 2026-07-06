@@ -7,10 +7,13 @@
 //   DEXORY_CLOUD_LIVE_URL=ws://localhost:8082 ctest -R DexoryCloudSessionResumeLive
 //
 // Coverage (ground truth pinned in lockstep with smoke.sh + the other live
-// tests: nissan_zala_50_zeg_1_0.mcap = 33670 messages / 6 topics):
+// tests: gen-ci-fixtures' bigSpec() "ci_synth_big.mcap" (`-hive-big`) = 3000
+// messages / 3 topics — a high-VOLUME fixture (~6MiB) so testForceDropAfter-
+// Batches(3) below reliably finds enough WS session batches to drop from;
+// DefaultSpecs' small fixtures are all under one batch's worth of bytes):
 //   1. ForcedMidPullDropResumesToComplete — testForceDropAfterBatches(N) drops the
 //      socket mid-download; the resume loop reconnects + OpenResume and drives the
-//      stream to COMPLETE with EXACTLY 33670 messages and NO duplicates
+//      stream to COMPLETE with EXACTLY 3000 messages and NO duplicates
 //      (received == server Eos.total_messages_sent). Proves gap-free + dupe-free.
 //   2. ResumeNotPossibleIsCleanVerbatim — openSessionResume() with a bogus
 //      (never-existed) subscription_id returns the VERBATIM server message
@@ -53,14 +56,12 @@ namespace {
 
 const char* liveUrl() { return std::getenv("DEXORY_CLOUD_LIVE_URL"); }
 
-constexpr const char* kSeq = "nissan_zala_50_zeg_1_0.mcap";
-constexpr std::uint64_t kTotalMessages = 33670;
+constexpr const char* kSeq =
+    "customer=test/customer_site=lab/robot=r1/source=synthetic/date=2026-06-24/ci_synth_big.mcap";
+constexpr std::uint64_t kTotalMessages = 3000;
 
 const std::vector<std::string>& allTopics() {
-  static const std::vector<std::string> kTopics = {
-      "/nissan/gps/duro/imu",       "/nissan/gps/duro/current_pose", "/nissan/gps/duro/mag",
-      "/nissan/gps/duro/status_string", "/nissan/vehicle_speed",     "/nissan/vehicle_steering",
-  };
+  static const std::vector<std::string> kTopics = {"/clock", "/imu", "/odom"};
   return kTopics;
 }
 
@@ -221,12 +222,12 @@ TEST(DexoryCloudSessionResumeLive, RepeatFetchIsCacheHitZeroTransport) {
   for (const auto& t : topics) {
     EXPECT_TRUE(finished1[t]) << "first pull topic failed: " << t;
   }
-  // Recorder-side ground truth (host-delegated): one ingest context, all 6
-  // topics bound, raw pushes == the pinned zeg_1 counts (imu 14904 / 33670).
+  // Recorder-side ground truth (host-delegated): one ingest context, all 3
+  // topics bound, raw pushes == the pinned ci_synth_big counts (imu 2000/3000).
   ASSERT_EQ(fake.created.size(), 1u) << "first pull should create exactly one parser-ingest context";
   ASSERT_EQ(fake.bindings.size(), topics.size());
   EXPECT_EQ(fake.pushes.size(), kTotalMessages);
-  EXPECT_EQ(pj_ingest_test::pushesForTopic(fake, "/nissan/gps/duro/imu"), 14904u);
+  EXPECT_EQ(pj_ingest_test::pushesForTopic(fake, "/imu"), 2000u);
   const int create_calls_after_first = host.createDataSourceCalls();
   EXPECT_EQ(create_calls_after_first, 1) << "first pull should create exactly one data source";
   EXPECT_EQ(worker.sessionCacheForTest().size(), 1u) << "COMPLETE pull must be cached";
@@ -258,7 +259,7 @@ TEST(DexoryCloudSessionResumeLive, RepeatFetchIsCacheHitZeroTransport) {
   EXPECT_EQ(fake.created.size(), ingest_creates_after_first) << "cache HIT must NOT re-create an ingest context";
   EXPECT_EQ(fake.pushes.size(), pushes_after_first) << "cache HIT must NOT re-push messages";
   // The re-emitted ledger counts come from the SESSION CACHE, not a re-ingest.
-  EXPECT_EQ(cached_counts["/nissan/gps/duro/imu"], 14904);
+  EXPECT_EQ(cached_counts["/imu"], 2000);
 }
 
 // Hermetic (NO gate): pin the spec §10 reconnect backoff schedule + attempt cap.

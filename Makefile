@@ -71,11 +71,20 @@ clean:
 	rm -f coverage.out coverage.html
 
 # ── SDK harness ──────────────────────────────────────────────────────────────
-# smoke: the single headless regression gate. Ensures Minio is up, builds and
-# starts its OWN server on :8081 (never touching the interactive :8080 instance
-# nor /tmp/pj-cloud-server.pid), runs the Go discovery assertions and the C++
-# SDK tests (hermetic + live), and prints SMOKE PASS / SMOKE FAIL. Self-contained
-# and idempotent. See scripts/smoke.sh for the pinned ground-truth constants.
+# smoke: the single headless regression gate — rewritten for the catalog-
+# migration cutover (2026-07-06). Ensures Minio is up, generates + seeds a
+# FRESH synthetic Hive-keyed MCAP corpus into a dedicated bucket, starts its OWN
+# Python `mcap_catalog` builder daemon (the sole catalog writer + tag-edit IPC
+# server) and its OWN Go server in `-external-builder` read-only mode on :8081
+# (never touching the interactive :8080 instance nor /tmp/pj-cloud-server.pid),
+# runs the Go discovery assertions (cross-checked against an independent
+# `mcaptopics` oracle, never hardcoded counts) and the C++ SDK tests (hermetic +
+# live), a full round-trip matrix, a restart-persistence check, and a tag-edit
+# flow that survives a full catalog REBUILD — then prints SMOKE PASS / SMOKE
+# FAIL. Self-contained and idempotent; needs the venv at
+# ~/.venvs/pj-catalog (boto3, mcap, watchdog — see scripts/smoke.sh's bootstrap
+# error for the exact command if it's missing). See scripts/smoke.sh for the
+# full architecture and ground-truth derivation.
 smoke:
 	bash scripts/smoke.sh
 
