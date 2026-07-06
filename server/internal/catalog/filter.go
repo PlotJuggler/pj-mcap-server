@@ -58,9 +58,15 @@ type FileSummary struct {
 //
 // Returns (files, nextPageToken, error). nextPageToken is empty when exhausted.
 // A read-only Store (OpenReadOnly) filters against the auryn schema.
+//
+// Pins db := s.DB() ONCE and threads it through both the summary query and the
+// per-row tag-attach loop below (B1 — catalog-migration §6.2a review): a
+// mid-loop ReopenIfSwapped swap must never let a later row's tags come from a
+// different generation than its summary.
 func FilterFiles(ctx context.Context, s *Store, args FilterArgs) ([]FileSummary, string, error) {
+	db := s.DB()
 	if s.readOnly {
-		return aurynFilterFiles(ctx, s, args)
+		return aurynFilterFiles(ctx, db, args)
 	}
 	limit := args.Limit
 	if limit <= 0 {
@@ -147,7 +153,7 @@ func FilterFiles(ctx context.Context, s *Store, args FilterArgs) ([]FileSummary,
 		 LIMIT ?`, where)
 	params = append(params, limit+1) // +1 to detect "has more"
 
-	rows, err := s.DB().QueryContext(ctx, q, params...)
+	rows, err := db.QueryContext(ctx, q, params...)
 	if err != nil {
 		return nil, "", fmt.Errorf("filter query: %w", err)
 	}
@@ -173,9 +179,12 @@ func FilterFiles(ctx context.Context, s *Store, args FilterArgs) ([]FileSummary,
 	}
 
 	// Attach effective tags (N+1 query per returned row — acceptable at v1 scale;
-	// flagged for M2 if the corpus grows large, idx_tags_*_kv exist).
+	// flagged for M2 if the corpus grows large, idx_tags_*_kv exist). Uses the
+	// pinned db (B1), not the Store-level EffectiveTags, for the same reason as
+	// aurynFilterFiles above — this path never swaps today (legacy store), but
+	// the code shape should not depend on that.
 	for i := range out {
-		tags, err := EffectiveTags(ctx, s, out[i].ID)
+		tags, err := effectiveTagsDB(ctx, db, out[i].ID)
 		if err != nil {
 			return nil, "", err
 		}

@@ -2,6 +2,7 @@ package catalog
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 )
 
@@ -61,26 +62,34 @@ type Vocabulary struct {
 
 // GetVocabulary assembles the vocabulary from the auryn dimension tables + the tag
 // facet query. Returns an empty (non-nil) Vocabulary on a legacy Go-schema store.
+//
+// Pins db := s.DB() ONCE and threads it through every phase below (B1 —
+// catalog-migration §6.2a review): the vocabulary is built from ~8 separate
+// queries (per-dimension counts, the robot/site/customer tree, sources, tag
+// facets) that must all describe the SAME generation — a swap landing mid-build
+// could otherwise pair one generation's file counts with another generation's
+// dimension rows.
 func GetVocabulary(ctx context.Context, s *Store) (*Vocabulary, error) {
 	if !s.readOnly {
 		// The live Go-schema path has no dimension tables. Return empty rather than
 		// erroring so the RPC is always answerable (no client uses it pre-cutover).
 		return &Vocabulary{}, nil
 	}
+	db := s.DB()
 
-	custCount, err := groupCount(ctx, s, "customer_id")
+	custCount, err := groupCount(ctx, db, "customer_id")
 	if err != nil {
 		return nil, err
 	}
-	siteCount, err := groupCount(ctx, s, "site_id")
+	siteCount, err := groupCount(ctx, db, "site_id")
 	if err != nil {
 		return nil, err
 	}
-	robotCount, err := groupCount(ctx, s, "robot_id")
+	robotCount, err := groupCount(ctx, db, "robot_id")
 	if err != nil {
 		return nil, err
 	}
-	srcCount, err := groupCount(ctx, s, "source_id")
+	srcCount, err := groupCount(ctx, db, "source_id")
 	if err != nil {
 		return nil, err
 	}
@@ -89,7 +98,7 @@ func GetVocabulary(ctx context.Context, s *Store) (*Vocabulary, error) {
 	// dimension rows (the auryn builder leaves lookup rows behind on delete/rename
 	// by design), so the vocabulary never shows a ghost node with file_count=0.
 	robotsBySite := map[uint64][]VocabRobot{}
-	if err := queryRows(ctx, s,
+	if err := queryRows(ctx, db,
 		`SELECT id, site_id, name FROM robots r WHERE EXISTS (SELECT 1 FROM files WHERE robot_id = r.id) ORDER BY name`,
 		func(scan func(...any) error) error {
 			var id, siteID uint64
@@ -106,7 +115,7 @@ func GetVocabulary(ctx context.Context, s *Store) (*Vocabulary, error) {
 
 	// sites grouped by customer_id, each with its robots, sorted by name.
 	sitesByCustomer := map[uint64][]VocabSite{}
-	if err := queryRows(ctx, s,
+	if err := queryRows(ctx, db,
 		`SELECT id, customer_id, name FROM sites s WHERE EXISTS (SELECT 1 FROM files WHERE site_id = s.id) ORDER BY name`,
 		func(scan func(...any) error) error {
 			var id, custID uint64
@@ -122,7 +131,7 @@ func GetVocabulary(ctx context.Context, s *Store) (*Vocabulary, error) {
 	}
 
 	var vocab Vocabulary
-	if err := queryRows(ctx, s,
+	if err := queryRows(ctx, db,
 		`SELECT id, name FROM customers c WHERE EXISTS (SELECT 1 FROM files WHERE customer_id = c.id) ORDER BY name`,
 		func(scan func(...any) error) error {
 			var id uint64
@@ -137,7 +146,7 @@ func GetVocabulary(ctx context.Context, s *Store) (*Vocabulary, error) {
 		return nil, err
 	}
 
-	if err := queryRows(ctx, s,
+	if err := queryRows(ctx, db,
 		`SELECT id, name FROM sources src WHERE EXISTS (SELECT 1 FROM files WHERE source_id = src.id) ORDER BY name`,
 		func(scan func(...any) error) error {
 			var id uint64
@@ -152,7 +161,7 @@ func GetVocabulary(ctx context.Context, s *Store) (*Vocabulary, error) {
 		return nil, err
 	}
 
-	facets, err := tagFacets(ctx, s)
+	facets, err := tagFacets(ctx, db)
 	if err != nil {
 		return nil, err
 	}
@@ -161,11 +170,12 @@ func GetVocabulary(ctx context.Context, s *Store) (*Vocabulary, error) {
 }
 
 // groupCount returns file counts grouped by a dimension FK column on files.
-func groupCount(ctx context.Context, s *Store, col string) (map[uint64]uint64, error) {
+// Takes an already-pinned db (B1) — see GetVocabulary.
+func groupCount(ctx context.Context, db *sql.DB, col string) (map[uint64]uint64, error) {
 	out := map[uint64]uint64{}
 	// col is an internal constant (never user input) — safe to interpolate.
 	q := fmt.Sprintf(`SELECT %s, COUNT(*) FROM files GROUP BY %s`, col, col)
-	if err := queryRows(ctx, s, q, func(scan func(...any) error) error {
+	if err := queryRows(ctx, db, q, func(scan func(...any) error) error {
 		var id, n uint64
 		if err := scan(&id, &n); err != nil {
 			return err
@@ -179,15 +189,16 @@ func groupCount(ctx context.Context, s *Store, col string) (map[uint64]uint64, e
 }
 
 // tagFacets groups tags_effective into per-key facets, dropping keys whose distinct
-// value count exceeds TagFacetCap (V4). Keys + values are returned sorted.
-func tagFacets(ctx context.Context, s *Store) ([]VocabFacet, error) {
+// value count exceeds TagFacetCap (V4). Keys + values are returned sorted. Takes
+// an already-pinned db (B1) — see GetVocabulary.
+func tagFacets(ctx context.Context, db *sql.DB) ([]VocabFacet, error) {
 	type kv struct {
 		value string
 		count uint64
 	}
 	byKey := map[string][]kv{}
 	var keyOrder []string
-	if err := queryRows(ctx, s,
+	if err := queryRows(ctx, db,
 		`SELECT key, value, COUNT(*) FROM tags_effective GROUP BY key, value ORDER BY key, value`,
 		func(scan func(...any) error) error {
 			var key, value string
@@ -218,10 +229,11 @@ func tagFacets(ctx context.Context, s *Store) ([]VocabFacet, error) {
 	return out, nil
 }
 
-// queryRows runs q and invokes fn for each row; fn receives a scan closure bound to
-// the current row. Centralizes the rows.Close/Err boilerplate.
-func queryRows(ctx context.Context, s *Store, q string, fn func(scan func(...any) error) error) error {
-	rows, err := s.DB().QueryContext(ctx, q)
+// queryRows runs q against an already-pinned db and invokes fn for each row; fn
+// receives a scan closure bound to the current row. Centralizes the
+// rows.Close/Err boilerplate.
+func queryRows(ctx context.Context, db *sql.DB, q string, fn func(scan func(...any) error) error) error {
+	rows, err := db.QueryContext(ctx, q)
 	if err != nil {
 		return err
 	}

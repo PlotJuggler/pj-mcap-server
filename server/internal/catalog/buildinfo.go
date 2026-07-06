@@ -11,8 +11,14 @@ import (
 // indexer-run signals orphaned by moving the writer out of process. Present is
 // false on the legacy (read-write Go) store or before the first build.
 type BuildInfo struct {
-	Present        bool
-	BuildID        int64 // monotonic; bumps each completed build (swap-detection §6.2a)
+	Present bool
+	// BuildID is a monotonic freshness/confirmation counter (bumps each completed
+	// build). It is NOT the swap-detection trigger for §6.2a — that is file
+	// identity ((dev, inode) of the served path; see ReopenIfSwapped in
+	// reopen.go and CATALOG_CONTRACT.md §9). BuildID is not even guaranteed
+	// comparable across a rebuild's best-effort seeding; use it only to display
+	// "which build is being served", never to decide whether to reopen.
+	BuildID        int64
 	LastBuildNs    int64
 	FilesScanned   int64
 	FilesFailed    int64

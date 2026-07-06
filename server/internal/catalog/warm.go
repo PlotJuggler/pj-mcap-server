@@ -1,6 +1,9 @@
 package catalog
 
-import "context"
+import (
+	"context"
+	"database/sql"
+)
 
 // WarmEntry is the (object key, change-detect etag) a chunk-index warmer needs to
 // pre-fill the cache: the etag is part of the cache key, so a warmed entry is
@@ -15,15 +18,16 @@ type WarmEntry struct {
 // is rebuilt from dimensions; on the legacy Go-schema store it is the stored
 // s3_key. Ordered by id for a stable, resumable warm sweep.
 func WarmEntries(ctx context.Context, s *Store) ([]WarmEntry, error) {
+	db := s.DB()
 	if s.readOnly {
-		return aurynWarmEntries(ctx, s)
+		return aurynWarmEntries(ctx, db)
 	}
-	return legacyWarmEntries(ctx, s)
+	return legacyWarmEntries(ctx, db)
 }
 
-func aurynWarmEntries(ctx context.Context, s *Store) ([]WarmEntry, error) {
+func aurynWarmEntries(ctx context.Context, db *sql.DB) ([]WarmEntry, error) {
 	var out []WarmEntry
-	err := queryRows(ctx, s, `
+	err := queryRows(ctx, db, `
 		SELECT c.name, st.name, r.name, src.name, f.date, f.filename, f.etag
 		FROM files f
 		JOIN customers c ON c.id = f.customer_id
@@ -48,9 +52,9 @@ func aurynWarmEntries(ctx context.Context, s *Store) ([]WarmEntry, error) {
 	return out, nil
 }
 
-func legacyWarmEntries(ctx context.Context, s *Store) ([]WarmEntry, error) {
+func legacyWarmEntries(ctx context.Context, db *sql.DB) ([]WarmEntry, error) {
 	var out []WarmEntry
-	err := queryRows(ctx, s, `SELECT s3_key, s3_etag FROM files ORDER BY id`,
+	err := queryRows(ctx, db, `SELECT s3_key, s3_etag FROM files ORDER BY id`,
 		func(scan func(...any) error) error {
 			var key, etag string
 			if err := scan(&key, &etag); err != nil {

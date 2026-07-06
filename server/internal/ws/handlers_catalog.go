@@ -67,20 +67,19 @@ func (h *CatalogHandler) ListFiles(ctx context.Context, req *pb.ListFilesRequest
 }
 
 // GetFile returns the summary + topics + effective tags, mapping ErrFileNotFound.
+//
+// Uses the compound catalog.GetFileDetail (B1 — catalog-migration §6.2a
+// review) rather than three separate GetFile/ListTopicsForFile/EffectiveTags
+// calls: each of those independently re-fetches Store.DB(), so a
+// ReopenIfSwapped landing between them could pair one generation's file
+// summary with another generation's topics/tags. GetFileDetail pins the
+// handle once and runs all three phases against it.
 func (h *CatalogHandler) GetFile(ctx context.Context, req *pb.GetFileRequest) (*pb.GetFileResponse, error) {
-	rec, err := catalog.GetFile(ctx, h.Store, req.GetFileId())
+	rec, topics, tags, err := catalog.GetFileDetail(ctx, h.Store, req.GetFileId())
 	if err != nil {
 		if errors.Is(err, catalog.ErrFileNotFound) {
 			return nil, errFileNotFound{id: req.GetFileId()}
 		}
-		return nil, err
-	}
-	topics, err := catalog.ListTopicsForFile(ctx, h.Store, rec.ID)
-	if err != nil {
-		return nil, err
-	}
-	tags, err := catalog.EffectiveTags(ctx, h.Store, rec.ID)
-	if err != nil {
 		return nil, err
 	}
 	resp := &pb.GetFileResponse{

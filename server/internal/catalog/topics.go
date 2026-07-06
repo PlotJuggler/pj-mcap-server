@@ -42,11 +42,24 @@ func ReplaceTopicsForFile(ctx context.Context, s *Store, fileID uint64, topics [
 
 // ListTopicsForFile returns all topics for the given file in name-sorted order.
 // A read-only Store (OpenReadOnly) reconstructs them from the auryn topic_set.
+//
+// This is the public, single-call entry point (fetches Store.DB() itself); a
+// caller composing this with a sibling summary/tags query in one logical
+// operation (B1 — catalog-migration §6.2a review) must instead pin
+// db := s.DB() once and call listTopicsLegacy/aurynListTopicsForFile directly
+// against that SAME handle. See GetFileDetail.
 func ListTopicsForFile(ctx context.Context, s *Store, fileID uint64) ([]TopicRecord, error) {
+	db := s.DB()
 	if s.readOnly {
-		return aurynListTopicsForFile(ctx, s, fileID)
+		return aurynListTopicsForFile(ctx, db, fileID)
 	}
-	rows, err := s.DB().QueryContext(ctx,
+	return listTopicsLegacy(ctx, db, fileID)
+}
+
+// listTopicsLegacy is ListTopicsForFile's legacy-schema branch over an
+// already-pinned db handle.
+func listTopicsLegacy(ctx context.Context, db *sql.DB, fileID uint64) ([]TopicRecord, error) {
+	rows, err := db.QueryContext(ctx,
 		`SELECT name, schema_name, schema_encoding, message_count
 		 FROM topics WHERE file_id = ? ORDER BY name`, fileID)
 	if err != nil {

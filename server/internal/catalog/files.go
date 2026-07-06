@@ -114,16 +114,30 @@ func UpsertFile(ctx context.Context, s *Store, rec FileRecord) (uint64, bool, er
 
 // GetFile returns the FileRecord with the given id, or ErrFileNotFound. A
 // read-only Store (OpenReadOnly) resolves against the auryn schema.
+//
+// This is the public, single-call entry point (fetches Store.DB() itself); a
+// caller composing this with a sibling topics/tags query in one logical
+// operation (B1 — catalog-migration §6.2a review) must instead pin
+// db := s.DB() once and call getFileLegacy/aurynGetFile directly against that
+// SAME handle. See GetFileDetail.
 func GetFile(ctx context.Context, s *Store, id uint64) (FileRecord, error) {
+	db := s.DB()
 	if s.readOnly {
-		return aurynGetFile(ctx, s, id)
+		return aurynGetFile(ctx, db, id)
 	}
+	return getFileLegacy(ctx, db, id)
+}
+
+// getFileLegacy is GetFile's legacy-schema branch over an already-pinned db
+// handle (single query; still routed through the same db so GetFileDetail can
+// reuse it without a second Store.DB() call).
+func getFileLegacy(ctx context.Context, db *sql.DB, id uint64) (FileRecord, error) {
 	var (
 		rec FileRecord
 		has int
 	)
 	rec.ID = id
-	row := s.DB().QueryRowContext(ctx,
+	row := db.QueryRowContext(ctx,
 		`SELECT s3_key, s3_etag, s3_last_modified, size_bytes, indexed_at,
 		        start_time_ns, end_time_ns, chunk_count, message_count, has_message_index, mcap_summary
 		 FROM files WHERE id = ?`, id)

@@ -210,17 +210,46 @@ func main() {
 	// onto the pj_cloud_catalog_* gauges so monitoring sees staleness once the
 	// writer is out-of-process. No-op (gauges stay 0) on the legacy in-process
 	// indexer path (GetBuildInfo returns not-present).
+	//
+	// Same tick also drives the READER side of atomic-publish + reopen-on-swap
+	// (§6.2a; CATALOG_CONTRACT.md §9): ReopenIfSwapped is a no-op unless the
+	// Python builder's rebuild replaced the served DB file (a new inode) since
+	// the last check; on a legacy (read-write) store it is always (false, nil).
 	go func() {
 		ticker := time.NewTicker(30 * time.Second)
 		defer ticker.Stop()
 		refresh := func() {
+			swapped, rerr := store.ReopenIfSwapped(ctx)
+			if rerr != nil {
+				mx.CatalogReopenFailuresTotal.Inc()
+				log.Warn("catalog reopen-on-swap failed; still serving the previous generation", "err", rerr)
+			}
+			// Counter fires immediately on a successful swap, independent of
+			// whether the freshness read below succeeds (S1 fix — it must not be
+			// possible for a real swap to go uncounted just because GetBuildInfo
+			// happened to error on that same tick).
+			if swapped {
+				mx.CatalogReopensTotal.Inc()
+			}
+
 			bi, err := catalog.GetBuildInfo(ctx, store)
 			if err != nil {
 				log.Warn("catalog freshness read failed", "err", err)
+				if swapped {
+					// Still log the swap itself, just without the new generation's
+					// build_id (GetBuildInfo is what would have supplied it).
+					log.Info("catalog file replaced; reopened")
+				}
 				return
 			}
 			if bi.Present {
 				mx.SetCatalogFreshness(bi.BuildID, bi.LastBuildNs, bi.FilesScanned, bi.FilesFailed)
+			}
+			// Logged after GetBuildInfo (not right after the swap) so the message
+			// carries the new generation's build_id — the swap itself doesn't know
+			// it, only that the file changed.
+			if swapped {
+				log.Info("catalog file replaced; reopened", "build_id", bi.BuildID)
 			}
 		}
 		refresh()

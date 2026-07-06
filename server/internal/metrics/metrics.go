@@ -61,6 +61,14 @@ type Metrics struct {
 	CatalogLastBuildTimestamp prometheus.Gauge // unix seconds of the last build
 	CatalogFilesScanned       prometheus.Gauge
 	CatalogFilesFailed        prometheus.Gauge
+
+	// Catalog atomic-publish reopen accounting (catalog-migration §6.2a): the
+	// reader-side half of the swap protocol (CATALOG_CONTRACT.md §9). Reopens
+	// counts successful hot-swaps onto a rebuilt catalog file; ReopenFailures
+	// counts a detected identity change whose new file failed verification (the
+	// old handle keeps serving — fail-closed — and the next poll tick retries).
+	CatalogReopensTotal        prometheus.Counter
+	CatalogReopenFailuresTotal prometheus.Counter
 }
 
 // New builds the collector set on a fresh Registry and registers them. The
@@ -124,6 +132,12 @@ func New() *Metrics {
 		CatalogFilesFailed: prometheus.NewGauge(
 			prometheus.GaugeOpts{Name: "pj_cloud_catalog_files_failed", Help: "Files quarantined by the last catalog build."},
 		),
+		CatalogReopensTotal: prometheus.NewCounter(
+			prometheus.CounterOpts{Name: "pj_cloud_catalog_reopens_total", Help: "Successful reader-side catalog reopens after an atomic-publish rebuild swapped the served file."},
+		),
+		CatalogReopenFailuresTotal: prometheus.NewCounter(
+			prometheus.CounterOpts{Name: "pj_cloud_catalog_reopen_failures_total", Help: "Detected catalog file swaps whose reopen failed verification (old handle kept serving)."},
+		),
 	}
 	reg.MustRegister(
 		m.PanicTotal,
@@ -133,6 +147,7 @@ func New() *Metrics {
 		m.BytesSentTotal, m.MessagesSentTotal, m.FetchedBytesTotal,
 		m.ChunkIndexWarmedTotal, m.ChunkIndexWarmSkipped, m.ChunkIndexWarmErrors,
 		m.CatalogBuildID, m.CatalogLastBuildTimestamp, m.CatalogFilesScanned, m.CatalogFilesFailed,
+		m.CatalogReopensTotal, m.CatalogReopenFailuresTotal,
 	)
 	return m
 }

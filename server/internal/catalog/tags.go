@@ -50,8 +50,19 @@ func ReplaceEmbeddedTagsForFile(ctx context.Context, s *Store, fileID uint64, ta
 
 // EffectiveTags returns the merged view (override ∪ embedded with override-wins).
 // IsOverride indicates which layer the row came from. Sorted by key.
+//
+// This is the public, single-call entry point (fetches Store.DB() itself); a
+// caller composing this with a sibling summary/topics query in one logical
+// operation (B1 — catalog-migration §6.2a review) must instead pin
+// db := s.DB() once and call effectiveTagsDB(ctx, db, fileID) directly, so all
+// phases land on the same generation. See aurynFilterFiles and GetFileDetail.
 func EffectiveTags(ctx context.Context, s *Store, fileID uint64) ([]EffectiveTag, error) {
-	rows, err := s.DB().QueryContext(ctx,
+	return effectiveTagsDB(ctx, s.DB(), fileID)
+}
+
+// effectiveTagsDB is EffectiveTags over an already-pinned db handle.
+func effectiveTagsDB(ctx context.Context, db *sql.DB, fileID uint64) ([]EffectiveTag, error) {
+	rows, err := db.QueryContext(ctx,
 		`SELECT key, value, is_override FROM tags_effective WHERE file_id = ? ORDER BY key`,
 		fileID)
 	if err != nil {

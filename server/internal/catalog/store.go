@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 
 	"pj-cloud/server/internal/metrics"
 
@@ -46,7 +47,25 @@ var errWriterPanic = errors.New("catalog: write job panicked (recovered; see log
 
 // Store wraps the SQLite handle + the catalog-writer goroutine plumbing.
 type Store struct {
-	db        *sql.DB
+	// dbPtr holds the current *sql.DB. It is an atomic.Pointer (not a bare field)
+	// so a read-only Store can be SWAPPED underneath in-flight readers when the
+	// Python builder atomically replaces the served catalog file (catalog-migration
+	// §6.2a / CATALOG_CONTRACT.md §9 "Publish & reopen protocol"): ReopenIfSwapped
+	// stores a freshly opened+verified handle here and closes the old one. DB() is
+	// the single public read accessor; every catalog read in the codebase goes
+	// through it, so a swap is transparent to callers that re-fetch DB() per query
+	// (which they all do — no caller holds a *sql.DB across a query boundary).
+	//
+	// A goroutine that already grabbed the old *sql.DB from DB() just before a swap
+	// may see a "sql: database is closed" (or similar) error on that in-flight
+	// query once the old handle is Close()d below — this is an accepted, transient
+	// race: the caller's NEXT query calls DB() again and lands on the new handle.
+	//
+	// The legacy writable path (Open) stores its handle here once and never swaps
+	// it — the writer goroutine (runJob) reads it via DB() too, so it behaves
+	// identically to before this field became a pointer.
+	dbPtr atomic.Pointer[sql.DB]
+
 	writeCh   chan writeJob
 	closeDone chan struct{}
 
@@ -63,6 +82,22 @@ type Store struct {
 	// Python builder is the sole writer, the Go server reads (catalog-migration
 	// plan §2.1).
 	readOnly bool
+
+	// dbPath is the served catalog path this Store was opened from. Only used by
+	// ReopenIfSwapped (readOnly stores) to re-stat/reopen the same path.
+	dbPath string
+
+	// identity is the (dev, inode) of the file backing the current dbPtr handle,
+	// captured atomically with verification (openVerified). Only meaningful for
+	// readOnly stores; nil until the first successful open. A pointer (not a bare
+	// struct) so it can be stored/loaded atomically alongside dbPtr.
+	identity atomic.Pointer[fileIdentity]
+
+	// reopenMu serializes ReopenIfSwapped calls so at most one swap is ever
+	// in-flight (the caller — the freshness-updater goroutine — already calls it
+	// serially off a single ticker, but the mutex makes that a documented
+	// invariant rather than an assumption).
+	reopenMu sync.Mutex
 
 	// metrics + log, if set, drive per-write-job panic recovery (spec §8.1).
 	// Set once via SetObservability right after Open; nil-safe (the Guard skips
@@ -108,10 +143,10 @@ func Open(ctx context.Context, dbPath string) (*Store, error) {
 	}
 
 	s := &Store{
-		db:        db,
 		writeCh:   make(chan writeJob, 64),
 		closeDone: make(chan struct{}),
 	}
+	s.dbPtr.Store(db)
 	go s.runWriter()
 	return s, nil
 }
@@ -132,7 +167,7 @@ func (s *Store) runJob(job writeJob) {
 	var tx *sql.Tx
 	panicked := metrics.Guard(s.metrics, s.log, "catalog-writer", func() {
 		var err error
-		tx, err = s.db.Begin()
+		tx, err = s.DB().Begin()
 		if err != nil {
 			job.done <- fmt.Errorf("begin tx: %w", err)
 			return
@@ -203,8 +238,11 @@ func (s *Store) Write(ctx context.Context, fn WriteFn) error {
 }
 
 // DB returns the underlying *sql.DB for read-only queries. Callers must NOT
-// use this for writes (would race with the writer goroutine).
-func (s *Store) DB() *sql.DB { return s.db }
+// use this for writes (would race with the writer goroutine). Callers must not
+// hold the returned handle across a call to ReopenIfSwapped — always re-call
+// DB() to get the current handle (every query in this codebase already does:
+// none stash a *sql.DB across an await point).
+func (s *Store) DB() *sql.DB { return s.dbPtr.Load() }
 
 // ReadOnly reports whether this Store was opened via OpenReadOnly (the
 // auryn-migration read path: no writer goroutine runs, and Write always fails
@@ -229,12 +267,12 @@ func (s *Store) Close() error {
 	// close the DB. Closing a nil channel / receiving from nil would panic/block.
 	if s.readOnly {
 		s.closeMu.Unlock()
-		return s.db.Close()
+		return s.DB().Close()
 	}
 	close(s.writeCh)
 	s.closeMu.Unlock()
 
 	// Wait for the writer goroutine to drain in-flight jobs, then close the DB.
 	<-s.closeDone
-	return s.db.Close()
+	return s.DB().Close()
 }

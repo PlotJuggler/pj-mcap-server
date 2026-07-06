@@ -71,14 +71,20 @@ func sumCounts(c []uint64) uint64 {
 // s3_key, topic_counts -> message_count, etag for the session's If-Match. Fields
 // the serving path does not read (s3_last_modified, indexed_at, has_message_index,
 // mcap_summary) are left zero.
-func aurynGetFile(ctx context.Context, s *Store, id uint64) (FileRecord, error) {
+//
+// Takes an already-pinned db (B1 — catalog-migration §6.2a review): callers that
+// compose this with another query against the same file (e.g. GetFileDetail's
+// summary+topics+tags read) must capture Store.DB() ONCE and pass the SAME
+// handle through every phase, or a concurrent ReopenIfSwapped could mix
+// generations mid-request (stale file ids paired with a new generation's rows).
+func aurynGetFile(ctx context.Context, db *sql.DB, id uint64) (FileRecord, error) {
 	var (
 		rec                                       FileRecord
 		customer, site, robot, source, date, name string
 		blob                                      []byte
 	)
 	rec.ID = id
-	row := s.DB().QueryRowContext(ctx, `
+	row := db.QueryRowContext(ctx, `
 		SELECT c.name, st.name, r.name, src.name, f.date, f.filename,
 		       f.etag, f.size_bytes, f.start_time_ns, f.end_time_ns, f.chunk_count, f.topic_counts
 		FROM files f
@@ -108,12 +114,17 @@ func aurynGetFile(ctx context.Context, s *Store, id uint64) (FileRecord, error) 
 // aurynListTopicsForFile reconstructs the file's topics from its deduped
 // topic_set, zipping the topic_id-ASC members with the aligned topic_counts varints,
 // then returns them name-sorted (matching the legacy ListTopicsForFile contract).
-func aurynListTopicsForFile(ctx context.Context, s *Store, fileID uint64) ([]TopicRecord, error) {
+//
+// Takes an already-pinned db (B1): this function itself runs TWO queries (the
+// files row, then the topic_set_members join) — both must land on the SAME
+// generation, and a caller composing this with a sibling summary/tags query
+// must pin once and pass that same handle down (see aurynGetFile's doc).
+func aurynListTopicsForFile(ctx context.Context, db *sql.DB, fileID uint64) ([]TopicRecord, error) {
 	var (
 		setID int64
 		blob  []byte
 	)
-	row := s.DB().QueryRowContext(ctx,
+	row := db.QueryRowContext(ctx,
 		`SELECT topic_set_id, topic_counts FROM files WHERE id = ?`, fileID)
 	switch err := row.Scan(&setID, &blob); {
 	case err == nil:
@@ -128,7 +139,7 @@ func aurynListTopicsForFile(ctx context.Context, s *Store, fileID uint64) ([]Top
 	}
 
 	// Members ORDERED BY topic_id ASC == the topic_counts ordering (the contract).
-	rows, err := s.DB().QueryContext(ctx, `
+	rows, err := db.QueryContext(ctx, `
 		SELECT tn.name, sc.name, sc.encoding
 		FROM topic_set_members tsm
 		JOIN topic_names tn ON tn.id = tsm.topic_id
@@ -187,7 +198,13 @@ func aurynHasHierarchicalKey(ctx context.Context, s *Store) (bool, error) {
 // files.id, the time-overlap predicate, topics-any-of via the topic_set, and tag
 // predicates via the tags_effective view. s3_key is rebuilt from dimensions and
 // message_count is summed from the topic_counts blob per row.
-func aurynFilterFiles(ctx context.Context, s *Store, args FilterArgs) ([]FileSummary, string, error) {
+//
+// Takes an already-pinned db (B1): the summary query and the per-row tag-attach
+// phase below MUST run against the SAME generation — a mid-loop ReopenIfSwapped
+// swap must never let row N's tags come from a different generation than row N's
+// summary (old file ids reused/renumbered across a full rebuild would then pair
+// with the WRONG file's tags).
+func aurynFilterFiles(ctx context.Context, db *sql.DB, args FilterArgs) ([]FileSummary, string, error) {
 	limit := args.Limit
 	if limit <= 0 {
 		limit = 200
@@ -286,7 +303,7 @@ func aurynFilterFiles(ctx context.Context, s *Store, args FilterArgs) ([]FileSum
 		LIMIT ?`, where)
 	params = append(params, limit+1)
 
-	rows, err := s.DB().QueryContext(ctx, q, params...)
+	rows, err := db.QueryContext(ctx, q, params...)
 	if err != nil {
 		return nil, "", fmt.Errorf("auryn filter query: %w", err)
 	}
@@ -320,9 +337,12 @@ func aurynFilterFiles(ctx context.Context, s *Store, args FilterArgs) ([]FileSum
 		next = encodeCursor(out[limit-1].ID)
 		out = out[:limit]
 	}
-	// Attach effective tags (tags_effective exists in both schemas).
+	// Attach effective tags (tags_effective exists in both schemas). Uses the
+	// SAME pinned db as the summary query above (B1) via effectiveTagsDB, not
+	// the Store-level EffectiveTags (which would re-fetch Store.DB() and could
+	// observe a different generation if a swap landed mid-loop).
 	for i := range out {
-		tags, err := EffectiveTags(ctx, s, out[i].ID)
+		tags, err := effectiveTagsDB(ctx, db, out[i].ID)
 		if err != nil {
 			return nil, "", err
 		}
