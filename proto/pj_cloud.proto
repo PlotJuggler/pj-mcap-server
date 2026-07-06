@@ -55,7 +55,7 @@ message HelloResponse {
 
 message Capabilities {
   bool resume_supported = 1;               // true in v1
-  bool tag_edit_supported = 2;             // true in v1
+  bool tag_edit_supported = 2;             // true when the catalog is writable locally OR a tag-edit IPC forwarder is configured; daemon liveness is checked at use time, not at Hello.
 }
 
 // BackendCapabilities lets the client toggle ADDITIVE UI behaviour without

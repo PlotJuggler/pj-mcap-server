@@ -44,6 +44,15 @@ type CatalogConfig struct {
 	// legacy in-process indexer + read-write catalog. The -external-builder flag /
 	// PJ_CLOUD_EXTERNAL_BUILDER env override it (main.go).
 	ExternalBuilder bool `yaml:"external_builder"`
+
+	// TagIPCSocket is the UNIX socket path of the Python catalog builder's
+	// tag-edit IPC endpoint (D2, CATALOG_CONTRACT.md §10). Default "" = off: a
+	// read-only (ExternalBuilder) store then rejects UpdateTags outright. When
+	// set, the WS UpdateTags handler forwards set/unset edits over this socket
+	// instead of rejecting them (still rejects if the store is writable — that
+	// path never needs forwarding). The -tag-ipc-socket flag / PJ_CLOUD_TAG_IPC_SOCKET
+	// env override it (main.go).
+	TagIPCSocket string `yaml:"tag_ipc_socket"`
 }
 
 type ServerConfig struct {

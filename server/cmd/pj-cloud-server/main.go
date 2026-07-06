@@ -25,6 +25,7 @@ import (
 	"pj-cloud/server/internal/metrics"
 	"pj-cloud/server/internal/session"
 	"pj-cloud/server/internal/storage"
+	"pj-cloud/server/internal/tagipc"
 	"pj-cloud/server/internal/warm"
 	"pj-cloud/server/internal/ws"
 )
@@ -36,6 +37,7 @@ func main() {
 		logLevel     = flag.String("log-level", "info", "log level: debug|info|warn|error")
 		dbPath       = flag.String("db", "", "SQLite catalog DB path (overrides config / PJ_CLOUD_DB; default /tmp/pj-cloud-catalog.db)")
 		externalBld  = flag.Bool("external-builder", false, "auryn cutover: open the catalog READ-ONLY (Python builder is the sole writer) and do not run the Go indexer (overrides config / PJ_CLOUD_EXTERNAL_BUILDER)")
+		tagIPCSocket = flag.String("tag-ipc-socket", "", "D2: UNIX socket of the Python catalog builder's tag-edit IPC endpoint (overrides config / PJ_CLOUD_TAG_IPC_SOCKET; empty disables tag-edit forwarding)")
 		pollInterval = flag.Duration("poll-interval", 0, "indexer poll interval (overrides config; e.g. 3s — used by the smoke harness)")
 		tlsCert      = flag.String("tls-cert", "", "TLS cert path (overrides config / PJ_CLOUD_TLS_CERT; set with -tls-key to serve TLS)")
 		tlsKey       = flag.String("tls-key", "", "TLS key path (overrides config / PJ_CLOUD_TLS_KEY)")
@@ -70,6 +72,13 @@ func main() {
 		cfg.Catalog.ExternalBuilder = true
 	} else if env := os.Getenv("PJ_CLOUD_EXTERNAL_BUILDER"); env == "1" || env == "true" {
 		cfg.Catalog.ExternalBuilder = true
+	}
+	// D2 tag-edit IPC socket: -tag-ipc-socket flag wins, else PJ_CLOUD_TAG_IPC_SOCKET
+	// env, else config/default (empty => forwarding stays off).
+	if *tagIPCSocket != "" {
+		cfg.Catalog.TagIPCSocket = *tagIPCSocket
+	} else if env := os.Getenv("PJ_CLOUD_TAG_IPC_SOCKET"); env != "" {
+		cfg.Catalog.TagIPCSocket = env
 	}
 	// TLS: -tls-cert/-tls-key flags win, else PJ_CLOUD_TLS_* env, else config.
 	if *tlsCert != "" {
@@ -288,6 +297,13 @@ func main() {
 	// WS handler on /api/ws, now with streaming + metrics wired.
 	handler := ws.NewHandlerWithSession(store, cfg.Auth.BearerToken, log, sessDeps)
 	handler.SetMetrics(mx)
+	// D2 tag-edit IPC forwarder (CATALOG_CONTRACT.md §10): only meaningful on a
+	// read-only (external-builder) store, but harmless to wire regardless — a
+	// writable store's UpdateTags path never consults it.
+	if cfg.Catalog.TagIPCSocket != "" {
+		handler.SetTagIPC(tagipc.NewClient(cfg.Catalog.TagIPCSocket))
+		log.Info("catalog: tag-edit IPC forwarding enabled", "socket", cfg.Catalog.TagIPCSocket)
+	}
 	mux := http.NewServeMux()
 	mux.Handle("/api/ws", handler)
 

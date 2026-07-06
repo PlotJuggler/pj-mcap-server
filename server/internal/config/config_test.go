@@ -54,6 +54,31 @@ func TestLoad_ExternalBuilder(t *testing.T) {
 	}
 }
 
+// TestDefaults_TagIPCSocket: off by default (mirrors ExternalBuilder).
+func TestDefaults_TagIPCSocket(t *testing.T) {
+	if Default().Catalog.TagIPCSocket != "" {
+		t.Errorf("default tag_ipc_socket should be empty (forwarding off)")
+	}
+}
+
+// TestLoad_TagIPCSocket: the D2 tag-edit IPC socket path round-trips through
+// YAML, mirroring TestLoad_ExternalBuilder.
+func TestLoad_TagIPCSocket(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "cfg.yaml")
+	body := "catalog:\n  db_path: /tmp/x.db\n  external_builder: true\n  tag_ipc_socket: /tmp/tag-ipc.sock\n"
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if c.Catalog.TagIPCSocket != "/tmp/tag-ipc.sock" {
+		t.Fatalf("tag_ipc_socket = %q, want /tmp/tag-ipc.sock", c.Catalog.TagIPCSocket)
+	}
+}
+
 // TestLoad_TLSDashboardMetrics: the spec §8.6 field names round-trip through YAML.
 func TestLoad_TLSDashboardMetrics(t *testing.T) {
 	t.Setenv("PJ_CLOUD_DASHBOARD_PASSWORD", "s3cret")

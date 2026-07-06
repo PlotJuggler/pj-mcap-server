@@ -69,6 +69,15 @@ type Metrics struct {
 	// old handle keeps serving — fail-closed — and the next poll tick retries).
 	CatalogReopensTotal        prometheus.Counter
 	CatalogReopenFailuresTotal prometheus.Counter
+
+	// Tag-IPC forwarding (D2, catalog-migration §1.1/CATALOG_CONTRACT.md §10):
+	// Forwards counts UpdateTags requests successfully forwarded to (and
+	// accepted by) the Python builder's tag-edit socket; Failures counts the
+	// forward call itself failing (busy, not-found, connection error, ...).
+	// Both stay 0 when tag-IPC forwarding is not configured, or the store is
+	// writable (the local write path never forwards).
+	TagIPCForwardsTotal prometheus.Counter
+	TagIPCFailuresTotal prometheus.Counter
 }
 
 // New builds the collector set on a fresh Registry and registers them. The
@@ -138,6 +147,12 @@ func New() *Metrics {
 		CatalogReopenFailuresTotal: prometheus.NewCounter(
 			prometheus.CounterOpts{Name: "pj_cloud_catalog_reopen_failures_total", Help: "Detected catalog file swaps whose reopen failed verification (old handle kept serving)."},
 		),
+		TagIPCForwardsTotal: prometheus.NewCounter(
+			prometheus.CounterOpts{Name: "pj_cloud_tag_ipc_forwards_total", Help: "UpdateTags requests successfully forwarded to the Python catalog builder's tag-edit IPC endpoint."},
+		),
+		TagIPCFailuresTotal: prometheus.NewCounter(
+			prometheus.CounterOpts{Name: "pj_cloud_tag_ipc_failures_total", Help: "Tag-edit IPC forward attempts that failed (busy, not-found, connection error, ...)."},
+		),
 	}
 	reg.MustRegister(
 		m.PanicTotal,
@@ -148,6 +163,7 @@ func New() *Metrics {
 		m.ChunkIndexWarmedTotal, m.ChunkIndexWarmSkipped, m.ChunkIndexWarmErrors,
 		m.CatalogBuildID, m.CatalogLastBuildTimestamp, m.CatalogFilesScanned, m.CatalogFilesFailed,
 		m.CatalogReopensTotal, m.CatalogReopenFailuresTotal,
+		m.TagIPCForwardsTotal, m.TagIPCFailuresTotal,
 	)
 	return m
 }

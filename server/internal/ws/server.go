@@ -30,6 +30,7 @@ import (
 	"pj-cloud/server/internal/authn"
 	"pj-cloud/server/internal/catalog"
 	"pj-cloud/server/internal/metrics"
+	"pj-cloud/server/internal/tagipc"
 	pb "pj-cloud/server/internal/wire/pj_cloud"
 )
 
@@ -67,6 +68,20 @@ const (
 // this exact string, so the two sites can't drift apart.
 const readOnlyTagEditMessage = "tag editing is disabled: the catalog is read-only (external-builder mode)"
 
+// tagIPCUnavailableMessage is the caller-facing message for a D2 forward
+// failure (busy, connection refused, timeout, ...) — CATALOG_CONTRACT.md §10:
+// not a guarantee the edit never lands, just that this request couldn't
+// confirm it; the caller should retry. The underlying error goes in Details.
+const tagIPCUnavailableMessage = "tag edit service unavailable; try again"
+
+// tagIPCKeyGoneMessage (S1) is the caller-facing message when phase 1 resolved
+// the wire file_id to a key, but by the time the edit reached the Python
+// builder that key no longer names a cataloged file (tagipc.ErrNotFound) — a
+// catalog rebuild raced the request. "file <id> not found" would be
+// misleading here: id WAS a real file a moment ago; it's the CURRENT catalog
+// that no longer has it under that key.
+const tagIPCKeyGoneMessage = "file no longer present in the catalog (it may have been re-cataloged); refresh the list"
+
 // Handler serves the WS protocol against the SQLite catalog Store + (optionally)
 // a session subsystem. When sess is nil the session arms (14/15/16) return
 // INVALID_REQUEST — used by the catalog-browse-only configuration / tests.
@@ -86,6 +101,12 @@ type Handler struct {
 	// metrics, if set, records ws-connection counters + guards the per-connection
 	// read/write loops against panics (spec §8.1). Optional.
 	metrics *metrics.Metrics
+	// tagIPC, if set, is the D2 tag-edit IPC forwarder (CATALOG_CONTRACT.md
+	// §10): when the store is read-only AND this is non-nil, handleUpdateTags
+	// forwards set/unset edits to the Python catalog builder's UNIX-socket
+	// endpoint instead of rejecting them outright. nil disables forwarding
+	// (the pre-D2 read-only rejection behavior).
+	tagIPC *tagipc.Client
 }
 
 // NewHandler builds a catalog-only WS handler (no streaming). authToken == ""
@@ -108,6 +129,13 @@ func newAuthenticator(token string) authn.ClientAuthenticator {
 		return nil
 	}
 	return authn.NewBearerToken(token)
+}
+
+// SetTagIPC wires the D2 tag-edit IPC forwarder into the handler (see the
+// Handler.tagIPC field doc). Idempotent; call once at startup, only when
+// catalog.tag_ipc_socket is configured.
+func (h *Handler) SetTagIPC(c *tagipc.Client) {
+	h.tagIPC = c
 }
 
 // SetMetrics wires the metrics collectors into the handler (ws-connection
@@ -415,11 +443,14 @@ func (c *connState) handleHello(reqID uint64, hello *pb.Hello) {
 					ResumeSupported: true,
 					// tag_edit_supported mirrors the catalog's write-ability: over a
 					// Store opened via OpenReadOnly (auryn-migration external-builder
-					// mode) Write always fails with catalog.ErrReadOnly, so advertising
-					// true here would let a client open an "Edit Tags" UI that is
-					// guaranteed to fail at runtime. See handleUpdateTags's ErrReadOnly
-					// branch for the matching wire-error path.
-					TagEditSupported: !c.h.store.ReadOnly(),
+					// mode) the LOCAL Write always fails with catalog.ErrReadOnly, so
+					// advertising true here would let a client open an "Edit Tags" UI
+					// that is guaranteed to fail at runtime — UNLESS a D2 tag-IPC
+					// forwarder is configured (c.h.tagIPC != nil), in which case edits
+					// DO work (forwarded to the Python builder over the UNIX socket,
+					// CATALOG_CONTRACT.md §10). See handleUpdateTags for the matching
+					// reject/forward branches.
+					TagEditSupported: !c.h.store.ReadOnly() || c.h.tagIPC != nil,
 				},
 				Backend: &pb.BackendCapabilities{
 					SupportsFileHierarchy: hierarchy,
@@ -495,15 +526,21 @@ func (c *connState) handleGetFile(ctx context.Context, reqID uint64, req *pb.Get
 }
 
 func (c *connState) handleUpdateTags(ctx context.Context, reqID uint64, req *pb.UpdateTagsRequest) {
-	// Fast-path: reject before touching CatalogHandler at all. An UpdateTags
-	// with EMPTY set_tags/unset_keys performs zero writes downstream (the loops
-	// below just don't iterate), so without this check it would read back
-	// EffectiveTags and return success even on a read-only store — an
+	// Fast-path: reject/forward before touching CatalogHandler at all. An
+	// UpdateTags with EMPTY set_tags/unset_keys performs zero writes downstream
+	// (the loops below just don't iterate), so without this check it would read
+	// back EffectiveTags and return success even on a read-only store — an
 	// inconsistent capability story given tag_edit_supported=false. The
 	// errors.Is(err, catalog.ErrReadOnly) branch below stays as a backstop for
 	// any future write path that bubbles the same error.
 	if c.h.store.ReadOnly() {
-		c.sendError(reqID, 0, pb.ErrorCode_ERROR_INVALID_REQUEST, readOnlyTagEditMessage, catalog.ErrReadOnly.Error())
+		if c.h.tagIPC == nil {
+			c.sendError(reqID, 0, pb.ErrorCode_ERROR_INVALID_REQUEST, readOnlyTagEditMessage, catalog.ErrReadOnly.Error())
+			return
+		}
+		// D2: a tag-IPC forwarder is configured — forward the edit to the Python
+		// catalog builder instead of rejecting it (CATALOG_CONTRACT.md §10).
+		c.handleUpdateTagsForwarded(ctx, reqID, req)
 		return
 	}
 
@@ -530,6 +567,124 @@ func (c *connState) handleUpdateTags(ctx context.Context, reqID uint64, req *pb.
 		RequestId: reqID,
 		Payload:   &pb.ServerMessage_UpdateTags{UpdateTags: resp},
 	})
+}
+
+// handleUpdateTagsForwarded is the D2 forward path (CATALOG_CONTRACT.md §10):
+// the store is read-only and a tag-IPC client is configured, so the edit is
+// forwarded to the Python catalog builder over its UNIX socket rather than
+// rejected.
+//
+// TRUST BOUNDARY: the socket has NO auth of its own (CATALOG_CONTRACT.md §10
+// "Socket permissions & trust boundary") — the Go WS bearer-auth check in
+// Hello (see the c.h.auth.Verify call above) is the ONLY gate a tag edit
+// passes through before reaching this forward. Every forwarded edit is logged
+// with the WS remote address for that reason.
+func (c *connState) handleUpdateTagsForwarded(ctx context.Context, reqID uint64, req *pb.UpdateTagsRequest) {
+	// Phase 1: resolve the wire file_id -> object key (the endpoint addresses
+	// files by key, not id — §10 "Key-based addressing"). A single db.QueryContext
+	// call, so no B1 pinning is needed for this phase alone.
+	key, err := catalog.ObjectKeyForFile(ctx, c.h.store.DB(), req.GetFileId())
+	if err != nil {
+		if errors.Is(err, catalog.ErrFileNotFound) {
+			c.sendError(reqID, 0, pb.ErrorCode_ERROR_NOT_FOUND, errFileNotFound{id: req.GetFileId()}.Error(), "")
+			return
+		}
+		c.sendError(reqID, 0, pb.ErrorCode_ERROR_INTERNAL, "UpdateTags failed (key resolve)", err.Error())
+		return
+	}
+
+	set := make(map[string]string, len(req.GetSetTags()))
+	for _, t := range req.GetSetTags() {
+		set[t.GetKey()] = t.GetValue()
+	}
+
+	// Phase 2: forward set/unset VERBATIM to the Python builder — it implements
+	// the same mask-on-unset semantics the legacy Go writer had, so this side is
+	// a pure transport, no business logic. Keep the response tags (ipcTags):
+	// they are the writer's own authoritative post-edit tags_effective, and are
+	// the B1-fix-part-2 fallback below if the local re-read can't confirm them.
+	ipcTags, err := c.h.tagIPC.UpdateTags(ctx, key, set, req.GetUnsetKeys())
+	if err != nil {
+		if c.h.metrics != nil {
+			c.h.metrics.TagIPCFailuresTotal.Inc()
+		}
+		if errors.Is(err, tagipc.ErrNotFound) {
+			// S1: phase 1 resolved a real file, but the key vanished from the
+			// catalog before the Python builder could act on it (a rebuild raced
+			// this request) — "file <id> not found" would misleadingly imply id
+			// never existed.
+			c.sendError(reqID, 0, pb.ErrorCode_ERROR_NOT_FOUND, tagIPCKeyGoneMessage, err.Error())
+			return
+		}
+		// ErrBusy, connection-refused, timeouts, and any other transport/protocol
+		// failure all map to the SAME caller-facing message (§10 "the caller
+		// should retry" — not a guarantee the edit never lands) — only the
+		// details differ.
+		c.sendError(reqID, 0, pb.ErrorCode_ERROR_INVALID_REQUEST, tagIPCUnavailableMessage, err.Error())
+		return
+	}
+
+	// B1: a catalog rebuild can land BETWEEN the IPC write above and the
+	// re-read below, and only the 30s freshness ticker (main.go) otherwise
+	// calls ReopenIfSwapped — without this call here, a rebuild landing in
+	// that exact window would make the re-read answer from the OLD generation
+	// (stale/missing tags) even though the edit already applied to the NEW
+	// one. Log-only on error (the previous generation just keeps being served,
+	// same contract as the ticker's own failure handling); count it as a
+	// reopen like the ticker does when it does swap — this call and the
+	// ticker's are just two different triggers for the same underlying event.
+	if swapped, rerr := c.h.store.ReopenIfSwapped(ctx); rerr != nil {
+		c.h.log.Warn("ws: tag-edit pre-re-read reopen-if-swapped failed; still serving the previous generation",
+			"remote", c.remote, "request_id", reqID, "err", rerr)
+	} else if swapped && c.h.metrics != nil {
+		c.h.metrics.CatalogReopensTotal.Inc()
+	}
+
+	// Finding A1 (design review, MANDATORY): build the response by re-resolving
+	// key -> CURRENT file_id -> tags_effective in ONE pinned generation. NEVER
+	// reuse req.GetFileId() here — a catalog rebuild between phase 1 and now can
+	// renumber file ids (§7), so the original id may by now name a DIFFERENT
+	// file. EffectiveTagsByKey re-derives everything from the stable key.
+	//
+	// Precedence: the local re-read is PRIMARY — unlike the IPC response, it
+	// proves THIS reader (the one about to answer the client) can actually see
+	// the edit against its own live catalog handle, which is the property A1
+	// cares about. Only when that re-read itself fails (ErrFileNotFound — e.g.
+	// the key was renamed/removed by a rebuild racing this very request even
+	// after the reopen above — or any other, transient, error) do we fall back
+	// to the IPC response's own tags: the edit DID apply (phase 2 returned 200),
+	// so answering ERROR_INTERNAL there would be wrong — the writer already
+	// told us the resulting tags_effective.
+	var effectiveTags []*pb.Tag
+	if tags, terr := catalog.EffectiveTagsByKey(ctx, c.h.store, key); terr != nil {
+		c.h.log.Warn("ws: tag-edit post-edit re-read failed; falling back to the IPC response's tags",
+			"remote", c.remote, "request_id", reqID, "key", key, "err", terr)
+		effectiveTags = tagipcTagsToProto(ipcTags)
+	} else {
+		effectiveTags = tagsToProto(tags)
+	}
+
+	if c.h.metrics != nil {
+		c.h.metrics.TagIPCForwardsTotal.Inc()
+	}
+	c.h.log.Info("ws: UpdateTags forwarded to tag-IPC", "remote", c.remote, "request_id", reqID,
+		"key", key, "set", len(req.GetSetTags()), "unset", len(req.GetUnsetKeys()), "effective", len(effectiveTags))
+
+	c.conn.SendPriority(&pb.ServerMessage{
+		RequestId: reqID,
+		Payload:   &pb.ServerMessage_UpdateTags{UpdateTags: &pb.UpdateTagsResponse{EffectiveTags: effectiveTags}},
+	})
+}
+
+// tagipcTagsToProto converts the tag-IPC client's response tags to the wire
+// shape — used only as the B1-fix fallback in handleUpdateTagsForwarded when
+// the mandatory local post-edit re-read (finding A1) itself fails.
+func tagipcTagsToProto(tags []tagipc.Tag) []*pb.Tag {
+	out := make([]*pb.Tag, 0, len(tags))
+	for _, t := range tags {
+		out = append(out, &pb.Tag{Key: t.Key, Value: t.Value, IsOverride: t.IsOverride})
+	}
+	return out
 }
 
 // sendError queues an Error frame on the priority channel. reqID routes a failed
