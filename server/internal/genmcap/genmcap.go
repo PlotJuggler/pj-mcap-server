@@ -26,6 +26,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"path"
 	"sort"
 
 	"github.com/foxglove/mcap/go/mcap"
@@ -226,6 +227,36 @@ func DefaultSpecs() []FileSpec {
 			},
 		},
 	}
+}
+
+// HiveKeyFor lays a DefaultSpecs() entry out under a deterministic
+// Hive-partitioned object key (catalog-migration plan §5.1: dev == prod key
+// shape) — the auryn Python catalog builder only catalogs keys matching this
+// exact template (mcap_catalog_builder/keyparse.py's HIVE_RE); a flat key
+// quarantines into catalog_failures instead. The dimensions are derived from
+// the spec's index so the set is byte-stable across runs AND exercises
+// multiple robots/dates:
+//
+//	customer=test/customer_site=lab/robot=r{1|2}/source=synthetic/date=2026-06-2{2|3}/<spec.Key>
+//
+// This is the SINGLE source of truth for the mapping — both cmd/gen-ci-fixtures
+// (which writes the on-disk/uploaded tree) and the ci_integration Go test
+// (which must resolve the SAME keys back out of the catalog) call this, so the
+// two can never drift apart.
+func HiveKeyFor(spec FileSpec, i int) string {
+	robot := fmt.Sprintf("r%d", i%2+1)
+	date := "2026-06-22"
+	if i%2 == 1 {
+		date = "2026-06-23"
+	}
+	return path.Join(
+		"customer=test",
+		"customer_site=lab",
+		"robot="+robot,
+		"source=synthetic",
+		"date="+date,
+		spec.Key,
+	)
 }
 
 // payload produces a deterministic body of n bytes for (topic, idx). The exact

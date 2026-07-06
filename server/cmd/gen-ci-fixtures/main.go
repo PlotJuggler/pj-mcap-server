@@ -24,31 +24,6 @@ import (
 	"pj-cloud/server/internal/genmcap"
 )
 
-// hiveKeyFor lays a spec out under a deterministic Hive-partitioned key
-// (catalog-migration plan §5.1: dev == prod key shape). The dimensions are
-// derived from the spec index so the set is byte-stable across runs AND exercises
-// multiple robots/dates — enough for the auryn builder's dimension extraction and
-// the cross-language read proof. The layout:
-//
-//	customer=test/customer_site=lab/robot=r{1|2}/source=synthetic/date=2026-06-2{2|3}/<spec.Key>
-//
-// 1 customer, 1 site, 2 robots, 1 source, 2 dates — strict hierarchy, varied leaves.
-func hiveKeyFor(spec genmcap.FileSpec, i int) string {
-	robot := fmt.Sprintf("r%d", i%2+1)
-	date := "2026-06-22"
-	if i%2 == 1 {
-		date = "2026-06-23"
-	}
-	return filepath.Join(
-		"customer=test",
-		"customer_site=lab",
-		"robot="+robot,
-		"source=synthetic",
-		"date="+date,
-		spec.Key,
-	)
-}
-
 // bigSpec is a single ADDITIONAL fixture (never part of DefaultSpecs — those
 // are shared, pinned CI/ci-integration ground truth; perturbing their counts
 // would ripple into unrelated gates). It exists for callers (the catalog-
@@ -76,7 +51,7 @@ func bigSpec() genmcap.FileSpec {
 }
 
 // bigHiveKey is bigSpec's FIXED Hive key — a distinct robot/date from every
-// hiveKeyFor(spec, i) output so it never collides with the alternating
+// genmcap.HiveKeyFor(spec, i) output so it never collides with the alternating
 // DefaultSpecs layout.
 const bigHiveKey = "customer=test/customer_site=lab/robot=r1/source=synthetic/date=2026-06-24/ci_synth_big.mcap"
 
@@ -150,7 +125,7 @@ func main() {
 	for i, spec := range specs {
 		rel := spec.Key
 		if *hive {
-			rel = hiveKeyFor(spec, i)
+			rel = genmcap.HiveKeyFor(spec, i)
 		}
 		writeOne(spec, rel)
 	}

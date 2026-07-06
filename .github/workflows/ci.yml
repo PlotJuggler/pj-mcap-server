@@ -9,6 +9,16 @@ name: ci
 # plugin build); the integration legs are instead the synthetic-fixture in-process
 # Go harness (`-tags=ci_integration`, internal/ws), seeded into Minio (s3) /
 # fake-gcs (gcs) service containers.
+#
+# M6 §5.4 (catalog migration) cutover: the integration legs' catalog is now built
+# by the REAL Python mcap_catalog builder (submodule mcap_catalog/, `--once`
+# subprocess) — never the retired in-process Go indexer.Scanner — and the Go side
+# only opens the resulting SQLite catalog READ-ONLY (catalog.OpenReadOnly),
+# exactly the external-builder production shape. Fixtures are seeded under a
+# Hive-partitioned key layout (`gen-ci-fixtures -hive`) because the auryn builder
+# only catalogs Hive-partitioned keys (a flat key quarantines into
+# catalog_failures instead). A new `builder-tests` job runs the Python builder's
+# own pytest suite.
 
 on:
   push:
@@ -87,6 +97,49 @@ jobs:
       - name: committed wire bindings compile (no protoc regenerate)
         run: cd server && go build ./internal/wire/...
 
+  builder-tests:
+    # M6 §5.4: the Python mcap_catalog builder's own pytest suite (schema,
+    # key-parsing round-trip, reconcile, dedup/topic-set, tag-edit IPC,
+    # atomic-publish/rebuild, ...). Needs the submodule checked out. No cloud
+    # SDKs required: the S3/GCS clients are injected/test-doubled (see
+    # mcap_catalog/CLAUDE.md's storage `Source` seam) — this job proves the
+    # builder library itself, independent of the {s3,gcs} integration legs
+    # below (which exercise it as a real subprocess against real emulators).
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+          # ⚠️ FORWARD-PROVISIONING (read before activating this workflow on
+          # GitHub): mcap_catalog's .gitmodules URL is
+          # git@github.com:AurynRobotics/mcap_server.git — a PRIVATE repo in a
+          # DIFFERENT org (AurynRobotics) than this repo's org (PlotJuggler).
+          # actions/checkout's default GITHUB_TOKEN can only fetch submodules
+          # within the SAME repo/org it was minted for, so `submodules: true`
+          # alone CANNOT fetch this one. Before CI is ever activated on GitHub:
+          #   1. Create a READ-ONLY deploy key on AurynRobotics/mcap_server
+          #      (repo Settings -> Deploy keys -> Add deploy key; do NOT allow
+          #      write access).
+          #   2. Add its PRIVATE half as the `MCAP_CATALOG_DEPLOY_KEY` secret on
+          #      THIS repo (Settings -> Secrets and variables -> Actions).
+          # Without both steps this job's checkout step fails immediately (a
+          # submodule-fetch permission error), before any test runs — expected
+          # and by design until the secret is provisioned.
+          ssh-key: ${{ secrets.MCAP_CATALOG_DEPLOY_KEY }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: pip install test deps
+        # Pinned to the versions verified against this test suite (see
+        # /home/davide/.venvs/pj-catalog + a clean-scratch-venv install check).
+        # Bump deliberately when intentionally updating the builder's tested
+        # dependency set — never let this float to whatever pip resolves on
+        # the day a runner happens to execute it.
+        run: pip install pytest==9.1.1 mcap==1.4.0 watchdog==6.0.0
+      - name: mcap_catalog builder pytest suite
+        run: cd mcap_catalog && python3 -m pytest mcap_catalog_builder/tests/ -q
+
   integration:
     # Plan A Task 46/46a: the {s3,gcs} integration matrix. fail-fast:false +
     # BOTH legs REQUIRED — a gcs-only failure blocks merges exactly like an
@@ -125,18 +178,45 @@ jobs:
           --health-retries 20
     steps:
       - uses: actions/checkout@v4
+        with:
+          # M6 §5.4: the ci_integration test invokes the Python builder as a real
+          # subprocess (mcap_catalog/mcap_catalog_builder), so the submodule must
+          # actually be checked out here (unlike unit/race/seam, which never touch it).
+          submodules: true
+          # ⚠️ FORWARD-PROVISIONING (see the identical note on the builder-tests
+          # job above): mcap_catalog is a PRIVATE submodule in a DIFFERENT org
+          # (AurynRobotics) than this repo (PlotJuggler) — the default
+          # GITHUB_TOKEN cannot fetch it. A READ-ONLY deploy key on
+          # AurynRobotics/mcap_server must be created and its private half
+          # stored as the `MCAP_CATALOG_DEPLOY_KEY` secret on THIS repo BEFORE
+          # CI is activated on GitHub; until then this checkout step fails at
+          # the submodule-fetch step, by design.
+          ssh-key: ${{ secrets.MCAP_CATALOG_DEPLOY_KEY }}
       - uses: actions/setup-go@v5
         with:
           go-version: "1.23"
           cache: true
           cache-dependency-path: server/go.sum
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: pip install builder deps
+        # boto3 / google-cloud-storage: the builder's --source s3/gcs Source
+        # backends import these lazily (__main__.py). mcap / watchdog: imported
+        # eagerly at module load regardless of --source (mcap_summary.py /
+        # watcher.py, pulled in by __main__) — see internal/catalog/crosslang_test.go.
+        # Pinned to the versions verified against this suite (see the
+        # builder-tests job's comment on update policy — same rule applies here).
+        run: pip install boto3==1.43.40 google-cloud-storage==3.12.0 mcap==1.4.0 watchdog==6.0.0
 
       - name: generate synthetic fixtures
         run: |
           mkdir -p "$RUNNER_TEMP/fixtures"
-          cd server && go run ./cmd/gen-ci-fixtures -out "$RUNNER_TEMP/fixtures" -manifest
+          cd server && go run ./cmd/gen-ci-fixtures -hive -out "$RUNNER_TEMP/fixtures" -manifest
 
-      # ── S3 leg seed: create bucket + upload fixtures via the mc image ────────
+      # ── S3 leg seed: create bucket + upload fixtures via the mc image,
+      # preserving each fixture's Hive-partitioned RELATIVE key (not just its
+      # basename) — the auryn builder only catalogs Hive-partitioned keys. ────
       - name: seed Minio (s3 leg)
         if: matrix.backend == 's3'
         run: |
@@ -146,11 +226,17 @@ jobs:
               set -e
               mc alias set local http://localhost:9000 ciadmin cipassword123
               mc mb -p local/ci-fixtures
-              for f in /fixtures/*.mcap; do mc cp -q "$f" "local/ci-fixtures/$(basename "$f")"; done
-              echo "seeded:"; mc ls local/ci-fixtures
+              cd /fixtures
+              find . -name "*.mcap" | while read -r f; do
+                rel="${f#./}"
+                mc cp -q "$f" "local/ci-fixtures/$rel"
+              done
+              echo "seeded:"; mc ls --recursive local/ci-fixtures
             '
 
-      # ── GCS leg seed: create bucket + upload fixtures via the JSON media API ─
+      # ── GCS leg seed: create bucket + upload fixtures via the JSON media API,
+      # preserving each fixture's Hive-partitioned RELATIVE key as the object
+      # name (same reasoning as the S3 leg above). ─────────────────────────────
       - name: seed fake-gcs (gcs leg)
         if: matrix.backend == 'gcs'
         run: |
@@ -159,13 +245,14 @@ jobs:
             "$host/storage/v1/b?project=pj-cloud-ci" \
             -H 'Content-Type: application/json' -d '{"name":"ci-fixtures"}')"
           case "$code" in 200|201|409) ;; *) echo "bucket create http $code"; exit 1;; esac
-          for f in "$RUNNER_TEMP"/fixtures/*.mcap; do
-            base="$(basename "$f")"
+          cd "$RUNNER_TEMP/fixtures"
+          find . -name '*.mcap' | while read -r f; do
+            rel="${f#./}"
             code="$(curl -s -o /dev/null -w '%{http_code}' -X POST \
-              "$host/upload/storage/v1/b/ci-fixtures/o?uploadType=media&name=$base" \
+              "$host/upload/storage/v1/b/ci-fixtures/o?uploadType=media&name=$rel" \
               -H 'Content-Type: application/octet-stream' --data-binary "@$f")"
-            [ "$code" = "200" ] || { echo "upload $base http $code"; exit 1; }
-            echo "uploaded $base"
+            [ "$code" = "200" ] || { echo "upload $rel http $code"; exit 1; }
+            echo "uploaded $rel"
           done
 
       - name: integration (${{ matrix.backend }})
@@ -175,8 +262,66 @@ jobs:
           PJ_CLOUD_S3_ACCESS_KEY: ciadmin
           PJ_CLOUD_S3_SECRET_KEY: cipassword123
           # gcs knob (ignored by the s3 leg) — the SDK auto-points at the emulator.
-          STORAGE_EMULATOR_HOST: ${{ matrix.backend == 'gcs' && 'localhost:4443' || '' }}
+          # MUST include the scheme: this env var also reaches the Python builder
+          # subprocess now (ci_integration_test.go's runBuilderOnce inherits
+          # os.Environ()), and google-cloud-storage requires a full URL here
+          # ("despite name, includes scheme" — google/cloud/storage/_helpers.py),
+          # while cloud.google.com/go/storage auto-adds a scheme when one is
+          # missing — so "http://host:port" satisfies both SDKs.
+          STORAGE_EMULATOR_HOST: ${{ matrix.backend == 'gcs' && 'http://localhost:4443' || '' }}
+          # M6 §5.4: the interpreter the ci_integration test runs the Python
+          # builder subprocess with — actions/setup-python put it on PATH above.
+          PJ_CI_BUILDER_PYTHON: python3
         run: |
           cd server
+          set -o pipefail
           go test -tags=ci_integration -count=1 -v \
-            -run TestCIIntegration_Backend ./internal/ws/
+            -run TestCIIntegration_Backend ./internal/ws/ \
+            | tee "$RUNNER_TEMP/ci-integration-${{ matrix.backend }}.log"
+
+      # ── S1 anti-vacuous guard: TestCIIntegration_Backend SKIPs (rather than
+      # fails) when PJ_CI_BUILDER_PYTHON is unset or the submodule is absent —
+      # both should be impossible in this job (the steps above set/checkout
+      # both), but a future workflow regression (e.g. a checkout reordering, an
+      # env typo) must fail LOUDLY here instead of silently going green with no
+      # assertions having run. Mirrors the same guard scripts/ci-integration.sh
+      # already enforces via its `PJ_CI_BUILDER_PYTHON:?...` hard-fail.
+      - name: assert the integration leg actually ran (non-vacuous)
+        run: |
+          log="$RUNNER_TEMP/ci-integration-${{ matrix.backend }}.log"
+          if grep -q -- '--- SKIP: TestCIIntegration_Backend' "$log"; then
+            echo "ANTI-VACUOUS GUARD FAILED: TestCIIntegration_Backend SKIPPED" \
+                 "instead of running (PJ_CI_BUILDER_PYTHON unset or the" \
+                 "mcap_catalog submodule missing?) — this leg would otherwise" \
+                 "have gone green having asserted nothing."
+            exit 1
+          fi
+          if ! grep -q -- '--- PASS: TestCIIntegration_Backend' "$log"; then
+            echo "ANTI-VACUOUS GUARD FAILED: no '--- PASS: TestCIIntegration_Backend'" \
+                 "line found in the test output — the leg did not demonstrably pass."
+            exit 1
+          fi
+          echo "OK: TestCIIntegration_Backend ran and PASSed (no vacuous SKIP)."
+
+      # ── S2 sabotage red-team check (s3 leg only — backend-agnostic proof of
+      # the Python builder's quarantine contract, so it need not repeat on
+      # gcs). Runs AFTER the main assertions above, against this job's own
+      # Minio service container, under a key prefix distinct from the real
+      # seeded fixtures ("customer=test/...") so it can never perturb the main
+      # leg's own catalog / assertions. Shares scripts/sabotage-check.sh with
+      # the local scripts/ci-integration.sh driver — same logic, both places.
+      - name: sabotage check (s3 leg — proves the harness is non-vacuous)
+        if: matrix.backend == 's3'
+        env:
+          SABOTAGE_SERVER_DIR: ${{ github.workspace }}/server
+          SABOTAGE_MCAP_CATALOG_DIR: ${{ github.workspace }}/mcap_catalog
+          SABOTAGE_PYTHON: python3
+          SABOTAGE_S3_ENDPOINT: http://localhost:9000
+          SABOTAGE_S3_BUCKET: ci-fixtures
+          SABOTAGE_S3_ACCESS_KEY: ciadmin
+          SABOTAGE_S3_SECRET_KEY: cipassword123
+          # Distinct from the real fixtures' "customer=test/..." prefix seeded
+          # above, so this red-team upload can never collide with / perturb
+          # the main leg's own catalog rows or assertions.
+          SABOTAGE_KEY_PREFIX: customer=sabotage/customer_site=lab/robot=r1/source=synthetic/date=2026-06-22
+        run: bash scripts/sabotage-check.sh

@@ -96,15 +96,19 @@ smoke:
 matrix:
 	bash scripts/matrix.sh
 
-# ci-integration: the LOCAL driver for the CI {s3,gcs} integration legs (Plan A
-# Task 46/46a) — the SAME synthetic-fixture in-process Go harness
-# (`-tags=ci_integration` over internal/ws) that .github/workflows/ci.yml runs in
-# GitHub Actions service containers, but proven here WITHOUT GitHub. It stands up
-# its OWN Minio + fake-gcs emulators on FRESH HIGH PORTS (19010 / 14450 — never
+# ci-integration: the LOCAL driver for the CI {s3,gcs} integration legs — the
+# SAME test (`-tags=ci_integration` over internal/ws, invoking the Python
+# mcap_catalog builder `--once` + catalog.OpenReadOnly — M6 §5.4's catalog-
+# migration cutover) that .github/workflows/ci.yml runs in GitHub Actions
+# service containers, but proven here WITHOUT GitHub. It stands up its OWN
+# Minio + fake-gcs emulators on FRESH HIGH PORTS (19010 / 14450 — never
 # :8080/:8081/:8082/:9000/:4443), seeds both buckets with the deterministic
-# synthetic MCAPs from cmd/gen-ci-fixtures, runs the tagged test per backend, and
-# ALWAYS reaps the containers. Prints CI-INTEGRATION PASS / FAIL. Requires docker
-# + curl. Scope one leg with `LEG=s3 make ci-integration` (or LEG=gcs).
+# Hive-keyed synthetic MCAPs from cmd/gen-ci-fixtures -hive, runs the tagged
+# test per backend, and ALWAYS reaps the containers. Prints CI-INTEGRATION
+# PASS / FAIL. Requires docker + curl + PJ_CI_BUILDER_PYTHON (a python3 with
+# boto3, google-cloud-storage, mcap, watchdog installed — see
+# scripts/ci-integration.sh's header for the one-time venv bootstrap). Scope
+# one leg with `LEG=s3 make ci-integration` (or LEG=gcs).
 ci-integration:
 	bash scripts/ci-integration.sh
 
