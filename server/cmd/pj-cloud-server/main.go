@@ -302,9 +302,11 @@ func main() {
 
 	// Graceful shutdown (spec §8.4): on SIGINT/SIGTERM stop accepting, cancel
 	// active session producers/consumers (clients get a clean close / Eos),
-	// checkpoint the catalog WAL via store.Close, and exit within a bounded
-	// window. http.Server.Shutdown drains in-flight HTTP; CancelAll tears down
-	// the streaming subsystem (which http.Server does NOT track).
+	// close the read-only catalog handle via store.Close (mode=ro cannot
+	// checkpoint the WAL — that's the Python builder's job, not ours), and
+	// exit within a bounded window. http.Server.Shutdown drains in-flight
+	// HTTP; CancelAll tears down the streaming subsystem (which http.Server
+	// does NOT track).
 	shutdownDone := make(chan struct{})
 	go func() {
 		defer close(shutdownDone)

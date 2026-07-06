@@ -8,7 +8,8 @@
 #   cd /path/to/plotjuggler_sdk && conan create . --build=missing
 #
 # Idempotent: safe to re-run (incremental). Run ./run.sh afterwards to start the
-# local backend (Minio + synthetic data + server).
+# local backend (Minio + synthetic data + the two-process backend: the Python
+# mcap_catalog builder + the Go server — see run.sh's header).
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -41,4 +42,4 @@ fi
 echo "    plugin -> plugin/toolbox_dexory_cloud/build/bin/libtoolbox_dexory_cloud_plugin.so"
 
 echo
-echo "==> build complete.  Next:  ./run.sh   (starts Minio + synthetic data + the server)"
+echo "==> build complete.  Next:  ./run.sh   (starts Minio + synthetic data + the catalog builder + the server)"

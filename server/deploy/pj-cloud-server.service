@@ -1,12 +1,22 @@
-# systemd unit for a bare-metal pj-cloud-server deploy (Plan A Task 36).
+# systemd unit for a bare-metal pj-cloud-server deploy (M6 §6.1). This is HALF
+# of the two-process backend (the M6 catalog-migration cutover retired the
+# in-process Go catalog writer/indexer): this unit is now a PURE READ-ONLY
+# catalog reader + unchanged streamer, and pairs with pj-cloud-builder.service
+# (the Python mcap_catalog builder — the sole catalog writer + tag-edit IPC
+# server). Install BOTH units; see pj-cloud-builder.service's header for its
+# half. The "one static binary" property is GONE — say so plainly: a
+# from-scratch deploy needs two running processes, not one.
 #
 # INSTALL
 #   sudo install -m0755 pj-cloud-server /usr/local/bin/pj-cloud-server
-#   sudo install -d -o pjcloud -g pjcloud /var/lib/pj-cloud      # catalog DB dir
+#   sudo useradd --system --no-create-home --shell /usr/sbin/nologin pjcloud
+#   sudo install -d -o pjcloud -g pjcloud /var/lib/pj-cloud      # SHARED with pj-cloud-builder.service
 #   sudo install -D -m0640 config.example.yaml /etc/pj-cloud/config.yaml
 #   sudo install -D -m0600 /dev/null /etc/pj-cloud/server.env    # then edit it
 #   sudo cp pj-cloud-server.service /etc/systemd/system/
 #   sudo systemctl daemon-reload && sudo systemctl enable --now pj-cloud-server
+#   # THEN install pj-cloud-builder.service (see its own header) — the server
+#   # will fail to start / crash-loop until the builder publishes a catalog.
 #
 # SECRETS go in /etc/pj-cloud/server.env (referenced by EnvironmentFile), e.g.:
 #   PJ_CLOUD_TOKEN=<shared-bearer-token>
@@ -17,30 +27,70 @@
 #   PJ_CLOUD_TLS_KEY=/etc/pj-cloud/server.key
 # config.yaml's ${ENV} refs are expanded from this same environment at load.
 #
-# Create the service user once:
-#   sudo useradd --system --no-create-home --shell /usr/sbin/nologin pjcloud
+# TAG-EDIT IPC (D2, CATALOG_CONTRACT.md §10): config.yaml's
+# catalog.tag_ipc_socket must point at the SAME /var/lib/pj-cloud/tag.sock the
+# builder unit serves (its default — see pj-cloud-builder.service). The
+# socket + DB live on the shared LOCAL volume both units' ReadWritePaths=
+# below grant; this is the only path UpdateTags can take now that the catalog
+# is always read-only. Every SUCCESSFUL tag edit is logged server-side with
+# the client's WS remote address (already implemented in the WS handler);
+# the failure paths (bad file id, IPC unavailable, ...) log the same field
+# too — nothing extra to enable here.
+#
+# Both units run as the SAME `pjcloud` user/group sharing /var/lib/pj-cloud
+# (the LOCKED hardening scheme for a bare-metal deploy — a compose deploy
+# instead pins both containers to the same numeric UID 65532; see
+# server/deploy/README.md's "Two-process deployment" item 2 for why compose
+# can't share a Unix user).
 
 [Unit]
-Description=PJ Cloud Connector server (MCAP-over-WebSocket)
-Documentation=https://github.com/  # internal: see 2026-05-28-pj-cloud-connector-design.md
+Description=PJ Cloud Connector server (MCAP-over-WebSocket, read-only catalog reader + streamer)
+# internal reference: see 2026-05-28-pj-cloud-connector-design.md, docs/CATALOG_CONTRACT.md
+Documentation=https://github.com/
 After=network-online.target
 Wants=network-online.target
+# Soft ordering only (see the header note above for why not a hard dependency
+# with a readiness condition): start the builder first when both are enabled.
+Wants=pj-cloud-builder.service
+After=pj-cloud-builder.service
+# Disable systemd's default start-rate limit (5 starts / 10s): this unit is
+# EXPECTED to crash-loop every RestartSec until the builder publishes its
+# first catalog (see the INSTALL note above + Restart=on-failure below). With
+# the default limit, systemd would give up after ~4 restarts (~8s) and leave
+# the unit permanently `failed` — long before even a fast cold-bucket scan
+# finishes, and it would NEVER come back on its own (a manual
+# `systemctl reset-failed` would be needed). StartLimitIntervalSec=0 disables
+# the limit entirely, so the crash-loop-until-ready design actually works.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
 User=pjcloud
 Group=pjcloud
 EnvironmentFile=/etc/pj-cloud/server.env
-# --config supplies storage/session/dashboard tuning; flags/env override.
+# --config supplies storage/session/dashboard tuning (incl. catalog.db_path +
+# catalog.tag_ipc_socket); flags/env override.
 ExecStart=/usr/local/bin/pj-cloud-server --config /etc/pj-cloud/config.yaml
+# The read-only catalog.OpenReadOnly fails fast (process exits 1) if the
+# builder hasn't published a DB yet — INTENTIONAL (main.go). Restart=on-failure
+# means this unit crash-loops harmlessly at RestartSec intervals until the
+# builder's first scan lands, then stays up normally — this relies on
+# StartLimitIntervalSec=0 in [Unit] above (see its comment); without it,
+# systemd's default rate limit would give up long before a cold-bucket scan
+# can finish.
 Restart=on-failure
 RestartSec=2s
-# Graceful shutdown: the server traps SIGTERM (drains sessions, checkpoints WAL).
+# Graceful shutdown: the server traps SIGTERM (drains sessions, closes the
+# read-only catalog handle).
 KillSignal=SIGTERM
 TimeoutStopSec=15s
 
-# Hardening: the server only needs to read the bucket over the network, write its
-# SQLite catalog under /var/lib/pj-cloud, and read its config/certs.
+# Hardening: the server reads the bucket over the network, reads (never
+# writes) the SQLite catalog under /var/lib/pj-cloud (shared with
+# pj-cloud-builder.service — ReadWritePaths is still granted here because a
+# read-only SQLite/WAL handle still needs write access to the -shm locking
+# segment, and because this same path holds the tag-edit IPC socket this unit
+# connects out to), and reads its config/certs.
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true

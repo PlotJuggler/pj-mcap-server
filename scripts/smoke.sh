@@ -564,7 +564,7 @@ PY
 # ─────────────────────────────────────────────────────────────────────────────
 step_builder_daemon() {
   log "step b1: starting the Python catalog builder daemon"
-  [[ -x "${VENV_PY}" ]] || fail "builder: venv interpreter not found at ${VENV_PY} — bootstrap it: python3 -m venv ~/.venvs/pj-catalog && ~/.venvs/pj-catalog/bin/pip install boto3 google-cloud-storage mcap watchdog"
+  [[ -x "${VENV_PY}" ]] || fail "builder: venv interpreter not found at ${VENV_PY} — bootstrap it: python3 -m venv ~/.venvs/pj-catalog && ~/.venvs/pj-catalog/bin/pip install boto3==1.43.40 google-cloud-storage==3.12.0 mcap==1.4.0 watchdog==6.0.0"
 
   rm -f "${SMOKE_DB}" "${SMOKE_DB}-wal" "${SMOKE_DB}-shm" "${TAG_SOCKET}"
   start_builder_daemon "${BUILDER_LOG}"

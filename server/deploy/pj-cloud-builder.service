@@ -1,0 +1,96 @@
+# systemd unit for a bare-metal mcap_catalog builder deploy (M6 §6.1). This is
+# HALF of the two-process backend — pairs with pj-cloud-server.service, which
+# is now a pure read-only catalog reader. Both units share
+# /var/lib/pj-cloud (the SQLite catalog DB + the tag-edit IPC socket) — this
+# MUST be a real local filesystem, NEVER NFS/EFS (SQLite WAL needs real
+# mmap'd shared-memory locking; a UNIX socket cannot be served correctly off a
+# network filesystem either).
+#
+# INSTALL
+#   sudo useradd --system --no-create-home --shell /usr/sbin/nologin pjcloud   # if not already done for the server unit
+#   sudo install -d -o pjcloud -g pjcloud /var/lib/pj-cloud       # SAME dir as the server unit
+#   sudo install -d /opt/pj-cloud-builder
+#   sudo cp -r mcap_catalog/mcap_catalog_builder /opt/pj-cloud-builder/
+#   python3 -m venv /opt/pj-cloud-builder/venv
+#   /opt/pj-cloud-builder/venv/bin/pip install boto3==1.43.40 google-cloud-storage==3.12.0 mcap==1.4.0 watchdog==6.0.0
+#   sudo chown -R pjcloud:pjcloud /opt/pj-cloud-builder
+#   sudo install -D -m0600 /dev/null /etc/pj-cloud/builder.env    # then edit it
+#   sudo cp pj-cloud-builder.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now pj-cloud-builder
+#
+# SECRETS / TARGET go in /etc/pj-cloud/builder.env (referenced by
+# EnvironmentFile). There is no single default storage target (S3 vs GCS,
+# bucket, prefix are deployment-specific) — set BUILDER_ARGS there, e.g.:
+#   BUILDER_ARGS=--source s3 --s3-bucket recordings --s3-prefix ""
+#   AWS_ACCESS_KEY_ID=...
+#   AWS_SECRET_ACCESS_KEY=...
+#   AWS_REGION=us-east-1
+# or, for GCS (credentials via ADC / a mounted service-account key):
+#   BUILDER_ARGS=--source gcs --gcs-bucket my-bucket --gcs-prefix ""
+#   GOOGLE_APPLICATION_CREDENTIALS=/etc/pj-cloud/gcs-key.json
+#
+# ORDERING: this unit's --tag-socket + --db paths (below) live on the SAME
+# /var/lib/pj-cloud the server unit reads. On first boot the server unit will
+# fail to start and then crash-loop (Restart=on-failure, with
+# StartLimitIntervalSec=0 so systemd's default rate limit doesn't cut that
+# short) until this unit's initial reconcile publishes a catalog DB — see
+# pj-cloud-server.service's comments and main.go's catalog.OpenReadOnly
+# fail-fast. That is intentional.
+
+[Unit]
+Description=PJ Cloud Connector catalog builder (mcap_catalog — SOLE catalog writer + tag-edit IPC)
+# internal reference: see docs/CATALOG_CONTRACT.md
+Documentation=https://github.com/
+After=network-online.target
+Wants=network-online.target
+# Disable systemd's default start-rate limit (5 starts / 10s). The builder
+# itself doesn't crash-loop by design the way the server unit does, but
+# nothing prevents a genuinely transient failure here either (network blip
+# reaching the bucket, a momentarily-locked DB, ...) — without this, systemd
+# would give up after a handful of quick restarts and leave the unit
+# permanently `failed`, which would then ALSO strand the server unit's own
+# crash-loop-until-ready (it has nothing to wait for). See
+# pj-cloud-server.service's [Unit] section for the matching setting.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=pjcloud
+Group=pjcloud
+WorkingDirectory=/opt/pj-cloud-builder
+EnvironmentFile=/etc/pj-cloud/builder.env
+# --no-watch: daemon mode, rescan-only (no inotify/SQS producer) — the safe
+# default for a bare-metal box; drop it if you want live S3 SQS / local
+# inotify event-driven discovery instead of pure periodic rescans.
+# BUILDER_ARGS (source/bucket/prefix) comes from the EnvironmentFile above.
+ExecStart=/opt/pj-cloud-builder/venv/bin/python3 -m mcap_catalog_builder \
+    --no-watch \
+    --tag-socket /var/lib/pj-cloud/tag.sock \
+    --db /var/lib/pj-cloud/catalog.db \
+    --rescan-interval 300 \
+    --log-level INFO \
+    $BUILDER_ARGS
+Restart=on-failure
+RestartSec=2s
+# Graceful shutdown: the builder traps SIGTERM (drains its work queue,
+# unlinks the tag socket, closes the DB cleanly — stale-socket unlink on an
+# unclean exit is handled builder-side on the NEXT start, see CATALOG_CONTRACT.md).
+KillSignal=SIGTERM
+TimeoutStopSec=15s
+
+# Hardening — mirrors pj-cloud-server.service where applicable. The builder
+# additionally needs to WRITE /var/lib/pj-cloud (the server unit only reads
+# it), and needs outbound network access to the storage backend (S3/GCS).
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/pj-cloud
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target

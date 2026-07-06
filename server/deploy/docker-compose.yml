@@ -1,20 +1,59 @@
-# pj-cloud-server deploy stack (Plan A Task 36): the server container + an
-# S3-compatible Minio, self-contained and healthchecked. This mirrors the dev
-# infra/minio stack (same bucket `recordings`, same admin/password123 creds) but
-# ALSO builds + runs pj-cloud-server against it, so `docker compose up` here
-# stands the whole backend up on one box.
+# pj-cloud-server deploy stack: the TWO-PROCESS backend (M6 catalog-migration
+# cutover) + an S3-compatible Minio, self-contained and healthchecked. This
+# mirrors the dev infra/minio stack (same bucket `recordings`, same
+# admin/password123 creds) but ALSO builds + runs both the Python
+# `mcap_catalog` builder (the sole catalog writer + tag-edit IPC server) and
+# the Go server (a pure read-only catalog reader + streamer) against it, so
+# `docker compose up` here stands the whole backend up on one box.
+#
+# ARCHITECTURE — read this before touching the volumes/ordering below:
+#   - The "one static binary" property is GONE. There are now two service
+#     containers: `builder` (writes the SQLite catalog + serves the tag-edit
+#     IPC socket) and `server` (opens that catalog READ-ONLY, forwards
+#     UpdateTags over the IPC socket, and is otherwise the unchanged
+#     streamer). Neither can do the other's job.
+#   - Both share ONE volume (`catalog-data`, mounted at /var/lib/pj-cloud in
+#     both containers) holding the SQLite DB (+ WAL/SHM sidecars) and the
+#     tag-edit UNIX socket. This volume MUST be a real local filesystem —
+#     NEVER NFS/EFS/any network filesystem: SQLite's WAL mode requires
+#     shared-memory mmap'd locking that network filesystems do not implement
+#     correctly (silent corruption risk), and a UNIX socket cannot be
+#     bind-mounted from a network filesystem's semantics either. A Docker
+#     named volume on the local Docker host's storage driver is fine.
+#   - Socket/DB permissions: both containers run as the SAME numeric UID
+#     (65532 — the Go image's existing nonroot user; the builder image now
+#     also runs as 65532, see Dockerfile.builder) so ordinary owner
+#     read/write is enough — no shared-group dance needed. The builder
+#     unlinks any stale socket from a previous run itself (crash-safe).
+#   - First-boot ordering: `server` has NO healthy catalog to read until
+#     `builder` publishes its first build. Rather than the fragile
+#     `depends_on: condition: service_completed_successfully` (which cannot
+#     express "the builder is a long-running daemon that ALSO must have
+#     produced its first output"), `builder` gets its OWN container
+#     healthcheck (a python3 one-liner: open catalog.db read-only, check
+#     build_metadata.last_build_ns > 0 — python3 ships in the builder's base
+#     image already, no extra tooling needed) and `server` is gated on
+#     `depends_on: builder: condition: service_healthy` — so the `server`
+#     container is not even STARTED until the builder has published its
+#     first catalog. Watch `docker compose logs -f builder` for "initial
+#     catalog build" progress while compose waits. `server` still keeps
+#     `restart: unless-stopped` too, as a belt-and-suspenders fallback for a
+#     LATER transient catalog hiccup (e.g. a rebuild racing this container's
+#     very first open) — but it is no longer the first-boot ordering
+#     mechanism, the healthcheck gate is.
 #
 # USAGE
 #   cd server/deploy
 #   # seed the bucket once (the server only READS; it does not create objects):
 #   #   upload your *.mcap recordings to s3://recordings (mc cp / aws s3 cp).
 #   PJ_CLOUD_TOKEN=changeme docker compose up -d --build
-#   curl -s localhost:8080/health          # -> ok
+#   curl -s localhost:8080/health          # -> ok (once the builder's first scan lands)
 #
 # The server config lives in deploy.config.yaml (mounted read-only). It points
 # storage.s3.endpoint at the in-network `minio` service. For a real S3 deploy,
 # drop the minio/minio-init services and edit deploy.config.yaml's endpoint +
-# creds (or run the server container alone against AWS).
+# creds (or run the server + builder containers alone against AWS/GCS) and the
+# builder service's `command:` args to match.
 services:
   minio:
     image: minio/minio:RELEASE.2024-06-13T22-53-53Z
@@ -43,6 +82,51 @@ services:
         echo 'minio ready: bucket recordings exists'
       "
 
+  # builder: the SOLE catalog writer + tag-edit IPC server (M6 cutover). Must
+  # come up before `server` can do anything useful — see the ARCHITECTURE note
+  # above for why this isn't expressed as a `depends_on` condition.
+  builder:
+    build:
+      context: ../..            # the repo root: needs mcap_catalog/ (a sibling of server/)
+      dockerfile: server/deploy/Dockerfile.builder
+    image: pj-cloud-builder:dev
+    depends_on:
+      minio:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    environment:
+      # boto3 honors AWS_ENDPOINT_URL for a Minio-compatible endpoint override
+      # with no code change; static Minio dev creds otherwise.
+      AWS_ENDPOINT_URL: http://minio:9000
+      AWS_ACCESS_KEY_ID: admin
+      AWS_SECRET_ACCESS_KEY: password123
+      AWS_REGION: us-east-1
+      AWS_DEFAULT_REGION: us-east-1
+    volumes:
+      - catalog-data:/var/lib/pj-cloud
+    command:
+      - "--source=s3"
+      - "--s3-bucket=recordings"
+      - "--no-watch"
+      - "--tag-socket=/var/lib/pj-cloud/tag.sock"
+      - "--db=/var/lib/pj-cloud/catalog.db"
+      - "--rescan-interval=300"
+      - "--log-level=INFO"
+    # Healthcheck: open the catalog DB read-only and confirm a build has
+    # actually been published (build_metadata.last_build_ns > 0) — NOT just
+    # "is the process alive". python3 + the stdlib sqlite3 module are already
+    # in this image, no extra tooling needed. Generous interval/retries (up
+    # to 20 minutes total) so a real cold-bucket first scan has time to
+    # finish before compose gives up waiting — see `server`'s `depends_on`.
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import sqlite3,sys; c=sqlite3.connect('file:/var/lib/pj-cloud/catalog.db?mode=ro', uri=True); row=c.execute('SELECT last_build_ns FROM build_metadata WHERE id=1').fetchone(); sys.exit(0 if row and row[0] and row[0] > 0 else 1)"]
+      interval: 5s
+      timeout: 3s
+      retries: 240
+      start_period: 5s
+    restart: unless-stopped
+
   server:
     build:
       context: ..            # the server/ module (Dockerfile is at deploy/Dockerfile)
@@ -53,6 +137,8 @@ services:
         condition: service_healthy
       minio-init:
         condition: service_completed_successfully
+      builder:
+        condition: service_healthy   # waits for builder's FIRST published catalog — see ARCHITECTURE note
     environment:
       # Single shared bearer token (design-spec §3 auth). Unset => DEV ANONYMOUS.
       PJ_CLOUD_TOKEN: ${PJ_CLOUD_TOKEN:-}
@@ -66,11 +152,23 @@ services:
     volumes:
       - ./deploy.config.yaml:/etc/pj-cloud/config.yaml:ro
       - catalog-data:/var/lib/pj-cloud
-    # The image ENTRYPOINT is pj-cloud-server; CMD points it at the mounted config.
-    command: ["--config", "/etc/pj-cloud/config.yaml", "--listen", ":8080"]
+    # The image ENTRYPOINT is pj-cloud-server; CMD points it at the mounted
+    # config + the SAME shared volume's DB/socket the builder writes/serves
+    # (deploy.config.yaml's catalog.tag_ipc_socket already points there too;
+    # the explicit flags here just make the two-process wiring visible).
+    command:
+      - "--config=/etc/pj-cloud/config.yaml"
+      - "--listen=:8080"
+      - "--db=/var/lib/pj-cloud/catalog.db"
+      - "--tag-ipc-socket=/var/lib/pj-cloud/tag.sock"
     # No container healthcheck: the distroless/static image ships no shell or curl,
     # so liveness is probed EXTERNALLY via the always-unauthenticated HTTP endpoint
     #   curl -fsS http://localhost:8080/health   # -> "ok" once the catalog is up
+    # restart: unless-stopped is a belt-and-suspenders fallback now, NOT the
+    # first-boot ordering mechanism (that's `depends_on: builder: condition:
+    # service_healthy` above) — it still helps if a LATER transient catalog
+    # hiccup (e.g. a rebuild racing this container's very first open) makes
+    # OpenReadOnly fail once even after the builder is healthy.
     restart: unless-stopped
 
 volumes:

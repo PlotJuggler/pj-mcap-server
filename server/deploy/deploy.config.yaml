@@ -25,11 +25,11 @@ storage:
     secret_key: ${PJ_CLOUD_S3_SECRET_KEY}
 
 catalog:
-  db_path: /var/lib/pj-cloud/catalog.db  # persisted via the catalog-data volume
+  db_path: /var/lib/pj-cloud/catalog.db  # written by the `builder` service, shared via the catalog-data volume
+  tag_ipc_socket: /var/lib/pj-cloud/tag.sock  # the `builder` service's tag-edit IPC socket, same shared volume
 
-indexer:
-  poll_interval: 5m
-  startup_scan: true
+# indexer: removed in M6 §2.6 — the catalog is built by the `builder` service
+# (Dockerfile.builder), not by an in-process Go indexer.
 
 session:
   max_concurrent: 16

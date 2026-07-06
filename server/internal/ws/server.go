@@ -557,9 +557,13 @@ func (c *connState) handleUpdateTagsForwarded(ctx context.Context, reqID uint64,
 	key, err := catalog.ObjectKeyForFile(ctx, c.h.store.DB(), req.GetFileId())
 	if err != nil {
 		if errors.Is(err, catalog.ErrFileNotFound) {
+			c.h.log.Warn("ws: UpdateTags rejected (file not found)", "remote", c.remote,
+				"request_id", reqID, "file_id", req.GetFileId())
 			c.sendError(reqID, 0, pb.ErrorCode_ERROR_NOT_FOUND, errFileNotFound{id: req.GetFileId()}.Error(), "")
 			return
 		}
+		c.h.log.Warn("ws: UpdateTags rejected (key resolve failed)", "remote", c.remote,
+			"request_id", reqID, "file_id", req.GetFileId(), "err", err)
 		c.sendError(reqID, 0, pb.ErrorCode_ERROR_INTERNAL, "UpdateTags failed (key resolve)", err.Error())
 		return
 	}
@@ -584,6 +588,8 @@ func (c *connState) handleUpdateTagsForwarded(ctx context.Context, reqID uint64,
 			// catalog before the Python builder could act on it (a rebuild raced
 			// this request) — "file <id> not found" would misleadingly imply id
 			// never existed.
+			c.h.log.Warn("ws: UpdateTags rejected (key gone before IPC apply)", "remote", c.remote,
+				"request_id", reqID, "key", key, "err", err)
 			c.sendError(reqID, 0, pb.ErrorCode_ERROR_NOT_FOUND, tagIPCKeyGoneMessage, err.Error())
 			return
 		}
@@ -591,6 +597,8 @@ func (c *connState) handleUpdateTagsForwarded(ctx context.Context, reqID uint64,
 		// failure all map to the SAME caller-facing message (§10 "the caller
 		// should retry" — not a guarantee the edit never lands) — only the
 		// details differ.
+		c.h.log.Warn("ws: UpdateTags IPC forward failed", "remote", c.remote,
+			"request_id", reqID, "key", key, "err", err)
 		c.sendError(reqID, 0, pb.ErrorCode_ERROR_INVALID_REQUEST, tagIPCUnavailableMessage, err.Error())
 		return
 	}

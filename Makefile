@@ -113,11 +113,25 @@ ci-integration:
 	bash scripts/ci-integration.sh
 
 # ── interactive server (:8080) convenience targets ──────────────────────────
-# These manage the USER-FACING server instance on :8080 with its own PID/log
-# files. They are independent of `smoke` (which uses :8081). server-start is a
-# no-op if a live instance is already recorded and running.
+# These manage the USER-FACING two-process backend `run.sh` starts: the Go
+# server AND the Python mcap_catalog builder daemon (the sole catalog writer +
+# tag-edit IPC server since the M6 catalog-migration cutover). They are
+# independent of `smoke` (which uses :8081 and its own, self-contained
+# builder). server-start is a no-op if a live server instance is already
+# recorded and running; it does NOT start the builder (it has no storage
+# target to build against — use `./run.sh` for a full two-process bring-up;
+# server-start is a bare-server convenience for relaunching against a catalog
+# DB an earlier `./run.sh` already built). CAVEAT: it only ever passes
+# `-listen :8080` — no `-db`, so it only matches the LOCAL --dexory_minio
+# target's default DB path (/tmp/pj-cloud-catalog.db); relaunching against a
+# cloud target's own DB path needs a manual `-db` flag. It ALSO passes no
+# `-tag-ipc-socket` at all, so tag-edit forwarding is SILENTLY disabled
+# (UpdateTags rejected outright) for anything started this way — use
+# `./run.sh` if you need working tag edits.
 SERVER_PID := /tmp/pj-cloud-server.pid
 SERVER_LOG := /tmp/pj-cloud-server.log
+BUILDER_PID := /tmp/pj-cloud-builder.pid
+BUILDER_TARGET_FILE := /tmp/pj-cloud-builder.target
 
 server-start: build
 	@if [ -f $(SERVER_PID) ] && kill -0 "$$(cat $(SERVER_PID))" 2>/dev/null; then \
@@ -128,12 +142,42 @@ server-start: build
 		echo "started (pid $$(cat $(SERVER_PID)))"; \
 	fi
 
+# server-stop reaps BOTH halves of the two-process backend `run.sh` starts:
+# the Go server AND the Python catalog builder daemon. Idempotent — safe to
+# call when neither, either, or both are running (this is what `./run.sh`
+# itself calls to switch targets, and what a user calls to tear everything
+# down).
 server-stop:
 	@if [ -f $(SERVER_PID) ] && kill -0 "$$(cat $(SERVER_PID))" 2>/dev/null; then \
 		echo "stopping pj-cloud-server (pid $$(cat $(SERVER_PID)))"; \
-		kill "$$(cat $(SERVER_PID))" 2>/dev/null || true; \
+		kill -TERM "$$(cat $(SERVER_PID))" 2>/dev/null || true; \
+		for i in 1 2 3 4 5 6 7 8 9 10; do \
+			kill -0 "$$(cat $(SERVER_PID))" 2>/dev/null || break; \
+			sleep 0.3; \
+		done; \
+		if kill -0 "$$(cat $(SERVER_PID))" 2>/dev/null; then \
+			echo "pj-cloud-server still up after 3s — escalating to SIGKILL"; \
+			kill -9 "$$(cat $(SERVER_PID))" 2>/dev/null || true; \
+		fi; \
 		rm -f $(SERVER_PID); \
 	else \
 		echo "pj-cloud-server not running (no live $(SERVER_PID))"; \
 		rm -f $(SERVER_PID); \
 	fi
+	@if [ -f $(BUILDER_PID) ] && kill -0 "$$(cat $(BUILDER_PID))" 2>/dev/null; then \
+		echo "stopping mcap_catalog builder (pid $$(cat $(BUILDER_PID)))"; \
+		kill -TERM "$$(cat $(BUILDER_PID))" 2>/dev/null || true; \
+		for i in 1 2 3 4 5 6 7 8 9 10; do \
+			kill -0 "$$(cat $(BUILDER_PID))" 2>/dev/null || break; \
+			sleep 0.3; \
+		done; \
+		if kill -0 "$$(cat $(BUILDER_PID))" 2>/dev/null; then \
+			echo "mcap_catalog builder still up after 3s — escalating to SIGKILL"; \
+			kill -9 "$$(cat $(BUILDER_PID))" 2>/dev/null || true; \
+		fi; \
+		rm -f $(BUILDER_PID); \
+	else \
+		echo "mcap_catalog builder not running (no live $(BUILDER_PID))"; \
+		rm -f $(BUILDER_PID); \
+	fi
+	@rm -f $(BUILDER_TARGET_FILE)

@@ -28,10 +28,17 @@ storage:
 
 catalog:
   db_path: /var/lib/pj-cloud/catalog.db
+  # tag_ipc_socket (D2, CATALOG_CONTRACT.md §10): the Python mcap_catalog
+  # builder's tag-edit UNIX socket. Required for UpdateTags to work at all —
+  # the catalog is always read-only now, so this IPC call is the only path a
+  # tag edit can take. MUST be on a SHARED LOCAL volume with the builder (see
+  # server/deploy/README.md's "Two-process deployment" section) — never NFS/EFS.
+  tag_ipc_socket: /var/lib/pj-cloud/tag.sock
 
 # indexer: removed in M6 §2.6 — the in-process Go catalog writer/indexer this
 # tuned no longer exists; the catalog is built by the external Python
-# mcap_catalog builder and served read-only.
+# mcap_catalog builder (server/deploy/Dockerfile.builder /
+# pj-cloud-builder.service) and served read-only.
 
 session:
   max_concurrent: 16
