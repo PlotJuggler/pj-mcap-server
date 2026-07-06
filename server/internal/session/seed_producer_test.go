@@ -14,8 +14,8 @@ import (
 // BEFORE the window stream. Here /map has two pre-window updates (t=50, t=100);
 // only the latest (t=100) is replayed, then the window's /pose@200.
 func TestProducer_LatchedSeedEmitsLastBeforeWindow(t *testing.T) {
-	seedChunk := chunk(1, 0, 100, 0, 50, "/map")     // pre-window chunk
-	winChunk := chunk(1, 150, 250, 1, 50, "/pose")   // in-window chunk
+	seedChunk := chunk(1, 0, 100, 0, 50, "/map")   // pre-window chunk
+	winChunk := chunk(1, 150, 250, 1, 50, "/pose") // in-window chunk
 	iter := fakeIter{byOffset: map[int64][]RawMessage{
 		0: {msg("/map", 50, "old-map"), msg("/map", 100, "new-map")},
 		1: {msg("/pose", 200, "pose")},
