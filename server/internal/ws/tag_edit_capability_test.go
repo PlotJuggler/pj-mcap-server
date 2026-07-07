@@ -56,6 +56,40 @@ func TestUpdateTags_ReadOnlyStore_WireError(t *testing.T) {
 	}
 }
 
+// TestUpdateTags_ReadOnlyStore_EmptyS3Key_WireError pins the VALIDATION ORDER
+// (Codex review of the s3_key addressing change): a present-but-EMPTY s3_key
+// is a malformed request regardless of tag-edit availability, so even with NO
+// tag-IPC forwarder configured the client must get the errEmptyS3Key answer
+// ("s3_key must be non-empty"), NOT readOnlyTagEditMessage — the same reply
+// the IPC-configured forward path gives, keeping the error surface independent
+// of server deployment shape.
+func TestUpdateTags_ReadOnlyStore_EmptyS3Key_WireError(t *testing.T) {
+	store := openAurynReadStore(t)
+	c := dialClient(t, newWSTestServer(t, store))
+	c.hello()
+
+	empty := ""
+	c.send(&pb.ClientMessage{
+		RequestId: 2,
+		Payload: &pb.ClientMessage_UpdateTags{UpdateTags: &pb.UpdateTagsRequest{
+			FileId:  1,
+			S3Key:   &empty,
+			SetTags: []*pb.Tag{{Key: "verified", Value: "yes"}},
+		}},
+	})
+	resp := c.recv()
+	e := resp.GetError()
+	if e == nil {
+		t.Fatalf("expected an Error frame, got %T", resp.GetPayload())
+	}
+	if e.GetCode() != pb.ErrorCode_ERROR_INVALID_REQUEST {
+		t.Errorf("Error.Code = %v, want ERROR_INVALID_REQUEST", e.GetCode())
+	}
+	if e.GetMessage() != "s3_key must be non-empty" {
+		t.Errorf("Error.Message = %q, want %q (the malformation, not the capability)", e.GetMessage(), "s3_key must be non-empty")
+	}
+}
+
 // TestUpdateTags_ReadOnlyStore_EmptyMutation_WireError: an UpdateTags with
 // NEITHER set_tags NOR unset_keys must still be rejected when no tag-IPC
 // forwarder is configured — handleUpdateTags rejects on tagIPC==nil alone, so

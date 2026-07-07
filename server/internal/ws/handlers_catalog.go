@@ -79,13 +79,43 @@ func (h *CatalogHandler) ListFiles(ctx context.Context, req *pb.ListFilesRequest
 // ReopenIfSwapped landing between them could pair one generation's file
 // summary with another generation's topics/tags. GetFileDetail pins the
 // handle once and runs all three phases against it.
+//
+// Addressing: when req.s3_key is PRESENT (proto3 optional), the file is
+// resolved by the STABLE object key and file_id is IGNORED — file ids are
+// generation-scoped handles that renumber across external-builder rebuilds,
+// so a client-held id can silently name the wrong file minutes later; the
+// key (from FileSummary.s3_key) cannot. There is deliberately NO id/key
+// mismatch validation (surviving a stale id is the point). Present-but-empty
+// is an error (never a silent fallback to file_id); absent = the unchanged
+// legacy id path. Key resolve + detail read share ONE pinned handle
+// (GetFileDetailByKey), keeping the whole response generation-consistent.
 func (h *CatalogHandler) GetFile(ctx context.Context, req *pb.GetFileRequest) (*pb.GetFileResponse, error) {
-	rec, topics, tags, err := catalog.GetFileDetail(ctx, h.Store, req.GetFileId())
-	if err != nil {
-		if errors.Is(err, catalog.ErrFileNotFound) {
-			return nil, errFileNotFound{id: req.GetFileId()}
+	var (
+		rec    catalog.FileRecord
+		topics []catalog.TopicRecord
+		tags   []catalog.EffectiveTag
+		err    error
+	)
+	if req.S3Key != nil {
+		key := req.GetS3Key()
+		if key == "" {
+			return nil, errEmptyS3Key{}
 		}
-		return nil, err
+		rec, topics, tags, err = catalog.GetFileDetailByKey(ctx, h.Store, key)
+		if err != nil {
+			if errors.Is(err, catalog.ErrFileNotFound) {
+				return nil, errFileNotFoundByKey{key: key}
+			}
+			return nil, err
+		}
+	} else {
+		rec, topics, tags, err = catalog.GetFileDetail(ctx, h.Store, req.GetFileId())
+		if err != nil {
+			if errors.Is(err, catalog.ErrFileNotFound) {
+				return nil, errFileNotFound{id: req.GetFileId()}
+			}
+			return nil, err
+		}
 	}
 	resp := &pb.GetFileResponse{
 		Summary: &pb.FileSummary{
@@ -145,6 +175,20 @@ func (h *CatalogHandler) GetVocabulary(ctx context.Context, _ *pb.GetVocabularyR
 type errFileNotFound struct{ id uint64 }
 
 func (e errFileNotFound) Error() string { return fmt.Sprintf("no file with id %d", e.id) }
+
+// errFileNotFoundByKey is errFileNotFound's key-addressed sibling: it carries
+// the s3_key so the connState layer can map it to ERROR_NOT_FOUND with the
+// key the client actually asked for.
+type errFileNotFoundByKey struct{ key string }
+
+func (e errFileNotFoundByKey) Error() string { return fmt.Sprintf("no file with s3_key %q", e.key) }
+
+// errEmptyS3Key is the present-but-EMPTY s3_key rejection (both GetFile and
+// UpdateTags): mapped to ERROR_INVALID_REQUEST at the connState layer —
+// NEVER a silent fallback to file_id addressing.
+type errEmptyS3Key struct{}
+
+func (errEmptyS3Key) Error() string { return "s3_key must be non-empty" }
 
 func tagsToProto(tags []catalog.EffectiveTag) []*pb.Tag {
 	out := make([]*pb.Tag, 0, len(tags))

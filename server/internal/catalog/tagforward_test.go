@@ -83,3 +83,27 @@ func TestEffectiveTagsByKey_MalformedKey(t *testing.T) {
 		t.Fatalf("EffectiveTagsByKey(malformed key) = %v, want ErrFileNotFound", err)
 	}
 }
+
+// TestFileIDForKey pins the exported key->id resolver (wire s3_key
+// addressing): a known key resolves to its CURRENT id; an unknown (but
+// well-formed) key and a malformed non-Hive key are both lookup-only misses
+// (ErrFileNotFound — never fabricating dimension rows).
+func TestFileIDForKey(t *testing.T) {
+	st := openMinimalAurynStore(t)
+
+	id, err := FileIDForKey(context.Background(), st.DB(), minimalAurynKey)
+	if err != nil {
+		t.Fatalf("FileIDForKey(%q): %v", minimalAurynKey, err)
+	}
+	if id != 1 {
+		t.Fatalf("FileIDForKey(%q) = %d, want 1", minimalAurynKey, id)
+	}
+
+	unknown := "customer=nope/customer_site=x/robot=y/source=z/date=2026-01-01/f.mcap"
+	if _, err := FileIDForKey(context.Background(), st.DB(), unknown); !errors.Is(err, ErrFileNotFound) {
+		t.Fatalf("FileIDForKey(unknown dims) = %v, want ErrFileNotFound", err)
+	}
+	if _, err := FileIDForKey(context.Background(), st.DB(), "flat_name.mcap"); !errors.Is(err, ErrFileNotFound) {
+		t.Fatalf("FileIDForKey(malformed key) = %v, want ErrFileNotFound", err)
+	}
+}

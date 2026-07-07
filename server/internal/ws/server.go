@@ -512,8 +512,28 @@ func (c *connState) handleGetFile(ctx context.Context, reqID uint64, req *pb.Get
 			c.sendError(reqID, 0, pb.ErrorCode_ERROR_NOT_FOUND, nf.Error(), "")
 			return
 		}
+		var nfk errFileNotFoundByKey
+		if errors.As(err, &nfk) {
+			c.sendError(reqID, 0, pb.ErrorCode_ERROR_NOT_FOUND, nfk.Error(), "")
+			return
+		}
+		var empty errEmptyS3Key
+		if errors.As(err, &empty) {
+			c.sendError(reqID, 0, pb.ErrorCode_ERROR_INVALID_REQUEST, empty.Error(), "")
+			return
+		}
 		c.sendError(reqID, 0, pb.ErrorCode_ERROR_INVALID_REQUEST, "GetFile failed", err.Error())
 		return
+	}
+
+	// Key-addressed requests IGNORE file_id by design (ids are generation-scoped
+	// handles that renumber across rebuilds — the key surviving a stale id is
+	// the feature). Debug-visibility only when both were sent and they disagree;
+	// NEVER a failure.
+	if req.S3Key != nil && req.GetFileId() != 0 && req.GetFileId() != resp.GetSummary().GetId() {
+		c.h.log.Debug("ws: GetFile id/key disagree; key wins (ids renumber across rebuilds)",
+			"remote", c.remote, "request_id", reqID, "key", req.GetS3Key(),
+			"wire_file_id", req.GetFileId(), "current_file_id", resp.GetSummary().GetId())
 	}
 
 	c.h.log.Info("ws: GetFile served", "remote", c.remote, "request_id", reqID,
@@ -533,6 +553,17 @@ func (c *connState) handleGetFile(ctx context.Context, reqID uint64, req *pb.Get
 // EMPTY set_tags/unset_keys request, so tag_edit_supported=false is never
 // contradicted by a no-op "success".
 func (c *connState) handleUpdateTags(ctx context.Context, reqID uint64, req *pb.UpdateTagsRequest) {
+	// Malformed-request validation FIRST (Codex review): a present-but-EMPTY
+	// s3_key is invalid regardless of whether tag editing is available, and the
+	// client should learn about the malformation, not the capability — so it
+	// gets the same errEmptyS3Key answer on a no-IPC server as on the forward
+	// path below (which re-checks for its own callers).
+	if req.S3Key != nil && req.GetS3Key() == "" {
+		c.h.log.Warn("ws: UpdateTags rejected (empty s3_key)", "remote", c.remote,
+			"request_id", reqID)
+		c.sendError(reqID, 0, pb.ErrorCode_ERROR_INVALID_REQUEST, errEmptyS3Key{}.Error(), "")
+		return
+	}
 	if c.h.tagIPC == nil {
 		c.sendError(reqID, 0, pb.ErrorCode_ERROR_INVALID_REQUEST, readOnlyTagEditMessage, "")
 		return
@@ -551,21 +582,44 @@ func (c *connState) handleUpdateTags(ctx context.Context, reqID uint64, req *pb.
 // passes through before reaching this forward. Every forwarded edit is logged
 // with the WS remote address for that reason.
 func (c *connState) handleUpdateTagsForwarded(ctx context.Context, reqID uint64, req *pb.UpdateTagsRequest) {
-	// Phase 1: resolve the wire file_id -> object key (the endpoint addresses
-	// files by key, not id — §10 "Key-based addressing"). A single db.QueryContext
-	// call, so no B1 pinning is needed for this phase alone.
-	key, err := catalog.ObjectKeyForFile(ctx, c.h.store.DB(), req.GetFileId())
-	if err != nil {
-		if errors.Is(err, catalog.ErrFileNotFound) {
-			c.h.log.Warn("ws: UpdateTags rejected (file not found)", "remote", c.remote,
-				"request_id", reqID, "file_id", req.GetFileId())
-			c.sendError(reqID, 0, pb.ErrorCode_ERROR_NOT_FOUND, errFileNotFound{id: req.GetFileId()}.Error(), "")
+	// Phase 1: determine the object key the edit addresses (the endpoint
+	// addresses files by key, not id — §10 "Key-based addressing").
+	//
+	// Key-addressed requests (s3_key PRESENT) use the client's key VERBATIM —
+	// no id->key resolve at all, so a stale generation-scoped file_id can never
+	// redirect the edit onto the wrong file (file_id is IGNORED by design; no
+	// mismatch validation). Present-but-EMPTY is rejected outright — never a
+	// silent fallback to file_id. An unknown key is NOT pre-validated here:
+	// the IPC's own 404 maps to tagIPCKeyGoneMessage below, same as the legacy
+	// path's phase-1-resolved-then-vanished race.
+	//
+	// Legacy id-addressed requests (s3_key ABSENT) resolve the wire file_id ->
+	// object key exactly as before. A single db.QueryContext call, so no B1
+	// pinning is needed for that phase alone.
+	var key string
+	if req.S3Key != nil {
+		key = req.GetS3Key()
+		if key == "" {
+			c.h.log.Warn("ws: UpdateTags rejected (empty s3_key)", "remote", c.remote,
+				"request_id", reqID)
+			c.sendError(reqID, 0, pb.ErrorCode_ERROR_INVALID_REQUEST, errEmptyS3Key{}.Error(), "")
 			return
 		}
-		c.h.log.Warn("ws: UpdateTags rejected (key resolve failed)", "remote", c.remote,
-			"request_id", reqID, "file_id", req.GetFileId(), "err", err)
-		c.sendError(reqID, 0, pb.ErrorCode_ERROR_INTERNAL, "UpdateTags failed (key resolve)", err.Error())
-		return
+	} else {
+		var err error
+		key, err = catalog.ObjectKeyForFile(ctx, c.h.store.DB(), req.GetFileId())
+		if err != nil {
+			if errors.Is(err, catalog.ErrFileNotFound) {
+				c.h.log.Warn("ws: UpdateTags rejected (file not found)", "remote", c.remote,
+					"request_id", reqID, "file_id", req.GetFileId())
+				c.sendError(reqID, 0, pb.ErrorCode_ERROR_NOT_FOUND, errFileNotFound{id: req.GetFileId()}.Error(), "")
+				return
+			}
+			c.h.log.Warn("ws: UpdateTags rejected (key resolve failed)", "remote", c.remote,
+				"request_id", reqID, "file_id", req.GetFileId(), "err", err)
+			c.sendError(reqID, 0, pb.ErrorCode_ERROR_INTERNAL, "UpdateTags failed (key resolve)", err.Error())
+			return
+		}
 	}
 
 	set := make(map[string]string, len(req.GetSetTags()))

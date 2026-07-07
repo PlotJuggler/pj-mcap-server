@@ -1,6 +1,9 @@
 package catalog
 
-import "context"
+import (
+	"context"
+	"database/sql"
+)
 
 // detail.go implements the compound GetFileDetail read (B1 — catalog-migration
 // §6.2a review): the WS GetFile handler used to compose catalog.GetFile +
@@ -21,8 +24,29 @@ import "context"
 // EffectiveTags itself. Returns ErrFileNotFound (wrapped) when the summary
 // phase does.
 func GetFileDetail(ctx context.Context, s *Store, fileID uint64) (FileRecord, []TopicRecord, []EffectiveTag, error) {
-	db := s.DB()
+	return getFileDetailDB(ctx, s.DB(), fileID)
+}
 
+// GetFileDetailByKey is GetFileDetail addressed by the STABLE object key
+// instead of a generation-scoped file id (wire s3_key addressing): it pins
+// db := s.DB() ONCE, resolves key -> CURRENT file id on that handle
+// (FileIDForKey), and runs the same three-phase read against the SAME handle
+// — so the id resolve and the detail read are guaranteed to answer from one
+// generation (a rebuild landing between them cannot pair one generation's id
+// with another's rows). Returns ErrFileNotFound when the key doesn't parse
+// as a Hive key or names no cataloged file.
+func GetFileDetailByKey(ctx context.Context, s *Store, key string) (FileRecord, []TopicRecord, []EffectiveTag, error) {
+	db := s.DB()
+	id, err := FileIDForKey(ctx, db, key)
+	if err != nil {
+		return FileRecord{}, nil, nil, err
+	}
+	return getFileDetailDB(ctx, db, id)
+}
+
+// getFileDetailDB is the shared three-phase core: every phase runs against
+// the caller's single pinned handle (B1 — see the file header).
+func getFileDetailDB(ctx context.Context, db *sql.DB, fileID uint64) (FileRecord, []TopicRecord, []EffectiveTag, error) {
 	rec, err := aurynGetFile(ctx, db, fileID)
 	if err != nil {
 		return FileRecord{}, nil, nil, err

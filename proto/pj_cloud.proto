@@ -194,7 +194,18 @@ message FlatMetadata {
 }
 
 message GetFileRequest {
-  uint64 file_id = 1;
+  uint64 file_id = 1;                      // GENERATION-SCOPED handle: renumbers across catalog rebuilds (see s3_key)
+  // Stable addressing (post-M6 external-builder rebuilds): file ids RENUMBER
+  // across catalog rebuilds — they are generation-scoped handles, so an id
+  // resolved from an earlier ListFiles can silently name a DIFFERENT file
+  // after a rebuild. s3_key is the stable identity (= FileSummary.s3_key,
+  // which the client already holds). proto3 `optional` = explicit presence:
+  //   present  => the server resolves by key and IGNORES file_id (no mismatch
+  //               validation — surviving a stale id is the point);
+  //   present but EMPTY => ERROR_INVALID_REQUEST (never a silent fallback to
+  //               file_id);
+  //   absent   => legacy id addressing (unchanged).
+  optional string s3_key = 2;
 }
 
 message TopicInfo {
@@ -210,9 +221,17 @@ message GetFileResponse {
 }
 
 message UpdateTagsRequest {
-  uint64 file_id           = 1;
+  uint64 file_id           = 1;            // GENERATION-SCOPED handle: renumbers across catalog rebuilds (see s3_key)
   repeated Tag set_tags    = 2;            // upsert override
   repeated string unset_keys = 3;          // delete override; or NULL-mask if embedded had it
+  // Stable addressing — same semantics as GetFileRequest.s3_key: file ids
+  // RENUMBER across catalog rebuilds (generation-scoped handles); s3_key is
+  // the stable identity from FileSummary.s3_key. When present the server
+  // addresses the edit by key and IGNORES file_id (no mismatch validation —
+  // surviving a stale id is the point); present-but-empty is
+  // ERROR_INVALID_REQUEST (never a silent fallback to file_id); absent =
+  // legacy id addressing (unchanged).
+  optional string s3_key = 4;
 }
 
 message UpdateTagsResponse {

@@ -34,22 +34,22 @@ func ObjectKeyForFile(ctx context.Context, db *sql.DB, id uint64) (string, error
 	return rec.S3Key, nil
 }
 
-// EffectiveTagsByKey resolves an object key to its CURRENT file_id and
-// returns its tags_effective, both against ONE freshly-pinned db handle
-// (s.DB() is called exactly once here) — this is the forwarder's response
-// phase (see file header, finding A1).
+// FileIDForKey resolves an object key to its CURRENT file id, on an
+// already-pinned db handle (B1 pattern — callers composing this with further
+// reads of the same file MUST pass the SAME handle through every phase, or a
+// concurrent ReopenIfSwapped could mix generations mid-request). The key is
+// Hive-parsed to dimension NAMES and looked up by joining on them —
+// lookup-only, NEVER creating rows (mirrors the Python db.lookup_file_id
+// contract: an unknown customer/site/robot/source is a miss, unlike the
+// builder's own resolve_customer/resolve_site/...).
 //
 // Returns ErrFileNotFound if key does not parse as a Hive key, or parses but
-// names no cataloged file (a lookup-only miss — mirrors the Python
-// db.lookup_file_id contract: never fabricates a dimension row for an
-// unknown customer/site/robot/source, unlike the builder's own
-// resolve_customer/resolve_site/...).
-func EffectiveTagsByKey(ctx context.Context, s *Store, key string) ([]EffectiveTag, error) {
+// names no cataloged file.
+func FileIDForKey(ctx context.Context, db *sql.DB, key string) (uint64, error) {
 	dims, ok := parseHiveKey(key)
 	if !ok {
-		return nil, ErrFileNotFound
+		return 0, ErrFileNotFound
 	}
-	db := s.DB()
 	var id uint64
 	err := db.QueryRowContext(ctx, `
 		SELECT f.id FROM files f
@@ -61,10 +61,26 @@ func EffectiveTagsByKey(ctx context.Context, s *Store, key string) ([]EffectiveT
 		dims.Customer, dims.Site, dims.Robot, dims.Source, dims.Date, dims.Filename).Scan(&id)
 	switch {
 	case err == nil:
+		return id, nil
 	case errors.Is(err, sql.ErrNoRows):
-		return nil, ErrFileNotFound
+		return 0, ErrFileNotFound
 	default:
-		return nil, fmt.Errorf("effective tags by key %q: %w", key, err)
+		return 0, fmt.Errorf("file id for key %q: %w", key, err)
+	}
+}
+
+// EffectiveTagsByKey resolves an object key to its CURRENT file_id and
+// returns its tags_effective, both against ONE freshly-pinned db handle
+// (s.DB() is called exactly once here) — this is the forwarder's response
+// phase (see file header, finding A1).
+//
+// Returns ErrFileNotFound if key does not parse as a Hive key, or parses but
+// names no cataloged file (see FileIDForKey).
+func EffectiveTagsByKey(ctx context.Context, s *Store, key string) ([]EffectiveTag, error) {
+	db := s.DB()
+	id, err := FileIDForKey(ctx, db, key)
+	if err != nil {
+		return nil, err
 	}
 	return effectiveTagsDB(ctx, db, id)
 }
