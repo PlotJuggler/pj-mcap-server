@@ -449,6 +449,11 @@ DexoryCloudDialog::DexoryCloudDialog() : worker_(std::make_unique<FetchWorker>()
   worker_->capabilitiesReady = [this](BackendCaps caps) {
     postEvent([this, caps = std::move(caps)]() mutable { onCapabilitiesReady(std::move(caps)); });
   };
+  // D2: same GUI-thread event-drain pattern as capabilitiesReady above, for the
+  // tag-edit-supported gate.
+  worker_->serverCapabilitiesReady = [this](ServerCaps caps) {
+    postEvent([this, caps]() { onServerCapabilitiesReady(caps); });
+  };
   worker_->sequencesReady = [this](std::vector<SequenceInfo> sequences) {
     postEvent([this, sequences = std::move(sequences)]() mutable { onSequencesReady(std::move(sequences)); });
   };
@@ -863,8 +868,18 @@ std::string DexoryCloudDialog::widget_data() {
   // selected, and no fetch is in flight (a tag edit re-lists sequences, which
   // would race a download's catalog reads). Slice 7: a tag edit is unambiguous
   // only for a single selection, so it is disabled when multiple are selected.
-  wd.setEnabled("buttonEditTags", state_.connected && state_.seq_selected_rows.size() == 1 &&
-                                      !state_.primary_sequence.empty() && !state_.fetch_active);
+  // D2: ALSO gated on tag_edit_supported (HelloResponse.capabilities) — a
+  // read-only catalog with no tag-edit IPC forwarder configured (post-M6) must
+  // never offer a control BackendConnection::updateTags() is guaranteed to
+  // reject. AND on !connecting (Codex review): during a reconnect handshake
+  // `connected`/`tag_edit_supported` still describe the PREVIOUS server, so
+  // the editor must not open on that stale window. This whole expression is
+  // recomputed every host tick, so a selection change can never re-enable the
+  // button past these gates.
+  wd.setEnabled("buttonEditTags", state_.connected && !state_.connecting &&
+                                      state_.seq_selected_rows.size() == 1 &&
+                                      !state_.primary_sequence.empty() && !state_.fetch_active &&
+                                      state_.tag_edit_supported);
 
   // Icon-only Connect / Cert buttons (the .ui clears their text + sets the
   // tooltips). Resolved by the host from its themed icon set; unknown ids fall
@@ -1402,6 +1417,11 @@ bool DexoryCloudDialog::onClicked(std::string_view widget_name) {
       std::lock_guard<std::mutex> lock(state_.mu);
       state_.connecting = true;
       state_.suppress_connect_error = false;  // explicit Connect reports failures
+      // Capability lifecycle (Codex review): the URI may now point at a
+      // DIFFERENT server, so the previous connection's latch must not leak
+      // into the new handshake window — drop it now and let
+      // onServerCapabilitiesReady re-latch from the NEW server's Hello.
+      state_.tag_edit_supported = false;
     }
     notify(PJ::ToolboxMessageLevel::kInfo, fmt::format("Connecting to {}…", uri));
     postCommand([w = worker_.get(), uri, cert_path, api_key, allow_insecure] {
@@ -1432,9 +1452,12 @@ bool DexoryCloudDialog::onClicked(std::string_view widget_name) {
   if (widget_name == "buttonEditTags") {
     std::lock_guard<std::mutex> lock(state_.mu);
     // Slice 7: tag editing is single-selection only; a multi-select disables the
-    // button. Guard against a stray click in any non-single-selection state.
-    if (!state_.connected || state_.seq_selected_rows.size() != 1 || state_.primary_sequence.empty() ||
-        state_.fetch_active) {
+    // button. D2: also re-check tag_edit_supported (read-only catalog / no
+    // tag-edit IPC configured) — same defense-in-depth as the other conditions
+    // here. Guard against a stray click in any state where the button should be
+    // disabled.
+    if (!state_.connected || state_.connecting || state_.seq_selected_rows.size() != 1 ||
+        state_.primary_sequence.empty() || state_.fetch_active || !state_.tag_edit_supported) {
       return true;  // button is disabled in this state; ignore a stray click
     }
     state_.tag_edit_sequence = state_.primary_sequence;
@@ -2125,6 +2148,13 @@ void DexoryCloudDialog::onCapabilitiesReady(BackendCaps caps) {
   // A fresh connect resets any prior prefix narrowing (a new server's key space
   // is unrelated to the old one's).
   state_.selected_prefix.clear();
+}
+
+void DexoryCloudDialog::onServerCapabilitiesReady(ServerCaps caps) {
+  std::lock_guard<std::mutex> lock(state_.mu);
+  // resume_supported is read at use time (the reconnect-resume path), not
+  // latched into state_ — the dialog has no resume-specific UI to gate today.
+  state_.tag_edit_supported = caps.tag_edit_supported;
 }
 
 void DexoryCloudDialog::onConnectFinished(bool ok, std::string status, std::string error) {

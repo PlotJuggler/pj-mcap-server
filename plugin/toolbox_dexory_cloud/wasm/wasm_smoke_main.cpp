@@ -88,19 +88,28 @@ bool zstdDecodeAll(const std::string& in, std::string* out, std::string* error) 
 
 void testSessionKey() {
   using namespace PJ::cloud;
-  // Reordered file_ids + topics produce the same normalized key + hash.
-  SessionKey a = computeSessionKey("wss://h/api/ws", {3, 1, 2}, {"/b", "/a"}, {100, 200});
-  SessionKey b = computeSessionKey("wss://h/api/ws", {1, 2, 3}, {"/a", "/b"}, {100, 200});
+  // Reordered sequence_names + topics produce the same normalized key + hash.
+  // Keyed on the stable s3-key NAME, not a wire file_id (post-M6 catalog
+  // rebuilds renumber rowids — see session_key.hpp).
+  SessionKey a = computeSessionKey("wss://h/api/ws", {"c", "a", "b"}, {"/b", "/a"}, {100, 200});
+  SessionKey b = computeSessionKey("wss://h/api/ws", {"a", "b", "c"}, {"/a", "/b"}, {100, 200});
   check(a == b, "session_key reordered-equal");
   check(a.hash == b.hash, "session_key reordered-hash-equal");
 
-  SessionKey c = computeSessionKey("wss://h1/api/ws", {1}, {"/a"}, {0, 0});
-  SessionKey d = computeSessionKey("wss://h2/api/ws", {1}, {"/a"}, {0, 0});
+  SessionKey c = computeSessionKey("wss://h1/api/ws", {"a"}, {"/a"}, {0, 0});
+  SessionKey d = computeSessionKey("wss://h2/api/ws", {"a"}, {"/a"}, {0, 0});
   check(c != d, "session_key different-uri");
 
-  SessionKey e = computeSessionKey("wss://h/api/ws", {1}, {"/a"}, {100, 200});
-  SessionKey f = computeSessionKey("wss://h/api/ws", {1}, {"/a"}, {100, 201});
+  SessionKey e = computeSessionKey("wss://h/api/ws", {"a"}, {"/a"}, {100, 200});
+  SessionKey f = computeSessionKey("wss://h/api/ws", {"a"}, {"/a"}, {100, 201});
   check(e != f, "session_key different-range");
+
+  // Same names+topics+range collide regardless of any file_id context — the
+  // whole point of the post-M6 re-key (a rebuild renumbering ids must not
+  // change session identity).
+  SessionKey g = computeSessionKey("wss://h/api/ws", {"nissan_zala_50"}, {"/a"}, {0, 0});
+  SessionKey h = computeSessionKey("wss://h/api/ws", {"nissan_zala_50"}, {"/a"}, {0, 0});
+  check(g == h, "session_key name-keyed-identity-stable");
 }
 
 void testSessionCache() {
@@ -109,7 +118,7 @@ void testSessionCache() {
   using dexory_cloud::SessionCache;
 
   SessionCache cache(2);
-  SessionKey k1 = computeSessionKey("wss://h/api/ws", {1}, {"/a"}, {0, 0});
+  SessionKey k1 = computeSessionKey("wss://h/api/ws", {"a"}, {"/a"}, {0, 0});
   CachedSession v1;
   v1.display_name = "ds1";
   v1.total_messages = 42;

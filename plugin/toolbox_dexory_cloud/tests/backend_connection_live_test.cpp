@@ -282,7 +282,17 @@ TEST(DexoryCloudBackendLive, UpdateTagsSetThenUnset) {
   std::string error;
   ASSERT_TRUE(conn.connect(&error)) << "connect failed: " << error;
 
-  // listSequences() builds the name->file_id index updateTags() resolves against.
+  // D2 capability gate (Codex review): a valid live server WITHOUT a tag-edit
+  // IPC socket advertises tag_edit_supported=false and updateTags() now fails
+  // fast client-side — that deployment shape is not a test failure, it is
+  // out of this test's scope. The smoke harness always runs with the IPC
+  // configured, so there this test still RUNS (never skips).
+  if (const auto caps = conn.serverCapabilities(); caps.has_value() && !caps->tag_edit_supported) {
+    GTEST_SKIP() << "server advertises tag_edit_supported=false (no tag-edit IPC) — tag round-trip not testable";
+  }
+
+  // listSequences(): updateTags() is key-addressed so no index is strictly
+  // needed, but the non-empty catalog assertion below still wants the list.
   ASSERT_FALSE(conn.listSequences().empty());
 
   const std::string kKey = "dexory_live_test_tag";

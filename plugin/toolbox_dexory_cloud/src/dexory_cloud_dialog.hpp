@@ -67,6 +67,16 @@ struct DialogState {
   // stays hidden and the dialog behaves exactly as before (default off).
   bool supports_file_hierarchy = false;
   std::vector<std::string> metadata_key_vocabulary;
+
+  // D2: HelloResponse.capabilities.tag_edit_supported, latched from
+  // serverCapabilitiesReady (see onServerCapabilitiesReady). false (the safe default,
+  // matching ServerCaps{}) until a successful connect proves the server
+  // supports tag editing; getWidgetData() ANDs this into buttonEditTags's
+  // enabled expression so the dialog never offers a tag-edit control the
+  // server is guaranteed to reject (post-M6: a read-only catalog with no
+  // tag-edit IPC forwarder configured). The BackendConnection::updateTags()
+  // gate is the authoritative enforcement point; this is UI-only.
+  bool tag_edit_supported = false;
   // The currently-selected top-level '/'-prefix narrowing the seqTable. Empty or
   // the "All" sentinel = no narrowing. Only meaningful when
   // supports_file_hierarchy is true. Bumps no epoch (it composes on top of the
@@ -374,6 +384,10 @@ class DexoryCloudDialog : public PJ::DialogPluginTyped {
   // D8: latch the server's BackendCapabilities (hierarchy flag + query-assist
   // vocabulary) into state_. Runs on the GUI thread (event-drained).
   void onCapabilitiesReady(BackendCaps caps);
+  // D2: latch the server's Capabilities (resume_supported/tag_edit_supported)
+  // into state_ so getWidgetData()'s buttonEditTags gate can see it. Runs on
+  // the GUI thread (event-drained), same as onCapabilitiesReady above.
+  void onServerCapabilitiesReady(ServerCaps caps);
   void onSequencesReady(std::vector<SequenceInfo> sequences);
   // Progressive discovery (PJ3 parity): populate the table from the initial
   // list as soon as it arrives, then fill each row's Date/Size as the server

@@ -311,6 +311,14 @@ bool BackendConnection::connect(std::string* error_out) {
   }
 
   version_ = ServerVersion{response.hello_response().server_version()};
+  // Reset BEFORE parsing (Codex review): connect() can run more than once on
+  // the same object (a reconnect, possibly to a DIFFERENT server behind the
+  // same URI), and "absent field => nullopt" must describe THIS handshake —
+  // without the reset, a second Hello omitting a field would silently keep the
+  // FIRST server's capabilities (e.g. a stale tag_edit_supported=true letting
+  // updateTags() past its gate).
+  backend_caps_.reset();
+  server_caps_.reset();
   // Parse the optional BackendCapabilities (HelloResponse.backend). Absent when
   // the server omits it (has_backend()==false): leave backend_caps_ at nullopt.
   if (response.hello_response().has_backend()) {
@@ -321,6 +329,17 @@ bool BackendConnection::connect(std::string* error_out) {
                                         be.metadata_key_vocabulary().end());
     backend_caps_ = std::move(caps);
   }
+  // Parse the optional Capabilities (HelloResponse.capabilities): the D2
+  // contract flags (resume_supported, tag_edit_supported). Absent when the
+  // server omits it (has_capabilities()==false): leave server_caps_ at
+  // nullopt (updateTags() treats absent as "proceed as before", not as false).
+  if (response.hello_response().has_capabilities()) {
+    const auto& cap = response.hello_response().capabilities();
+    ServerCaps caps;
+    caps.resume_supported = cap.resume_supported();
+    caps.tag_edit_supported = cap.tag_edit_supported();
+    server_caps_ = caps;
+  }
   return true;
 }
 
@@ -330,6 +349,10 @@ std::optional<ServerVersion> BackendConnection::version() const {
 
 std::optional<BackendCaps> BackendConnection::backendCapabilities() const {
   return backend_caps_;
+}
+
+std::optional<ServerCaps> BackendConnection::serverCapabilities() const {
+  return server_caps_;
 }
 
 std::vector<SequenceInfo> BackendConnection::listSequences() {
@@ -376,14 +399,22 @@ TopicsResult BackendConnection::listTopicsChecked(const std::string& sequence_na
     result.error = "not connected";
     return result;
   }
-  auto it = file_id_by_name_.find(sequence_name);
-  if (it == file_id_by_name_.end()) {
-    result.error = "unknown sequence \"" + sequence_name + "\" (not in the catalog index; refresh the list)";
-    return result;
-  }
 
   pj_cloud::v1::ClientMessage request;
-  request.mutable_get_file()->set_file_id(it->second);
+  auto* get_file = request.mutable_get_file();
+  // Key-addressing (post-M6): catalog file ids RENUMBER across
+  // external-builder rebuilds, so a stale/absent browse index (file_id_by_name_,
+  // last rebuilt by listSequences()) must never fail this RPC locally. Always
+  // send s3_key — sequence_name IS the s3_key verbatim (SequenceInfo.name ==
+  // FileSummary.s3_key, see wire_mapping.cpp) — so the server resolves the key
+  // in its CURRENT generation and ignores file_id when the key is present.
+  // Still populate file_id when the name happens to resolve against our index
+  // (harmless: the server ignores it whenever s3_key is present); an
+  // unresolved name simply proceeds key-only instead of failing fast.
+  get_file->set_s3_key(sequence_name);
+  if (auto it = file_id_by_name_.find(sequence_name); it != file_id_by_name_.end()) {
+    get_file->set_file_id(it->second);
+  }
 
   pj_cloud::v1::ServerMessage response;
   if (!sendAndWait(request, &response)) {
@@ -439,15 +470,33 @@ bool BackendConnection::updateTags(const std::string& sequence_name,
     set_error("not connected");
     return false;
   }
-  auto it = file_id_by_name_.find(sequence_name);
-  if (it == file_id_by_name_.end()) {
-    set_error("unknown sequence '" + sequence_name + "'");
+  // D2 contract: never send an UpdateTags the server is guaranteed to reject.
+  // Gate on the HANDSHAKE-time snapshot: PRESENT-and-false means the catalog
+  // is read-only (post-M6: the Python builder is the sole writer) and no
+  // tag-edit IPC forwarder is configured — every such request would fail
+  // server-side anyway. Absent (nullopt, an older/odd server) is NOT treated
+  // as false: proceed exactly as before so the server-side rejection (if any)
+  // still lands verbatim.
+  if (server_caps_.has_value() && !server_caps_->tag_edit_supported) {
+    set_error("server does not support tag editing (read-only catalog; no tag-edit IPC configured)");
     return false;
   }
 
   pj_cloud::v1::ClientMessage request;
   auto* update = request.mutable_update_tags();
-  update->set_file_id(it->second);
+  // Key-addressing (post-M6): same rationale as listTopicsChecked() above —
+  // catalog file ids renumber across external-builder rebuilds, so a client
+  // file_id resolved from an old ListFiles can silently denote a DIFFERENT
+  // file. Always send s3_key (sequence_name verbatim) so this RPC is immune
+  // to a stale/absent browse index; the server resolves the key in its
+  // CURRENT generation and ignores file_id when the key is present. Still
+  // populate file_id when the name resolves against our index (harmless —
+  // ignored server-side whenever s3_key is present); an unresolved name
+  // proceeds key-only rather than failing locally.
+  update->set_s3_key(sequence_name);
+  if (auto it = file_id_by_name_.find(sequence_name); it != file_id_by_name_.end()) {
+    update->set_file_id(it->second);
+  }
   for (const auto& [key, value] : set_tags) {
     auto* tag = update->add_set_tags();
     tag->set_key(key);

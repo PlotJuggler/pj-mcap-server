@@ -681,6 +681,37 @@ if(BUILD_TESTING)
   )
   add_test(NAME DexoryCloudBackendErrorTest COMMAND toolbox_dexory_cloud_backend_error_test)
 
+  # D2 HelloResponse.capabilities parse + updateTags() tag-edit gate (HERMETIC):
+  # stands up a minimal in-process ix::WebSocketServer that fakes the Hello
+  # handshake payload (no such fake-server harness existed before this test —
+  # backend_connection_error_test.cpp above only covers closed-port / never-
+  # connected). Asserts tag_edit_supported=false -> serverCapabilities() parses
+  # it AND updateTags() fails fast with the exact gate message WITHOUT sending
+  # an UpdateTags frame; tag_edit_supported=true -> updateTags() proceeds past
+  # the gate and actually sends (and completes, since the fake server answers
+  # ListFiles/UpdateTags too); resume_supported round-trips independently.
+  add_executable(toolbox_dexory_cloud_server_caps_test
+    tests/server_caps_test.cpp
+    src/backend_connection.cpp
+    src/wire_mapping.cpp
+    src/session_decode.cpp
+    ${DEXORY_CLOUD_PROTO_SRCS}
+  )
+  target_include_directories(toolbox_dexory_cloud_server_caps_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${DEXORY_CLOUD_PROTO_OUT_DIR}
+  )
+  set_source_files_properties(
+    src/backend_connection.cpp
+    src/wire_mapping.cpp
+    src/session_decode.cpp
+    PROPERTIES COMPILE_OPTIONS "-Wno-conversion"
+  )
+  target_link_libraries(toolbox_dexory_cloud_server_caps_test PRIVATE
+    protobuf::libprotobuf ixwebsocket::ixwebsocket zstd::libzstd_static LZ4::lz4_static GTest::gtest_main
+  )
+  add_test(NAME DexoryCloudServerCapsTest COMMAND toolbox_dexory_cloud_server_caps_test)
+
   # D12 env-var fallback (HERMETIC): the CLI URL/token precedence rule
   # (explicit --url/--token > env DEXORY_CLOUD_URL/DEXORY_CLOUD_API_KEY >
   # default). Pure header (tools/cli_url_resolve.hpp), std only — no socket.

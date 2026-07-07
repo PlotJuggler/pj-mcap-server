@@ -155,6 +155,13 @@ int runHello(dexory_cloud::BackendConnection& conn, const std::string& error) {
     }
     std::cout << '\n';
   }
+  // Capabilities (HelloResponse.capabilities): protocol-level D2 flags. Printed
+  // when the server advertised them (has_capabilities()); absent on an
+  // older/odd server that omits the field.
+  if (const auto caps = conn.serverCapabilities(); caps.has_value()) {
+    std::cout << "capabilities: resume_supported=" << (caps->resume_supported ? "true" : "false")
+              << " tag_edit_supported=" << (caps->tag_edit_supported ? "true" : "false") << '\n';
+  }
   return kExitOk;
 }
 
@@ -583,10 +590,20 @@ int runTag(dexory_cloud::BackendConnection& conn, const std::string& sequence_na
     std::cerr << "tag: nothing to do (give at least one --set k=v or --unset k)\n";
     return kExitUsage;
   }
+  // D2: fail fast with a clear message when the server has already told us (at
+  // Hello) it can't do tag editing (read-only catalog; no tag-edit IPC
+  // configured). updateTags() below also gates on this, so this check is
+  // purely a UX shortcut — not the enforcement point.
+  if (const auto caps = conn.serverCapabilities(); caps.has_value() && !caps->tag_edit_supported) {
+    std::cerr << "tag: server does not support tag editing (read-only catalog; no tag-edit IPC configured)\n";
+    return kExitFailure;
+  }
 
-  // listSequences() builds the name->file_id index that updateTags() resolves
-  // the sequence name against (the result itself is unused here).
-  (void)conn.listSequences();
+  // No pre-listSequences() call: updateTags() addresses the file by s3_key
+  // (the sequence name sent verbatim), so it no longer needs the browse
+  // name->file_id index populated first — key-addressing made that round trip
+  // redundant. (The post-update listSequences() below, which refreshes the
+  // printed metadata, still runs.)
 
   std::vector<dexory_cloud::TagRow> effective;
   std::string error;

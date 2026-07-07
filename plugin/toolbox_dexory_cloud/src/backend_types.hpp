@@ -118,6 +118,28 @@ struct BackendCaps {
   std::vector<std::string> metadata_key_vocabulary;
 };
 
+// HelloResponse.capabilities (proto type Capabilities): protocol-level feature
+// flags, orthogonal to BackendCaps' storage-backend-shaped UI hints.
+//   resume_supported    → true in v1 (reconnect-and-resume is always offered).
+//   tag_edit_supported   → false means the catalog is READ-ONLY *and* no
+//                          tag-edit IPC forwarder is configured on the server
+//                          side (post-M6: the Python builder is the sole
+//                          catalog writer; the Go server only forwards
+//                          UpdateTags over a unix-socket IPC when one is wired
+//                          up) — every UpdateTags the client sent would be
+//                          rejected. The client MUST NOT offer a tag-edit UI
+//                          it knows will fail (D2 contract). NOTE: this is a
+//                          HANDSHAKE-TIME snapshot; daemon liveness is still
+//                          re-checked at use time on the server, so
+//                          tag_edit_supported==true does not itself guarantee
+//                          a later UpdateTags succeeds.
+// Parsed once at connect() into BackendConnection::serverCapabilities(); the
+// CLI `hello` verb surfaces it and `tag`/updateTags() gate on it.
+struct ServerCaps {
+  bool resume_supported = false;
+  bool tag_edit_supported = false;
+};
+
 // ---------------------------------------------------------------------------
 // Session / streaming (Slice 2). These mirror the wire OpenSessionResponse
 // bindings (names + schemas cross the wire ONCE; everything afterwards is

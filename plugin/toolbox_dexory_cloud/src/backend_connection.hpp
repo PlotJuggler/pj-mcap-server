@@ -73,16 +73,30 @@ class BackendConnection {
   // backend.
   [[nodiscard]] std::optional<BackendCaps> backendCapabilities() const;
 
+  // The Capabilities (HelloResponse.capabilities) the server advertised at
+  // connect(): resume_supported + tag_edit_supported. nullopt before a
+  // successful connect() or when the server omitted the field
+  // (has_capabilities()==false) — callers must treat an absent value as
+  // "unknown", NOT as false (an older/odd server that omits the field is not
+  // asserting read-only; see updateTags()'s gate, which only short-circuits
+  // when the value is PRESENT and false).
+  [[nodiscard]] std::optional<ServerCaps> serverCapabilities() const;
+
   // ListFiles RPC, paging through next_page_token, mapped to SequenceInfo. The
   // internal name->file_id index is rebuilt from the result so listTopics /
   // getTopicMetadata can resolve a sequence name back to its file id.
   [[nodiscard]] std::vector<SequenceInfo> listSequences();
 
-  // GetFile RPC for the file backing `sequence_name`, mapped to one TopicInfo
-  // per topic, with failure DISTINGUISHED from genuinely-zero topics: result.ok
-  // is false (with a human-readable result.error) on unknown name, timeout,
-  // dead socket, or a server Error reply. Callers that cache per-sequence
-  // topics must use this and only cache ok results.
+  // GetFile RPC for the file backing `sequence_name`, addressed by s3_key
+  // (sequence_name is sent verbatim as s3_key — see the key-addressing note
+  // above the implementation: catalog file ids renumber across
+  // external-builder rebuilds, so this RPC no longer depends on the browse
+  // name->file_id index being populated or fresh). Mapped to one TopicInfo per
+  // topic, with failure DISTINGUISHED from genuinely-zero topics: result.ok is
+  // false (with a human-readable result.error) on timeout, dead socket, or a
+  // server Error reply (including an unknown key, which the server reports as
+  // ERROR_NOT_FOUND). Callers that cache per-sequence topics must use this and
+  // only cache ok results.
   [[nodiscard]] TopicsResult listTopicsChecked(const std::string& sequence_name);
 
   // Convenience wrapper over listTopicsChecked for callers that don't need the
@@ -102,12 +116,15 @@ class BackendConnection {
 
   // UpdateTags RPC (envelope arm 13) for the file backing `sequence_name`.
   // `set_tags` upserts override (key,value) pairs; `unset_keys` removes an
-  // override (or NULL-masks an embedded tag of that key). Resolves the sequence
-  // name to its file id via the index built by the last listSequences(); an
-  // unknown name is a failure. On success returns true and fills *effective_out
-  // (if non-null) with the server's post-update effective-tags view. On failure
-  // returns false and sets *error to the verbatim server Error message (or a
-  // transport reason). Blocking, worker-thread only (same as the other RPCs).
+  // override (or NULL-masks an embedded tag of that key). Addressed by s3_key
+  // (sequence_name sent verbatim as s3_key — same key-addressing rationale as
+  // listTopicsChecked() above): catalog file ids renumber across
+  // external-builder rebuilds, so this RPC is immune to a stale/absent browse
+  // name->file_id index — the server resolves the key in its CURRENT
+  // generation. On success returns true and fills *effective_out (if non-null)
+  // with the server's post-update effective-tags view. On failure returns
+  // false and sets *error to the verbatim server Error message (or a transport
+  // reason). Blocking, worker-thread only (same as the other RPCs).
   [[nodiscard]] bool updateTags(const std::string& sequence_name,
                                 const std::vector<std::pair<std::string, std::string>>& set_tags,
                                 const std::vector<std::string>& unset_keys, std::vector<TagRow>* effective_out,
@@ -261,6 +278,13 @@ class BackendConnection {
   // HelloResponse.backend, parsed at connect()/reconnectAndHello(). nullopt when
   // the server omits the field (has_backend()==false).
   std::optional<BackendCaps> backend_caps_;
+  // HelloResponse.capabilities, parsed at connect() only (reconnectAndHello(),
+  // the resume-path re-handshake, does not refresh EITHER of version_/
+  // backend_caps_ today — a mid-download reconnect keeps the ORIGINAL
+  // connect()'s capabilities rather than re-deriving them, matching that
+  // existing convention). nullopt when the server omits the field
+  // (has_capabilities()==false).
+  std::optional<ServerCaps> server_caps_;
 
   static constexpr std::chrono::seconds kRequestTimeout{10};
   // OpenSession/OpenResume only: the server answers AFTER loading every

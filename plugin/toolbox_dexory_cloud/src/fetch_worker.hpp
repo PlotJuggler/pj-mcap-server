@@ -96,7 +96,13 @@ class FetchWorker {
   /// success — emits the same sequencesReady the catalog browse path uses (so
   /// the dialog reuses its onSequencesReady refresh, invalidating the seq view
   /// cache + Lua re-eval). On failure no re-list happens; the dialog surfaces
-  /// the verbatim error.
+  /// the verbatim error. NOTE (key-addressing): the underlying UpdateTags RPC
+  /// addresses the file by s3_key (sequence_name verbatim), so it no longer
+  /// depends on the browse name->file_id index being fresh — that index can be
+  /// minutes stale (rebuilt only by the last listSequences()) without this call
+  /// failing. The post-success re-list above still MUST happen regardless: it
+  /// is what refreshes the flat metadata + Lua filter view, which key-addressing
+  /// does not provide for free.
   void updateTagsAsync(std::string sequence_name, std::vector<std::pair<std::string, std::string>> set_tags,
                        std::vector<std::string> unset_keys);
 
@@ -127,6 +133,17 @@ class FetchWorker {
   /// vocabulary) off it. Carries supports_file_hierarchy + metadata_key_vocabulary;
   /// empty/false when the server omitted the field.
   std::function<void(BackendCaps caps)> capabilitiesReady;
+  /// The Capabilities (HelloResponse.capabilities) the server advertised,
+  /// emitted at the SAME point as capabilitiesReady above (before
+  /// connectFinished) so the dialog can gate the tag-edit button off it before
+  /// its next tick. Carries resume_supported + tag_edit_supported; defaults
+  /// (both false) when the server omitted the field — see ServerCaps's comment
+  /// in backend_types.hpp for why an absent field is NOT the same as a
+  /// deliberate false at the BackendConnection::updateTags() gate, but the
+  /// dialog's button-disable UI collapses "unknown" and "known-false" to the
+  /// same disabled state (never offering a control that might fail is the
+  /// conservative default for an ancient/odd server too).
+  std::function<void(ServerCaps caps)> serverCapabilitiesReady;
   /// Full SequenceInfo entries, including user_metadata (used by the Lua
   /// metadata filter). The name-only callback is kept
   /// for code paths that only want names.

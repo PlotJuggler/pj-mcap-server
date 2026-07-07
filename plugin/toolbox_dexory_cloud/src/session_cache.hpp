@@ -8,9 +8,12 @@
 // per-topic pullFinished ledger from cached counts and skips ALL transport. The
 // datastore owns the actual memory; this cache stores only counts metadata.
 //
-// KEY: SessionKey over the EXACT OpenSessionParams sent on the wire
-// (server_uri, file_ids[], topics[], time_range). Exact-tuple only: a different
-// time-range or topic set is a MISS; reordered inputs collide (HIT).
+// KEY: SessionKey over the EXACT logical selection requested
+// (server_uri, sequence_names[], topics[], time_range) — sequence_names are the
+// stable s3 keys (SequenceInfo.name), NOT the wire file_ids sent in
+// OpenSessionParams (those renumber across a post-M6 catalog builder rebuild;
+// see session_key.hpp for why). Exact-tuple only: a different time-range or
+// topic set is a MISS; reordered inputs collide (HIT).
 //
 // EXISTENCE VERIFICATION (the toolbox adaptation): a HIT additionally requires
 // that the cached dataset is STILL present in the host catalog (the user may

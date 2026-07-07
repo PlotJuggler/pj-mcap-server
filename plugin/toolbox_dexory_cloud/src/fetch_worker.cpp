@@ -97,6 +97,14 @@ void FetchWorker::connectAsync(std::string uri, std::string cert_path, std::stri
     if (capabilitiesReady) {
       capabilitiesReady(backend_->backendCapabilities().value_or(BackendCaps{}));
     }
+    // D2: same ordering rationale as capabilitiesReady above — surface the
+    // Capabilities (resume_supported/tag_edit_supported) BEFORE connectFinished
+    // so the dialog can gate the tag-edit button off it in time for the next
+    // tick. An omitted field -> ServerCaps{} defaults (tag_edit_supported
+    // false), the conservative "don't offer a control that might fail" choice.
+    if (serverCapabilitiesReady) {
+      serverCapabilitiesReady(backend_->serverCapabilities().value_or(ServerCaps{}));
+    }
     if (connectFinished) {
       connectFinished(true, "Connected — server " + version_text, {});
     }
@@ -294,43 +302,43 @@ void FetchWorker::pullTopicsAsync(std::vector<std::string> sequence_names, std::
   }
 
   // ---- SessionCache HIT path (Slice 8): ZERO transport ----------------------
-  // Compute the SessionKey over the EXACT OpenSessionParams (server_uri,
-  // browse-resolved file_ids[], topics[], time_range). Resolve file_ids from the
-  // BROWSE backend's already-populated index (resolveFileIds is const + no
-  // round trip). If the browse index can't resolve every name (e.g. no prior
-  // listSequences), we cannot key — fall through to a normal fetch (MISS), never
-  // a guess. A HIT requires the cached dataset to STILL exist in the host.
+  // Compute the SessionKey over the EXACT logical selection (server_uri,
+  // sequence_names[], topics[], time_range). Keyed on `sequence_names` directly
+  // (the stable s3 keys) rather than any wire-resolved file_id: post-M6 the
+  // catalog is rebuilt out of process and every rebuild RENUMBERS rowids, so a
+  // file_id captured now could be silently reassigned to a DIFFERENT file by
+  // the time this cache entry is looked up again — a hash/equality HIT on a
+  // stale numeric id would replay the WRONG file's cached counts (see
+  // session_key.hpp's header comment). `sequence_names` is always available
+  // here (no resolve, no MISS fallthrough needed). A HIT requires the cached
+  // dataset to STILL exist in the host.
   {
-    std::vector<std::string> key_missing;
-    std::vector<std::uint64_t> key_file_ids = backend_->resolveFileIds(sequence_names, &key_missing);
-    if (key_missing.empty() && key_file_ids.size() == sequence_names.size()) {
-      const PJ::cloud::SessionKey key =
-          PJ::cloud::computeSessionKey(conn_uri_, key_file_ids, topic_names, {start_ns, end_ns});
-      const auto& exists = dataset_exists_
-                               ? dataset_exists_
-                               : SessionCache::ExistencePredicate(
-                                     [this](const std::string& name) { return datasetExistsInHost(name); });
-      if (auto cached = session_cache_.lookup(key, exists)) {
-        // HIT: re-emit the per-topic pullFinished ledger from cached counts with
-        // NO BackendConnection construction. Each requested topic reports ok with
-        // a final progress sample from its cached count (count == "messages", a
-        // reasonable progress proxy since the bytes already live in the store).
-        if (pullServedFromCache) {
-          pullServedFromCache(group_name);
-        }
-        for (const auto& t : topic_names) {
-          auto cit = cached->counts_by_topic.find(t);
-          const std::uint64_t count = (cit != cached->counts_by_topic.end()) ? cit->second : 0;
-          if (pullProgress) {
-            pullProgress(t, static_cast<std::int64_t>(count));
-          }
-          if (pullFinished) {
-            pullFinished(group_name, t, /*ok=*/true, {});
-          }
-        }
-        finish_all();
-        return;
+    const PJ::cloud::SessionKey key =
+        PJ::cloud::computeSessionKey(conn_uri_, sequence_names, topic_names, {start_ns, end_ns});
+    const auto& exists = dataset_exists_
+                             ? dataset_exists_
+                             : SessionCache::ExistencePredicate(
+                                   [this](const std::string& name) { return datasetExistsInHost(name); });
+    if (auto cached = session_cache_.lookup(key, exists)) {
+      // HIT: re-emit the per-topic pullFinished ledger from cached counts with
+      // NO BackendConnection construction. Each requested topic reports ok with
+      // a final progress sample from its cached count (count == "messages", a
+      // reasonable progress proxy since the bytes already live in the store).
+      if (pullServedFromCache) {
+        pullServedFromCache(group_name);
       }
+      for (const auto& t : topic_names) {
+        auto cit = cached->counts_by_topic.find(t);
+        const std::uint64_t count = (cit != cached->counts_by_topic.end()) ? cit->second : 0;
+        if (pullProgress) {
+          pullProgress(t, static_cast<std::int64_t>(count));
+        }
+        if (pullFinished) {
+          pullFinished(group_name, t, /*ok=*/true, {});
+        }
+      }
+      finish_all();
+      return;
     }
   }
 
@@ -637,31 +645,29 @@ void FetchWorker::pullTopicsAsync(std::vector<std::string> sequence_names, std::
   // ---- SessionCache store: COMPLETE-only (Slice 8) --------------------------
   // Store the per-topic counts ONLY on a clean COMPLETE download (no cancel, no
   // error/Unset). cancel / error / no-terminal-Eos -> NO entry (no half-cached
-  // state). The key is the SAME tuple the HIT path computes (browse-resolved
-  // file_ids). The datastore now owns the decoded rows under group_name; the
-  // cache records only counts metadata so a repeat fetch is a zero-transport HIT.
+  // state). The key is the SAME tuple the HIT path computes — `sequence_names`
+  // directly, never a resolved file_id (post-M6 rowids renumber across catalog
+  // rebuilds; see session_key.hpp). The datastore now owns the decoded rows
+  // under group_name; the cache records only counts metadata so a repeat fetch
+  // is a zero-transport HIT.
   if (stats.eos == SessionEos::Complete && !cancelled && !session_failed) {
-    std::vector<std::string> store_missing;
-    std::vector<std::uint64_t> store_file_ids = backend_->resolveFileIds(sequence_names, &store_missing);
-    if (store_missing.empty() && store_file_ids.size() == sequence_names.size()) {
-      const PJ::cloud::SessionKey key =
-          PJ::cloud::computeSessionKey(conn_uri_, store_file_ids, topic_names, {start_ns, end_ns});
-      CachedSession entry;
-      entry.display_name = group_name;
-      entry.server_uri = conn_uri_;
-      for (const auto& t : topic_names) {
-        std::uint64_t count = 0;
-        for (const auto& [tid, name] : name_by_id) {
-          if (name == t) {
-            count = counts.count(tid) ? counts.at(tid) : 0;
-            break;
-          }
+    const PJ::cloud::SessionKey key =
+        PJ::cloud::computeSessionKey(conn_uri_, sequence_names, topic_names, {start_ns, end_ns});
+    CachedSession entry;
+    entry.display_name = group_name;
+    entry.server_uri = conn_uri_;
+    for (const auto& t : topic_names) {
+      std::uint64_t count = 0;
+      for (const auto& [tid, name] : name_by_id) {
+        if (name == t) {
+          count = counts.count(tid) ? counts.at(tid) : 0;
+          break;
         }
-        entry.counts_by_topic[t] = count;
-        entry.total_messages += count;
       }
-      session_cache_.store(key, std::move(entry));
+      entry.counts_by_topic[t] = count;
+      entry.total_messages += count;
     }
+    session_cache_.store(key, std::move(entry));
   }
 
   finish_all();

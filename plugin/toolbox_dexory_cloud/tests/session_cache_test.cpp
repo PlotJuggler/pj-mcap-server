@@ -52,7 +52,7 @@ auto alwaysPresent() {
 // that returns the cached counts with ZERO transport.
 TEST(DexoryCloudSessionCacheTest, HitReturnsCachedCountsZeroTransport) {
   SessionCache cache;
-  const SessionKey key = computeSessionKey(kUri, {1, 2}, {"/a", "/b"}, {0, 0});
+  const SessionKey key = computeSessionKey(kUri, {"file_1", "file_2"}, {"/a", "/b"}, {0, 0});
   cache.store(key, makeEntry("seq_x", 10, 20));
 
   int transport_calls = 0;
@@ -68,19 +68,19 @@ TEST(DexoryCloudSessionCacheTest, HitReturnsCachedCountsZeroTransport) {
 // Reordered/duplicated inputs collide -> HIT on the same key.
 TEST(DexoryCloudSessionCacheTest, ReorderedSelectionHits) {
   SessionCache cache;
-  const SessionKey stored = computeSessionKey(kUri, {1, 2, 3}, {"/a", "/b"}, {100, 200});
+  const SessionKey stored = computeSessionKey(kUri, {"file_1", "file_2", "file_3"}, {"/a", "/b"}, {100, 200});
   cache.store(stored, makeEntry("seq_y", 5, 7));
 
-  const SessionKey reordered = computeSessionKey(kUri, {3, 2, 1}, {"/b", "/a"}, {100, 200});
+  const SessionKey reordered = computeSessionKey(kUri, {"file_3", "file_2", "file_1"}, {"/b", "/a"}, {100, 200});
   auto hit = cache.lookup(reordered, alwaysPresent());
   ASSERT_TRUE(hit.has_value());
   EXPECT_EQ(hit->display_name, "seq_y");
 }
 
-// Exact-tuple only: a different time-range / topic set / file_ids is a MISS.
+// Exact-tuple only: a different time-range / topic set / sequence_names is a MISS.
 TEST(DexoryCloudSessionCacheTest, KeyExactnessMissesOnAnyDifference) {
   SessionCache cache;
-  const SessionKey base = computeSessionKey(kUri, {1, 2}, {"/a", "/b"}, {100, 200});
+  const SessionKey base = computeSessionKey(kUri, {"file_1", "file_2"}, {"/a", "/b"}, {100, 200});
   cache.store(base, makeEntry("seq_z", 1, 1));
 
   int transport_calls = 0;
@@ -92,19 +92,21 @@ TEST(DexoryCloudSessionCacheTest, KeyExactnessMissesOnAnyDifference) {
     return hit.has_value();
   };
 
-  EXPECT_FALSE(miss_on_range(computeSessionKey(kUri, {1, 2}, {"/a", "/b"}, {100, 201})));   // range
-  EXPECT_FALSE(miss_on_range(computeSessionKey(kUri, {1, 2}, {"/a"}, {100, 200})));          // topics
-  EXPECT_FALSE(miss_on_range(computeSessionKey(kUri, {1, 2, 3}, {"/a", "/b"}, {100, 200}))); // file_ids
-  EXPECT_FALSE(miss_on_range(computeSessionKey("ws://other:8082", {1, 2}, {"/a", "/b"}, {100, 200}))); // uri
+  EXPECT_FALSE(miss_on_range(computeSessionKey(kUri, {"file_1", "file_2"}, {"/a", "/b"}, {100, 201})));  // range
+  EXPECT_FALSE(miss_on_range(computeSessionKey(kUri, {"file_1", "file_2"}, {"/a"}, {100, 200})));         // topics
+  EXPECT_FALSE(
+      miss_on_range(computeSessionKey(kUri, {"file_1", "file_2", "file_3"}, {"/a", "/b"}, {100, 200})));  // names
+  EXPECT_FALSE(
+      miss_on_range(computeSessionKey("ws://other:8082", {"file_1", "file_2"}, {"/a", "/b"}, {100, 200})));  // uri
   EXPECT_EQ(transport_calls, 4);
 }
 
 // LRU eviction over a small entry budget: the LRU entry is dropped first.
 TEST(DexoryCloudSessionCacheTest, LruEvictsLeastRecentlyUsedOverBudget) {
   SessionCache cache(/*max_entries=*/2);
-  const SessionKey k1 = computeSessionKey(kUri, {1}, {"/a"}, {0, 0});
-  const SessionKey k2 = computeSessionKey(kUri, {2}, {"/a"}, {0, 0});
-  const SessionKey k3 = computeSessionKey(kUri, {3}, {"/a"}, {0, 0});
+  const SessionKey k1 = computeSessionKey(kUri, {"file_1"}, {"/a"}, {0, 0});
+  const SessionKey k2 = computeSessionKey(kUri, {"file_2"}, {"/a"}, {0, 0});
+  const SessionKey k3 = computeSessionKey(kUri, {"file_3"}, {"/a"}, {0, 0});
 
   cache.store(k1, makeEntry("one", 1, 0));
   cache.store(k2, makeEntry("two", 2, 0));
@@ -124,7 +126,7 @@ TEST(DexoryCloudSessionCacheTest, LruEvictsLeastRecentlyUsedOverBudget) {
 TEST(DexoryCloudSessionCacheTest, FreshInstanceIsEmpty) {
   SessionCache cache;
   EXPECT_EQ(cache.size(), 0u);
-  const SessionKey key = computeSessionKey(kUri, {1}, {"/a"}, {0, 0});
+  const SessionKey key = computeSessionKey(kUri, {"file_1"}, {"/a"}, {0, 0});
   EXPECT_FALSE(cache.lookup(key, alwaysPresent()).has_value());
 }
 
@@ -133,7 +135,7 @@ TEST(DexoryCloudSessionCacheTest, FreshInstanceIsEmpty) {
 // evicted so the next fetch re-fills it.
 TEST(DexoryCloudSessionCacheTest, DatasetGoneEvictsAndMisses) {
   SessionCache cache;
-  const SessionKey key = computeSessionKey(kUri, {1}, {"/a"}, {0, 0});
+  const SessionKey key = computeSessionKey(kUri, {"file_1"}, {"/a"}, {0, 0});
   cache.store(key, makeEntry("cleared_seq", 9, 9));
   EXPECT_EQ(cache.size(), 1u);
 
@@ -146,7 +148,7 @@ TEST(DexoryCloudSessionCacheTest, DatasetGoneEvictsAndMisses) {
 // as a MISS, but the entry is NOT evicted (we cannot prove it gone).
 TEST(DexoryCloudSessionCacheTest, PresenceUnknownMissesWithoutEvicting) {
   SessionCache cache;
-  const SessionKey key = computeSessionKey(kUri, {1}, {"/a"}, {0, 0});
+  const SessionKey key = computeSessionKey(kUri, {"file_1"}, {"/a"}, {0, 0});
   cache.store(key, makeEntry("unknown_seq", 3, 4));
 
   SessionCache::ExistencePredicate none;  // null predicate == presence-unknown
@@ -157,10 +159,32 @@ TEST(DexoryCloudSessionCacheTest, PresenceUnknownMissesWithoutEvicting) {
   EXPECT_TRUE(cache.lookup(key, alwaysPresent()).has_value());
 }
 
+// Regression (post-M6): the cache key is the s3-key NAME, never a wire
+// file_id. Two lookups built from the SAME names+topics+range HIT the SAME
+// entry no matter what numeric file_id a given catalog generation happened to
+// resolve them to — a rebuild renumbering rowids must not change (or worse,
+// silently collide with an unrelated file's) cached session identity.
+TEST(DexoryCloudSessionCacheTest, NameKeyedIdentitySurvivesCatalogRebuildRenumbering) {
+  SessionCache cache;
+  const SessionKey stored = computeSessionKey(kUri, {"nissan_zala_50"}, {"/a"}, {0, 0});
+  cache.store(stored, makeEntry("nissan_zala_50", 42, 0));
+
+  // "After a rebuild": the same logical selection (same name) still HITs.
+  const SessionKey after_rebuild = computeSessionKey(kUri, {"nissan_zala_50"}, {"/a"}, {0, 0});
+  auto hit = cache.lookup(after_rebuild, alwaysPresent());
+  ASSERT_TRUE(hit.has_value());
+  EXPECT_EQ(hit->total_messages, 42u);
+
+  // A DIFFERENT name (a different file) never collides, even though a stale
+  // numeric-id-based key could have if some other file inherited the old id.
+  const SessionKey different_file = computeSessionKey(kUri, {"other_seq"}, {"/a"}, {0, 0});
+  EXPECT_FALSE(cache.lookup(different_file, alwaysPresent()).has_value());
+}
+
 // evict() drops a specific entry; re-store re-fills.
 TEST(DexoryCloudSessionCacheTest, ExplicitEvict) {
   SessionCache cache;
-  const SessionKey key = computeSessionKey(kUri, {1}, {"/a"}, {0, 0});
+  const SessionKey key = computeSessionKey(kUri, {"file_1"}, {"/a"}, {0, 0});
   cache.store(key, makeEntry("e", 1, 1));
   cache.evict(key);
   EXPECT_EQ(cache.size(), 0u);
