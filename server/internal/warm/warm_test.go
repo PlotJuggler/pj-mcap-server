@@ -158,6 +158,45 @@ func TestWarmer_WarmsAllThenSkips(t *testing.T) {
 	}
 }
 
+func TestWarmer_StopsAtBudget(t *testing.T) {
+	store := seedStore(t, 5)
+	codec := newFakeCodec()
+	// Each fake index is ~ApproxBytes() (a base ~512 with no schemas). A budget of
+	// ~2 entries must stop the sweep well before all 5 — the warmer must NOT keep
+	// fetching files that would only evict what it just warmed. Concurrency 1 keeps
+	// the overshoot minimal.
+	oneEntry := int64((format.FileChunkIndex{}).ApproxBytes())
+	cache := format.NewChunkIndexCacheSized(0, 100*oneEntry) // roomy cache; budget does the bounding
+	w := &Warmer{
+		Store: store, Codec: codec, Cache: cache, Concurrency: 1,
+		Budget: 2 * oneEntry, Metrics: metrics.New(),
+	}
+
+	if err := w.Run(context.Background()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	total := 0
+	for i := 0; i < 5; i++ {
+		total += codec.callsFor(warmFixtureKey(i))
+	}
+	if total >= 5 || total < 2 {
+		t.Fatalf("warmed %d files, want a bounded 2-3 (stopped at budget, not all 5)", total)
+	}
+}
+
+func TestWarmer_NoBudgetWarmsAll(t *testing.T) {
+	store := seedStore(t, 4)
+	codec := newFakeCodec()
+	cache := format.NewChunkIndexCache(64)
+	w := &Warmer{Store: store, Codec: codec, Cache: cache, Concurrency: 2, Metrics: metrics.New()}
+	if err := w.Run(context.Background()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if cache.Len() != 4 {
+		t.Fatalf("cache len=%d, want 4 (Budget=0 warms everything)", cache.Len())
+	}
+}
+
 func TestWarmer_PoisonFileDoesNotAbort(t *testing.T) {
 	store := seedStore(t, 4)
 	codec := newFakeCodec(warmFixtureKey(2)) // k2 always fails

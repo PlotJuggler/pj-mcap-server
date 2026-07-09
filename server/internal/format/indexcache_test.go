@@ -52,6 +52,45 @@ func TestChunkIndexCache_LRUEviction(t *testing.T) {
 	}
 }
 
+// idxOfSchemaBytes builds a FileChunkIndex whose approxBytes is ~schemaLen (the
+// per-topic SchemaData dominates the footprint).
+func idxOfSchemaBytes(schemaLen int) FileChunkIndex {
+	return FileChunkIndex{Schemas: []TopicSchemaInfo{{
+		TopicName: "/t", SchemaName: "S", SchemaEncoding: "ros2msg",
+		MessageEncoding: "cdr", SchemaData: make([]byte, schemaLen),
+	}}}
+}
+
+func TestChunkIndexCache_ByteEviction(t *testing.T) {
+	const entry = 10 * 1024
+	// Byte cap ~25 KB, no entry cap: holds ~2 of the ~10 KB entries.
+	c := NewChunkIndexCacheSized(0, 25*1024)
+	for i := 0; i < 6; i++ {
+		c.Put(fmt.Sprintf("k%d", i), "e", idxOfSchemaBytes(entry))
+	}
+	// Memory is bounded to the budget plus at most one MRU entry (never unbounded).
+	if c.Bytes() > 25*1024+2*entry {
+		t.Fatalf("curBytes=%d exceeds budget + one entry", c.Bytes())
+	}
+	if c.Len() > 3 {
+		t.Fatalf("len=%d too large for a %d-byte budget", c.Len(), 25*1024)
+	}
+	if _, ok := c.Get("k0", "e", 0); ok {
+		t.Fatal("k0 (LRU) should have been byte-evicted")
+	}
+	if _, ok := c.Get("k5", "e", 0); !ok {
+		t.Fatal("k5 (MRU) must survive")
+	}
+
+	// A single entry larger than the whole budget is still kept (MRU never evicts
+	// itself) — it's cached, not looped-away.
+	c.Clear()
+	c.Put("huge", "e", idxOfSchemaBytes(200*1024))
+	if _, ok := c.Get("huge", "e", 0); !ok || c.Len() != 1 {
+		t.Fatalf("an oversized single entry should be kept; len=%d", c.Len())
+	}
+}
+
 func TestChunkIndexCache_RePutRefreshes(t *testing.T) {
 	c := NewChunkIndexCache(2)
 	c.Put("a", "e", FileChunkIndex{FileID: 1})

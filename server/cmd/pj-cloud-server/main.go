@@ -148,8 +148,16 @@ func main() {
 	// Shared chunk-index cache: starts empty (there is no in-process scan to
 	// pre-warm it anymore); the A+ background warmer below fills it from the
 	// catalog, and any cache miss on the request path falls back to a direct
-	// codec read (see SessionDeps.cachedChunkIndex).
-	idxCache := format.NewChunkIndexCache(4096)
+	// codec read (see SessionDeps.cachedChunkIndex). BYTE-bounded (not entry
+	// count): a cached index is dominated by its per-topic schema text, so a large
+	// real catalog would pin many GB under an entry cap. The warmer stops at this
+	// budget (see warm.Warmer).
+	cacheBytes := cfg.Catalog.ChunkIndexCacheBytes
+	if cacheBytes <= 0 {
+		cacheBytes = 512 << 20
+	}
+	idxCache := format.NewChunkIndexCacheSized(0, cacheBytes)
+	log.Info("chunk-index cache configured", "max_bytes", cacheBytes)
 
 	// A+ background chunk-index warmer (catalog-migration §3.2): pre-fill the shared
 	// cache from the catalog so a download's plan phase is an in-memory hit —
@@ -157,7 +165,7 @@ func main() {
 	// never blocks serving.
 	warmer := &warm.Warmer{
 		Store: store, Codec: codec, Blob: bs, Cache: idxCache,
-		Concurrency: 4, Log: log, Metrics: mx,
+		Concurrency: 4, Budget: cacheBytes, Log: log, Metrics: mx,
 	}
 	go func() {
 		if werr := warmer.Run(ctx); werr != nil {

@@ -53,6 +53,13 @@ type CatalogConfig struct {
 	// WS UpdateTags handler forwards set/unset edits over this socket instead.
 	// The -tag-ipc-socket flag / PJ_CLOUD_TAG_IPC_SOCKET env override it (main.go).
 	TagIPCSocket string `yaml:"tag_ipc_socket"`
+
+	// ChunkIndexCacheBytes bounds the in-memory chunk-index cache by estimated
+	// bytes (default 512 MiB). A cached index is dominated by its per-topic schema
+	// text, so many-topic files are large; a byte cap (not an entry count) is what
+	// bounds RSS. The background warmer stops once this is reached. 0 => the
+	// package default.
+	ChunkIndexCacheBytes int64 `yaml:"chunk_index_cache_bytes"`
 }
 
 type ServerConfig struct {
@@ -204,7 +211,7 @@ func Default() Config {
 				SecretKey: "password123",
 			},
 		},
-		Catalog: CatalogConfig{DBPath: "/tmp/pj-cloud-catalog.db"},
+		Catalog: CatalogConfig{DBPath: "/tmp/pj-cloud-catalog.db", ChunkIndexCacheBytes: 512 << 20},
 		Indexer: IndexerConfig{
 			PollInterval:     30 * time.Second,
 			StartupScan:      true,

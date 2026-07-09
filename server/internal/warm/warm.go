@@ -32,8 +32,13 @@ type Warmer struct {
 	Blob        storage.BlobStore
 	Cache       *format.ChunkIndexCache
 	Concurrency int // bounded WAN concurrency; default 4
-	Log         *slog.Logger
-	Metrics     *metrics.Metrics // optional
+	// Budget bounds the sweep to roughly one cache-worth of NEWLY-warmed bytes
+	// (set to the cache's byte cap). Past it, warming more only evicts what was
+	// just warmed — a net-zero WAN cost — so the sweep stops and lets cold misses
+	// on the request path fill the hot set. 0 = warm the whole catalog.
+	Budget  int64
+	Log     *slog.Logger
+	Metrics *metrics.Metrics // optional
 }
 
 // Run warms every cataloged file's chunk index once. It blocks until the sweep
@@ -60,11 +65,22 @@ func (w *Warmer) Run(ctx context.Context) error {
 	g, gctx := errgroup.WithContext(ctx)
 	g.SetLimit(conc)
 	var warmed, skipped, errored atomic.Int64
+	var warmedBytes atomic.Int64 // cumulative bytes of NEWLY-warmed indexes this sweep
+	scheduled := 0
 	for _, e := range entries {
 		e := e
 		if gctx.Err() != nil {
 			break // parent cancelled (shutdown) — stop scheduling
 		}
+		// Bounded warm: once we've warmed ~one cache-worth of bytes, warming more
+		// only evicts what we just warmed — a net-zero WAN cost. Budget on CUMULATIVE
+		// warmed bytes (not the cache's current size, which eviction keeps just under
+		// the cap and would never trip a "full" check). g.SetLimit paces this loop, so
+		// the check runs between (throttled) schedules and overshoots by at most `conc`.
+		if w.Budget > 0 && warmedBytes.Load() >= w.Budget {
+			break
+		}
+		scheduled++
 		g.Go(func() error {
 			if gctx.Err() != nil {
 				return nil
@@ -93,6 +109,7 @@ func (w *Warmer) Run(ctx context.Context) error {
 				return nil
 			}
 			w.Cache.Put(e.Key, e.ETag, idx)
+			warmedBytes.Add(int64(idx.ApproxBytes()))
 			warmed.Add(1)
 			w.inc(func(m *metrics.Metrics) { m.ChunkIndexWarmedTotal.Inc() })
 			return nil
@@ -100,8 +117,11 @@ func (w *Warmer) Run(ctx context.Context) error {
 	}
 	_ = g.Wait() // per-file funcs never return non-nil; Wait surfaces only ctx errors we ignore
 
+	unwarmed := len(entries) - scheduled // not warmed: the byte budget was reached first
 	log.Info("warm: chunk-index warm complete",
-		"files", len(entries), "warmed", warmed.Load(), "skipped", skipped.Load(), "errors", errored.Load())
+		"files", len(entries), "warmed", warmed.Load(), "skipped", skipped.Load(),
+		"errors", errored.Load(), "unwarmed_over_budget", unwarmed,
+		"warmed_bytes", warmedBytes.Load())
 	return nil
 }
 
