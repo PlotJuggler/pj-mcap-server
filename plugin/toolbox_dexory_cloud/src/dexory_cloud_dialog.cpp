@@ -508,6 +508,12 @@ DexoryCloudDialog::DexoryCloudDialog() : worker_(std::make_unique<FetchWorker>()
       state_.wire_bytes_total = wire_bytes;
     });
   };
+  worker_->pullEstimate = [this](std::uint64_t estimated_total_bytes) {
+    postEvent([this, estimated_total_bytes]() {
+      std::lock_guard<std::mutex> lock(state_.mu);
+      state_.estimated_total_bytes = estimated_total_bytes;
+    });
+  };
   worker_->pullPhase = [this](std::string phase) {
     postEvent([this, phase = std::move(phase)]() mutable { onPullPhase(std::move(phase)); });
   };
@@ -1242,9 +1248,7 @@ std::string DexoryCloudDialog::widget_data() {
     if (!state_.topic_selected_rows.empty()) {
       wd.setSelectedRows("topicTable", state_.topic_selected_rows);
     }
-    if (state_.fetch_active && !state_.fetch_status.empty()) {
-      wd.setLabel("topicHeader", fetchStatusLineLocked());
-    } else if (state_.topics_loading) {
+    if (state_.topics_loading) {
       wd.setLabel("topicHeader", "Topics — loading…");
     } else if (!state_.topics_failed.empty()) {
       // At least one selected sequence's topics request failed (timeout / dead
@@ -1261,6 +1265,20 @@ std::string DexoryCloudDialog::widget_data() {
       wd.setLabel(
           "topicHeader",
           fmt::format("Topics ({}/{})", state_.topic_selected_rows.size(), state_.topic_names.size()));
+    }
+    // Download status gets its OWN full-width row (fetchStatusLabel, above the
+    // table) instead of overwriting the header, so long phase/transition strings
+    // don't collide with the All|Custom toggle. Visible only during a fetch; the
+    // received-vs-decoded breakdown + compression ratio ride along as its hover
+    // tooltip (setFieldValid ok=true is the host's only per-widget tooltip path,
+    // and applies no invalid styling at ok=true).
+    if (state_.fetch_active && !state_.fetch_status.empty()) {
+      wd.setLabel("fetchStatusLabel", fetchStatusLineLocked());
+      wd.setVisible("fetchStatusLabel", true);
+      const bool show_tip = !state_.fetch_phase_static && !state_.fetch_tooltip.empty();
+      wd.setFieldValid("fetchStatusLabel", true, show_tip ? state_.fetch_tooltip : std::string());
+    } else {
+      wd.setVisible("fetchStatusLabel", false);
     }
   }
 
@@ -2453,14 +2471,27 @@ void DexoryCloudDialog::onPullProgress(std::string topic_name, std::int64_t byte
     //    it legitimately exceeds both the wire figure and the on-disk file sizes.
     // Showing both makes the compression ratio visible. The rate is decode
     // throughput, not network. The "received" fragment is shown once known (>0).
-    std::string recv_prefix;
-    if (state_.wire_bytes_total > 0) {
-      recv_prefix = fmt::format("{:.2f} MiB received / ",
-                                static_cast<double>(state_.wire_bytes_total) / (1024.0 * 1024.0));
+    // Compact line: "Fetching NN% - XX MiB/s". The percentage is wire bytes
+    // received vs the server's pre-flight estimate (an UPPER BOUND, so clamp
+    // below 100 while active); until an estimate + first bytes arrive it falls
+    // back to a topic count. The received-vs-decoded breakdown + compression
+    // ratio move to the hover tooltip so the header stays short next to the
+    // All|Custom toggle.
+    const double recv_mib = static_cast<double>(state_.wire_bytes_total) / (1024.0 * 1024.0);
+    std::string progress;
+    if (state_.estimated_total_bytes > 0 && state_.wire_bytes_total > 0) {
+      double pct = 100.0 * static_cast<double>(state_.wire_bytes_total) /
+                   static_cast<double>(state_.estimated_total_bytes);
+      pct = pct > 99.0 ? 99.0 : (pct < 0.0 ? 0.0 : pct);
+      progress = fmt::format("{:.0f}%", pct);
+    } else {
+      progress = fmt::format("{}/{} topics", state_.fetch_done, state_.fetch_total);
     }
-    state_.fetch_status =
-        fmt::format("Fetching: {}/{} topics, {}{:.2f} MiB decoded ({:.2f} MiB/s)", state_.fetch_done,
-                    state_.fetch_total, recv_prefix, mib, mibps);
+    state_.fetch_status = fmt::format("Fetching {} · {:.1f} MiB/s", progress, mibps);
+    const double ratio = recv_mib > 0.0 ? mib / recv_mib : 0.0;
+    state_.fetch_tooltip =
+        fmt::format("{}/{} topics\n{:.1f} MiB received / {:.1f} MiB decoded ({:.1f}x)", state_.fetch_done,
+                    state_.fetch_total, recv_mib, mib, ratio);
   }
 }
 

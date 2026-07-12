@@ -185,6 +185,10 @@ class FetchWorker {
   /// (compressed batch bodies — the network figure, vs pullProgress's decoded
   /// figure). Throttled with pullProgress; a final sample fires at pull end.
   std::function<void(std::int64_t wire_bytes)> pullWireBytes;
+  /// Total estimated download size in bytes (the server pre-flight budget, an
+  /// UPPER BOUND). Fired once, right after the session opens, so the dialog can
+  /// render a byte-based progress percentage. 0 = server gave no estimate.
+  std::function<void(std::uint64_t estimated_total_bytes)> pullEstimate;
   /// Per-topic completion. Fires exactly once per requested topic. ok=false on
   /// undecodable schema (no parser) or a transport/session failure.
   std::function<void(std::string sequence_name, std::string topic_name, bool ok, std::string error)> pullFinished;

@@ -434,6 +434,12 @@ void FetchWorker::pullTopicsAsync(std::vector<std::string> sequence_names, std::
         " estimated - downloading");
   }
 
+  // Hand the numeric pre-flight estimate to the dialog for the byte-based
+  // progress percentage (pullPhase above only carries it as prose).
+  if (pullEstimate) {
+    pullEstimate(session_info.estimated_chunk_bytes);
+  }
+
   // Map session topic_id -> requested topic name so per-topic pullFinished /
   // pullProgress address the user-facing names.
   std::unordered_map<std::uint32_t, std::string> name_by_id;

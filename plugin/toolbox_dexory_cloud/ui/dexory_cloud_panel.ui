@@ -104,84 +104,74 @@
          <property name="font"><font><bold>true</bold></font></property>
         </widget>
        </item>
+       <!-- Two aligned filter rows: a caption in column 0, the controls in
+            column 1 (mirrors basicForm's label/control grid), so the "Filter..."
+            field and the date picker share one left edge. -->
        <item>
-        <layout class="QHBoxLayout" name="seqFilterRow">
-         <property name="spacing"><number>4</number></property>
-         <item>
-          <widget class="QLineEdit" name="seqFilter">
-           <property name="placeholderText"><string>Filter&#8230;</string></property>
-           <property name="clearButtonEnabled"><bool>true</bool></property>
+        <layout class="QGridLayout" name="seqFilterGrid" columnstretch="0,1">
+         <property name="leftMargin"><number>0</number></property>
+         <property name="topMargin"><number>0</number></property>
+         <property name="rightMargin"><number>0</number></property>
+         <property name="bottomMargin"><number>0</number></property>
+         <property name="horizontalSpacing"><number>6</number></property>
+         <property name="verticalSpacing"><number>4</number></property>
+         <item row="1" column="0">
+          <widget class="QLabel" name="labelFilterName">
+           <property name="text"><string>Filter by filename:</string></property>
           </widget>
          </item>
-         <item>
-          <widget class="QPushButton" name="seqRegexToggle">
-           <property name="text"><string>.*</string></property>
-           <property name="checkable"><bool>true</bool></property>
-           <property name="toolTip"><string>Use regular expression</string></property>
-           <property name="minimumSize"><size><width>28</width><height>28</height></size></property>
-           <property name="maximumSize"><size><width>28</width><height>28</height></size></property>
+         <item row="1" column="1">
+          <layout class="QHBoxLayout" name="seqFilterRow">
+           <property name="spacing"><number>4</number></property>
+           <item>
+            <widget class="QLineEdit" name="seqFilter">
+             <property name="placeholderText"><string>Filter&#8230;</string></property>
+             <property name="clearButtonEnabled"><bool>true</bool></property>
+            </widget>
+           </item>
+           <item>
+            <widget class="QPushButton" name="seqRegexToggle">
+             <property name="text"><string>.*</string></property>
+             <property name="checkable"><bool>true</bool></property>
+             <property name="toolTip"><string>Use regular expression</string></property>
+             <property name="minimumSize"><size><width>28</width><height>28</height></size></property>
+             <property name="maximumSize"><size><width>28</width><height>28</height></size></property>
+            </widget>
+           </item>
+          </layout>
+         </item>
+         <item row="0" column="0">
+          <widget class="QLabel" name="labelFilterTime">
+           <property name="text"><string>Filter by time range:</string></property>
+          </widget>
+         </item>
+         <!-- Generic date/time range picker: presets + from/to fields + calendar overlay -->
+         <item row="0" column="1">
+          <widget class="DateRangePicker" name="datePicker">
+           <property name="sizePolicy">
+            <sizepolicy hsizetype="Preferred" vsizetype="Preferred"><horstretch>0</horstretch><verstretch>0</verstretch></sizepolicy>
+           </property>
           </widget>
          </item>
         </layout>
        </item>
-       <!-- Generic date/time range picker: presets + from/to fields + calendar overlay -->
+       <!-- Metadata based filter: a FIXED-height block, moved directly under the
+            time-range row so all three filters (filename / time / metadata) stack
+            at the top. The former table<->query vertical splitter is gone; the
+            sequence table below now takes all remaining height. -->
        <item>
-        <widget class="DateRangePicker" name="datePicker">
-         <property name="sizePolicy">
-          <sizepolicy hsizetype="Preferred" vsizetype="Preferred"><horstretch>0</horstretch><verstretch>0</verstretch></sizepolicy>
-         </property>
-        </widget>
-       </item>
-       <!-- The sequence table and the Lua query editor share a DRAGGABLE
-            vertical splitter. Its handle is the separator (grab-and-resize),
-            styled by the app's global QSplitter::handle QSS (a 1px border-grey
-            line that highlights on hover) exactly like the column splitters.
-            Initial bias toward the table via verstretch (2 vs 1); the query
-            editor starts compact and the user can drag the divider to taste. -->
-       <item>
-        <widget class="QSplitter" name="seqQuerySplitter">
-         <property name="orientation"><enum>Qt::Vertical</enum></property>
-         <property name="childrenCollapsible"><bool>false</bool></property>
-         <!-- Wrapper pane: a bare QTableWidget as a splitter child cannot carry
-              margins, so this pane adds the 6px bottom gap to the splitter
-              handle (mirroring the queryPane's 6px top margin below it). -->
-         <widget class="QWidget" name="seqTablePane" native="true">
-          <property name="sizePolicy">
-           <!-- verstretch 1 vs the queryPane's 0: the splitter hands ALL extra
-                height to the table, so the filter pane opens at its minimum. -->
-           <sizepolicy hsizetype="Expanding" vsizetype="Expanding"><horstretch>0</horstretch><verstretch>1</verstretch></sizepolicy>
-          </property>
-          <layout class="QVBoxLayout" name="seqTablePaneLayout">
-           <property name="leftMargin"><number>0</number></property>
-           <property name="topMargin"><number>0</number></property>
-           <property name="rightMargin"><number>0</number></property>
-           <property name="bottomMargin"><number>6</number></property>
-           <item>
-            <widget class="QTableWidget" name="seqTable">
-             <!-- Middle elision: file-mode names are long object keys whose
-                  distinguishing part is the TAIL (the filename); Qt's default
-                  right elision hid exactly that. -->
-             <property name="textElideMode"><enum>Qt::ElideMiddle</enum></property>
-             <property name="selectionMode"><enum>QAbstractItemView::ExtendedSelection</enum></property>
-             <property name="selectionBehavior"><enum>QAbstractItemView::SelectRows</enum></property>
-             <property name="editTriggers"><set>QAbstractItemView::NoEditTriggers</set></property>
-             <attribute name="verticalHeaderVisible"><bool>false</bool></attribute>
-            </widget>
-           </item>
-          </layout>
-         </widget>
-         <widget class="QWidget" name="queryPane" native="true">
-          <property name="sizePolicy">
-           <sizepolicy hsizetype="Expanding" vsizetype="Expanding"><horstretch>0</horstretch><verstretch>0</verstretch></sizepolicy>
-          </property>
-          <layout class="QVBoxLayout" name="queryPaneLayout">
-           <property name="leftMargin"><number>0</number></property>
-           <!-- Top margin so the filter-mode header clears the splitter handle
-                directly above it. -->
-           <property name="topMargin"><number>6</number></property>
-           <property name="rightMargin"><number>0</number></property>
-           <property name="bottomMargin"><number>0</number></property>
-           <property name="spacing"><number>2</number></property>
+        <widget class="QWidget" name="queryPane" native="true">
+         <!-- Fixed height (min == max): the metadata filter no longer resizes
+              against the table (it used to be a splitter pane). Tune the number
+              if the Basic/Advanced content needs more or less room. -->
+         <property name="minimumSize"><size><width>0</width><height>140</height></size></property>
+         <property name="maximumSize"><size><width>16777215</width><height>140</height></size></property>
+         <layout class="QVBoxLayout" name="queryPaneLayout">
+          <property name="leftMargin"><number>0</number></property>
+          <property name="topMargin"><number>0</number></property>
+          <property name="rightMargin"><number>0</number></property>
+          <property name="bottomMargin"><number>0</number></property>
+          <property name="spacing"><number>2</number></property>
            <!-- "Metadata based filter" header + Basic|Advanced mode selector.
                 The ACTIVE mode decides which filter applies (the other's state
                 is preserved but ignored). Basic: one dropdown per S3-key field.
@@ -197,8 +187,7 @@
              <property name="spacing"><number>8</number></property>
              <item>
               <widget class="QLabel" name="labelFilterMode">
-               <property name="text"><string>Metadata based filter</string></property>
-               <property name="font"><font><bold>true</bold></font></property>
+               <property name="text"><string>Filter by metadata:</string></property>
               </widget>
              </item>
              <item>
@@ -297,8 +286,25 @@
               </layout>
             </widget>
            </item>
-          </layout>
-         </widget>
+         </layout>
+        </widget>
+       </item>
+       <!-- Sequence table: fills all height left below the fixed filter blocks
+            (the former table/query splitter is gone). Keeps objectName seqTable:
+            the plugin drives headers/rows/selection through it. -->
+       <item>
+        <widget class="QTableWidget" name="seqTable">
+         <property name="sizePolicy">
+          <sizepolicy hsizetype="Expanding" vsizetype="Expanding"><horstretch>0</horstretch><verstretch>1</verstretch></sizepolicy>
+         </property>
+         <!-- Middle elision: file-mode names are long object keys whose
+              distinguishing part is the TAIL (the filename); Qt's default right
+              elision hid exactly that. -->
+         <property name="textElideMode"><enum>Qt::ElideMiddle</enum></property>
+         <property name="selectionMode"><enum>QAbstractItemView::ExtendedSelection</enum></property>
+         <property name="selectionBehavior"><enum>QAbstractItemView::SelectRows</enum></property>
+         <property name="editTriggers"><set>QAbstractItemView::NoEditTriggers</set></property>
+         <attribute name="verticalHeaderVisible"><bool>false</bool></attribute>
         </widget>
        </item>
       </layout>
@@ -367,6 +373,17 @@
           </widget>
          </item>
         </layout>
+       </item>
+       <!-- Dedicated download status line: its OWN full-width row (below the
+            topic filter, above the table) so long fetch/transition strings do
+            not fight the All|Custom toggle in the header. Hidden until a download
+            runs; the plugin toggles visibility + text + hover tooltip. -->
+       <item>
+        <widget class="QLabel" name="fetchStatusLabel">
+         <property name="visible"><bool>false</bool></property>
+         <property name="wordWrap"><bool>true</bool></property>
+         <property name="text"><string/></property>
+        </widget>
        </item>
        <item>
         <widget class="QTableWidget" name="topicTable">

@@ -272,7 +272,14 @@ struct DialogState {
   // compressed network figure, vs bytes_by_topic's decoded total). Refreshed from
   // pullWireBytes on the GUI thread; shown as "X MiB received / Y MiB decoded".
   std::int64_t wire_bytes_total = 0;
+  // Server pre-flight download-size estimate (upper bound; 0 = unknown). Drives
+  // the byte-based progress percentage on the status line. Set from pullEstimate.
+  std::uint64_t estimated_total_bytes = 0;
   std::string fetch_status;
+  // Full breakdown (topics + received/decoded + compression ratio) shown as the
+  // status line's hover tooltip, so the visible line can stay compact. Empty
+  // outside an active byte-flowing fetch.
+  std::string fetch_tooltip;
   // True while fetch_status is a coarse PHASE line from pullPhase ("Opening
   // session…") rather than the byte-driven progress line; widget_data appends
   // a live elapsed counter so the user sees movement before any byte flows.
