@@ -33,6 +33,12 @@ struct IngestTopic {
   std::string type_name;  // schema name verbatim (e.g. "sensor_msgs/msg/Imu")
   PJ::ParserBindingHandle binding{};
   bool decodable = false;
+  bool bound = false;  // binding created (lazily, on the FIRST message)
+  // Deferred ParserBindingRequest ingredients: binding happens on the first
+  // message (2026-07-12), so a topic that delivers NOTHING never registers in
+  // the host data tree — zero-message entries users could drag with no effect.
+  std::string schema_encoding;
+  std::string schema_data;
   std::string skip_reason;          // set when !decodable
   std::uint64_t rows = 0;           // messages pushed to the host
   std::uint64_t decode_errors = 0;  // pushMessage failures
@@ -53,9 +59,9 @@ class ParserIngestDriver {
   ParserIngestDriver(const ParserIngestDriver&) = delete;
   ParserIngestDriver& operator=(const ParserIngestDriver&) = delete;
 
-  // Creates the host parser-ingest context for `ds` and binds one host parser
-  // per session topic. Topics without a host parser become !decodable with a
-  // per-topic reason.
+  // Creates the host parser-ingest context for `ds` and RESOLVES each session
+  // topic's schema. Parser bindings are created lazily by decode() on a topic's
+  // first message; schema-less topics become !decodable here with a reason.
   IngestBindResult bindSession(
       PJ::ToolboxRuntimeHostView runtime, PJ::sdk::DataSourceHandle ds, const SessionInfo& info);
 

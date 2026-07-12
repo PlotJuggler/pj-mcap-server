@@ -490,16 +490,11 @@ void FetchWorker::pullTopicsAsync(std::vector<std::string> sequence_names, std::
 
   IngestBindResult bind = driver.bindSession(runtime, *ds, session_info);
 
-  // Topics that failed to bind a parser report pullFinished(false) immediately.
-  // Map by topic_id -> decodable so we can address the per-topic outcome.
+  // Per-topic decodability maps are built AFTER the download (see below):
+  // bindings are now created lazily on each topic's first message, so a
+  // bind failure only becomes known mid-stream.
   std::unordered_map<std::uint32_t, bool> decodable_by_id;
   std::unordered_map<std::uint32_t, std::string> skip_reason_by_id;
-  for (const auto& [tid, dec] : driver.decoders()) {
-    decodable_by_id.emplace(tid, dec.decodable);
-    if (!dec.decodable) {
-      skip_reason_by_id.emplace(tid, dec.skip_reason);
-    }
-  }
 
   // Debug surface for REAL parser-bind failures: one compact notification with
   // "topic (type): host reason" lines (capped), so a missing/incompatible
@@ -596,6 +591,15 @@ void FetchWorker::pullTopicsAsync(std::vector<std::string> sequence_names, std::
   const bool session_failed = (stats.eos == SessionEos::Error || stats.eos == SessionEos::Unset);
 
   write_lock.unlock();  // release before invoking the GUI-thread callbacks
+
+  // Snapshot the POST-download per-topic outcomes: lazy binding means a topic's
+  // decodable flag can flip to false at its first message (bind failure).
+  for (const auto& [tid, dec] : driver.decoders()) {
+    decodable_by_id[tid] = dec.decodable;
+    if (!dec.decodable) {
+      skip_reason_by_id[tid] = dec.skip_reason;
+    }
+  }
 
   for (const auto& t : topic_names) {
     // Resolve the topic_id for this requested name.

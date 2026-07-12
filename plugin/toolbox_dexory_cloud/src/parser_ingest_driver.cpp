@@ -63,31 +63,13 @@ IngestBindResult ParserIngestDriver::bindSession(
     const SessionSchema& schema = *sit->second;
     it.type_name = schema.name;
 
-    // Fields forwarded VERBATIM — same fields data_load_mcap forwards (modulo
-    // its channel-message_encoding preference, which collapses to schema.encoding
-    // for the cdr/ros2msg wire in scope); type name normalization happens inside
-    // parser_ros.
-    //
-    // parser_config_json = "{}" (non-empty) is LOAD-BEARING: the host skips
-    // parser->loadConfig() for an empty config, and parser_ros selects its
-    // SPECIALIZED handlers (tf -> kFrameTransforms, pointclouds, images...)
-    // only inside loadConfig; "" silently degrades every topic to generic
-    // scalar-only ingest. Empirically pinned by ToolboxParserIngestRealRosTest.
-    auto binding = ingest_.ensureParserBinding(PJ::ParserBindingRequest{
-        .topic_name = t.topic_name,
-        .parser_encoding = schema.encoding,
-        .type_name = schema.name,
-        .schema = PJ::Span<const uint8_t>(
-            reinterpret_cast<const std::uint8_t*>(schema.data.data()), schema.data.size()),
-        .parser_config_json = "{}",
-    });
-    if (!binding.has_value()) {
-      it.skip_reason = binding.error();
-      result.errors.push_back(t.topic_name + " (" + schema.name + "): " + it.skip_reason);
-      topics_.emplace(t.topic_id, std::move(it));
-      continue;
-    }
-    it.binding = *binding;
+    // Binding is DEFERRED to the first message (decode() below): binding a
+    // topic registers it in the host data tree, and a session routinely carries
+    // topics that deliver nothing (channels declared in the MCAP summary that
+    // never published — 366 of them on real Dexory rosbox files). Eager binding
+    // filled the tree with zero-message entries users could drag to no effect.
+    it.schema_encoding = schema.encoding;
+    it.schema_data = schema.data;
     it.decodable = true;
     ++result.decodable;
     topics_.emplace(t.topic_id, std::move(it));
@@ -99,6 +81,36 @@ bool ParserIngestDriver::decode(const DecodedMessage& m) {
   auto it = topics_.find(m.topic_id);
   if (it == topics_.end() || !it->second.decodable || !active_) {
     return false;
+  }
+  if (!it->second.bound) {
+    // First message for this topic: create the host parser binding NOW (the
+    // deferred bindSession step). Runs in the same host-write critical section
+    // as pushMessage, so the threading discipline is unchanged.
+    //
+    // Fields forwarded VERBATIM — same fields data_load_mcap forwards; type
+    // name normalization happens inside parser_ros.
+    //
+    // parser_config_json = "{}" (non-empty) is LOAD-BEARING: the host skips
+    // parser->loadConfig() for an empty config, and parser_ros selects its
+    // SPECIALIZED handlers (tf -> kFrameTransforms, pointclouds, images...)
+    // only inside loadConfig; "" silently degrades every topic to generic
+    // scalar-only ingest. Empirically pinned by ToolboxParserIngestRealRosTest.
+    IngestTopic& topic = it->second;
+    auto binding = ingest_.ensureParserBinding(PJ::ParserBindingRequest{
+        .topic_name = topic.topic_name,
+        .parser_encoding = topic.schema_encoding,
+        .type_name = topic.type_name,
+        .schema = PJ::Span<const uint8_t>(
+            reinterpret_cast<const std::uint8_t*>(topic.schema_data.data()), topic.schema_data.size()),
+        .parser_config_json = "{}",
+    });
+    if (!binding.has_value()) {
+      topic.decodable = false;
+      topic.skip_reason = binding.error();
+      return false;
+    }
+    topic.binding = *binding;
+    topic.bound = true;
   }
   // One owned copy per message; the shared_ptr doubles as the PayloadView
   // anchor, so the host's lazy ObjectStore closures (tf/pointcloud re-reads

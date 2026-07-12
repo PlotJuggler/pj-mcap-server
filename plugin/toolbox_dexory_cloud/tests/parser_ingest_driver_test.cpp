@@ -52,13 +52,38 @@ TEST(ParserIngestDriverTest, BindsVerbatimPushesPayloadsAndReleases) {
   PJ::ToolboxRuntimeHostView runtime{fake.toolboxRuntime()};
   const auto bind = driver.bindSession(runtime, PJ::sdk::DataSourceHandle{42}, makeSession());
 
-  // One decodable topic; the ingest context was created for ds id 42.
-  EXPECT_EQ(bind.decodable, 1u);
+  // TWO schema-resolved candidates (/tf + /refused — the latter's parser
+  // refusal is only discoverable at its first message now); the ingest context
+  // was created for ds id 42.
+  EXPECT_EQ(bind.decodable, 2u);
   ASSERT_EQ(fake.created.size(), 1u);
   EXPECT_EQ(fake.created[0], 42u);
 
-  // Exactly one recorded binding, ALL five fields verbatim — including the
-  // load-bearing non-empty "{}" parser config.
+  // LAZY BINDING (2026-07-12): bindSession creates NO host bindings — a topic
+  // that never delivers a message must never register in the host data tree
+  // (zero-message entries users could drag to no effect).
+  EXPECT_TRUE(fake.bindings.empty());
+
+  // One skipped topic at bind time (schema missing from the session dictionary),
+  // in the "<topic> (<type>): <reason>" format.
+  ASSERT_EQ(bind.errors.size(), 1u);
+  EXPECT_NE(bind.errors[0].find("/no_schema"), std::string::npos);
+  EXPECT_NE(bind.errors[0].find("(no schema)"), std::string::npos);
+
+  const auto& topics = driver.decoders();
+  ASSERT_EQ(topics.size(), 3u);
+  EXPECT_TRUE(topics.at(10).decodable);
+  EXPECT_TRUE(topics.at(10).skip_reason.empty());
+  EXPECT_TRUE(topics.at(20).decodable);  // candidate until its first message
+  EXPECT_TRUE(topics.at(20).skip_reason.empty());
+  EXPECT_FALSE(topics.at(30).decodable);
+  EXPECT_FALSE(topics.at(30).skip_reason.empty());
+  EXPECT_TRUE(driver.hasDecodable());
+
+  // Decodable topic: the FIRST message creates the binding (all five fields
+  // verbatim — including the load-bearing non-empty "{}" parser config), then
+  // pushes with exact ts + bytes.
+  EXPECT_TRUE(driver.decode(makeMessage(10, 111, std::string("\x01\x02\x03", 3))));
   ASSERT_EQ(fake.bindings.size(), 1u);
   const auto& b = fake.bindings[0];
   EXPECT_EQ(b.topic_name, "/tf");
@@ -66,32 +91,15 @@ TEST(ParserIngestDriverTest, BindsVerbatimPushesPayloadsAndReleases) {
   EXPECT_EQ(b.type_name, "tf2_msgs/msg/TFMessage");
   EXPECT_EQ(b.schema, "geometry_msgs/TransformStamped[] transforms\n");
   EXPECT_EQ(b.config, "{}");
-
-  // Two skipped topics, each with a per-topic error in the format
-  // "<topic> (<type>): <reason>".
-  ASSERT_EQ(bind.errors.size(), 2u);
-  // /refused: type "mock/refused", reason from the host refusal.
-  EXPECT_NE(bind.errors[0].find("/refused"), std::string::npos);
-  EXPECT_NE(bind.errors[0].find("mock/refused"), std::string::npos);
-  // /no_schema: no schema id 99 in the session → "(no schema)" placeholder.
-  EXPECT_NE(bind.errors[1].find("/no_schema"), std::string::npos);
-  EXPECT_NE(bind.errors[1].find("(no schema)"), std::string::npos);
-
-  const auto& topics = driver.decoders();
-  ASSERT_EQ(topics.size(), 3u);
-  EXPECT_TRUE(topics.at(10).decodable);
-  EXPECT_TRUE(topics.at(10).skip_reason.empty());
-  EXPECT_FALSE(topics.at(20).decodable);
-  EXPECT_FALSE(topics.at(20).skip_reason.empty());
-  EXPECT_FALSE(topics.at(30).decodable);
-  EXPECT_FALSE(topics.at(30).skip_reason.empty());
-  EXPECT_TRUE(driver.hasDecodable());
-
-  // Decodable topic: pushed through the fetcher with exact ts + bytes.
-  EXPECT_TRUE(driver.decode(makeMessage(10, 111, std::string("\x01\x02\x03", 3))));
   EXPECT_TRUE(driver.decode(makeMessage(10, 222, std::string("\x04", 1))));
-  // Undecodable topic and unknown topic: refused, never pushed.
+  EXPECT_EQ(fake.bindings.size(), 1u);  // bound once, not per message
+
+  // Refused topic: its first message attempts the bind, the host refuses, the
+  // topic flips undecodable with the host's reason. Unknown topic: refused.
   EXPECT_FALSE(driver.decode(makeMessage(20, 333, "x")));
+  EXPECT_FALSE(topics.at(20).decodable);
+  EXPECT_NE(topics.at(20).skip_reason.find("no parser found"), std::string::npos);
+  EXPECT_EQ(fake.bindings.size(), 1u);  // the refusal recorded no binding
   EXPECT_FALSE(driver.decode(makeMessage(77, 444, "y")));
 
   ASSERT_EQ(fake.pushes.size(), 2u);
