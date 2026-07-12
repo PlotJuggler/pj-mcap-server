@@ -77,11 +77,6 @@ struct DialogState {
   // tag-edit IPC forwarder configured). The BackendConnection::updateTags()
   // gate is the authoritative enforcement point; this is UI-only.
   bool tag_edit_supported = false;
-  // The currently-selected top-level '/'-prefix narrowing the seqTable. Empty or
-  // the "All" sentinel = no narrowing. Only meaningful when
-  // supports_file_hierarchy is true. Bumps no epoch (it composes on top of the
-  // cached visible set, recomputed cheaply each tick from the prefix string).
-  std::string selected_prefix;
 
   // Discovery
   std::vector<SequenceRecord> sequences;
@@ -98,6 +93,13 @@ struct DialogState {
   // Bumped on every content/order change to `sequences` (populate + sort) so the
   // seqTable view cache below can detect staleness with a cheap counter compare.
   std::size_t seq_epoch = 0;
+  // Delivery gating for the HEAVY seqTable keys (2026-07-12): rows/headers are
+  // re-sent only when the view cache was rebuilt, and the visible set only when
+  // it changed. At 24k catalog files the unconditional per-tick push serialized
+  // megabytes of JSON per frame and saturated the GUI thread (the 1-2 Hz
+  // calendar hover preview + unresponsive topic clicks).
+  bool seq_rows_pushed = false;
+  std::vector<int> seq_visible_pushed = {-1};  // sentinel: never delivered
   std::vector<std::string> topic_names;
   std::vector<TopicInfo> topic_infos;  // partial info from listTopics (size/ts/created)
   // Slice 7: per-sequence topic cache, keyed by sequence name. When N sequences
@@ -139,7 +141,7 @@ struct DialogState {
   // multi-file stitch path (union topics, slider span, stitched download). The
   // real file keys stay the backend identity; the row->keys mapping lives in
   // the seq_view_cache below.
-  bool aggregate = true;
+  bool aggregate = false;  // OFF by default (2026-07-12): one row per file
   // Column sort state — the plugin owns row ordering (built-in table widget
   // sorting would desync the index-based selection/visibility). -1 = unsorted
   // (server/load order). seqTable cols: 0=Name 1=Date 2=Size; topicTable: 0=Name 1=Size.
@@ -212,11 +214,18 @@ struct DialogState {
   // seq_epoch so it rebuilds only when the sequence set changes.
   Schema query_schema;
   std::size_t query_schema_epoch = static_cast<std::size_t>(-1);
-  // Metadata-filter mode, driven by the Basic|Advanced tab widget (filterTabs).
+  // Topic-selection mode, driven by the All|Custom radio pair in the Topics
+  // header (radioTopicsAll / radioTopicsCustom -> DualOptionsWidget). true =
+  // All: every listed topic downloads, the table is inert. false = Custom:
+  // the selected rows download (+ /tf, /tf_static appended implicitly at fetch
+  // time — kForcedTopics); zero-count rows are disabled.
+  bool topics_all = false;
+  // Metadata-filter mode, driven by the Basic|Advanced radio pair (rendered as
+  // a DualOptionsWidget by the host; radioFilterBasic / radioFilterAdvanced).
   // 0 = Basic: dropdown equality filters on the S3-key fields below; the Lua
   // query is ignored. 1 = Advanced: the Lua query applies; the Basic dropdowns
-  // are ignored. Switching tabs switches which filter is active (state for the
-  // other tab is preserved, not cleared).
+  // are ignored. Switching modes switches which filter is active (state for the
+  // other mode is preserved, not cleared).
   int filter_tab = 0;
   // Basic-tab selections: S3-key field name -> chosen value. Absent/empty = "any"
   // (no constraint). Keys: customer, customer_site, robot, source.
@@ -470,6 +479,9 @@ class DexoryCloudDialog : public PJ::DialogPluginTyped {
   // and re-map index-based selection by name. Caller MUST hold state_.mu;
   // both are no-ops when the table's sort column is -1 (load order).
   void sortSequencesLocked();
+  // Drop the whole sequence selection + the dependent topic view (topics list,
+  // topic selection, slider span source). Caller holds state_.mu.
+  void clearSelectionStateLocked();
   void sortTopicsLocked();
 
   // Rebuild the cached query-assist metadata schema when the sequence set

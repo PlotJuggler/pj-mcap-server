@@ -309,18 +309,6 @@ if(BUILD_TESTING)
   )
   add_test(NAME DexoryCloudElideNameTest COMMAND toolbox_dexory_cloud_elide_name_test)
 
-  # D8 client-side '/'-prefix hierarchy derivation (HERMETIC): distinct sorted
-  # prefixes, flat-corpus-empty, combo "All" sentinel, starts-with semantics,
-  # and the narrows-existing-visible-rows composition. Header-only
-  # (src/hierarchy_prefix.h), std only — no Qt, no host.
-  add_executable(toolbox_dexory_cloud_hierarchy_prefix_test
-    tests/hierarchy_prefix_test.cpp
-  )
-  target_link_libraries(toolbox_dexory_cloud_hierarchy_prefix_test PRIVATE GTest::gtest_main)
-  target_include_directories(toolbox_dexory_cloud_hierarchy_prefix_test PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/src
-  )
-  add_test(NAME DexoryCloudHierarchyPrefixTest COMMAND toolbox_dexory_cloud_hierarchy_prefix_test)
 
   # Name filter (substring + ".*" regex).
   add_executable(toolbox_dexory_cloud_name_filter_test

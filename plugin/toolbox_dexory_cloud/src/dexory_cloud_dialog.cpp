@@ -27,7 +27,6 @@
 #include "fetch_summary.h"
 #include "fetch_worker.hpp"
 #include "format_utils.h"
-#include "hierarchy_prefix.h"
 #include "dexory_cloud_panel_manifest.hpp"
 #include "dexory_cloud_panel_ui.hpp"
 #include "name_filter.h"
@@ -257,6 +256,14 @@ const std::array<std::pair<const char*, const char*>, 4> kBasicFilterKeys = {{
     {"robot", "Robot"},
     {"source", "Source"},
 }};
+
+// Topics every download must include: without /tf + /tf_static a
+// transform-consuming import (3D scene, TF-resolved point clouds) receives data
+// it cannot place. Appended IMPLICITLY at fetch time (never force-SELECTED in
+// the table: a plugin that mutates the user's selection per event fights the
+// host's selection applier — every gesture got a programmatic clear+reselect a
+// tick later, scrambling clicks and drags; 2026-07-12).
+constexpr std::array<std::string_view, 2> kForcedTopics = {"/tf", "/tf_static"};
 
 // Distinct sorted values of one parsed S3-key field across the sequences — the
 // dropdown options for that Basic-tab key.
@@ -574,10 +581,22 @@ void DexoryCloudDialog::initFromSettings() {
   state_.range_lower = std::clamp(settings.getInt("dexory_cloud/range_lower", 0), 0, DialogState::kSliderSteps);
   state_.range_upper =
       std::clamp(settings.getInt("dexory_cloud/range_upper", DialogState::kSliderSteps), 0, DialogState::kSliderSteps);
-  // PJ3 parity: stage the last selection for re-selection once the matching
-  // sequence/topic list arrives from the auto-connect below.
-  state_.restore_selected_sequence = settings.getString("dexory_cloud/selected_sequence");
-  state_.restore_selected_topics = settings.getStringList("dexory_cloud/selected_topics");
+  // Selection is deliberately NOT restored across runs (2026-07-12): the
+  // toolbox always opens with nothing selected. (The restore_* staging slots
+  // remain for the in-session flows but start empty.)
+  // View-mode + filter-tab + Basic-tab constraints from the previous run. The
+  // Basic values are provisional: onSequencesReady prunes any that no longer
+  // match the server's data (the combo falls back to "(any)").
+  state_.aggregate = settings.getBool("dexory_cloud/aggregate", false);
+  state_.topics_all = settings.getBool("dexory_cloud/topics_all", false);
+  state_.filter_tab = std::clamp(settings.getInt("dexory_cloud/filter_tab", 0), 0, 1);
+  for (const auto& [key, label] : kBasicFilterKeys) {
+    (void)label;
+    const std::string value = settings.getString(std::string("dexory_cloud/basic_filter/") + key);
+    if (!value.empty()) {
+      state_.basic_filter[key] = value;
+    }
+  }
 
   if (!history.empty()) {
     const std::string uri = state_.uri;
@@ -851,11 +870,56 @@ std::string DexoryCloudDialog::widget_data() {
   // fetch is in flight; Download needs a sequence + topic(s) and an idle
   // worker; Cancel is live only during a fetch.
   wd.setEnabled("buttonConnect", !state_.connecting && !state_.fetch_active);
-  // Slice 7: Fetch is enabled with >=1 selected sequence + >=1 selected topic
-  // (a stitched multi-file selection downloads via ONE OpenFresh).
+  // Connection-state visibility: auto-connect at bind is silent by design, so
+  // announce its outcome here instead — a stateful tooltip on the (re)connect
+  // button, and the host's standard invalid tint on the URI field while it is
+  // not connected (cleared the moment the connection lands). An EMPTY URI is
+  // not tinted: a fresh install opening on a red field would read as an error.
+  {
+    std::string connect_tip;
+    bool uri_ok = true;
+    std::string uri_tip;
+    if (state_.connecting) {
+      connect_tip = fmt::format("Connecting to {}...", state_.uri);
+      uri_tip = connect_tip;
+    } else if (state_.connected) {
+      connect_tip = fmt::format("Connected to {} - click to reconnect", state_.uri);
+      uri_tip = fmt::format("Connected to {}", state_.uri);
+    } else if (state_.uri.empty()) {
+      connect_tip = "Enter a server URI (e.g. ws://localhost:8080) and connect";
+      uri_tip = connect_tip;
+    } else {
+      connect_tip = fmt::format("Not connected - click to connect to {}", state_.uri);
+      uri_ok = false;
+      uri_tip = connect_tip;
+    }
+    wd.setFieldValid("buttonConnect", true, connect_tip);
+    wd.setFieldValid("comboUri", uri_ok, uri_tip);
+  }
+  // Slice 7: Fetch is enabled with >=1 selected sequence + a topic selection
+  // (All mode always qualifies; Custom needs >=1 selected row). A stitched
+  // multi-file selection downloads via ONE OpenFresh.
   wd.setEnabled(
-      "buttonFetch", state_.connected && !state_.selected_sequences.empty() && !state_.topic_selected_rows.empty() &&
-                         !state_.fetch_active);
+      "buttonFetch", state_.connected && !state_.selected_sequences.empty() &&
+                         (state_.topics_all || !state_.topic_selected_rows.empty()) && !state_.fetch_active);
+  // Tooltip = the FIRST unmet requirement (priority-ordered), so a disabled
+  // Download always says why. Pushed via setFieldValid with ok=true: the host's
+  // generic field-validity branch then applies only the tooltip (no invalid
+  // red-background cue — the disabled look already covers the visual state).
+  {
+    const char* fetch_tip =
+        "Download the selected topics of the selected sequence(s); /tf and /tf_static are always included";
+    if (state_.fetch_active) {
+      fetch_tip = "Disabled: a download is in progress (use Cancel to stop it)";
+    } else if (!state_.connected) {
+      fetch_tip = "Disabled: connect to a server first";
+    } else if (state_.selected_sequences.empty()) {
+      fetch_tip = "Disabled: select at least one sequence";
+    } else if (!state_.topics_all && state_.topic_selected_rows.empty()) {
+      fetch_tip = "Disabled: select at least one topic (or switch topics to All)";
+    }
+    wd.setFieldValid("buttonFetch", true, fetch_tip);
+  }
   // Refresh re-lists sequences without a disconnect/reconnect (PJ3
   // main_window.cpp:933-945): live only while connected and idle.
   wd.setEnabled("buttonRefresh", state_.connected && !state_.connecting && !state_.fetch_active);
@@ -901,12 +965,12 @@ std::string DexoryCloudDialog::widget_data() {
     // widget_data() runs every host tick, and the per-sequence filter + metadata
     // copies are too heavy to redo at 20Hz on the GUI thread.
     auto& cache = state_.seq_view_cache;
-    const bool hit = cache.valid && cache.aggregate == state_.aggregate && cache.filter_tab == state_.filter_tab &&
+    const bool cache_hit = cache.valid && cache.aggregate == state_.aggregate && cache.filter_tab == state_.filter_tab &&
                      cache.basic_filter == state_.basic_filter && cache.seq_epoch == state_.seq_epoch &&
                      cache.seq_filter == state_.seq_filter && cache.seq_filter_regex == state_.seq_filter_regex &&
                      cache.query_text == state_.query_text && cache.date_from_ns == state_.date_from_ns &&
                      cache.date_to_ns == state_.date_to_ns;
-    if (!hit) {
+    if (!cache_hit) {
       // Build a schema from the union of every sequence's CANONICAL filter fields
       // (the 4 S3-key fields) — the PJ3 query engine uses it for shorthand
       // expansion. NOT rec.metadata: the Advanced query filters only by the
@@ -1030,21 +1094,34 @@ std::string DexoryCloudDialog::widget_data() {
       cache.date_to_ns = state_.date_to_ns;
     }
 
-    wd.setTableHeaders("seqTable", {"Name", "Date", "Size"});
-    wd.setTableRows("seqTable", cache.rows);
+    // Heavy-key gating: rows/headers only when the cache was rebuilt this tick
+    // (every content mutation funnels through seq_epoch / the cache-hit fields).
+    if (!cache_hit || !state_.seq_rows_pushed) {
+      wd.setTableHeaders("seqTable", {"Name", "Date", "Size"});
+      wd.setTableRows("seqTable", cache.rows);
+      state_.seq_rows_pushed = true;
+    }
 
     // Info/metadata panel: hidden by default, shown when the checkShowInfo
     // checkbox is ticked. The PanelEngine/QUiLoader does NOT honor the .ui
-    // `visible=false` property (see how comboPrefix/labelPrefix are driven by
-    // explicit wd.setVisible below) — so visibility must be pushed via the
+    // `visible=false` property — so visibility must be pushed via the
     // widget-data API every tick. setChecked keeps the box in sync (QSignalBlocker
     // in the host's apply pass prevents a feedback toggle).
     wd.setVisible("dataViewContainer", state_.show_info);
     wd.setChecked("checkShowInfo", state_.show_info);
+    // Info toggle RETIRED from the chrome for now (2026-07-12) — hidden, not
+    // deleted: all the Info-panel plumbing (show_info, dataViewContainer, the
+    // metadata renderer) stays live so one flipped literal brings it back.
+    wd.setVisible("checkShowInfo", false);
     wd.setChecked("checkAggregate", state_.aggregate);
-    // Basic|Advanced filter tab + the Basic-tab dropdowns. Each dropdown lists
-    // "(any)" + the distinct values of its S3-key field; index 0 = no constraint.
-    wd.setTabIndex("filterTabs", state_.filter_tab);
+    // Basic|Advanced filter mode (the radio pair the host renders as a
+    // DualOptionsWidget) + the Basic-tab dropdowns. Each dropdown lists
+    // "(any)" + the distinct values of its S3-key field; index 0 = no
+    // constraint. Exactly one pane is visible per mode.
+    wd.setChecked("radioFilterBasic", state_.filter_tab == 0);
+    wd.setChecked("radioFilterAdvanced", state_.filter_tab == 1);
+    wd.setVisible("basicPane", state_.filter_tab == 0);
+    wd.setVisible("advancedPane", state_.filter_tab == 1);
     for (const auto& [key, label] : kBasicFilterKeys) {
       const std::vector<std::string> values = distinctFieldValues(state_.sequences, key);
       std::vector<std::string> items;
@@ -1064,21 +1141,14 @@ std::string DexoryCloudDialog::widget_data() {
       wd.setCurrentIndex(combo, idx);
     }
 
-    // D8: additive '/'-prefix hierarchy operates on per-FILE keys, so it only
-    // applies in file mode. In aggregate mode the rows are sessions (the
-    // aggregation already groups by partition), so the prefix combo is hidden.
+    // (The D8 "Folder:" prefix combo was removed 2026-07-12: with Hive keys the
+    // top-level prefix IS the customer dimension, which the Basic metadata
+    // filter covers properly — vocabulary, persistence, stale-value pruning.)
     std::vector<int> seq_visible = cache.visible;
-    if (!state_.aggregate && state_.supports_file_hierarchy) {
-      seq_visible = applyPrefixToVisible(cache.visible, state_.sequence_names, state_.selected_prefix);
-      wd.setItems("comboPrefix", buildPrefixComboItems(state_.sequence_names));
-      wd.setVisible("comboPrefix", true);
-      wd.setVisible("labelPrefix", true);
-    } else {
-      wd.setItems("comboPrefix", {});
-      wd.setVisible("comboPrefix", false);
-      wd.setVisible("labelPrefix", false);
+    if (seq_visible != state_.seq_visible_pushed) {
+      wd.setVisibleRows("seqTable", seq_visible);
+      state_.seq_visible_pushed = seq_visible;
     }
-    wd.setVisibleRows("seqTable", seq_visible);
 
     // Selection highlight, recomputed fresh from selected_sequences (the real-key
     // source of truth) ∩ each row's key list. Robust across both view modes and
@@ -1094,32 +1164,75 @@ std::string DexoryCloudDialog::widget_data() {
       }
     }
     state_.seq_selected_rows = selected_rows;  // keep other consumers consistent
+    // Hidden-selection policy (2026-07-12): if the current filters/view hide
+    // EVERY selected row, drop the selection entirely — topics + slider reset.
+    // Otherwise the panel holds a selection the user cannot see (a 20-minute
+    // slider span with no highlighted row). Skipped mid-fetch: the download
+    // snapshot took the selection at click time and keeps its bookkeeping.
+    if (!state_.selected_sequences.empty() && !state_.fetch_active && !state_.sequences.empty()) {
+      const std::set<int> visible_set(seq_visible.begin(), seq_visible.end());
+      const bool any_visible = std::any_of(selected_rows.begin(), selected_rows.end(),
+                                           [&](int r) { return visible_set.count(r) > 0; });
+      if (!any_visible) {
+        clearSelectionStateLocked();
+        selected_rows.clear();
+      }
+    }
     if (!selected_rows.empty()) {
       wd.setSelectedRows("seqTable", selected_rows);
     }
-    wd.setLabel("seqHeader", fmt::format("Sequences ({}/{})", seq_visible.size(), cache.rows.size()));
+    // Header doubles as the connection-state line while there is nothing to
+    // count — a bare "Sequences (0/0)" after a silent failed auto-connect gave
+    // no hint that connecting (not filtering) is the missing step.
+    if (state_.connecting) {
+      wd.setLabel("seqHeader", "Sequences - connecting...");
+    } else if (!state_.connected) {
+      wd.setLabel("seqHeader", "Sequences - not connected");
+    } else {
+      wd.setLabel("seqHeader", fmt::format("Sequences ({}/{})", seq_visible.size(), cache.rows.size()));
+    }
   }
 
   // Topic table — name-substring filter via visible_rows. Multi-select
-  // semantics handled by the .ui (selectionMode=MultiSelection).
+  // semantics handled by the .ui (selectionMode=MultiSelection). Two selection
+  // modes (the All|Custom radio pair the host renders as a DualOptionsWidget):
+  // All = every listed topic downloads, the table is inert. Custom = the
+  // selected rows download (+ kForcedTopics appended implicitly at fetch time);
+  // zero-count rows are disabled (nothing to fetch).
   {
     std::vector<std::vector<std::string>> rows;
     std::vector<int> visible;
+    std::vector<int> disabled;
     rows.reserve(state_.topic_names.size());
     for (size_t i = 0; i < state_.topic_names.size(); ++i) {
       const auto& name = state_.topic_names[i];
-      std::string size_text;
+      // Per-topic MESSAGE COUNT ("Count"): the wire TopicInfo carries no
+      // per-topic byte size (deriving one needs the deferred file_metrics body
+      // pass), so the second column shows the count we genuinely have. "0" is
+      // deliberately visible — a declared-but-empty channel is worth noticing.
+      std::string count_text;
+      std::int64_t count = -1;  // unknown until topic_infos arrives
       if (i < state_.topic_infos.size()) {
-        size_text = formatBytes(state_.topic_infos[i].total_size_bytes);
+        count = state_.topic_infos[i].message_count;
+        count_text = fmt::format("{}", count);
       }
-      rows.push_back({name, size_text});
+      // Custom mode: a zero-count row is not selectable (nothing to download).
+      if (!state_.topics_all && count == 0) {
+        disabled.push_back(static_cast<int>(i));
+      }
+      rows.push_back({name, count_text});
       if (nameMatches(name, state_.topic_filter, state_.topic_filter_regex)) {
         visible.push_back(static_cast<int>(i));
       }
     }
-    wd.setTableHeaders("topicTable", {"Name", "Size"});
+    wd.setChecked("radioTopicsAll", state_.topics_all);
+    wd.setChecked("radioTopicsCustom", !state_.topics_all);
+    // In All mode the table is inert — the mode already selects everything.
+    wd.setEnabled("topicTable", !state_.topics_all);
+    wd.setTableHeaders("topicTable", {"Name", "Count"});
     wd.setTableRows("topicTable", rows);
     wd.setVisibleRows("topicTable", visible);
+    wd.setDisabledRows("topicTable", state_.topics_all ? std::vector<int>{} : disabled);
     if (!state_.topic_selected_rows.empty()) {
       wd.setSelectedRows("topicTable", state_.topic_selected_rows);
     }
@@ -1135,8 +1248,13 @@ std::string DexoryCloudDialog::widget_data() {
                                              state_.topics_failed.size(), state_.selected_sequences.size()));
     } else if (state_.topic_names.empty()) {
       wd.setLabel("topicHeader", "Topics");
+    } else if (state_.topics_all) {
+      wd.setLabel("topicHeader", fmt::format("Topics (all {})", state_.topic_names.size()));
     } else {
-      wd.setLabel("topicHeader", fmt::format("Topics ({})", state_.topic_names.size()));
+      // Selection feedback: how many topics the Download will actually carry.
+      wd.setLabel(
+          "topicHeader",
+          fmt::format("Topics ({}/{})", state_.topic_selected_rows.size(), state_.topic_names.size()));
     }
   }
 
@@ -1628,21 +1746,43 @@ bool DexoryCloudDialog::onClicked(std::string_view widget_name) {
         return true;
       }
       int empty_topics = 0;
-      for (int row : state_.topic_selected_rows) {
-        if (row >= 0 && row < static_cast<int>(state_.topic_names.size())) {
-          topics.push_back(state_.topic_names[row]);
-          // Catalog-declared topics with ZERO recorded messages are selectable
-          // (the recorder writes the channel even when nothing published — 75
-          // of 171 on the Dexory staging bags). Count them for the pre-flight
-          // hint below; the server will return no data for them.
-          if (row < static_cast<int>(state_.topic_infos.size()) && state_.topic_infos[row].message_count == 0) {
-            ++empty_topics;
+      if (state_.topics_all) {
+        // All mode: request every listed topic EXPLICITLY (not the wire's
+        // "empty = all" shorthand) so the per-topic pull ledger, progress and
+        // estimates see the same list the user saw. Zero-count topics are
+        // expected here — no pre-flight warning.
+        topics = state_.topic_names;
+      } else {
+        for (int row : state_.topic_selected_rows) {
+          if (row >= 0 && row < static_cast<int>(state_.topic_names.size())) {
+            topics.push_back(state_.topic_names[row]);
+            // Catalog-declared topics with ZERO recorded messages are selectable
+            // (the recorder writes the channel even when nothing published — 75
+            // of 171 on the Dexory staging bags). Count them for the pre-flight
+            // hint below; the server will return no data for them.
+            if (row < static_cast<int>(state_.topic_infos.size()) && state_.topic_infos[row].message_count == 0) {
+              ++empty_topics;
+            }
           }
         }
       }
       if (topics.empty()) {
         notify(PJ::ToolboxMessageLevel::kWarning, "Select a sequence + topic(s) first");
         return true;
+      }
+      if (!state_.topics_all) {
+        // Implicit TF inclusion: append kForcedTopics that the selection lacks
+        // (only those actually listed for this sequence set). All-mode already
+        // carries the full list.
+        for (std::string_view forced : kForcedTopics) {
+          if (std::find(topics.begin(), topics.end(), forced) != topics.end()) {
+            continue;
+          }
+          if (std::find(state_.topic_names.begin(), state_.topic_names.end(), forced) !=
+              state_.topic_names.end()) {
+            topics.emplace_back(forced);
+          }
+        }
       }
       if (empty_topics > 0) {
         // Non-blocking heads-up: these will come back "no messages in the
@@ -1762,18 +1902,38 @@ bool DexoryCloudDialog::onToggled(std::string_view widget_name, bool checked) {
   if (widget_name == "checkAggregate") {
     std::lock_guard<std::mutex> lock(state_.mu);
     state_.aggregate = checked;  // seq_view_cache misses on the mode change and rebuilds
+    // Row identities change between the file and session views (one session row
+    // = N file keys), so carrying a selection across the toggle produced
+    // half-mapped highlights. Start clean instead.
+    clearSelectionStateLocked();
+    return true;
+  }
+  if (widget_name == "radioTopicsAll" || widget_name == "radioTopicsCustom") {
+    // The All|Custom topic-selection mode (radio pair -> DualOptionsWidget).
+    // Only the newly-CHECKED radio moves the mode; the render tick re-applies
+    // table enablement / disabled rows / forced topics for the new mode.
+    if (checked) {
+      std::lock_guard<std::mutex> lock(state_.mu);
+      state_.topics_all = (widget_name == "radioTopicsAll");
+    }
+    return true;
+  }
+  if (widget_name == "radioFilterBasic" || widget_name == "radioFilterAdvanced") {
+    // The Basic|Advanced mode selector (radio pair -> DualOptionsWidget). Each
+    // radio reports its own toggle; only the newly-CHECKED one moves the mode
+    // (the unchecked partner's `false` arrives too and is ignored).
+    if (checked) {
+      std::lock_guard<std::mutex> lock(state_.mu);
+      // 0 Basic / 1 Advanced — seq_view_cache rebuilds on the change.
+      state_.filter_tab = (widget_name == "radioFilterAdvanced") ? 1 : 0;
+    }
     return true;
   }
   return false;
 }
 
-bool DexoryCloudDialog::onTabChanged(std::string_view widget_name, int index) {
-  if (widget_name == "filterTabs") {
-    std::lock_guard<std::mutex> lock(state_.mu);
-    state_.filter_tab = index;  // 0 Basic / 1 Advanced — seq_view_cache rebuilds on the change
-    return true;
-  }
-  return false;
+bool DexoryCloudDialog::onTabChanged(std::string_view /*widget_name*/, int /*index*/) {
+  return false;  // no tab widgets left; the filter mode is the radio pair above
 }
 
 bool DexoryCloudDialog::onValueChanged(std::string_view /*widget_name*/, int /*value*/) {
@@ -1937,18 +2097,6 @@ bool DexoryCloudDialog::onIndexChanged(std::string_view widget_name, int index) 
       return true;
     }
   }
-  // D8: the '/'-prefix hierarchy combo. Item 0 is the "All" sentinel (no
-  // narrowing); items 1..N are the derived prefixes. Resolve the picked item
-  // against the same buildPrefixComboItems() the widget_data populated.
-  if (widget_name == "comboPrefix") {
-    std::lock_guard<std::mutex> lock(state_.mu);
-    const auto items = buildPrefixComboItems(state_.sequence_names);
-    if (index < static_cast<int>(items.size())) {
-      state_.selected_prefix = items[static_cast<std::size_t>(index)];
-    }
-    ++state_.seq_epoch;  // refresh the seqTable view next tick (cheap recompute)
-    return true;
-  }
   enum class Which { kKey, kOp, kVal };
   Which which;
   if (widget_name == "keyCombo") {
@@ -2005,6 +2153,20 @@ bool DexoryCloudDialog::onIndexChanged(std::string_view widget_name, int index) 
   state_.query_cursor = result.cursor;
   state_.query_push_pending = true;  // push the rewritten text + caret back to the editor
   return true;
+}
+
+void DexoryCloudDialog::clearSelectionStateLocked() {
+  state_.restore_selected_sequence.clear();
+  state_.restore_selected_topics.clear();
+  state_.seq_selected_rows.clear();
+  state_.selected_sequences.clear();
+  state_.primary_sequence.clear();
+  state_.topic_names.clear();
+  state_.topic_infos.clear();
+  state_.topic_selected_rows.clear();
+  state_.topics_loading = false;
+  state_.topics_failed.clear();
+  state_.topics_failure_notified = false;
 }
 
 bool DexoryCloudDialog::onSelectionChanged(std::string_view widget_name, const std::vector<std::string>& selected) {
@@ -2145,9 +2307,6 @@ void DexoryCloudDialog::onCapabilitiesReady(BackendCaps caps) {
   // as a filterable key.
   (void)caps.metadata_key_vocabulary;
   state_.metadata_key_vocabulary = canonicalVocabularyKeys();
-  // A fresh connect resets any prior prefix narrowing (a new server's key space
-  // is unrelated to the old one's).
-  state_.selected_prefix.clear();
 }
 
 void DexoryCloudDialog::onServerCapabilitiesReady(ServerCaps caps) {
@@ -2280,8 +2439,13 @@ void DexoryCloudDialog::onPullProgress(std::string topic_name, std::int64_t byte
   // pushed to the notification bell (it would flood the diagnostics log). Once
   // the user has hit Cancel, don't overwrite the "Cancelling…" header.
   if (!state_.cancelling) {
+    // "decoded": the counter sums DECOMPRESSED message payloads (client-side,
+    // post chunk/batch decode), so it legitimately exceeds the zstd-compressed
+    // on-disk file sizes — labeling it plainly avoids "downloaded more than
+    // the files weigh" confusion. The rate is decode throughput, not network.
     state_.fetch_status = fmt::format(
-        "Fetching: {}/{} topics, {:.2f} MiB ({:.2f} MiB/s)", state_.fetch_done, state_.fetch_total, mib, mibps);
+        "Fetching: {}/{} topics, {:.2f} MiB decoded ({:.2f} MiB/s)", state_.fetch_done, state_.fetch_total, mib,
+        mibps);
   }
 }
 
@@ -2384,22 +2548,22 @@ void DexoryCloudDialog::persistState() {
   int upper = DialogState::kSliderSteps;
   std::string selected_sequence;
   std::vector<std::string> selected_topics;
+  bool aggregate = true;
+  bool topics_all = false;
+  int filter_tab = 0;
+  std::map<std::string, std::string, std::less<>> basic_filter;
   {
     std::lock_guard<std::mutex> lock(state_.mu);
     query = state_.query_text;
     lower = state_.range_lower;
     upper = state_.range_upper;
-    // PJ3 parity: remember the last selection so the next connect can re-select
-    // it. Resolve the selected topic ROW indices back to names (names are
-    // stable across re-fetch; row indices are not). Slice 7: persisted restore
-    // is intentionally SINGLE (the primary sequence); restoring a multi-select
-    // adds selection-restore ambiguity for no value.
-    selected_sequence = state_.primary_sequence;
-    for (int row : state_.topic_selected_rows) {
-      if (row >= 0 && row < static_cast<int>(state_.topic_names.size())) {
-        selected_topics.push_back(state_.topic_names[static_cast<std::size_t>(row)]);
-      }
-    }
+    aggregate = state_.aggregate;
+    topics_all = state_.topics_all;
+    filter_tab = state_.filter_tab;
+    basic_filter = state_.basic_filter;
+    // Selection is deliberately not persisted (2026-07-12): the toolbox opens
+    // with nothing selected. The empty strings below CLEAR any value a previous
+    // version persisted, so an old install cannot resurrect a stale restore.
   }
   SettingsStore settings(settings_);
   settings.setString("dexory_cloud/metadata_query", query);
@@ -2407,6 +2571,17 @@ void DexoryCloudDialog::persistState() {
   settings.setInt("dexory_cloud/range_upper", upper);
   settings.setString("dexory_cloud/selected_sequence", selected_sequence);
   settings.setStringList("dexory_cloud/selected_topics", selected_topics);
+  settings.setBool("dexory_cloud/aggregate", aggregate);
+  settings.setBool("dexory_cloud/topics_all", topics_all);
+  settings.setInt("dexory_cloud/filter_tab", filter_tab);
+  // One key per Basic-tab field; an unset filter writes "" so a previously
+  // persisted constraint is cleared, not resurrected.
+  for (const auto& [key, label] : kBasicFilterKeys) {
+    (void)label;
+    const auto it = basic_filter.find(key);
+    settings.setString(
+        std::string("dexory_cloud/basic_filter/") + key, it != basic_filter.end() ? it->second : std::string{});
+  }
 }
 
 void DexoryCloudDialog::notify(PJ::ToolboxMessageLevel level, const std::string& message) {
@@ -2570,14 +2745,14 @@ void DexoryCloudDialog::sortTopicsLocked() {
 
   // Sort an index permutation, then apply it to the parallel name/info vectors.
   std::vector<std::size_t> perm;
-  if (col == 1 && have_infos) {  // Size — numeric
+  if (col == 1 && have_infos) {  // Messages — numeric
     std::vector<std::int64_t> keys;
     keys.reserve(state_.topic_infos.size());
     for (const auto& t : state_.topic_infos) {
-      keys.push_back(t.total_size_bytes);
+      keys.push_back(t.message_count);
     }
     perm = sortedPermutation(keys, asc);
-  } else {  // Name (col 0) or fallback when sizes are unavailable
+  } else {  // Name (col 0) or fallback when counts are unavailable
     perm = sortedPermutation(state_.topic_names, asc);
   }
 
@@ -2700,6 +2875,20 @@ void DexoryCloudDialog::onSequencesReady(std::vector<SequenceInfo> seqs) {
     populateSequencesLocked(seqs, /*seed_dates=*/true);
     sortSequencesLocked();
     count = state_.sequences.size();
+
+    // Graceful fallback for restored/stale Basic-tab constraints: a value that
+    // no longer exists in the fresh data would render as "(any)" in the combo
+    // yet still hide every row through matchesBasicFilter — prune it so the
+    // filter state and the visible combo agree (default = no constraint).
+    for (auto it = state_.basic_filter.begin(); it != state_.basic_filter.end();) {
+      const std::vector<std::string> values = distinctFieldValues(state_.sequences, it->first);
+      if (std::find(values.begin(), values.end(), it->second) == values.end()) {
+        it = state_.basic_filter.erase(it);
+        ++state_.seq_epoch;  // constraint changed → recompute the visible set
+      } else {
+        ++it;
+      }
+    }
 
     // PJ3 parity: re-select the persisted sequence if it's present in the
     // freshly-listed sequences and the user hasn't already picked one this
