@@ -502,6 +502,12 @@ DexoryCloudDialog::DexoryCloudDialog() : worker_(std::make_unique<FetchWorker>()
     postEvent(
         [this, topic_name = std::move(topic_name), bytes]() mutable { onPullProgress(std::move(topic_name), bytes); });
   };
+  worker_->pullWireBytes = [this](std::int64_t wire_bytes) {
+    postEvent([this, wire_bytes]() {
+      std::lock_guard<std::mutex> lock(state_.mu);
+      state_.wire_bytes_total = wire_bytes;
+    });
+  };
   worker_->pullPhase = [this](std::string phase) {
     postEvent([this, phase = std::move(phase)]() mutable { onPullPhase(std::move(phase)); });
   };
@@ -1843,6 +1849,7 @@ bool DexoryCloudDialog::onClicked(std::string_view widget_name) {
         state_.imported_any = false;
         state_.error_counts.clear();
         state_.bytes_by_topic.clear();
+        state_.wire_bytes_total = 0;
         state_.speed_samples.clear();
         state_.topic_fetch_status.clear();
       }
@@ -2439,13 +2446,21 @@ void DexoryCloudDialog::onPullProgress(std::string topic_name, std::int64_t byte
   // pushed to the notification bell (it would flood the diagnostics log). Once
   // the user has hit Cancel, don't overwrite the "Cancelling…" header.
   if (!state_.cancelling) {
-    // "decoded": the counter sums DECOMPRESSED message payloads (client-side,
-    // post chunk/batch decode), so it legitimately exceeds the zstd-compressed
-    // on-disk file sizes — labeling it plainly avoids "downloaded more than
-    // the files weigh" confusion. The rate is decode throughput, not network.
-    state_.fetch_status = fmt::format(
-        "Fetching: {}/{} topics, {:.2f} MiB decoded ({:.2f} MiB/s)", state_.fetch_done, state_.fetch_total, mib,
-        mibps);
+    // Two figures, deliberately distinct:
+    //  - "received": compressed bytes off the wire (state_.wire_bytes_total) —
+    //    the network cost, which the zstd batch/envelope compression shrinks.
+    //  - "decoded": DECOMPRESSED message payloads (post chunk/batch decode), so
+    //    it legitimately exceeds both the wire figure and the on-disk file sizes.
+    // Showing both makes the compression ratio visible. The rate is decode
+    // throughput, not network. The "received" fragment is shown once known (>0).
+    std::string recv_prefix;
+    if (state_.wire_bytes_total > 0) {
+      recv_prefix = fmt::format("{:.2f} MiB received / ",
+                                static_cast<double>(state_.wire_bytes_total) / (1024.0 * 1024.0));
+    }
+    state_.fetch_status =
+        fmt::format("Fetching: {}/{} topics, {}{:.2f} MiB decoded ({:.2f} MiB/s)", state_.fetch_done,
+                    state_.fetch_total, recv_prefix, mib, mibps);
   }
 }
 

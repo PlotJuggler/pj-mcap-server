@@ -74,6 +74,15 @@ type Metrics struct {
 	// writable (the local write path never forwards).
 	TagIPCForwardsTotal prometheus.Counter
 	TagIPCFailuresTotal prometheus.Counter
+
+	// Response-compression effectiveness (compressed-envelope path). Input =
+	// marshaled ServerMessage bytes that entered the compression path (allowlisted
+	// + above threshold); Output = bytes actually emitted for them (compressed
+	// frame, or the raw fallback when zstd didn't shrink it). Output/Input is the
+	// realized wire savings on compressible RPC responses. Both stay 0 when the
+	// feature is off or no client negotiated it.
+	WSResponseCompressInputBytes  prometheus.Counter
+	WSResponseCompressOutputBytes prometheus.Counter
 }
 
 // New builds the collector set on a fresh Registry and registers them. The
@@ -140,6 +149,12 @@ func New() *Metrics {
 		TagIPCFailuresTotal: prometheus.NewCounter(
 			prometheus.CounterOpts{Name: "pj_cloud_tag_ipc_failures_total", Help: "Tag-edit IPC forward attempts that failed (busy, not-found, connection error, ...)."},
 		),
+		WSResponseCompressInputBytes: prometheus.NewCounter(
+			prometheus.CounterOpts{Name: "pj_cloud_ws_response_compress_input_bytes_total", Help: "Marshaled ServerMessage bytes that entered the response-compression path (allowlisted + above threshold)."},
+		),
+		WSResponseCompressOutputBytes: prometheus.NewCounter(
+			prometheus.CounterOpts{Name: "pj_cloud_ws_response_compress_output_bytes_total", Help: "Bytes emitted for compression-path responses (compressed frame or raw fallback); Output/Input is the realized savings."},
+		),
 	}
 	reg.MustRegister(
 		m.PanicTotal,
@@ -150,6 +165,7 @@ func New() *Metrics {
 		m.CatalogBuildID, m.CatalogLastBuildTimestamp, m.CatalogFilesScanned, m.CatalogFilesFailed,
 		m.CatalogReopensTotal, m.CatalogReopenFailuresTotal,
 		m.TagIPCForwardsTotal, m.TagIPCFailuresTotal,
+		m.WSResponseCompressInputBytes, m.WSResponseCompressOutputBytes,
 	)
 	return m
 }

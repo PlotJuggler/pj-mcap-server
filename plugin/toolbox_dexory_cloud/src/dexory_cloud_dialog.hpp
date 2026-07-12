@@ -268,6 +268,10 @@ struct DialogState {
   // Fetch progress — per-topic byte counters, refreshed from
   // pullProgress signals on the GUI thread.
   std::map<std::string, std::int64_t, std::less<>> bytes_by_topic;
+  // Cumulative WS payload bytes RECEIVED off the wire for the active pull (the
+  // compressed network figure, vs bytes_by_topic's decoded total). Refreshed from
+  // pullWireBytes on the GUI thread; shown as "X MiB received / Y MiB decoded".
+  std::int64_t wire_bytes_total = 0;
   std::string fetch_status;
   // True while fetch_status is a coarse PHASE line from pullPhase ("Opening
   // session…") rather than the byte-driven progress line; widget_data appends

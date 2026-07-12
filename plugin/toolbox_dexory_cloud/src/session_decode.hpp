@@ -43,4 +43,18 @@ namespace dexory_cloud {
 [[nodiscard]] bool decodeBatch(const pj_cloud::v1::MessageBatch& batch, std::vector<DecodedMessage>* out,
                                std::string* error);
 
+// kMaxDecodedEnvelopeBytes is the hard ceiling on a decoded EncodedServerMessage
+// (the compressed-envelope RPC path). A catalog RPC response is pagination-bounded,
+// so 64 MiB is far above any legitimate frame while capping a decompression-bomb
+// attempt. Independent of the server's read limit (which only bounds client->server).
+inline constexpr std::uint64_t kMaxDecodedEnvelopeBytes = 64ull * 1024 * 1024;
+
+// decodeEncodedEnvelope decompresses one EncodedServerMessage.body into *out with
+// the FULL validation chain (Codex review): bounded announced size, EXACTLY one
+// zstd frame with NO trailing/concatenated data, a KNOWN frame content size equal
+// to `announced_size`, an exact-size allocation, and an exact-size decompress. Any
+// deviation returns false (leaving *out unspecified) — the caller treats that as a
+// protocol violation and drops the frame. Stateless; no carried context.
+[[nodiscard]] bool decodeEncodedEnvelope(const std::string& body, std::uint64_t announced_size, std::string* out);
+
 }  // namespace dexory_cloud

@@ -2,6 +2,7 @@ package ws
 
 import (
 	"context"
+	"sync/atomic"
 	"time"
 
 	"google.golang.org/protobuf/proto"
@@ -12,7 +13,9 @@ import (
 
 // ConnAPI is what handlers + the session consumer see when they need to send a
 // frame on the WS. SendPriority carries catalog RPC responses, Error, Progress
-// and Eos; SendBulk carries MessageBatch (the only thing on the bulk channel).
+// and Eos (an allowlisted RPC response may be transparently wrapped in an
+// EncodedServerMessage when the client negotiated compression — see compress.go);
+// SendBulk carries MessageBatch (the only thing on the bulk channel).
 // Per design spec §6.4, the write loop drains priority before bulk at every
 // frame boundary, and the bulk channel's small capacity (16) lets a slow client
 // backpressure the producer naturally. Both return false when the frame could
@@ -58,10 +61,19 @@ type conn struct {
 	// done is closed by the read loop when the connection is finished; Send*
 	// observe it so a queue attempt cannot block forever after teardown.
 	done chan struct{}
+	// compressor wraps allowlisted RPC responses in an EncodedServerMessage when
+	// the peer negotiated it. nil => the compressed-envelope path is off and every
+	// response marshals raw (the default for write-only unit tests).
+	compressor *responseCompressor
+	// acceptEncoding is true once this client's Hello advertised a compression
+	// encoding the server supports. Written once from the read loop (handleHello),
+	// read on every SendPriority (which can fire from several session goroutines) —
+	// hence atomic.
+	acceptEncoding atomic.Bool
 }
 
-func newConn(c *websocket.Conn, writeTimeout time.Duration) *conn {
-	cc := newConnFromAdapter(wsAdapter{c: c}, writeTimeout)
+func newConn(c *websocket.Conn, writeTimeout time.Duration, rc *responseCompressor) *conn {
+	cc := newConnFromAdapter(wsAdapter{c: c}, writeTimeout, rc)
 	cc.ws = c
 	return cc
 }
@@ -77,15 +89,20 @@ func unmarshalClient(data []byte, msg *pb.ClientMessage) error {
 	return proto.Unmarshal(data, msg)
 }
 
-func newConnFromAdapter(w writeAdapter, writeTimeout time.Duration) *conn {
+func newConnFromAdapter(w writeAdapter, writeTimeout time.Duration, rc *responseCompressor) *conn {
 	return &conn{
 		w:            w,
 		writeTimeout: writeTimeout,
 		priorityCh:   make(chan []byte, priorityChanCap),
 		bulkCh:       make(chan []byte, bulkChanCap),
 		done:         make(chan struct{}),
+		compressor:   rc,
 	}
 }
+
+// setAcceptEncoding records whether the connected client can decode compressed
+// responses (negotiated at Hello). Idempotent; safe to call from the read loop.
+func (c *conn) setAcceptEncoding(v bool) { c.acceptEncoding.Store(v) }
 
 // runWriteLoop drains priority then bulk until ctx is done OR a socket write
 // fails. Implements spec §6.4 multiplexing fairness: a ready priority frame
@@ -137,7 +154,11 @@ func (c *conn) SendPriority(m *pb.ServerMessage) bool {
 	if c.isDone() {
 		return false
 	}
-	buf, err := proto.Marshal(m)
+	// Compressed-envelope path: allowlisted RPC responses are wrapped when the
+	// client negotiated it and compression actually saves bytes; everything else
+	// (HelloResponse, Error, Progress, Eos) marshals raw. A nil compressor is
+	// nil-safe and always yields raw.
+	buf, err := c.compressor.marshalResponse(m, c.acceptEncoding.Load())
 	if err != nil {
 		return false
 	}

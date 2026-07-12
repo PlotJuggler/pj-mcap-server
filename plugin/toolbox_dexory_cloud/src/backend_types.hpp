@@ -192,7 +192,8 @@ enum class SessionEos {
 // client-side ground truth the live test asserts against (received message COUNT).
 struct SessionStats {
   std::uint64_t messages_received = 0;   // messages handed to the sink
-  std::uint64_t bytes_received = 0;      // sum of RAW payload bytes handed to the sink
+  std::uint64_t bytes_received = 0;      // sum of RAW (decompressed) payload bytes handed to the sink
+  std::uint64_t wire_bytes_received = 0; // WS payload bytes received off the wire (compressed batch bodies + control frames)
   std::uint64_t batches_received = 0;
   std::uint64_t eos_total_messages_sent = 0;  // server's Eos.total_messages_sent
   std::uint64_t eos_total_bytes_sent = 0;

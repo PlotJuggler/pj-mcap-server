@@ -33,7 +33,7 @@ func (r *recordWS) count() int {
 
 func TestConn_PriorityBeatsBulk(t *testing.T) {
 	w := &recordWS{}
-	c := newConnFromAdapter(w, 5*time.Second)
+	c := newConnFromAdapter(w, 5*time.Second, nil)
 
 	// Queue a bulk frame then a priority frame BEFORE the write loop starts. When
 	// the loop runs, the priority frame must be written first (frame 0).
@@ -73,7 +73,7 @@ func TestConn_PriorityBeatsBulk(t *testing.T) {
 
 func TestConn_SendBulkReturnsFalseWhenFull(t *testing.T) {
 	w := &recordWS{}
-	c := newConnFromAdapter(w, 5*time.Second)
+	c := newConnFromAdapter(w, 5*time.Second, nil)
 	c.bulkCh = make(chan []byte, 1)
 	// Do not start the write loop; fill the channel.
 	if !c.SendBulk(&pb.ServerMessage{}) {
@@ -86,7 +86,7 @@ func TestConn_SendBulkReturnsFalseWhenFull(t *testing.T) {
 
 func TestConn_SendReturnsFalseAfterClose(t *testing.T) {
 	w := &recordWS{}
-	c := newConnFromAdapter(w, 5*time.Second)
+	c := newConnFromAdapter(w, 5*time.Second, nil)
 	c.bulkCh = make(chan []byte, 1)
 	c.priorityCh = make(chan []byte, 1)
 	// Fill both channels so the non-blocking send would otherwise just return

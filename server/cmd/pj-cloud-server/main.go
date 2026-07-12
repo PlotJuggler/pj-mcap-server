@@ -254,6 +254,17 @@ func main() {
 	// WS handler on /api/ws, now with streaming + metrics wired.
 	handler := ws.NewHandlerWithSession(store, cfg.Auth.BearerToken, log, sessDeps)
 	handler.SetMetrics(mx)
+	// Compressed-envelope path for bulky catalog RPC responses (opt-in per client
+	// via Hello). Transport-level; applies even to catalog-only connections.
+	if err := handler.SetResponseCompression(cfg.Server.ResponseCompression); err != nil {
+		log.Error("ws: response compression init failed", "err", err)
+		os.Exit(1)
+	}
+	if cfg.Server.ResponseCompression.Enabled {
+		log.Info("ws: response compression enabled",
+			"level", cfg.Server.ResponseCompression.Level,
+			"threshold_bytes", cfg.Server.ResponseCompression.ThresholdBytes)
+	}
 	// D2 tag-edit IPC forwarder (CATALOG_CONTRACT.md §10): the only way
 	// UpdateTags can succeed now that the catalog is always read-only; a
 	// server with no socket configured rejects every UpdateTags outright.

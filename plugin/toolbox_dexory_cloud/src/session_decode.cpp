@@ -99,6 +99,35 @@ bool lz4DecodeAll(const std::string& in, std::string* out, std::string* error) {
 
 }  // namespace
 
+bool decodeEncodedEnvelope(const std::string& body, std::uint64_t announced_size, std::string* out) {
+  if (announced_size == 0 || announced_size > kMaxDecodedEnvelopeBytes) {
+    return false;  // announced size absent or over the ceiling
+  }
+  if (body.empty() || body.size() > kMaxDecodedEnvelopeBytes) {
+    return false;  // compressed body absent or implausibly large
+  }
+  // Reject trailing/concatenated data: the body must be EXACTLY one frame.
+  const std::size_t frame_size = ZSTD_findFrameCompressedSize(body.data(), body.size());
+  if (ZSTD_isError(frame_size) || frame_size != body.size()) {
+    return false;
+  }
+  // The frame must declare its content size, and it must equal the announced size
+  // (Go's EncodeAll always writes the content size, so a missing one is invalid).
+  const unsigned long long content = ZSTD_getFrameContentSize(body.data(), body.size());
+  if (content == ZSTD_CONTENTSIZE_ERROR || content == ZSTD_CONTENTSIZE_UNKNOWN) {
+    return false;
+  }
+  if (content != announced_size || content > kMaxDecodedEnvelopeBytes) {
+    return false;
+  }
+  out->resize(static_cast<std::size_t>(content));
+  const std::size_t n = ZSTD_decompress(out->data(), out->size(), body.data(), body.size());
+  if (ZSTD_isError(n) || n != content) {
+    return false;
+  }
+  return true;
+}
+
 bool decodeBatch(const pj_cloud::v1::MessageBatch& batch, std::vector<DecodedMessage>* out, std::string* error) {
   out->clear();
 

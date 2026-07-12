@@ -537,6 +537,11 @@ void FetchWorker::pullTopicsAsync(std::vector<std::string> sequence_names, std::
   // Progress throttle: emit pullProgress at most ~10 Hz per topic.
   std::unordered_map<std::uint32_t, std::int64_t> bytes_by_id;
   std::unordered_map<std::uint32_t, std::chrono::steady_clock::time_point> last_emit;
+  // pullProgress is throttled PER TOPIC (last_emit is keyed by topic id). The
+  // wire-byte figure is session-wide, so it gets its OWN single throttle stamp —
+  // otherwise it would re-emit the same value once per topic that trips its own
+  // window (N GUI events/window instead of one).
+  std::chrono::steady_clock::time_point last_wire_emit{};
   const auto kProgressInterval = std::chrono::milliseconds(100);
 
   // Expose the session backend so requestCancel() can fire a wire Cancel.
@@ -573,6 +578,12 @@ void FetchWorker::pullTopicsAsync(std::vector<std::string> sequence_names, std::
             }
           }
         }
+        // Live network figure (compressed wire bytes) — session-wide, so it rides
+        // its own throttle stamp rather than the per-topic one above.
+        if (pullWireBytes && now - last_wire_emit >= kProgressInterval) {
+          last_wire_emit = now;
+          pullWireBytes(static_cast<std::int64_t>(session_backend->sessionWireBytesReceived()));
+        }
         return true;
       });
 
@@ -591,6 +602,11 @@ void FetchWorker::pullTopicsAsync(std::vector<std::string> sequence_names, std::
   const bool session_failed = (stats.eos == SessionEos::Error || stats.eos == SessionEos::Unset);
 
   write_lock.unlock();  // release before invoking the GUI-thread callbacks
+
+  // Final authoritative wire-byte total (the whole pull, all resume legs).
+  if (pullWireBytes) {
+    pullWireBytes(static_cast<std::int64_t>(stats.wire_bytes_received));
+  }
 
   // Snapshot the POST-download per-topic outcomes: lazy binding means a topic's
   // decodable flag can flip to false at its first message (bind failure).

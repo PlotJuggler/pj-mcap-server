@@ -29,6 +29,7 @@ import (
 
 	"pj-cloud/server/internal/authn"
 	"pj-cloud/server/internal/catalog"
+	"pj-cloud/server/internal/config"
 	"pj-cloud/server/internal/metrics"
 	"pj-cloud/server/internal/tagipc"
 	pb "pj-cloud/server/internal/wire/pj_cloud"
@@ -109,6 +110,24 @@ type Handler struct {
 	// endpoint instead of rejecting them outright. nil disables forwarding
 	// (the pre-D2 read-only rejection behavior).
 	tagIPC *tagipc.Client
+	// compressor wraps allowlisted RPC responses in an EncodedServerMessage when a
+	// client opts in via Hello (the compressed-envelope path). nil => the feature
+	// is off (the default until SetResponseCompression is called; catalog-only
+	// test handlers stay raw).
+	compressor *responseCompressor
+}
+
+// SetResponseCompression enables (or disables) the compressed-envelope path from
+// the transport config. Builds the shared zstd encoder once; a disabled config
+// leaves the compressor nil (every response marshals raw). Call once at startup
+// before serving. Returns an error only if the encoder cannot be constructed.
+func (h *Handler) SetResponseCompression(cfg config.ResponseCompressionConfig) error {
+	rc, err := newResponseCompressor(cfg, h.metrics)
+	if err != nil {
+		return err
+	}
+	h.compressor = rc
+	return nil
 }
 
 // NewHandler builds a catalog-only WS handler (no streaming). authToken == ""
@@ -216,7 +235,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	c := &connState{
 		h:      h,
-		conn:   newConn(wsConn, writeTimeout),
+		conn:   newConn(wsConn, writeTimeout, h.compressor),
 		remote: remote,
 		subs:   map[uint64]*subHandle{},
 	}
@@ -395,6 +414,18 @@ func (c *connState) requireAuth(reqID uint64) bool {
 	return false
 }
 
+// clientAcceptsZstd reports whether the client's Hello advertised the ZSTD
+// response encoding in accepted_response_encodings. Empty list (old clients /
+// proto3 default) => false => raw frames only.
+func clientAcceptsZstd(hello *pb.Hello) bool {
+	for _, e := range hello.GetAcceptedResponseEncodings() {
+		if e == pb.CompressionEncoding_COMPRESSION_ENCODING_ZSTD {
+			return true
+		}
+	}
+	return false
+}
+
 func (c *connState) handleHello(reqID uint64, hello *pb.Hello) {
 	c.h.log.Info("ws: Hello", "remote", c.remote, "request_id", reqID,
 		"protocol_version", hello.GetProtocolVersion())
@@ -416,6 +447,12 @@ func (c *connState) handleHello(reqID uint64, hello *pb.Hello) {
 		}
 	}
 	c.authenticated = true
+
+	// Negotiate the compressed-envelope path AFTER auth: record whether this
+	// client advertised a compression encoding the server supports. Effective only
+	// when the server compressor is also enabled (h.compressor != nil). The
+	// HelloResponse below is NOT allowlisted, so it always goes raw regardless.
+	c.conn.setAcceptEncoding(clientAcceptsZstd(hello))
 
 	// BackendCapabilities are DERIVED LIVE from the catalog (Plan D Task 8), not
 	// hardcoded: the metadata-key vocabulary is the constant derived keys UNION the

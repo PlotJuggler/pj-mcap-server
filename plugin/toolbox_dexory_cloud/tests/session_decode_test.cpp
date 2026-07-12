@@ -170,3 +170,56 @@ TEST(DexoryCloudSessionDecode, UnknownBodyEncodingRejected) {
   EXPECT_FALSE(dexory_cloud::decodeBatch(batch, &out, &err));
   EXPECT_NE(err.find("unknown body_encoding"), std::string::npos) << err;
 }
+
+// ---------------------------------------------------------------------------
+// decodeEncodedEnvelope — the compressed-envelope RPC path (hardened decoder).
+// The tests mirror the server: zstdCompress() is the server-side encoder, and
+// ZSTD_compress writes the frame content size into the header (as Go's EncodeAll
+// does), which the decoder requires.
+// ---------------------------------------------------------------------------
+
+// A well-formed frame with the correct announced size round-trips exactly.
+TEST(DecodeEncodedEnvelope, RoundTripsExact) {
+  const std::string payload = "the quick brown fox jumps over the lazy dog, repeatedly. ";
+  std::string big;
+  for (int i = 0; i < 200; ++i) {
+    big += payload;
+  }
+  const std::string frame = zstdCompress(big);
+  std::string out;
+  ASSERT_TRUE(dexory_cloud::decodeEncodedEnvelope(frame, big.size(), &out));
+  EXPECT_EQ(out, big);
+}
+
+// The announced size MUST match the frame's true content size.
+TEST(DecodeEncodedEnvelope, RejectsAnnouncedSizeMismatch) {
+  const std::string body = "some compressible content some compressible content";
+  const std::string frame = zstdCompress(body);
+  std::string out;
+  EXPECT_FALSE(dexory_cloud::decodeEncodedEnvelope(frame, body.size() + 1, &out));
+  EXPECT_FALSE(dexory_cloud::decodeEncodedEnvelope(frame, body.size() - 1, &out));
+}
+
+// Zero and over-ceiling announced sizes are rejected before any allocation.
+TEST(DecodeEncodedEnvelope, RejectsOutOfBoundsAnnounced) {
+  const std::string frame = zstdCompress("hello hello hello");
+  std::string out;
+  EXPECT_FALSE(dexory_cloud::decodeEncodedEnvelope(frame, 0, &out));
+  EXPECT_FALSE(dexory_cloud::decodeEncodedEnvelope(frame, dexory_cloud::kMaxDecodedEnvelopeBytes + 1, &out));
+}
+
+// Trailing / concatenated data after a valid frame is a protocol violation.
+TEST(DecodeEncodedEnvelope, RejectsTrailingData) {
+  const std::string body = "payload payload payload payload";
+  std::string frame = zstdCompress(body);
+  frame += "GARBAGE";  // a second, junk "frame" appended
+  std::string out;
+  EXPECT_FALSE(dexory_cloud::decodeEncodedEnvelope(frame, body.size(), &out));
+}
+
+// Garbage and empty bodies are rejected cleanly (no crash, no OOM).
+TEST(DecodeEncodedEnvelope, RejectsGarbageAndEmpty) {
+  std::string out;
+  EXPECT_FALSE(dexory_cloud::decodeEncodedEnvelope("not a zstd frame at all", 32, &out));
+  EXPECT_FALSE(dexory_cloud::decodeEncodedEnvelope(std::string{}, 32, &out));
+}

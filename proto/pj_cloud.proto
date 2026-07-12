@@ -35,7 +35,35 @@ message ServerMessage {
     Eos                  eos            = 17;
     Error                error          = 18;
     GetVocabularyResponse get_vocabulary = 19;  // filter vocabulary response
+    EncodedServerMessage  encoded        = 20;  // compressed wrapper for an allowlisted response (opt-in via Hello)
   }
+}
+
+// -----------------------------------------------------------------------------
+// Compressed-envelope wrapper (ADDITIVE, opt-in via Hello.accepted_response_encodings)
+// -----------------------------------------------------------------------------
+
+// CompressionEncoding identifies how EncodedServerMessage.body was compressed.
+// An enum (not a hardcoded-zstd wrapper) so a future codec doesn't need another
+// oneof arm — the client refuses any encoding it did not advertise in Hello.
+enum CompressionEncoding {
+  COMPRESSION_ENCODING_UNSPECIFIED = 0;
+  COMPRESSION_ENCODING_ZSTD        = 1;
+}
+
+// EncodedServerMessage carries a COMPLETE marshaled ServerMessage (its real
+// request_id/subscription_id and payload) compressed into `body`. It rides in the
+// ServerMessage oneof (field 20) with the OUTER request_id/subscription_id left
+// ZERO — the inner message is the sole routing authority, so the client unwraps
+// BEFORE it routes. The server emits this ONLY for allowlisted RPC responses, and
+// only when the client advertised the encoding, the marshaled response is above a
+// size threshold, AND compression actually saves bytes. HelloResponse, Error,
+// Progress, Eos and MessageBatch are NEVER wrapped (the last is already ZSTD-framed
+// inside). One self-contained frame; no cross-message state.
+message EncodedServerMessage {
+  CompressionEncoding encoding          = 1;
+  uint64              uncompressed_size = 2;   // exact marshaled size of the inner ServerMessage; decoder rejects any mismatch
+  bytes               body              = 3;   // one self-contained compressed frame of the inner ServerMessage
 }
 
 // -----------------------------------------------------------------------------
@@ -45,6 +73,12 @@ message ServerMessage {
 message Hello {
   uint32 protocol_version = 1;             // current = 1
   string auth_token       = 2;             // bearer token from config
+  // Response encodings the client can decode for the ADDITIVE compressed-envelope
+  // path (EncodedServerMessage). Empty ⇒ raw ServerMessage frames only (old
+  // clients; proto3 default). The server compresses an allowlisted RPC response
+  // iff the client advertised the matching encoding here. Negotiated once at
+  // Hello; the HelloResponse itself is ALWAYS raw.
+  repeated CompressionEncoding accepted_response_encodings = 3;
 }
 
 message HelloResponse {

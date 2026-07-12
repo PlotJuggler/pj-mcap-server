@@ -40,6 +40,7 @@ class WebSocket;
 namespace pj_cloud::v1 {
 class ServerMessage;
 class ClientMessage;
+class Hello;
 }  // namespace pj_cloud::v1
 
 namespace dexory_cloud {
@@ -181,6 +182,14 @@ class BackendConnection {
   // before/between attempts returns Cancelled. Worker-thread only.
   [[nodiscard]] SessionStats downloadSessionResumable(const SessionInfo& info, const MessageHandler& on_message);
 
+  // Live WS payload bytes received for the active session so far (compressed
+  // batch bodies + control frames). Reset at each fresh open; monotonic within a
+  // download (incl. resume legs). Thread-safe. Lets the worker emit a live
+  // "received" figure next to the "decoded" total during a fetch.
+  [[nodiscard]] std::uint64_t sessionWireBytesReceived() const {
+    return session_wire_bytes_.load(std::memory_order_relaxed);
+  }
+
   // Optional hint invoked just before each reconnect attempt (attempt is 1-based,
   // max is the attempt cap). Wired by the worker to surface "Resuming (attempt
   // N/3)…" through the dialog. Set once on the worker thread before a download.
@@ -266,6 +275,12 @@ class BackendConnection {
   // Called from the ixwebsocket receive thread for each inbound binary frame.
   void onBinaryFrame(const std::string& bytes);
 
+  // Fills a Hello with the protocol version, auth token, and the response
+  // encodings this client can decode (the compressed-envelope opt-in). One
+  // builder shared by initial connect() and reconnectAndHello() so the two paths
+  // can't drift (Codex review).
+  void fillHello(pj_cloud::v1::Hello* hello) const;
+
   std::uint64_t nextRequestId();
 
   std::string uri_;        // raw user URI (ws:// or wss://); /api/ws is appended on connect
@@ -331,6 +346,13 @@ class BackendConnection {
   std::uint64_t session_subscription_id_ = 0;
   std::atomic<bool> cancel_requested_{false};
   std::deque<std::shared_ptr<pj_cloud::v1::ServerMessage>> session_inbox_;
+  // Total WS payload bytes of the SESSION frames received off the wire since the
+  // active download began (compressed batch bodies + tiny control frames). Reset
+  // at the start of each download entry point and reported as
+  // SessionStats.wire_bytes_received. Written on the receive thread (under mu_),
+  // read on the caller thread at download end — hence atomic. NOTE: this is the WS
+  // payload size, not true network bytes (no TLS/TCP/IP framing overhead).
+  std::atomic<std::uint64_t> session_wire_bytes_{0};
 
   // ---- reconnect-resume (Slice 8) ------------------------------------------
   // Surface "Resuming (attempt N/max)…" through the worker->dialog path.

@@ -7,6 +7,8 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdint>
+#include <string>
 #include <thread>
 #include <utility>
 
@@ -88,10 +90,39 @@ std::uint64_t BackendConnection::nextRequestId() {
   return next_request_id_++;
 }
 
+void BackendConnection::fillHello(pj_cloud::v1::Hello* hello) const {
+  hello->set_protocol_version(kProtocolVersion);
+  hello->set_auth_token(api_key_);
+  // Opt into the compressed-envelope path: advertise the response encodings this
+  // client can decode. The server wraps allowlisted RPC responses only when it
+  // sees ZSTD here; an old server ignores the field and keeps sending raw frames.
+  hello->add_accepted_response_encodings(pj_cloud::v1::COMPRESSION_ENCODING_ZSTD);
+}
+
 void BackendConnection::onBinaryFrame(const std::string& bytes) {
   auto message = std::make_shared<pj_cloud::v1::ServerMessage>();
   if (!message->ParseFromString(bytes)) {
     return;  // undecodable frame — drop it; the waiting RPC will time out
+  }
+  // Compressed-envelope path: unwrap BEFORE routing. The outer envelope carries
+  // zero request_id/subscription_id — the INNER message is the sole routing
+  // authority — so a wrapped frame must be decoded and replaced here, before the
+  // request_id read below. A malformed/oversized/nested frame is a protocol
+  // violation: drop it (the waiting RPC times out) rather than trust it.
+  if (message->has_encoded()) {
+    const auto& enc = message->encoded();
+    if (enc.encoding() != pj_cloud::v1::COMPRESSION_ENCODING_ZSTD) {
+      return;  // an encoding we never advertised — drop
+    }
+    std::string raw;
+    if (!decodeEncodedEnvelope(enc.body(), enc.uncompressed_size(), &raw)) {
+      return;  // failed the validation chain — drop
+    }
+    auto inner = std::make_shared<pj_cloud::v1::ServerMessage>();
+    if (!inner->ParseFromString(raw) || inner->has_encoded()) {
+      return;  // undecodable inner, or nested compression (protocol violation) — drop
+    }
+    message = std::move(inner);
   }
   const std::uint64_t request_id = message->request_id();
   std::lock_guard<std::mutex> lock(mu_);
@@ -114,6 +145,9 @@ void BackendConnection::onBinaryFrame(const std::string& bytes) {
   // download is active; stray late frames after Eos are dropped.
   if (session_active_ &&
       (message->has_batch() || message->has_progress() || message->has_eos() || message->has_error())) {
+    // Account the wire size (compressed batch body + framing) BEFORE the decode
+    // in the download loop turns it into the larger decompressed payload total.
+    session_wire_bytes_.fetch_add(bytes.size(), std::memory_order_relaxed);
     session_inbox_.push_back(std::move(message));
     cv_.notify_all();
   }
@@ -285,9 +319,7 @@ bool BackendConnection::connect(std::string* error_out) {
 
   // Hello handshake. Empty api_key is allowed (dev anonymous).
   pj_cloud::v1::ClientMessage request;
-  auto* hello = request.mutable_hello();
-  hello->set_protocol_version(kProtocolVersion);
-  hello->set_auth_token(api_key_);
+  fillHello(request.mutable_hello());
 
   pj_cloud::v1::ServerMessage response;
   if (!sendAndWait(request, &response)) {
@@ -619,6 +651,9 @@ bool BackendConnection::openSessionFresh(const OpenSessionParams& params, Sessio
     session_subscription_id_ = 0;
     session_inbox_.clear();
     cancel_requested_.store(false);
+    // Fresh session = start of a new download; zero the wire-byte accumulator so
+    // it measures THIS download (resume legs deliberately keep accumulating).
+    session_wire_bytes_.store(0, std::memory_order_relaxed);
   }
 
   pj_cloud::v1::ServerMessage response;
@@ -838,6 +873,7 @@ SessionStats BackendConnection::downloadSession(const SessionInfo& info, const M
     session_active_ = false;
     session_inbox_.clear();
   }
+  result.stats.wire_bytes_received = session_wire_bytes_.load(std::memory_order_relaxed);
   return result.stats;
 }
 
@@ -851,9 +887,7 @@ bool BackendConnection::reconnectAndHello(std::string* error_out) {
     return false;
   }
   pj_cloud::v1::ClientMessage request;
-  auto* hello = request.mutable_hello();
-  hello->set_protocol_version(kProtocolVersion);
-  hello->set_auth_token(api_key_);
+  fillHello(request.mutable_hello());
 
   pj_cloud::v1::ServerMessage response;
   if (!sendAndWait(request, &response)) {
@@ -960,6 +994,9 @@ SessionStats BackendConnection::downloadSessionResumable(const SessionInfo& info
   auto finalize = [&](SessionEos eos, std::string error) -> SessionStats {
     cumulative.eos = eos;
     cumulative.error = std::move(error);
+    // Wire bytes are a connection-wide accumulator (reset only at fresh open), so
+    // its current value already spans every resume leg — read it, don't sum.
+    cumulative.wire_bytes_received = session_wire_bytes_.load(std::memory_order_relaxed);
     std::lock_guard<std::mutex> lock(mu_);
     session_active_ = false;
     session_inbox_.clear();
@@ -982,6 +1019,7 @@ SessionStats BackendConnection::downloadSessionResumable(const SessionInfo& info
       cumulative.eos_total_messages_sent = result.stats.eos_total_messages_sent;
       cumulative.eos_total_bytes_sent = result.stats.eos_total_bytes_sent;
       cumulative.error = result.stats.error;
+      cumulative.wire_bytes_received = session_wire_bytes_.load(std::memory_order_relaxed);
       return cumulative;
     }
 

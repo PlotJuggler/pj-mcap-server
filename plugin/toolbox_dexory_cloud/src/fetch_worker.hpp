@@ -181,6 +181,10 @@ class FetchWorker {
   /// Cumulative bytes ingested for a topic during a pull (decoded RAW payload
   /// bytes). Throttled to ~10 Hz on the worker side.
   std::function<void(std::string topic_name, std::int64_t bytes)> pullProgress;
+  /// Cumulative WS payload bytes RECEIVED off the wire for the whole pull
+  /// (compressed batch bodies — the network figure, vs pullProgress's decoded
+  /// figure). Throttled with pullProgress; a final sample fires at pull end.
+  std::function<void(std::int64_t wire_bytes)> pullWireBytes;
   /// Per-topic completion. Fires exactly once per requested topic. ok=false on
   /// undecodable schema (no parser) or a transport/session failure.
   std::function<void(std::string sequence_name, std::string topic_name, bool ok, std::string error)> pullFinished;

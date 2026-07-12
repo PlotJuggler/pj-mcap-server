@@ -65,6 +65,62 @@ type CatalogConfig struct {
 type ServerConfig struct {
 	Listen string    `yaml:"listen"` // e.g. ":8080"
 	TLS    TLSConfig `yaml:"tls"`
+	// ResponseCompression governs the ADDITIVE compressed-envelope path for
+	// catalog RPC responses (EncodedServerMessage). Transport-level, not session:
+	// it applies to catalog-only connections too. It only takes effect when a
+	// client opts in via Hello.accepted_response_encodings; MessageBatch and the
+	// pre-handshake frames are never wrapped (the server-side allowlist).
+	ResponseCompression ResponseCompressionConfig `yaml:"response_compression"`
+}
+
+// ResponseCompressionConfig tunes the server side of the compressed-envelope
+// feature. The client-side decompression cap is a client concern (a fixed 64 MiB
+// ceiling) and is not configured here.
+type ResponseCompressionConfig struct {
+	// Enabled turns the server side on. Default true (see DefaultResponseCompression).
+	// When false the server never wraps a response even if the client advertised
+	// support — the client transparently falls back to raw frames.
+	Enabled bool `yaml:"enabled"`
+	// Level is the zstd compression level for RPC bodies (default 3). Reuses the
+	// same level scale as the session body frames.
+	Level int `yaml:"level"`
+	// ThresholdBytes is the minimum marshaled ServerMessage size below which a
+	// response is sent raw — small frames don't benefit (default 4096).
+	ThresholdBytes int `yaml:"threshold_bytes"`
+	// Concurrency bounds the shared zstd encoder's internal worker pool (default
+	// 4). Each worker holds a ~8 MiB window, so klauspost's implicit per-CPU
+	// default is wasteful on high-core hosts.
+	Concurrency int `yaml:"concurrency"`
+}
+
+// DefaultResponseCompression returns the transport-compression defaults: feature
+// ON, level 3, 4 KiB threshold, 4 encoder workers.
+func DefaultResponseCompression() ResponseCompressionConfig {
+	return ResponseCompressionConfig{
+		Enabled:        true,
+		Level:          3,
+		ThresholdBytes: 4096,
+		Concurrency:    4,
+	}
+}
+
+// WithDefaults fills any zero-valued numeric field with its default. Enabled is
+// intentionally NOT touched here: Load overlays YAML on top of Default() (which
+// sets Enabled=true), so an explicit `enabled: false` survives while an omitted
+// key keeps the default — a plain bool can't distinguish those in WithDefaults.
+// Exported so the ws layer can fill a hand-built config from the SAME single
+// source of the level/threshold/concurrency constants.
+func (r *ResponseCompressionConfig) WithDefaults() {
+	d := DefaultResponseCompression()
+	if r.Level <= 0 {
+		r.Level = d.Level
+	}
+	if r.ThresholdBytes <= 0 {
+		r.ThresholdBytes = d.ThresholdBytes
+	}
+	if r.Concurrency <= 0 {
+		r.Concurrency = d.Concurrency
+	}
 }
 
 // TLSConfig holds the optional server TLS cert/key (spec §8.6). When BOTH Cert
@@ -199,7 +255,7 @@ func expandEnv(b []byte) []byte {
 // server runs out-of-the-box against the dev stack with no config file.
 func Default() Config {
 	return Config{
-		Server: ServerConfig{Listen: ":8080"},
+		Server: ServerConfig{Listen: ":8080", ResponseCompression: DefaultResponseCompression()},
 		Auth:   AuthConfig{BearerToken: os.Getenv("PJ_CLOUD_TOKEN")},
 		Format: "mcap",
 		Storage: StorageConfig{
@@ -288,6 +344,7 @@ func Load(path string) (Config, error) {
 	// A YAML file may set only a subset of the session block (or omit it). Fill
 	// the gaps with spec defaults so streaming always has valid tuning.
 	cfg.Session.withSessionDefaults()
+	cfg.Server.ResponseCompression.WithDefaults()
 	if cfg.Catalog.DBPath == "" {
 		cfg.Catalog.DBPath = Default().Catalog.DBPath
 	}
