@@ -10,6 +10,18 @@ server:
   tls:
     cert: /etc/pj-cloud/server.crt
     key:  /etc/pj-cloud/server.key
+  # response_compression: opt-in ZSTD compression of BULKY catalog RPC responses
+  # (ListFiles / GetVocabulary / GetFile / OpenSession / UpdateTags) — a client
+  # negotiates it in its Hello, and only responses that clear the threshold AND
+  # actually shrink are wrapped. Transport-level (applies to catalog-only
+  # connections too), distinct from the session batch-body compression below.
+  # Session MessageBatch bodies are already ZSTD-framed and are never re-wrapped.
+  # Defaults shown; the whole block may be omitted to keep them.
+  response_compression:
+    enabled: true                        # false => the server never wraps a response
+    level: 1                             # zstd level for RPC bodies (1 = fastest; these bodies compress well anyway)
+    threshold_bytes: 4096                # responses smaller than this are sent raw
+    concurrency: 4                       # shared encoder worker pool
 
 auth:
   bearer_token: ${PJ_CLOUD_TOKEN}        # set the env var; do NOT inline secrets

@@ -25,7 +25,7 @@ func newTestCompressor(t *testing.T, threshold int) *responseCompressor {
 	t.Helper()
 	rc, err := newResponseCompressor(config.ResponseCompressionConfig{
 		Enabled:        true,
-		Level:          3,
+		Level:          1,
 		ThresholdBytes: threshold,
 		Concurrency:    2,
 	}, nil)

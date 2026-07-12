@@ -26,10 +26,15 @@ deployment" below before adapting any of this to your own infra.
 | `Dockerfile` | Multi-stage build of the Go server → `gcr.io/distroless/static-debian12:nonroot`. |
 | `Dockerfile.builder` | Build of the Python catalog builder daemon (`python:3.12-slim`). |
 | `docker-compose.yml` | Minio + `builder`, each with its own container healthcheck; `server` is gated on `builder`'s health and probed externally via `/health` (no container healthcheck of its own — distroless); config/volumes mounted. |
+| `docker-compose.dexory.yml` | **Dexory** S3 deploy (real AWS bucket, no Minio, IAM-role creds) — `builder` + `server` only. See `docs/ec2-deploy.md`. |
 | `deploy.config.yaml` | Compose-tuned server config (plaintext :8080, `minio:9000` endpoint, `tag_ipc_socket` pointed at the shared volume). |
+| `config.dexory-ec2.yaml` | Server config for the Dexory Compose deploy (real S3, empty creds = IAM role, shared-volume DB/socket paths). |
 | `config.example.yaml` | The FULL server config surface, commented, field-verified against `config.go`. |
 | `pj-cloud-server.service` | systemd unit for the Go server, bare-metal deploy. |
 | `pj-cloud-builder.service` | systemd unit for the Python builder daemon, bare-metal deploy. |
+
+For a step-by-step **EC2** walkthrough (Docker Compose, IAM instance role, IMDS
+hop-limit, security group, TLS) see `docs/ec2-deploy.md`.
 
 ## Two-process deployment (read this first)
 
@@ -170,10 +175,12 @@ has no TLS concept.
 ## Config reference
 
 `config.example.yaml` is the authoritative, commented field list for the Go
-server (server incl. TLS, auth, storage.s3, catalog.db_path,
-catalog.tag_ipc_socket, session, dashboard.basic_auth, metrics). Defaults:
-dashboard OFF (empty password disables it gracefully), metrics ON and
-unauthenticated, plaintext transport, tag-edit forwarding OFF (empty
-`tag_ipc_socket` — UpdateTags is rejected outright until it's set to a
-reachable builder socket). The builder daemon's own flags are documented via
+server (server incl. TLS + `response_compression`, auth, storage.s3,
+catalog.db_path, catalog.tag_ipc_socket, session, dashboard.basic_auth,
+metrics). Defaults: dashboard OFF (empty password disables it gracefully),
+metrics ON and unauthenticated, plaintext transport, tag-edit forwarding OFF
+(empty `tag_ipc_socket` — UpdateTags is rejected outright until it's set to a
+reachable builder socket), and `response_compression` ON (opt-in per client via
+Hello — the server only wraps a bulky catalog RPC response when the client
+advertised ZSTD support and the body actually shrinks). The builder daemon's own flags are documented via
 `python3 -m mcap_catalog_builder --help` and in `mcap_catalog/CATALOG_CONTRACT.md`.

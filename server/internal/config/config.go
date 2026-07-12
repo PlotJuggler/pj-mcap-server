@@ -81,8 +81,10 @@ type ResponseCompressionConfig struct {
 	// When false the server never wraps a response even if the client advertised
 	// support — the client transparently falls back to raw frames.
 	Enabled bool `yaml:"enabled"`
-	// Level is the zstd compression level for RPC bodies (default 3). Reuses the
-	// same level scale as the session body frames.
+	// Level is the zstd compression level for RPC bodies (default 1). Level 1 is
+	// deliberate: catalog RPC bodies (Hive keys, tags) compress heavily even at
+	// the fastest level, so the CPU of a higher level buys little extra ratio.
+	// Same level scale as the session body frames.
 	Level int `yaml:"level"`
 	// ThresholdBytes is the minimum marshaled ServerMessage size below which a
 	// response is sent raw — small frames don't benefit (default 4096).
@@ -94,11 +96,11 @@ type ResponseCompressionConfig struct {
 }
 
 // DefaultResponseCompression returns the transport-compression defaults: feature
-// ON, level 3, 4 KiB threshold, 4 encoder workers.
+// ON, level 1, 4 KiB threshold, 4 encoder workers.
 func DefaultResponseCompression() ResponseCompressionConfig {
 	return ResponseCompressionConfig{
 		Enabled:        true,
-		Level:          3,
+		Level:          1,
 		ThresholdBytes: 4096,
 		Concurrency:    4,
 	}

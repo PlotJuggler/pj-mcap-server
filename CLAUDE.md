@@ -71,6 +71,18 @@ doubt, but don't relitigate the decision itself.
 - **LZ4 chunks are FRAMES, decoded with `lz4.NewReader`** — not raw blocks. Chunk
   `UncompressedCRC` is read but NEVER verified; the only integrity surface is a
   zstd/lz4 decode failure.
+- **Catalog RPC responses use an OPT-IN compressed envelope** (`EncodedServerMessage`,
+  field 20 in the `ServerMessage` oneof; client negotiates via
+  `Hello.accepted_response_encodings`). Server wraps only via an EXPLICIT allowlist
+  (ListFiles/GetVocabulary/GetFile/OpenSession/UpdateTags) — HelloResponse/Error/
+  Progress/Eos/MessageBatch are ALWAYS raw (handshake ordering, latency, and batches
+  are already ZSTD inside), with a raw fallback when compression doesn't shrink.
+  Outer envelope carries ZERO request_id/subscription_id — the inner message is the
+  sole routing authority (client unwraps BEFORE routing, hardened decoder: 64 MiB
+  cap, exactly-one-frame, exact-size). **Default level 1** (bodies compress well
+  even at the fastest level); transport-level config `server.response_compression`,
+  distinct from the session `body_zstd_level`. WS permessage-deflate stays OFF at
+  both ends (it would double-compress the batch frames).
 - **GCS change-detect identity = `Generation` (decimal string) + `Updated`** — never
   MD5/CRC32C — slotted into the existing `(etag,size,last_modified)` triple with
   zero indexer/schema change.
@@ -221,6 +233,9 @@ Arrow ingest (`src/arrow_ingest.*`) → raw-record forwarding to host MessagePar
   resolves the migration's D3.
 - `docs/gce-deploy-smoke.md` — the Asensus GCE/ADC deploy-smoke runbook (the pending
   real-bucket M1 gate).
+- `docs/ec2-deploy.md` — the **Dexory** EC2 deploy runbook (Docker Compose, IAM
+  instance role, IMDS hop-limit); paired artifacts
+  `server/deploy/{docker-compose.dexory.yml,config.dexory-ec2.yaml}`.
 
 **Canonical references (kept in `arch/`):**
 1. `arch/2026-05-28-pj-cloud-connector-design.md` — **the canonical design spec (single
@@ -375,9 +390,12 @@ Editing the proposal = edit the `.md`, re-run the script, regenerate the PDF.
 ## Architecture being designed (the big picture)
 
 A single WebSocket per client carries everything, multiplexed via a Protobuf envelope:
-catalog RPCs **and** session data streaming on one connection. Streaming is
-**bounded-horizon, as-fast-as-possible** (a bulk download with a known size), *not*
-wall-clock-paced playback. "Streaming" here means *incremental/progressive download* — bytes arrive
+catalog RPCs **and** session data streaming on one connection. Bulky **catalog RPC
+responses** are additionally ZSTD-compressed at the envelope layer when the client
+opts in at Hello (`EncodedServerMessage`; server-side allowlist, hardened client
+decoder — see the pin below); **session data batches** carry their own inner ZSTD
+frame independently. Streaming is **bounded-horizon, as-fast-as-possible** (a bulk
+download with a known size), *not* wall-clock-paced playback. "Streaming" here means *incremental/progressive download* — bytes arrive
 in batches so the client can show already-received data while the rest downloads in the background —
 **not** real-time pacing. Supports reconnect-and-resume (short retain window) and
 cancel-mid-stream.
