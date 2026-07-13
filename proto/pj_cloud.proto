@@ -1,0 +1,418 @@
+syntax = "proto3";
+
+package pj_cloud.v1;
+option go_package = "pj-cloud/server/internal/wire/pj_cloud;pj_cloud";
+
+// -----------------------------------------------------------------------------
+// Envelopes
+// -----------------------------------------------------------------------------
+
+message ClientMessage {
+  uint64 request_id = 1;
+  oneof payload {
+    Hello              hello         = 10;
+    ListFilesRequest   list_files    = 11;
+    GetFileRequest     get_file      = 12;
+    UpdateTagsRequest  update_tags   = 13;
+    OpenSessionRequest open_session  = 14;
+    CancelSession      cancel        = 15;
+    SessionAck         ack           = 16;
+    GetVocabularyRequest get_vocabulary = 17;   // filter vocabulary (dimensions + tag facets)
+  }
+}
+
+message ServerMessage {
+  uint64 request_id      = 1;
+  uint64 subscription_id = 2;
+  oneof payload {
+    HelloResponse        hello_response = 10;
+    ListFilesResponse    list_files     = 11;
+    GetFileResponse      get_file       = 12;
+    UpdateTagsResponse   update_tags    = 13;
+    OpenSessionResponse  open_session   = 14;
+    MessageBatch         batch          = 15;
+    Progress             progress       = 16;
+    Eos                  eos            = 17;
+    Error                error          = 18;
+    GetVocabularyResponse get_vocabulary = 19;  // filter vocabulary response
+    EncodedServerMessage  encoded        = 20;  // compressed wrapper for an allowlisted response (opt-in via Hello)
+  }
+}
+
+// -----------------------------------------------------------------------------
+// Compressed-envelope wrapper (ADDITIVE, opt-in via Hello.accepted_response_encodings)
+// -----------------------------------------------------------------------------
+
+// CompressionEncoding identifies how EncodedServerMessage.body was compressed.
+// An enum (not a hardcoded-zstd wrapper) so a future codec doesn't need another
+// oneof arm — the client refuses any encoding it did not advertise in Hello.
+enum CompressionEncoding {
+  COMPRESSION_ENCODING_UNSPECIFIED = 0;
+  COMPRESSION_ENCODING_ZSTD        = 1;
+}
+
+// EncodedServerMessage carries a COMPLETE marshaled ServerMessage (its real
+// request_id/subscription_id and payload) compressed into `body`. It rides in the
+// ServerMessage oneof (field 20) with the OUTER request_id/subscription_id left
+// ZERO — the inner message is the sole routing authority, so the client unwraps
+// BEFORE it routes. The server emits this ONLY for allowlisted RPC responses, and
+// only when the client advertised the encoding, the marshaled response is above a
+// size threshold, AND compression actually saves bytes. HelloResponse, Error,
+// Progress, Eos and MessageBatch are NEVER wrapped (the last is already ZSTD-framed
+// inside). One self-contained frame; no cross-message state.
+message EncodedServerMessage {
+  CompressionEncoding encoding          = 1;
+  uint64              uncompressed_size = 2;   // exact marshaled size of the inner ServerMessage; decoder rejects any mismatch
+  bytes               body              = 3;   // one self-contained compressed frame of the inner ServerMessage
+}
+
+// -----------------------------------------------------------------------------
+// Hello / auth
+// -----------------------------------------------------------------------------
+
+message Hello {
+  uint32 protocol_version = 1;             // current = 1
+  string auth_token       = 2;             // bearer token from config
+  // Response encodings the client can decode for the ADDITIVE compressed-envelope
+  // path (EncodedServerMessage). Empty ⇒ raw ServerMessage frames only (old
+  // clients; proto3 default). The server compresses an allowlisted RPC response
+  // iff the client advertised the matching encoding here. Negotiated once at
+  // Hello; the HelloResponse itself is ALWAYS raw.
+  repeated CompressionEncoding accepted_response_encodings = 3;
+}
+
+message HelloResponse {
+  string server_version = 1;               // semver
+  Capabilities capabilities = 2;
+  BackendCapabilities backend = 3;         // M0: storage-backend-shaped client hints
+}
+
+message Capabilities {
+  bool resume_supported = 1;               // true in v1
+  bool tag_edit_supported = 2;             // true when the catalog is writable locally OR a tag-edit IPC forwarder is configured; daemon liveness is checked at use time, not at Hello.
+}
+
+// BackendCapabilities lets the client toggle ADDITIVE UI behaviour without
+// learning which storage backend is behind the server (S3 vs GCS stays
+// invisible — these are abstract capability flags, NOT storage-specific fields).
+//   supports_file_hierarchy  → client may render a tree/breadcrumb browser
+//                              (Asensus GCS prefixes); false ⇒ flat table (Dexory).
+//   metadata_key_vocabulary  → keys the server knows are searchable (e.g.
+//                              "robot_id","procedure_date","operator"); populates
+//                              the Lua query-assist dropdowns.
+message BackendCapabilities {
+  bool supports_file_hierarchy = 1;
+  repeated string metadata_key_vocabulary = 2;
+}
+
+// -----------------------------------------------------------------------------
+// Catalog
+// -----------------------------------------------------------------------------
+
+message TimeRange {
+  sint64 start_ns = 1;
+  sint64 end_ns   = 2;
+}
+
+message TagPredicate {
+  string key   = 1;
+  string value = 2;                        // exact match; empty value matches "key exists"
+}
+
+message FileFilter {
+  TimeRange recorded_between = 1;
+  repeated string topics_any_of  = 2;      // file must have at least one of these
+  repeated TagPredicate tag_all  = 3;      // file must satisfy all
+  repeated TagPredicate tag_any  = 4;      // file must satisfy at least one (if non-empty)
+
+  // Dimension selection (catalog-vocabulary-rpc.md V1/V5): ids picked from the most
+  // recent GetVocabularyResponse (same-session handles). proto3 `optional` = explicit
+  // presence (0 is a valid id). The strict hierarchy means a set robot_id already
+  // implies its site+customer; the server ANDs whatever is present, so the deepest is
+  // sufficient. source_id is an INDEPENDENT flat dimension, ANDed in alongside.
+  optional uint64 customer_id = 5;
+  optional uint64 site_id     = 6;
+  optional uint64 robot_id    = 7;
+  optional uint64 source_id   = 8;
+}
+
+// GetVocabulary returns the FILTER VOCABULARY (catalog-vocabulary-rpc.md): the
+// strict customer->site->robot hierarchy (cascading comboboxes), the flat source
+// dimension, and the flat tag facets. Small + bounded — sent once, cached by the
+// client, re-fetched on an explicit refresh. Built from the dimension tables + a
+// tag-facet query; no `files` scan for the tree.
+message GetVocabularyRequest {}                    // no args today; reserved for future scoping
+
+message GetVocabularyResponse {
+  repeated DimCustomer customers = 1;              // hierarchical dimensions (tree)
+  repeated DimSource   sources   = 2;              // flat normalized dimension (V7)
+  repeated TagFacet    tags      = 3;              // flat EAV facets
+}
+
+// Hierarchical dimensions — a strict tree so illegal states are unrepresentable
+// (a robot lives INSIDE its site node). Filtered by id (V1).
+message DimCustomer {
+  uint64 id              = 1;                      // session handle (valid for THIS connection)
+  string name            = 2;
+  uint64 file_count      = 3;                      // files under this customer (UX; 0 if unset)
+  repeated DimSite sites = 4;
+}
+message DimSite {
+  uint64 id                = 1;
+  string name              = 2;
+  uint64 file_count        = 3;
+  repeated DimRobot robots = 4;
+}
+message DimRobot {
+  uint64 id         = 1;
+  string name       = 2;
+  uint64 file_count = 3;
+  // (DimRobot date bounds DEFERRED — V6; additive later)
+}
+
+// Flat NORMALIZED dimension: source (independent single combo, V7).
+message DimSource {
+  uint64 id         = 1;
+  string name       = 2;                           // e.g. "ros-bags", "synthetic"
+  uint64 file_count = 3;
+}
+
+// Flat tag facets (independent key -> {values}). High-cardinality keys are dropped
+// (cardinality cap, V4) — they remain filterable via free-text/Lua.
+message TagFacet {
+  string key                    = 1;               // e.g. "mission", "quality"
+  repeated TagFacetValue values = 2;
+}
+message TagFacetValue {
+  string value      = 1;                           // a STRING (tags have no ids)
+  uint64 file_count = 2;                           // UX; 0 if unset
+}
+
+message ListFilesRequest {
+  FileFilter filter   = 1;
+  uint32 limit        = 2;                 // default 200, server-clamped to 1000
+  string page_token   = 3;                 // empty for first page
+}
+
+message FileSummary {
+  uint64 id              = 1;
+  string s3_key          = 2;
+  uint64 size_bytes      = 3;
+  TimeRange recorded     = 4;
+  uint32 topic_count     = 5;
+  uint64 message_count   = 6;
+  repeated Tag tags      = 7;              // effective view (override ∪ embedded)
+}
+
+message Tag {
+  string key   = 1;
+  string value = 2;
+  bool   is_override = 3;                  // true if from tags_override layer
+}
+
+message ListFilesResponse {
+  repeated FileSummary files = 1;
+  string next_page_token     = 2;          // empty when exhausted
+  // SHAPE REQ (load-bearing, unified-plan §3.1): a FLAT key→value view of each
+  // file's effective tags, keyed by file id (decimal string), each value the
+  // file's tags_effective rendered as one map<string,string>. Maps 1:1 onto the
+  // Mosaico client's SequenceInfo.user_metadata with NO transform. The richer
+  // per-file FileSummary.tags (with is_override) stays for the dashboard/editor;
+  // this map is the client-ingest contract. NOT storage-specific.
+  map<string, FlatMetadata> metadata = 3;
+}
+
+// FlatMetadata is one file's tags_effective as a plain string→string map.
+message FlatMetadata {
+  map<string, string> entries = 1;
+}
+
+message GetFileRequest {
+  uint64 file_id = 1;                      // GENERATION-SCOPED handle: renumbers across catalog rebuilds (see s3_key)
+  // Stable addressing (post-M6 external-builder rebuilds): file ids RENUMBER
+  // across catalog rebuilds — they are generation-scoped handles, so an id
+  // resolved from an earlier ListFiles can silently name a DIFFERENT file
+  // after a rebuild. s3_key is the stable identity (= FileSummary.s3_key,
+  // which the client already holds). proto3 `optional` = explicit presence:
+  //   present  => the server resolves by key and IGNORES file_id (no mismatch
+  //               validation — surviving a stale id is the point);
+  //   present but EMPTY => ERROR_INVALID_REQUEST (never a silent fallback to
+  //               file_id);
+  //   absent   => legacy id addressing (unchanged).
+  optional string s3_key = 2;
+}
+
+message TopicInfo {
+  string name             = 1;
+  string schema_name      = 2;
+  string schema_encoding  = 3;             // "ros2msg" / "protobuf" / "jsonschema" / ...
+  uint64 message_count    = 4;
+}
+
+message GetFileResponse {
+  FileSummary summary  = 1;
+  repeated TopicInfo topics = 2;
+}
+
+message UpdateTagsRequest {
+  uint64 file_id           = 1;            // GENERATION-SCOPED handle: renumbers across catalog rebuilds (see s3_key)
+  repeated Tag set_tags    = 2;            // upsert override
+  repeated string unset_keys = 3;          // delete override; or NULL-mask if embedded had it
+  // Stable addressing — same semantics as GetFileRequest.s3_key: file ids
+  // RENUMBER across catalog rebuilds (generation-scoped handles); s3_key is
+  // the stable identity from FileSummary.s3_key. When present the server
+  // addresses the edit by key and IGNORES file_id (no mismatch validation —
+  // surviving a stale id is the point); present-but-empty is
+  // ERROR_INVALID_REQUEST (never a silent fallback to file_id); absent =
+  // legacy id addressing (unchanged).
+  optional string s3_key = 4;
+}
+
+message UpdateTagsResponse {
+  repeated Tag effective_tags = 1;         // post-update view
+}
+
+// -----------------------------------------------------------------------------
+// Session open
+// -----------------------------------------------------------------------------
+
+message OpenSessionRequest {
+  oneof mode {
+    OpenFresh  fresh  = 1;
+    OpenResume resume = 2;
+  }
+}
+
+message OpenFresh {
+  repeated uint64 file_ids    = 1;
+  repeated string topic_names = 2;          // empty = all union topics
+  TimeRange       time_range  = 3;          // optional; default = stitched union
+  // Latched / transient-local replay. When true AND time_range is set, the
+  // server ALSO delivers, for every requested topic that has NO message inside
+  // the window, its last message BEFORE time_range.start — so latched state
+  // (map, costmaps, static poses published once at recording start) survives
+  // time-windowing instead of vanishing with "no messages in the selected time
+  // range". Off => the strict [start,end) window (unchanged; preserves the gates).
+  bool include_latched = 4;
+}
+
+message OpenResume {
+  uint64 subscription_id  = 1;
+  uint64 resume_after_seq = 2;
+}
+
+message TopicBinding {
+  uint32 topic_id         = 1;             // server-assigned, small uint
+  string topic_name       = 2;
+  uint32 schema_id        = 3;             // references SchemaBinding
+  string message_encoding = 4;             // e.g. "cdr", "protobuf"
+}
+
+message SchemaBinding {
+  uint32 schema_id  = 1;
+  string name       = 2;
+  string encoding   = 3;                   // schema definition language
+  bytes  data       = 4;                   // schema bytes (e.g. .proto, .msg)
+}
+
+message OpenSessionResponse {
+  uint64    subscription_id        = 1;
+  TimeRange merged_time_range      = 2;
+  uint64    estimated_chunk_bytes  = 3;
+  uint64    approximate_messages   = 4;
+  repeated TopicBinding  topic_id_map = 5;
+  repeated SchemaBinding schemas      = 6;
+}
+
+// -----------------------------------------------------------------------------
+// Streaming
+// -----------------------------------------------------------------------------
+
+enum PayloadEncoding {
+  PAYLOAD_ENCODING_UNSPECIFIED = 0;
+  PAYLOAD_ENCODING_RAW         = 1;
+  PAYLOAD_ENCODING_ZSTD        = 2;         // body_encoding=NONE fallback path only
+  PAYLOAD_ENCODING_LZ4         = 3;         // inbound decode only; server never emits
+}
+
+enum BodyEncoding {
+  BODY_ENCODING_UNSPECIFIED = 0;            // treat as NONE; v1 server always sets explicitly
+  BODY_ENCODING_NONE        = 1;            // messages ride in `messages` (singleton/legacy)
+  BODY_ENCODING_ZSTD        = 2;            // `body` = one self-contained ZSTD frame (default)
+}
+
+message Message {
+  uint32 topic_id        = 1;
+  uint32 schema_id       = 2;
+  sint64 log_time_ns     = 3;
+  sint64 publish_time_ns = 4;
+  PayloadEncoding payload_encoding = 5;
+  bytes  payload         = 6;
+}
+
+message MessageBatchBody {                  // marshaled, then compressed per MessageBatch.body_encoding
+  repeated Message messages = 1;
+}
+
+message MessageBatch {
+  uint64 seq             = 1;
+  uint64 source_file_id  = 2;
+  repeated Message messages = 3;            // populated ONLY when body_encoding = NONE
+  BodyEncoding body_encoding    = 4;        // default path: ZSTD
+  uint64 body_uncompressed_size = 5;        // size of marshaled MessageBatchBody before compression
+  bytes  body                   = 6;        // compressed marshaled MessageBatchBody (default path)
+}
+
+message Progress {
+  uint64 bytes_sent         = 1;
+  uint64 messages_sent      = 2;
+  uint64 dropped_messages   = 3;
+  uint64 estimated_total_bytes    = 4;     // echo of OpenSessionResponse.estimated_chunk_bytes
+  uint64 estimated_total_messages = 5;
+}
+
+enum EosReason {
+  EOS_REASON_UNSPECIFIED = 0;
+  EOS_REASON_COMPLETE    = 1;
+  EOS_REASON_CANCELLED   = 2;
+  EOS_REASON_ERROR       = 3;
+}
+
+message Eos {
+  EosReason reason            = 1;
+  uint64    total_messages_sent = 2;
+  uint64    total_bytes_sent    = 3;
+}
+
+message CancelSession {
+  uint64 subscription_id = 1;
+}
+
+message SessionAck {
+  uint64 subscription_id = 1;
+  uint64 through_seq     = 2;
+}
+
+// -----------------------------------------------------------------------------
+// Errors
+// -----------------------------------------------------------------------------
+
+enum ErrorCode {
+  ERROR_UNSPECIFIED         = 0;
+  ERROR_AUTH_FAILED         = 1;
+  ERROR_PROTOCOL_VERSION    = 2;
+  ERROR_NOT_FOUND           = 3;
+  ERROR_INVALID_REQUEST     = 4;
+  ERROR_RESOURCE_LIMIT      = 5;
+  ERROR_S3_UNAVAILABLE      = 6;
+  ERROR_INTERNAL            = 7;
+  reserved 8;
+  reserved "ERROR_CANCELLED";              // cancellation reported via Eos.reason
+  ERROR_RESUME_NOT_POSSIBLE = 9;
+}
+
+message Error {
+  ErrorCode code     = 1;
+  string    message  = 2;                  // ≤ 256 bytes after server truncation
+  string    details  = 3;                  // ≤ 2048 bytes; do not surface to end-users by default
+}

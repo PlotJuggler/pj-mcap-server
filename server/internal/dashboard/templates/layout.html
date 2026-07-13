@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>{{.Title}} — pj-cloud</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="stylesheet" href="/static/pico.min.css">
+</head>
+<body>
+<main class="container">
+  <nav>
+    <ul><li><strong>pj-cloud</strong></li></ul>
+    <ul>
+      <li><a href="/dashboard/">Overview</a></li>
+      <li><a href="/dashboard/files">Files</a></li>
+      <li><a href="/dashboard/sessions">Sessions</a></li>
+      <li><a href="/dashboard/indexer">Catalog</a></li>
+    </ul>
+  </nav>
+  {{block "content" .}}{{end}}
+  <footer><small>pj-cloud-server {{.ServerVersion}}</small></footer>
+</main>
+</body>
+</html>

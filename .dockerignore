@@ -1,0 +1,33 @@
+# Docker build-context ignore for the REPO-ROOT-context image build:
+#   server/deploy/Dockerfile.builder   (context: repo root — see its header;
+#     only ever COPYs mcap_catalog/mcap_catalog_builder/)
+# (server/deploy/Dockerfile's context is server/, so this file has no effect
+# on that build; it's harmless there either way.)
+
+.git
+.github
+.claude
+.remember
+.pytest_cache
+
+# PJ4 / plugin / SDK artifacts — never needed by the builder image, and often
+# huge (Qt, Conan caches, CMake build dirs).
+plugin/
+PJ4/
+pj-official-plugins/
+**/build/
+**/.cache/
+**/.cpm-cache/
+**/.qt/
+
+# Go build outputs — irrelevant to the Python builder image.
+server/bin/
+server/dist/
+
+# Local dev / scratch state that should never end up in an image layer.
+*.db
+*.db-wal
+*.db-shm
+*.log
+*.pid
+infra/*/data/

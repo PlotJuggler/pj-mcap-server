@@ -1,0 +1,2 @@
+# WASM build outputs — reproducible from build.sh, never committed.
+build/

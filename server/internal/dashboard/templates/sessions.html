@@ -1,0 +1,13 @@
+{{define "content"}}
+<h2>Active sessions ({{.Count}})</h2>
+{{if eq .Count 0}}<p><em>No active sessions.</em></p>{{end}}
+<table>
+  <thead><tr><th>Subscription ID</th><th>Files</th><th>Chunks</th><th>Producer done?</th></tr></thead>
+  <tbody>
+  {{range .Sessions}}
+    <tr><td>{{.ID}}</td><td>{{.FileCount}}</td><td>{{.ChunkCount}}</td><td>{{.ProducerDone}}</td></tr>
+  {{end}}
+  </tbody>
+</table>
+<script>setTimeout(() => location.reload(), 2000);</script>
+{{end}}

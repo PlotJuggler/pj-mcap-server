@@ -1,0 +1,53 @@
+# Deploy config mounted into the server container by docker-compose.yml.
+# This is the compose-tuned variant of config.example.yaml: plaintext :8080 and
+# an in-network Minio endpoint (http://minio:9000). For a real S3 deploy edit the
+# storage.s3 block (endpoint/creds) and, optionally, add a server.tls block.
+# Field names are verified against internal/config/config.go.
+
+server:
+  listen: ":8080"
+  # tls:                                 # uncomment BOTH for wss:// + https dashboard
+  #   cert: /etc/pj-cloud/server.crt
+  #   key:  /etc/pj-cloud/server.key
+
+auth:
+  bearer_token: ${PJ_CLOUD_TOKEN}        # from the compose env; empty => DEV ANONYMOUS
+
+format: mcap
+
+storage:
+  s3:
+    bucket: recordings
+    region: us-east-1
+    prefix: ""
+    endpoint: http://minio:9000          # the in-network minio service
+    access_key: ${PJ_CLOUD_S3_ACCESS_KEY}
+    secret_key: ${PJ_CLOUD_S3_SECRET_KEY}
+
+catalog:
+  db_path: /var/lib/pj-cloud/catalog.db  # written by the `builder` service, shared via the catalog-data volume
+  tag_ipc_socket: /var/lib/pj-cloud/tag.sock  # the `builder` service's tag-edit IPC socket, same shared volume
+
+# indexer: removed in M6 §2.6 — the catalog is built by the `builder` service
+# (Dockerfile.builder), not by an in-process Go indexer.
+
+session:
+  max_concurrent: 16
+  retain_after_disconnect: 60s
+  retain_max_seqs: 256
+  retain_max_bytes: 67108864             # 64 MB
+  max_batch_bytes: 524288                # 512 KB
+  max_batch_age: 50ms
+  max_message_bytes: 16777216            # 16 MB
+  compress_threshold_bytes: 4096
+  body_zstd_level: 3
+
+dashboard:
+  enabled: true
+  basic_auth:
+    username: admin
+    password: ${PJ_CLOUD_DASHBOARD_PASSWORD}   # empty env var => dashboard DISABLED
+
+metrics:
+  enabled: true
+  require_auth: false                    # /metrics unauthenticated by default

@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ui version="4.0">
+ <class>TagDialog</class>
+ <widget class="QDialog" name="TagDialog">
+  <property name="windowTitle"><string>Edit Tags</string></property>
+  <property name="minimumWidth"><number>520</number></property>
+  <property name="minimumHeight"><number>360</number></property>
+  <layout class="QVBoxLayout">
+   <item>
+    <!-- The sequence being edited; set via WidgetData.setLabel before
+         requestSubDialog so the editor names its target. -->
+    <widget class="QLabel" name="tagSequenceLabel">
+     <property name="text"><string>Tags</string></property>
+     <property name="font"><font><bold>true</bold></font></property>
+    </widget>
+   </item>
+   <item>
+    <!-- Effective tags display: Key / Value / Source. Pre-filled via
+         setTableHeaders + setTableRows; override rows tinted via setRowColor.
+         Read-only display; staged edits are entered through the inputs below
+         and reflected back into the table on the next tick. -->
+    <widget class="QTableWidget" name="tagTable">
+     <property name="editTriggers"><set>QAbstractItemView::NoEditTriggers</set></property>
+     <property name="selectionBehavior"><enum>QAbstractItemView::SelectRows</enum></property>
+     <property name="alternatingRowColors"><bool>true</bool></property>
+    </widget>
+   </item>
+   <item>
+    <!-- Staging row: key + value inputs and Set/Unset buttons. tagSetButton
+         stages an upsert of (tagKey, tagValue); tagUnsetButton stages a removal
+         of tagKey. Nothing is committed until the dialog is accepted (OK). -->
+    <layout class="QHBoxLayout" name="tagEditRow">
+     <item>
+      <widget class="QLineEdit" name="tagKey">
+       <property name="placeholderText"><string>key</string></property>
+      </widget>
+     </item>
+     <item>
+      <widget class="QLineEdit" name="tagValue">
+       <property name="placeholderText"><string>value</string></property>
+      </widget>
+     </item>
+     <item>
+      <widget class="QPushButton" name="tagSetButton">
+       <property name="text"><string>Set</string></property>
+      </widget>
+     </item>
+     <item>
+      <widget class="QPushButton" name="tagUnsetButton">
+       <property name="text"><string>Unset</string></property>
+      </widget>
+     </item>
+    </layout>
+   </item>
+   <item>
+    <widget class="QDialogButtonBox" name="buttonBox">
+     <property name="standardButtons"><set>QDialogButtonBox::Cancel|QDialogButtonBox::Ok</set></property>
+    </widget>
+   </item>
+  </layout>
+ </widget>
+</ui>

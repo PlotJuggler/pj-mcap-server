@@ -1,0 +1,45 @@
+# The Asensus/M1b "end" endpoint: a local GCS-compatible emulator
+# (fsouza/fake-gcs-server). It is the GCS-leg analog of infra/minio — the deeper
+# `make matrix` gate (leg m8) points a second server instance at it to prove the
+# storage.gcs arm round-trips identically to the S3/Dexory arm.
+#
+# NOT auto-started by `make smoke`. smoke stays on Minio (:9000) and must NOT
+# require this to be up. Only the GCS matrix leg brings this up (and tears it
+# down if it started it).
+#
+# Pins (mirror the storage seam + matrix.sh):
+#   - HTTP scheme on :4443 (the storage SDK over STORAGE_EMULATOR_HOST=localhost:4443
+#     uses plain HTTP — avoids self-signed-cert trust friction).
+#   - memory backend: the bucket/objects live only for the container's lifetime, so
+#     every leg starts from a clean slate; seed.sh (idempotent) uploads EXACTLY the
+#     8 ground-truth MCAPs via the JSON upload API.
+#   - public-host localhost:4443 so download/upload Location headers resolve back to
+#     the same emulator the Go SDK is pointed at.
+#
+# Bucket `recordings` is created + seeded by infra/fake-gcs/seed.sh (the JSON API),
+# NOT a bulk mount of the dataset dir: /home/gn/ws/jkk_dataset02 holds EXTRAS beyond
+# the 8 (a `... (Copy).mcap` duplicate of zeg_2 + non-mcap notes), which a bulk mount
+# would index as a 9th file and break the pinned counts / overlap invariants.
+services:
+  fake-gcs:
+    image: fsouza/fake-gcs-server:1.49.2
+    command:
+      - -scheme
+      - http
+      - -port
+      - "4443"
+      - -host
+      - "0.0.0.0"
+      - -public-host
+      - localhost:4443
+      - -backend
+      - memory
+      - -log-level
+      - warn
+    ports: ["4443:4443"]
+    healthcheck:
+      # The JSON bucket-list endpoint is up as soon as the server is serving.
+      test: ["CMD", "wget", "-q", "-O", "-", "http://localhost:4443/storage/v1/b"]
+      interval: 2s
+      timeout: 3s
+      retries: 15

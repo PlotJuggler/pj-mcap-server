@@ -1,0 +1,30 @@
+{{define "content"}}
+<h2>{{.S3Key}}</h2>
+<p><a href="/dashboard/files">← Files</a></p>
+<table>
+  <tr><th>File ID</th><td>{{.ID}}</td></tr>
+  <tr><th>Recorded</th><td>{{.StartHuman}} → {{.EndHuman}}</td></tr>
+  <tr><th>Size</th><td>{{.SizeHuman}}</td></tr>
+  <tr><th>Messages</th><td>{{.MessageCount}}</td></tr>
+</table>
+
+<h3>Topics ({{len .Topics}})</h3>
+<table>
+  <thead><tr><th>Topic</th><th>Schema</th><th>Encoding</th><th>Messages</th></tr></thead>
+  <tbody>
+  {{range .Topics}}
+    <tr><td>{{.Name}}</td><td>{{.SchemaName}}</td><td>{{.SchemaEncoding}}</td><td>{{.MessageCount}}</td></tr>
+  {{end}}
+  </tbody>
+</table>
+
+<h3>Tags (effective)</h3>
+<table>
+  <thead><tr><th>Key</th><th>Value</th><th>Layer</th></tr></thead>
+  <tbody>
+  {{range .Tags}}
+    <tr><td>{{.Key}}</td><td>{{.Value}}</td><td>{{if .IsOverride}}override{{else}}embedded{{end}}</td></tr>
+  {{end}}
+  </tbody>
+</table>
+{{end}}
