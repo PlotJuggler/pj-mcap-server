@@ -13,7 +13,7 @@
 server:
   listen: ":8085"          # asensus instance; dev :8080 / smoke :8081 / matrix :8082 / 3d-demo :8083 / dexory-aws :8084
 auth:
-  bearer_token: ${PJ_CLOUD_TOKEN}   # optional; unset = dev-anonymous
+  bearer_token: ${PJ_CLOUD_TOKEN}   # fail-closed: unset => server won't start unless PJ_CLOUD_ALLOW_ANONYMOUS=1
 format: mcap
 storage:
   gcs:

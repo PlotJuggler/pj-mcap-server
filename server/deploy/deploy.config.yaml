@@ -11,7 +11,7 @@ server:
   #   key:  /etc/pj-cloud/server.key
 
 auth:
-  bearer_token: ${PJ_CLOUD_TOKEN}        # from the compose env; empty => DEV ANONYMOUS
+  bearer_token: ${PJ_CLOUD_TOKEN}        # fail-closed: empty => server refuses to start unless PJ_CLOUD_ALLOW_ANONYMOUS=1
 
 format: mcap
 

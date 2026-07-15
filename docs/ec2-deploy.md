@@ -146,9 +146,10 @@ PJ_CLOUD_TOKEN='<a-long-random-shared-bearer-token>' \
   docker compose -f docker-compose.dexory.yml up -d --build
 ```
 
-- `PJ_CLOUD_TOKEN` is the single shared bearer token clients must present. Unset
-  ⇒ **dev-anonymous** (fine behind a private security group, not on a public
-  port).
+- `PJ_CLOUD_TOKEN` is the single shared bearer token clients must present. **Auth
+  is fail-closed:** with it unset the server *refuses to start*. To run with no
+  authentication on purpose (only behind a private security group, never a public
+  port) also pass `PJ_CLOUD_ALLOW_ANONYMOUS=1`.
 - To enable the dashboard, also pass `PJ_CLOUD_DASHBOARD_PASSWORD=...` (empty ⇒
   dashboard stays disabled).
 - Put these in a `.env` file next to the compose file if you prefer (`docker

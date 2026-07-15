@@ -140,8 +140,10 @@ services:
       builder:
         condition: service_healthy   # waits for builder's FIRST published catalog — see ARCHITECTURE note
     environment:
-      # Single shared bearer token (design-spec §3 auth). Unset => DEV ANONYMOUS.
+      # Single shared bearer token (design-spec §3 auth). Auth is FAIL-CLOSED:
+      # unset => the server refuses to start unless PJ_CLOUD_ALLOW_ANONYMOUS=1.
       PJ_CLOUD_TOKEN: ${PJ_CLOUD_TOKEN:-}
+      PJ_CLOUD_ALLOW_ANONYMOUS: ${PJ_CLOUD_ALLOW_ANONYMOUS:-}   # "1" => run with NO auth (local dev only)
       # Static Minio creds the example config interpolates into storage.s3.
       PJ_CLOUD_S3_ACCESS_KEY: admin
       PJ_CLOUD_S3_SECRET_KEY: password123

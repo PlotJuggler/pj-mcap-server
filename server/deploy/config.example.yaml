@@ -24,7 +24,10 @@ server:
     concurrency: 4                       # shared encoder worker pool
 
 auth:
-  bearer_token: ${PJ_CLOUD_TOKEN}        # set the env var; do NOT inline secrets
+  # Auth is FAIL-CLOSED: with no bearer token the server REFUSES to start. Set the
+  # env var (do NOT inline secrets). To run with NO authentication on purpose
+  # (local dev only), start with -allow-anonymous or PJ_CLOUD_ALLOW_ANONYMOUS=1.
+  bearer_token: ${PJ_CLOUD_TOKEN}
 
 format: mcap                              # v1 supports only "mcap"
 

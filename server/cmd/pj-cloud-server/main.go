@@ -48,6 +48,7 @@ func main() {
 		pollInterval = flag.Duration("poll-interval", 0, "DEPRECATED no-op: the in-process indexer this tuned no longer exists")
 		tlsCert      = flag.String("tls-cert", "", "TLS cert path (overrides config / PJ_CLOUD_TLS_CERT; set with -tls-key to serve TLS)")
 		tlsKey       = flag.String("tls-key", "", "TLS key path (overrides config / PJ_CLOUD_TLS_KEY)")
+		allowAnon    = flag.Bool("allow-anonymous", false, "start with NO client authentication (accept every client). REQUIRED to run without a bearer token; also via PJ_CLOUD_ALLOW_ANONYMOUS=1")
 	)
 	flag.Parse()
 
@@ -104,8 +105,17 @@ func main() {
 		cfg.Auth.BearerToken = tok
 	}
 
+	// Fail CLOSED on a missing bearer token: without one the server accepts EVERY
+	// client, so refuse to start unless anonymous mode is explicitly opted into
+	// (flag or env). This turns "forgot PJ_CLOUD_TOKEN" from a silently wide-open
+	// deploy into a hard startup error.
 	if cfg.Auth.BearerToken == "" {
-		log.Warn("PJ_CLOUD_TOKEN not set: running in DEV ANONYMOUS mode (any token accepted)")
+		if !*allowAnon && os.Getenv("PJ_CLOUD_ALLOW_ANONYMOUS") == "" {
+			log.Error("refusing to start: no bearer token configured (set PJ_CLOUD_TOKEN or auth.bearer_token). " +
+				"To run with NO authentication on purpose, pass -allow-anonymous or set PJ_CLOUD_ALLOW_ANONYMOUS=1")
+			os.Exit(1)
+		}
+		log.Warn("authentication DISABLED (anonymous mode): every client is accepted — never expose this port publicly")
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)

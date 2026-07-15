@@ -63,4 +63,10 @@ Stop everything: `make server-stop && (cd infra/minio && docker compose down)`
 
 One backend (builder + server) runs at a time — `make server-stop` to switch targets.
 
+> **Auth:** `run.sh` runs the server with **no authentication** (`-allow-anonymous`)
+> for local use. A real deployment must set `PJ_CLOUD_TOKEN` (a single shared bearer
+> token) — the server is **fail-closed** and refuses to start without it (pass
+> `-allow-anonymous` / `PJ_CLOUD_ALLOW_ANONYMOUS=1` only to intentionally run open).
+> See `server/deploy/README.md` and `docs/ec2-deploy.md`.
+
 Run the full regression gate (needs the pinned corpus): `make smoke`.
