@@ -12,11 +12,10 @@
 //      EXACT reorder-collide / different-uri / different-range cases from the
 //      native unit test.
 //   2. The SessionCache LRU + existence-predicate semantics (src/session_cache.hpp).
-//   3. The '/'-prefix hierarchy derivation (src/hierarchy_prefix.h).
-//   4. The stitched multi-file selection merge + overlap validation
+//   3. The stitched multi-file selection merge + overlap validation
 //      (src/stitch_select.h).
-//   5. CLI/URL precedence resolution (tools/cli_url_resolve.hpp).
-//   6. The REAL one-shot ZSTD batch-body decode path — byte-identical to
+//   4. CLI/URL precedence resolution (tools/cli_url_resolve.hpp).
+//   5. The REAL one-shot ZSTD batch-body decode path — byte-identical to
 //      session_decode.cpp's zstdDecodeAll (ZSTD_getFrameContentSize +
 //      ZSTD_decompress) — against a frame produced by the NATIVE conan libzstd
 //      1.5.7 encoder (embedded via wasm_test_frame.h). Decoder = the single-file
@@ -40,7 +39,6 @@
 #include <vector>
 
 #include "cli_url_resolve.hpp"
-#include "hierarchy_prefix.h"
 #include "session_cache.hpp"
 #include "session_key.hpp"
 #include "stitch_select.h"
@@ -137,19 +135,10 @@ void testSessionCache() {
   check(cache.size() == 0, "session_cache evicts-gone");
 }
 
-void testHierarchy() {
-  using dexory_cloud::buildPrefixComboItems;
-  using dexory_cloud::deriveTopLevelPrefixes;
-  using dexory_cloud::nameUnderPrefix;
-  std::vector<std::string> names = {"runA/x.mcap", "runA/y.mcap", "runB/z.mcap", "loose.mcap"};
-  auto prefixes = deriveTopLevelPrefixes(names);
-  check(prefixes.size() == 2 && prefixes[0] == "runA/" && prefixes[1] == "runB/", "hierarchy prefixes");
-  auto items = buildPrefixComboItems(names);
-  check(!items.empty() && items[0] == "All", "hierarchy combo-all-sentinel");
-  check(nameUnderPrefix("runA/x.mcap", "runA/"), "hierarchy under-prefix");
-  check(!nameUnderPrefix("runB/z.mcap", "runA/"), "hierarchy not-under-prefix");
-  check(nameUnderPrefix("loose.mcap", "All"), "hierarchy all-matches");
-}
+// NOTE: the former testHierarchy() exercised src/hierarchy_prefix.h — the
+// standalone '/'-prefix combo helper (deriveTopLevelPrefixes / nameUnderPrefix).
+// That helper was removed from the plugin (the browse UI now organizes by the
+// s3_key metadata fields, src/s3_key_fields.h), so the smoke no longer tests it.
 
 void testStitch() {
   using dexory_cloud::buildStitchedSelection;
@@ -216,7 +205,6 @@ int main() {
               ZSTD_VERSION_MINOR, ZSTD_VERSION_RELEASE);
   testSessionKey();
   testSessionCache();
-  testHierarchy();
   testStitch();
   testCliUrl();
   testZstdDecode();
