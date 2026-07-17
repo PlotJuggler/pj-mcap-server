@@ -137,34 +137,46 @@ jobs:
     env:
       PJ_CLOUD_BACKEND: ${{ matrix.backend }}
       PJ_CLOUD_CI_BUCKET: ci-fixtures
-    # Both emulators run as service containers; each leg seeds + uses only its own.
-    services:
-      minio:
-        image: minio/minio:RELEASE.2024-06-13T22-53-53Z
-        env:
-          MINIO_ROOT_USER: ciadmin
-          MINIO_ROOT_PASSWORD: cipassword123
-        ports:
-          - 9000:9000
-        options: >-
-          --health-cmd "mc ready local || exit 1"
-          --health-interval 3s
-          --health-timeout 3s
-          --health-retries 20
-      fakegcs:
-        image: fsouza/fake-gcs-server:1.49.2
-        ports:
-          - 4443:4443
-        options: >-
-          --health-cmd "wget -q -O - http://localhost:4443/storage/v1/b || exit 1"
-          --health-interval 3s
-          --health-timeout 3s
-          --health-retries 20
+    # NOTE: the emulators are started as explicit `docker run` steps below, NOT
+    # as GitHub `services:` containers. A `services:` block cannot override the
+    # image's command, and `minio/minio`'s default entrypoint does NOT start a
+    # server (so `mc ready local` never turns healthy and the whole job fails at
+    # "Initialize containers"). Starting them with `docker run --network host`
+    # + the real `server`/fake-gcs command mirrors infra/{minio,fake-gcs}/
+    # docker-compose.yml (which work) and matches the `--network host` the seed
+    # steps below already use.
     steps:
       # M6 §5.4: the ci_integration test invokes the Python builder as a real
       # subprocess (mcap_catalog/mcap_catalog_builder), now VENDORED in this
       # repo — a plain checkout has it (no submodule, no deploy key).
       - uses: actions/checkout@v4
+
+      # ── start the leg's emulator (see the NOTE above) ────────────────────────
+      - name: start Minio (s3 leg)
+        if: matrix.backend == 's3'
+        run: |
+          docker run -d --name minio --network host \
+            -e MINIO_ROOT_USER=ciadmin -e MINIO_ROOT_PASSWORD=cipassword123 \
+            minio/minio:RELEASE.2024-06-13T22-53-53Z server /data --console-address ":9001"
+          echo "waiting for minio health…"
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:9000/minio/health/live; then echo "minio ready"; exit 0; fi
+            sleep 1
+          done
+          echo "minio did not become healthy"; docker logs minio || true; exit 1
+      - name: start fake-gcs (gcs leg)
+        if: matrix.backend == 'gcs'
+        run: |
+          docker run -d --name fakegcs --network host \
+            fsouza/fake-gcs-server:1.49.2 \
+            -scheme http -port 4443 -host 0.0.0.0 -public-host localhost:4443 \
+            -backend memory -log-level warn
+          echo "waiting for fake-gcs health…"
+          for i in $(seq 1 30); do
+            if curl -sf "http://localhost:4443/storage/v1/b?project=pj-cloud-ci"; then echo "fake-gcs ready"; exit 0; fi
+            sleep 1
+          done
+          echo "fake-gcs did not become healthy"; docker logs fakegcs || true; exit 1
       - uses: actions/setup-go@v5
         with:
           go-version: "1.23"
