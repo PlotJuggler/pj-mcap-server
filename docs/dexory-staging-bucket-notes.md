@@ -1,6 +1,6 @@
-# Dexory AWS Staging Bucket — Test & Benchmark Notes
+# S3 Use Case — AWS Staging Bucket — Test & Benchmark Notes
 
-**Working notes (2026-06-22)** for using the real Dexory staging bucket to test and
+**Working notes (2026-06-22)** for using the real S3-use-case staging bucket to test and
 benchmark the **catalog migration** (see [`auryn-catalog-migration-plan.md`](auryn-catalog-migration-plan.md)
 + [`catalog-vocabulary-rpc.md`](catalog-vocabulary-rpc.md)). Gathered by direct
 exploration with the AWS CLI + `~/Apps/mcap-linux-amd64`. **All numbers are real,
@@ -90,7 +90,7 @@ zstd 467/467 chunks, 346.67 MiB → 65.38 MiB (81%), no chunk overlap, summarize
 152 channels | 50 distinct schemas | message encoding = cdr (all) | schema encoding = ros2msg (all)
 2 metadata records named "rosbag2" (~238 KB YAML each, duplicated) | 0 attachments
 ```
-- **Topic variety is high and includes custom Dexory packages** — round-trip/parser
+- **Topic variety is high and includes custom vendor packages** — round-trip/parser
   tests must not assume standard ROS2 only: `custom_msgs/{Metric,TowerDriverState}`,
   `arri_nav_action/MissionParameters`, `arri_wire_guide/WireGuideStatus`,
   `roboteq_driver/MotorControllerStatus`, `monitor_msgs/MonitorState`,
@@ -152,7 +152,7 @@ Real-world breakage to harden the builder's quarantine/skip logic and the reader
    `starting_time` in the rosbag2 metadata.
 2. **"doctor errors" ≠ broken:** healthy `*_continuous_*` files report 72–73 doctor "errors"
    that are just **0-message channels declared in the summary**. **`mcap doctor` exit-0 is NOT
-   a valid acceptance gate** for real Dexory files.
+   a valid acceptance gate** for these real files.
 3. **URL-encoding:** `…/source=low-fat-bags/…/2026-05-19_..._BLOCK-A-(Slow)_0.mcap` (spaces +
    parens). Un-encoded keys 404 / break the WS path.
 4. **`_lakeview_index/` skip-by-prefix:** non-Hive, `.snap`, live-rewritten filename — skip by

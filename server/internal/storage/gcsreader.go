@@ -17,7 +17,7 @@ import (
 )
 
 // gcsStore is the Google Cloud Storage BlobStore implementation (Plan A Task
-// 14b, Asensus M1b). It is a drop-in behind the IDENTICAL interface as the S3
+// 14b, GCS use case M1b). It is a drop-in behind the IDENTICAL interface as the S3
 // arm and, like s3Store, wraps each GetRange/Head/List SDK call in the shared
 // retryWith (Plan A Task 14: ONE backoff schedule, classifyGCS deciding
 // transient-vs-permanent). This is the only place the GCS SDK is touched (the

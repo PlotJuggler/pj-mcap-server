@@ -1,4 +1,4 @@
-# GCE Deployment Smoke (Asensus) — real ADC + persistent-disk catalog survival
+# GCE Deployment Smoke (GCS use case) — real ADC + persistent-disk catalog survival
 
 **Status:** operator runbook for a **pending** real-deployment validation (the
 real-bucket M1 gate). Extracted 2026-06-22 from the archived Plan C "Task 8a"
@@ -8,7 +8,7 @@ before that doc was deleted; adapted to the current repo's tooling.
 
 The emulator matrix (`make matrix`, the CI `{s3,gcs}` legs) proves wire / format /
 protocol correctness against MinIO + fake-gcs, but it **cannot** validate the real
-Asensus deployment shape:
+GCS-use-case deployment shape:
 
 - a long-lived server container on a **GCE VM**,
 - reading the bucket via **Application Default Credentials from an
@@ -18,7 +18,7 @@ Asensus deployment shape:
 
 Real GCE + ADC + the metadata server can't run in GitHub-hosted CI, so this is a
 **manual checklist** (or a scheduled *self-hosted* GCE runner job). It is the
-operational expression of the unified plan's M2c-ASEN acceptance gate.
+operational expression of the unified plan's M2c-GCS acceptance gate.
 
 > **Emulator-fidelity caveat (load-bearing):** run **≥1 real-GCS and ≥1 real-S3**
 > deploy smoke before declaring the cloud backend a proven drop-in. The emulators
@@ -53,7 +53,7 @@ operational expression of the unified plan's M2c-ASEN acceptance gate.
 
 ```bash
 #!/usr/bin/env bash
-# gce_smoke.sh — Asensus GCE deployment smoke. Run ON the GCE VM.
+# gce_smoke.sh — GCS-use-case GCE deployment smoke. Run ON the GCE VM.
 # Preconditions above: server container running, attached SA with bucket-read
 # scope, persistent disk at /var/lib/pj-cloud, NO key file on disk.
 set -euo pipefail

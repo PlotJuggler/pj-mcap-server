@@ -21,7 +21,7 @@ import (
 //   - maxBytes: total estimated bytes of the cached indexes. This is the memory
 //     bound that matters — a FileChunkIndex is dominated by its per-topic
 //     SchemaData, so a many-topic file (hundreds of KB–MBs of schema text) is
-//     ~100x a tiny fixture. An entry-count cap alone let 4096 real Dexory files
+//     ~100x a tiny fixture. An entry-count cap alone let 4096 real S3-bucket files
 //     pin ~10 GB; a byte cap bounds RSS regardless of per-file size.
 //   - max: entry count (a coarse safety cap; 0 = unbounded by count).
 //

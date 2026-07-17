@@ -66,7 +66,7 @@ IngestBindResult ParserIngestDriver::bindSession(
     // Binding is DEFERRED to the first message (decode() below): binding a
     // topic registers it in the host data tree, and a session routinely carries
     // topics that deliver nothing (channels declared in the MCAP summary that
-    // never published — 366 of them on real Dexory rosbox files). Eager binding
+    // never published — 366 of them on real S3-use-case rosbox files). Eager binding
     // filled the tree with zero-message entries users could drag to no effect.
     it.schema_encoding = schema.encoding;
     it.schema_data = schema.data;

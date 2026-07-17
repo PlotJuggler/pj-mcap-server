@@ -14,7 +14,7 @@ import (
 // derivedMetadataKeys is the constant set of per-file DERIVED metadata keys the
 // client-ingest flat map always carries (ws.flatMetadata builds exactly these,
 // overlaid by tags_effective). It is the floor of the metadata vocabulary so the
-// dropdown is meaningful and STABLE even on a tag-free corpus (the real Dexory
+// dropdown is meaningful and STABLE even on a tag-free corpus (the real S3
 // nissan corpus carries no embedded MCAP tags, so a pure tags vocabulary would be
 // empty and time-varying during tag-edit flows). Keep in lockstep with
 // ws.flatMetadata's derived keys.

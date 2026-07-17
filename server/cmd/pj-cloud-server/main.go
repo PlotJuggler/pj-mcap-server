@@ -135,7 +135,7 @@ func main() {
 	defer stop()
 
 	// Storage seam: dispatch on the StorageConfig tagged union (S3/Minio for
-	// Dexory, GCS for Asensus). New is the single selection point; nothing outside
+	// the S3 use case, GCS for the GCS use case). New is the single selection point; nothing outside
 	// internal/storage picks a backend or imports a cloud SDK.
 	bs, err := storage.New(ctx, cfg.Storage)
 	if err != nil {

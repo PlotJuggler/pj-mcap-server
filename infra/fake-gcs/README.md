@@ -1,11 +1,11 @@
-# infra/fake-gcs — the Asensus/M1b GCS emulator endpoint
+# infra/fake-gcs — the GCS-use-case/M1b GCS emulator endpoint
 
 This is the GCS-leg analog of `infra/minio`: a local
 [`fsouza/fake-gcs-server`](https://github.com/fsouza/fake-gcs-server) emulator that
 the storage seam's `gcs` arm (`server/internal/storage/gcsreader.go`, Plan A Task 14b)
 talks to over `STORAGE_EMULATOR_HOST`. It exists so the dual-leg correctness gate
 (Plan A Task 46a) can prove the `storage.gcs` arm round-trips **identically** to the
-S3/Dexory arm against the same 8-MCAP corpus.
+S3 arm against the same 8-MCAP corpus.
 
 **It is NOT auto-started by `make smoke`.** `make smoke` stays entirely on Minio
 (`:9000`) and must succeed with this emulator down. Only the deeper `make matrix`

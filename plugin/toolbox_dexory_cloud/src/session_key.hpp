@@ -18,7 +18,7 @@
 // rebuild a brand-new file can inherit the numeric id a stale SessionCache
 // entry was keyed on, and a hash/equality HIT would then replay that OLD
 // file's cached counts under the NEW file's identity — a silent wrong-data
-// bug, not a crash (realistic risk: Dexory corpora share a uniform topic set,
+// bug, not a crash (realistic risk: these corpora share a uniform topic set,
 // so nothing about the request shape would look wrong). The stable identity is
 // FileSummary.s3_key, which is exactly SequenceInfo.name (see
 // wire_mapping.cpp: `info.name = summary.s3_key()`) — an object key never

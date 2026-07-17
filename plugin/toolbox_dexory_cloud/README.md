@@ -1,11 +1,11 @@
-# toolbox_dexory_cloud — PlotJuggler "Dexory Cloud" plugin
+# toolbox_dexory_cloud — PlotJuggler cloud connector plugin
 
 A PlotJuggler 4 **Toolbox** plugin that browses MCAP recordings served from a
 cloud bucket (via the self-hosted *PJ Cloud Connector* Go server) and fetches
 them on demand into the PlotJuggler datastore. It is the **START endpoint** of
 the connector pipeline (server → WebSocket/Protobuf → this plugin).
 
-> **Shape note.** "Dexory Cloud" **IS a cloud TOOLBOX** (a Mosaico-style
+> **Shape note.** The cloud connector **IS a cloud TOOLBOX** (a Mosaico-style
 > non-modal panel: browse catalog, Lua-filter, select sequences + topics +
 > time-range, Fetch). It is *not* a Streaming/File DataSource. This is a
 > deliberate, verified product decision — see

@@ -205,7 +205,7 @@ dashboard:
 	}
 }
 
-// TestLoad_GCSOnly: a storage.gcs-only config (the Asensus M1b leg) loads and
+// TestLoad_GCSOnly: a storage.gcs-only config (the GCS-use-case M1b leg) loads and
 // validates when the S3 arm is explicitly cleared. Default() seeds S3, so a GCS
 // config must null it (storage: { s3: null, gcs: {...} }) to satisfy the
 // exactly-one-of union. credentials_file is env-expanded (dev-only path).

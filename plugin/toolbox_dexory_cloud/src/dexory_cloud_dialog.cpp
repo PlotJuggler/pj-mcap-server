@@ -193,7 +193,7 @@ std::string formatMetadata(const MapType& metadata, std::string_view indent = {}
 // Arrow-typed formatFieldType/formatSchemaFields helpers of toolbox_mosaico are
 // gone with the Arrow dependency; TopicInfo now carries plain string pairs. The
 // inert backend never populates schema_fields, so this block is simply omitted
-// for the Dexory Cloud plugin until the real client-core lands.
+// for the cloud connector plugin until the real client-core lands.
 std::string formatSchemaFields(const std::vector<std::pair<std::string, std::string>>& fields) {
   std::string text;
   if (fields.empty()) {
@@ -1782,7 +1782,7 @@ bool DexoryCloudDialog::onClicked(std::string_view widget_name) {
             topics.push_back(state_.topic_names[row]);
             // Catalog-declared topics with ZERO recorded messages are selectable
             // (the recorder writes the channel even when nothing published — 75
-            // of 171 on the Dexory staging bags). Count them for the pre-flight
+            // of 171 on the S3-use-case staging bags). Count them for the pre-flight
             // hint below; the server will return no data for them.
             if (row < static_cast<int>(state_.topic_infos.size()) && state_.topic_infos[row].message_count == 0) {
               ++empty_topics;

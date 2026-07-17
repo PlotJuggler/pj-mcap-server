@@ -11,8 +11,8 @@
          plaintext-fallback checkbox. Its inner inputs keep the objectNames
          certPath / apiKey / allowInsecure so PanelEngine's sub-dialog harvester
          surfaces them to the plugin on OK. No apiKeyPattern is set: the editor
-         is format-agnostic and defaults to "non-empty is valid". A Dexory key
-         format can be supplied here once the real backend defines one. -->
+         is format-agnostic and defaults to "non-empty is valid". A deployment-specific
+         key format can be supplied here once the real backend defines one. -->
     <widget class="CredentialsEditor" name="certContents"/>
    </item>
    <item>

@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT
 //
 // session_decode — the pure, socket-free batch decoder for the session/streaming
-// path of the Dexory Cloud WS+Protobuf client.
+// path of the cloud connector WS+Protobuf client.
 //
 // It turns one decoded pj_cloud.v1 MessageBatch into a flat list of decoded
 // messages (topic_id / schema_id / times / RAW payload), applying exactly the

@@ -1,8 +1,8 @@
-# pj-cloud-server config for the DEXORY EC2 / Docker-Compose deploy (real AWS S3).
+# pj-cloud-server config for the S3-use-case EC2 / Docker-Compose deploy (real AWS S3).
 # Mounted read-only into the `server` container by docker-compose.dexory.yml.
 #
-# DEXORY-SPECIFIC: bucket, region and prefix below are the Dexory staging values.
-# (Asensus is a SEPARATE GCS/GCE deploy — see docs/gce-deploy-smoke.md.)
+# SPECIFIC TO THE S3 USE CASE: bucket, region and prefix below are the S3 staging values.
+# (The GCS use case is a SEPARATE GCS/GCE deploy — see docs/gce-deploy-smoke.md.)
 #
 # CREDENTIALS ARE NOT IN THIS FILE. endpoint/access_key/secret_key are
 # present-and-EMPTY on purpose: empty endpoint = real AWS S3 (virtual-hosted),

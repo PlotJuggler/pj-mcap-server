@@ -2,7 +2,7 @@
 # Copyright 2026 Davide Faconti
 # SPDX-License-Identifier: MIT
 #
-# build.sh — the reproducible WASM compile job for the Dexory Cloud decode-core.
+# build.sh — the reproducible WASM compile job for the cloud connector decode-core.
 #
 # Unified plan M2c-DEX "WASM bonus" + risk 8: "a CI job that at minimum COMPILES
 # client-core to WASM so the path cannot silently rot". This is a DEMO / NON-GATING

@@ -3,7 +3,7 @@
 //
 // D11 plugin-load smoke test (HERMETIC): dlopen the built toolbox .so the way the
 // PlotJuggler host does and assert its two extern-"C" entry vtables resolve. The
-// one Dexory Cloud .so exports BOTH a toolbox vtable and a borrowed dialog vtable
+// one cloud connector .so exports BOTH a toolbox vtable and a borrowed dialog vtable
 // (dexory_cloud_toolbox.cpp: PJ_TOOLBOX_PLUGIN + PJ_DIALOG_PLUGIN); the host's
 // ToolboxLibrary resolves "PJ_get_toolbox_vtable" + "PJ_get_dialog_vtable" via
 // dlsym (see plotjuggler_sdk pj_plugins/src/toolbox_library.cpp). We mirror that

@@ -1,10 +1,10 @@
-# DEXORY S3 deploy — the two-process backend against the real AWS bucket, no
+# S3-USE-CASE deploy — the two-process backend against the real AWS bucket, no
 # Minio. Derived from docker-compose.yml (the local-dev stack) by: dropping the
 # minio/minio-init services, pointing both services at real S3, and taking
 # credentials from the EC2 instance IAM role (no static keys on the box).
 #
-# This is DEXORY-SPECIFIC (bucket/region/prefix below). Asensus is a separate
-# GCS deploy. Full walkthrough: docs/ec2-deploy.md.
+# This is SPECIFIC TO THE S3 USE CASE (bucket/region/prefix below). The GCS use
+# case is a separate GCS deploy. Full walkthrough: docs/ec2-deploy.md.
 #
 # USAGE (on the EC2 box, from server/deploy/):
 #   PJ_CLOUD_TOKEN=<token> docker compose -f docker-compose.dexory.yml up -d --build

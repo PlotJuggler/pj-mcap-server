@@ -11,8 +11,8 @@
 #
 #   ./run.sh                    same as --dexory_minio
 #   ./run.sh --dexory_minio     LOCAL: Minio (S3) + synthetic recordings + builder + server on :8080.
-#   ./run.sh --dexory_aws       Dexory staging bucket on AWS S3 (config.dexory-staging.yaml, :8084).
-#   ./run.sh --asensus_google   Asensus bucket on Google Cloud Storage (config.asensus-staging.yaml).
+#   ./run.sh --dexory_aws       S3 staging bucket on AWS S3 (config.dexory-staging.yaml, :8084).
+#   ./run.sh --asensus_google   GCS staging bucket on Google Cloud Storage (config.asensus-staging.yaml).
 #   ./run.sh <path/to.yaml>     power user: any S3/GCS server config file.
 #
 # Idempotent: if the target's server is ALREADY running it is reused (and its

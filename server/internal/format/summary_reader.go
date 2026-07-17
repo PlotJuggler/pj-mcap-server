@@ -4,7 +4,7 @@
 // Info() then walks the summary in 4KiB reads and the message-index counting
 // adds 2 GETs per (chunk x channel). Against a real bucket (~tens of ms RTT per
 // GET) that made one OpenSession plan-build take MINUTES per file (measured
-// 3m24s on the Dexory staging bucket) versus a 10s client timeout, and a 34-file
+// 3m24s on the S3 staging bucket) versus a 10s client timeout, and a 34-file
 // warm scan take ~6 minutes. summarySource collapses the whole footer/summary
 // phase into at most THREE ranged GETs (trailing probe, summary section, magic
 // prefix) and serves everything else from memory; reads outside the cached

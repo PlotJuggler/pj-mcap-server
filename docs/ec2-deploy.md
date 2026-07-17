@@ -1,13 +1,14 @@
-# EC2 deployment runbook — PJ Cloud Connector for **Dexory** (AWS S3, Docker Compose)
+# EC2 deployment runbook — PJ Cloud Connector for the **S3 use case** (AWS S3, Docker Compose)
 
 Step-by-step for standing up the **two-process backend** on a single EC2
-instance, serving MCAP recordings from the Dexory S3 bucket to PlotJuggler
+instance, serving MCAP recordings from the S3 bucket to PlotJuggler
 clients over WebSocket, using the container/compose deploy shape.
 
-> **This runbook is DEXORY-SPECIFIC.** The bucket
+> **This runbook is SPECIFIC TO THE S3 USE CASE.** The bucket
 > (`dexory-data-offload-staging-bucket`), region (`eu-west-2`), the Hive prefix,
-> and the S3 backend are all Dexory. **Asensus is a separate GCS-on-GCE deploy**
-> — see `docs/gce-deploy-smoke.md`, not this file. The Dexory constants are
+> and the S3 backend are all specific to this deployment. **The GCS use case is a
+> separate GCS-on-GCE deploy** — see `docs/gce-deploy-smoke.md`, not this file.
+> The S3 constants are
 > baked into two committed artifacts you'll use below:
 > `server/deploy/config.dexory-ec2.yaml` and
 > `server/deploy/docker-compose.dexory.yml`. The only per-environment knob is the
@@ -124,7 +125,7 @@ mandatory; its build context is the repo root.)
 
 ## 4. Set the S3 scope (the one knob you tune)
 
-The Dexory constants (bucket, region) are already in the two committed
+The deployment constants (bucket, region) are already in the two committed
 artifacts. The one thing to decide is **how much data to serve** — the S3
 `prefix`. The default is the first-contact scope (one robot, one day, 34 files).
 Widen it deliberately (an unscoped scan of the whole Hive lake blows the scan
@@ -230,9 +231,9 @@ atomically-published rebuild without a restart.
 
 ## Reference
 
-- `server/deploy/docker-compose.dexory.yml` — the Dexory compose (this deploy).
-- `server/deploy/config.dexory-ec2.yaml` — the Dexory server config (this deploy).
+- `server/deploy/docker-compose.dexory.yml` — the S3-use-case compose (this deploy).
+- `server/deploy/config.dexory-ec2.yaml` — the S3-use-case server config (this deploy).
 - `server/deploy/README.md` — deploy-kit overview + the base local-dev compose + the systemd shape.
 - `server/deploy/pj-cloud-{server,builder}.service` — the systemd alternative.
 - `docs/CATALOG_CONTRACT.md` — the cross-process contract (schema, publish/reopen, tag IPC).
-- `docs/gce-deploy-smoke.md` — the **Asensus** GCS/GCE deploy (the other client).
+- `docs/gce-deploy-smoke.md` — the **GCS use case** GCS/GCE deploy (the other deployment).

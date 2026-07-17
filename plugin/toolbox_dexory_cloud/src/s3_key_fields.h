@@ -1,7 +1,7 @@
 // Copyright 2026 Davide Faconti
 // SPDX-License-Identifier: MIT
 //
-// Parse the Dexory-relevant fields out of an S3 object key for the
+// Parse the relevant fields out of an S3 object key for the
 // "non-advanced" metadata filter. The keys are Hive-partitioned:
 //   customer=dexory/customer_site=nashville/robot=arri-182/source=ros-bags/date=2026-05-19/rosbox_….mcap
 // which yields exactly the fields the user cares about: each `k=v` path segment

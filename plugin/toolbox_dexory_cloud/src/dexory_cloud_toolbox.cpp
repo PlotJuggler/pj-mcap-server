@@ -3,7 +3,7 @@
 //
 // DexoryCloudToolbox — the cloud TOOLBOX entry (Slice 5 restore).
 //
-// "Dexory Cloud" IS a cloud TOOLBOX (the Mosaico-style non-modal panel: browse
+// The cloud connector IS a cloud TOOLBOX (the Mosaico-style non-modal panel: browse
 // catalog, Lua filter, select sequence+topics+time-range, Fetch downloads right
 // there). It does NOT appear in the Streaming combo. This REPLACES the Slice-4
 // PjCloudSource : StreamSourceBase shape (pj_cloud_source.cpp, deleted).

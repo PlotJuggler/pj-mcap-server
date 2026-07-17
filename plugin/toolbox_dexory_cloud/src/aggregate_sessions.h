@@ -3,7 +3,7 @@
 //
 // Time-based session aggregation (client-side, display layer).
 //
-// Real Dexory recordings are sliced into ~13-min / ~22MB chunk files by a
+// Real S3-use-case recordings are sliced into ~13-min / ~22MB chunk files by a
 // rolling recorder. Users want to browse the continuous *run* as one entity,
 // not 34 chunks. This groups files into sessions purely from data we already
 // have in the catalog: the Hive partition path + per-file [min_ts, max_ts].

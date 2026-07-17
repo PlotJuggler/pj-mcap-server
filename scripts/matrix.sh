@@ -66,7 +66,7 @@ exit 2
 #       COMPLETE clean, then each mcapdiff'd vs its original
 #   m7  duplicate/overlap rejection probes — duplicate seq is a clean usage error
 #       (exit 2); an overlapping (same-file-twice) server selection is rejected.
-#   m8  GCS DUAL-LEG anti-drift gate (Plan A Task 46a, Asensus M1b): brings up the
+#   m8  GCS DUAL-LEG anti-drift gate (Plan A Task 46a, GCS use case M1b): brings up the
 #       fake-gcs-server emulator (infra/fake-gcs), seeds it with the SAME 8
 #       ground-truth MCAPs, reaps the S3 matrix server and re-boots a SECOND server
 #       on :8082 pointed at GCS (fresh temp DB, STORAGE_EMULATOR_HOST). Asserts
@@ -476,7 +476,7 @@ leg_m7() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# m8: GCS DUAL-LEG anti-drift gate (Plan A Task 46a, Asensus M1b).
+# m8: GCS DUAL-LEG anti-drift gate (Plan A Task 46a, GCS use case M1b).
 #
 # Brings up fake-gcs, seeds the SAME 8 ground-truth MCAPs, reaps the S3 matrix
 # server, and re-boots a SECOND server on :8082 pointed at GCS (fresh temp DB,

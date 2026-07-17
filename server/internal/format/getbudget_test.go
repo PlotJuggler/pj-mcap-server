@@ -11,7 +11,7 @@ import (
 // countingStore wraps a BlobStore and counts the round trips. Over WAN every
 // GetRange/Head is one HTTPS request (~tens of ms RTT), so these counts ARE the
 // latency model: OpenSession plan-building was measured at 3m24s/file on the
-// real Dexory staging bucket purely from per-(chunk x channel) GETs.
+// real S3 staging bucket purely from per-(chunk x channel) GETs.
 type countingStore struct {
 	inner    storage.BlobStore
 	getRange atomic.Int64

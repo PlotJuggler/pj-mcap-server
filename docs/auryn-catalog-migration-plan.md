@@ -147,7 +147,7 @@ start_ns, end_ns`) must remain derivable. Audit before sign-off.
 
 ## 4. Python writer completeness
 
-- [ ] **4.1 (decision 4)** **GCS backend** for the builder, behind the existing `Source` protocol (mirror `S3Source`): identity = `Generation` (decimal string) + `Updated`, slotted into the `(etag, size, last_modified_ns)` triple exactly as Go's `gcsreader.go` does. `STORAGE_EMULATOR_HOST` for the fake-gcs leg. (Asensus M1b.)
+- [ ] **4.1 (decision 4)** **GCS backend** for the builder, behind the existing `Source` protocol (mirror `S3Source`): identity = `Generation` (decimal string) + `Updated`, slotted into the `(etag, size, last_modified_ns)` triple exactly as Go's `gcsreader.go` does. `STORAGE_EMULATOR_HOST` for the fake-gcs leg. (GCS use case, M1b.)
 - [ ] **4.2** Retry/backoff parity: add a `retry_with` (≈50–800ms, permanent short-circuit, cancel-aware) wrapping the S3 + GCS call bodies (Go has `storage.retryWith`; auryn has none).
 - [ ] **4.3** `synchronous=NORMAL` PRAGMA under WAL (set consciously in both `db.py` and the Go reader DSN; document the agreed value).
 - [ ] **4.4** Populate `files.chunk_count` (TASK 2.2 counterpart) + confirm `has_error` is actually set (today `derive_tags()` returns `[]` and `has_error` is always 0 — wire up real validation-health).

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # build.sh — build the PJ Cloud Connector:
 #   1. the Go server + dev tools  (fast, no protoc — the wire bindings are checked in)
-#   2. the "Dexory Cloud" connector plugin (Conan + CMake)
+#   2. the cloud connector plugin (Conan + CMake)
 #
 # Prerequisite: the plotjuggler_sdk Conan package must already be in your cache.
 # Install it from the PlotJuggler/plotjuggler_sdk-cloud repo (cloud branch):
@@ -27,7 +27,7 @@ echo "==> [1/2] Building the Go server + dev tools (server/bin/)"
     && go build -o bin/gen-3d-fixture   ./cmd/gen-3d-fixture )
 echo "    server -> server/bin/pj-cloud-server"
 
-echo "==> [2/2] Building the Dexory Cloud connector plugin"
+echo "==> [2/2] Building the cloud connector plugin"
 SDK_VER="$(cat "$ROOT/plugin/SDK_VERSION")"
 if ! conan list "plotjuggler_sdk/$SDK_VER" 2>/dev/null | grep -q "plotjuggler_sdk/$SDK_VER"; then
   echo "ERROR: plotjuggler_sdk/$SDK_VER not found in Conan cache."

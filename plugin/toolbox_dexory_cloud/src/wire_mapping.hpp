@@ -1,7 +1,7 @@
 // Copyright 2026 Davide Faconti
 // SPDX-License-Identifier: MIT
 //
-// Pure wire->local mapping functions for the Dexory Cloud WS+Protobuf client.
+// Pure wire->local mapping functions for the cloud connector WS+Protobuf client.
 //
 // These are deliberately socket-free and host-free so they can be unit-tested
 // against hand-built protobuf messages (see tests/wire_mapping_test.cpp). The

@@ -14,7 +14,7 @@ session — with reconnect-resume and a repeat-fetch cache.
 | `proto/pj_cloud.proto` | Canonical wire schema (WS + Protobuf envelope) |
 | `server/` | Go server: read-only catalog reader, session streaming, tag-edit IPC forwarding |
 | `mcap_catalog/` | Python `mcap_catalog` builder (submodule) — the SOLE catalog writer + tag-edit IPC server |
-| `plugin/toolbox_dexory_cloud/` | "Dexory Cloud" toolbox plugin + `dexory-cloud-cli` (builds standalone) |
+| `plugin/toolbox_dexory_cloud/` | Cloud connector toolbox plugin + `dexory-cloud-cli` (builds standalone) |
 | `infra/minio/` | Local S3 (Minio) — development storage endpoint |
 | `scripts/smoke.sh` | `make smoke` — end-to-end regression gate |
 | `arch/` | Design spec and implementation plans |
@@ -57,8 +57,8 @@ Stop everything: `make server-stop && (cd infra/minio && docker compose down)`
 | Command | What |
 |---|---|
 | `./run.sh` or `./run.sh --dexory_minio` | Local Minio + synthetic data. No credentials. **`:8080`** |
-| `./run.sh --dexory_aws` | Dexory staging bucket on AWS S3. Creds: `AWS_PROFILE` (defaults to `dexory-staging`). **`:8084`** |
-| `./run.sh --asensus_google` | Asensus bucket on GCS. Creds: Application Default Credentials. *(fill in `server/deploy/config.asensus-staging.yaml` first)* **`:8085`** |
+| `./run.sh --dexory_aws` | S3 staging bucket on AWS S3. Creds: `AWS_PROFILE` (defaults to `dexory-staging`). **`:8084`** |
+| `./run.sh --asensus_google` | GCS staging bucket. Creds: Application Default Credentials. *(fill in `server/deploy/config.asensus-staging.yaml` first)* **`:8085`** |
 | `./run.sh <path/to.yaml>` | Any S3/GCS server config file. |
 
 One backend (builder + server) runs at a time — `make server-stop` to switch targets.

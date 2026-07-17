@@ -180,8 +180,8 @@ type AuthConfig struct {
 // StorageConfig is a TAGGED UNION: exactly one of {S3, GCS} is non-nil. This is
 // the StorageCredentials responsibility boundary (Plan A unified-plan seam 2) —
 // only storage.New(cfg) ever reads what is inside. Validate() enforces the
-// exactly-one-of invariant. Default() seeds the S3/Minio (Dexory) arm; an
-// Asensus GCS config must explicitly null S3 (storage: { s3: null, gcs: {...} }).
+// exactly-one-of invariant. Default() seeds the S3/Minio arm; a
+// GCS config must explicitly null S3 (storage: { s3: null, gcs: {...} }).
 type StorageConfig struct {
 	S3  *S3Config  `yaml:"s3"`
 	GCS *GCSConfig `yaml:"gcs"`
@@ -197,7 +197,7 @@ type S3Config struct {
 }
 
 // GCSConfig is the Google Cloud Storage arm of the storage union (Plan A Task
-// 14b, Asensus M1b). Credentials baseline is ADC / Workload Identity (the
+// 14b, GCS use case M1b). Credentials baseline is ADC / Workload Identity (the
 // attached service account — no key on disk); CredentialsFile is DEV ONLY. There
 // is intentionally NO Endpoint field — the emulator endpoint is auto-selected by
 // the SDK from the STORAGE_EMULATOR_HOST env var, not config.
@@ -378,7 +378,7 @@ func (c Config) Validate() error {
 		return fmt.Errorf("server.listen must not be empty")
 	}
 	// Storage is a tagged union: EXACTLY ONE of {s3, gcs}. Default() seeds the S3
-	// arm; an Asensus deploy nulls it and sets gcs. Neither / both is a deploy
+	// arm; a GCS deploy nulls it and sets gcs. Neither / both is a deploy
 	// mistake, not a silent pick.
 	switch {
 	case c.Storage.S3 != nil && c.Storage.GCS != nil:

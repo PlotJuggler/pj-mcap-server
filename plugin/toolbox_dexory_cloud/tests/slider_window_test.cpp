@@ -20,7 +20,7 @@ using dexory_cloud::SliderWindow;
 
 constexpr int kSteps = 1'000'000;
 
-// Real Dexory staging numbers: 34 contiguous files, ~7.35h union. union_min is
+// Real S3-use-case staging numbers: 34 contiguous files, ~7.35h union. union_min is
 // the first file's start; span ~2.65e13 ns. The persisted middle band that
 // triggered the report.
 constexpr std::int64_t kAggMin = 1779209029609533992LL;

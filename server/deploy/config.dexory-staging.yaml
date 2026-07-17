@@ -1,4 +1,4 @@
-# pj-cloud-server — Dexory STAGING bucket (real AWS S3).
+# pj-cloud-server — S3-use-case STAGING bucket (real AWS S3).
 # arn:aws:s3:::dexory-data-offload-staging-bucket
 #
 # CREDENTIALS ARE NOT IN THIS FILE (it is committed). Resolution order:

@@ -1,4 +1,4 @@
-# pj-cloud-server — Asensus (Google Cloud Storage).  TEMPLATE — fill in before use.
+# pj-cloud-server — GCS use case (Google Cloud Storage).  TEMPLATE — fill in before use.
 #
 # Used by:  ./run.sh --asensus_google   (it refuses to start while the REPLACE_ME
 # placeholders below are present, and points you here).
@@ -19,7 +19,7 @@ storage:
   gcs:
     bucket: REPLACE_ME_with_your_gcs_bucket
     # Scope to a sub-path so the first scan of a large bucket stays bounded
-    # (mirrors the Dexory Hive prefix). Leave "" to scan the whole bucket.
+    # (mirrors the S3-use-case Hive prefix). Leave "" to scan the whole bucket.
     prefix: ""
     # credentials_file: /path/to/service-account.json   # DEV ONLY; prod uses ADC / Workload Identity
 catalog:

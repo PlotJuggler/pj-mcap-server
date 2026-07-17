@@ -1,7 +1,7 @@
-# The Asensus/M1b "end" endpoint: a local GCS-compatible emulator
+# The GCS-use-case/M1b "end" endpoint: a local GCS-compatible emulator
 # (fsouza/fake-gcs-server). It is the GCS-leg analog of infra/minio — the deeper
 # `make matrix` gate (leg m8) points a second server instance at it to prove the
-# storage.gcs arm round-trips identically to the S3/Dexory arm.
+# storage.gcs arm round-trips identically to the S3 arm.
 #
 # NOT auto-started by `make smoke`. smoke stays on Minio (:9000) and must NOT
 # require this to be up. Only the GCS matrix leg brings this up (and tears it

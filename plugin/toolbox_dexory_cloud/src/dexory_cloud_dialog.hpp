@@ -62,7 +62,7 @@ struct DialogState {
   // D8: BackendCapabilities the server advertised at connect (HelloResponse.
   // backend). supports_file_hierarchy gates the additive '/'-prefix combo over
   // the seqTable (the as-built adaptation of Plan D's unrenderable QTreeWidget);
-  // metadata_key_vocabulary seeds the keyCombo query-assist. For the flat Dexory
+  // metadata_key_vocabulary seeds the keyCombo query-assist. For the flat S3-use-case
   // corpus the server reports supports_file_hierarchy=false, so the prefix combo
   // stays hidden and the dialog behaves exactly as before (default off).
   bool supports_file_hierarchy = false;

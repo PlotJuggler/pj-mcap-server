@@ -1,4 +1,4 @@
-# Dexory Cloud — WASM decode-core compile path (M2c-DEX "WASM bonus")
+# Cloud connector — WASM decode-core compile path (M2c-DEX "WASM bonus")
 
 This directory holds the **reproducible Emscripten build that compiles the as-built
 client protocol/decode core to WebAssembly**, the smoke that runs it under node, and

@@ -3,7 +3,7 @@
 //
 // Sequence display-name shortening for the seqTable Name column.
 //
-// Real Dexory sequence identifiers are full S3 object keys, Hive-partitioned:
+// Real S3-use-case sequence identifiers are full S3 object keys, Hive-partitioned:
 //   customer=dexory/customer_site=nashville/robot=arri-182/source=ros-bags/date=2026-05-19/rosbox_2026-05-19_16-43-46.mcap
 // which is long and noisy. The displayed name strips it down to just the
 // values, slash-separated:

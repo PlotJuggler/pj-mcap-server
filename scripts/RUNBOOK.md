@@ -253,7 +253,7 @@ once from the EDITED in-tree SDK before any plugin build:
 (`scripts/bump_core_version.py` is deliberately NOT used for this version — it
 would move the extern/plotjuggler_core submodule to a nonexistent upstream tag.)
 
-## Real AWS staging bucket (Dexory M1 real-bucket run)
+## Real AWS staging bucket (S3-use-case M1 real-bucket run)
 
 Config: `server/deploy/config.dexory-staging.yaml` (bucket
 `dexory-data-offload-staging-bucket`, real AWS — no endpoint override, no
