@@ -24,8 +24,6 @@ func TestRegistry_ReattachBeatsFiredEvictionTimer(t *testing.T) {
 	// scheduler tick (time.Nanosecond), so it is essentially always "already
 	// firing" by the time we reattach — the exact race.
 	reg := NewRegistry(RegistryOpts{MaxConcurrent: 4, RetainAfterDisconnect: 0})
-	var evicted atomic.Bool
-	reg.SetOnEvict(func(*SessionState) { evicted.Store(true) })
 
 	for i := 0; i < 500; i++ {
 		s := newState()
@@ -47,7 +45,6 @@ func TestRegistry_ReattachBeatsFiredEvictionTimer(t *testing.T) {
 		}
 		reg.Cancel(s.ID)
 	}
-	_ = evicted
 }
 
 // BindConsumer must be membership-atomic: a Cancel racing the bind either binds
