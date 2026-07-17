@@ -17,6 +17,7 @@
 
 #include <gtest/gtest.h>
 
+#include <lz4frame.h>
 #include <zstd.h>
 
 #include <string>
@@ -51,7 +52,65 @@ pj_cloud::v1::Message makeMessage(std::uint32_t topic_id, std::uint32_t schema_i
   return m;
 }
 
+// One-shot LZ4 frame compress (test helper — the legacy-singleton wire side).
+std::string lz4Compress(const std::string& in) {
+  const size_t bound = LZ4F_compressFrameBound(in.size(), nullptr);
+  std::string out;
+  out.resize(bound);
+  const size_t n = LZ4F_compressFrame(out.data(), out.size(), in.data(), in.size(), nullptr);
+  EXPECT_FALSE(LZ4F_isError(n)) << LZ4F_getErrorName(n);
+  out.resize(n);
+  return out;
+}
+
 }  // namespace
+
+// LZ4 singleton round-trip: the inbound-only LZ4 leg must recover the payload
+// verbatim (previously untested — the known "LZ4/frame-loop test gap").
+TEST(DexoryCloudSessionDecode, Lz4SingletonRoundTrip) {
+  const std::string payload = "lz4-payload-0123456789-abcdefghij";
+  pj_cloud::v1::MessageBatch batch;
+  batch.set_body_encoding(pj_cloud::v1::BODY_ENCODING_NONE);
+  *batch.add_messages() =
+      makeMessage(1, 1, 100, 100, lz4Compress(payload), pj_cloud::v1::PAYLOAD_ENCODING_LZ4);
+
+  std::vector<dexory_cloud::DecodedMessage> out;
+  std::string error;
+  ASSERT_TRUE(dexory_cloud::decodeBatch(batch, &out, &error)) << error;
+  ASSERT_EQ(out.size(), 1u);
+  EXPECT_EQ(out[0].payload, payload);
+}
+
+// Trailing bytes after a complete LZ4 frame are a protocol violation, exactly
+// like the envelope decoder's exactly-one-frame rule — silently ignoring them
+// would accept a corrupt/concatenated payload as clean.
+TEST(DexoryCloudSessionDecode, Lz4TrailingGarbageRejected) {
+  std::string wire = lz4Compress("payload-that-decodes-fine");
+  wire += "TRAILING-GARBAGE";
+  pj_cloud::v1::MessageBatch batch;
+  batch.set_body_encoding(pj_cloud::v1::BODY_ENCODING_NONE);
+  *batch.add_messages() = makeMessage(1, 1, 100, 100, wire, pj_cloud::v1::PAYLOAD_ENCODING_LZ4);
+
+  std::vector<dexory_cloud::DecodedMessage> out;
+  std::string error;
+  EXPECT_FALSE(dexory_cloud::decodeBatch(batch, &out, &error))
+      << "trailing bytes after the LZ4 frame must be rejected";
+}
+
+// A frame truncated mid-stream must fail with a clean error, never silently
+// deliver a short payload.
+TEST(DexoryCloudSessionDecode, Lz4TruncatedFrameRejected) {
+  std::string wire = lz4Compress(std::string(4096, 'x'));
+  wire.resize(wire.size() / 2);  // truncate mid-frame
+  pj_cloud::v1::MessageBatch batch;
+  batch.set_body_encoding(pj_cloud::v1::BODY_ENCODING_NONE);
+  *batch.add_messages() = makeMessage(1, 1, 100, 100, wire, pj_cloud::v1::PAYLOAD_ENCODING_LZ4);
+
+  std::vector<dexory_cloud::DecodedMessage> out;
+  std::string error;
+  EXPECT_FALSE(dexory_cloud::decodeBatch(batch, &out, &error))
+      << "truncated LZ4 frame must be rejected";
+}
 
 // Default path: a ZSTD-compressed MessageBatchBody round-trips to the exact
 // messages, with the inner RAW payloads recovered verbatim.

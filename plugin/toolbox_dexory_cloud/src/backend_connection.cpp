@@ -143,8 +143,18 @@ void BackendConnection::onBinaryFrame(const std::string& bytes) {
   // request_id == 0: a SESSION frame (MessageBatch / Progress / Eos, or a
   // stream-fatal Error carrying subscription_id). Only accumulate while a
   // download is active; stray late frames after Eos are dropped.
+  //
+  // Subscription filter: the frame's subscription_id must match the active
+  // session's. A frame for another (or a stale) subscription must never be fed
+  // into THIS download's inbox — that would splice foreign or late-duplicate
+  // batches into the stream. subscription_id 0 is tolerated only if the server
+  // omits it (older servers), matched against session_subscription_id_ == 0.
   if (session_active_ &&
       (message->has_batch() || message->has_progress() || message->has_eos() || message->has_error())) {
+    const std::uint64_t sub = message->subscription_id();
+    if (sub != 0 && session_subscription_id_ != 0 && sub != session_subscription_id_) {
+      return;  // frame for a different subscription — drop
+    }
     // Account the wire size (compressed batch body + framing) BEFORE the decode
     // in the download loop turns it into the larger decompressed payload total.
     session_wire_bytes_.fetch_add(bytes.size(), std::memory_order_relaxed);
@@ -387,7 +397,10 @@ std::optional<ServerCaps> BackendConnection::serverCapabilities() const {
   return server_caps_;
 }
 
-std::vector<SequenceInfo> BackendConnection::listSequences() {
+std::vector<SequenceInfo> BackendConnection::listSequences(bool* complete) {
+  if (complete != nullptr) {
+    *complete = false;
+  }
   std::vector<SequenceInfo> sequences;
   std::unordered_map<std::string, std::uint64_t> file_ids;
   if (!socket_) {
@@ -395,6 +408,7 @@ std::vector<SequenceInfo> BackendConnection::listSequences() {
   }
 
   std::string page_token;
+  bool exhausted = false;
   for (;;) {
     pj_cloud::v1::ClientMessage request;
     auto* list = request.mutable_list_files();
@@ -402,10 +416,10 @@ std::vector<SequenceInfo> BackendConnection::listSequences() {
 
     pj_cloud::v1::ServerMessage response;
     if (!sendAndWait(request, &response)) {
-      break;  // timeout / closed — return whatever we collected
+      break;  // timeout / closed — PARTIAL (exhausted stays false)
     }
     if (!response.has_list_files()) {
-      break;  // error or unexpected payload
+      break;  // error or unexpected payload — PARTIAL
     }
 
     const auto& list_response = response.list_files();
@@ -416,12 +430,22 @@ std::vector<SequenceInfo> BackendConnection::listSequences() {
 
     page_token = list_response.next_page_token();
     if (page_token.empty()) {
-      break;  // exhausted
+      exhausted = true;  // full listing
+      break;
     }
   }
 
-  // Publish the freshly-built index atomically (listTopics reads it next).
+  if (!exhausted) {
+    // Incomplete pagination: do NOT publish the partial index over the last
+    // complete one (a dropped page must not silently shrink the browse index).
+    // Return the partial vector so the caller can decide to warn/discard.
+    return sequences;
+  }
+  // Publish the freshly-built COMPLETE index atomically (listTopics reads it next).
   file_id_by_name_ = std::move(file_ids);
+  if (complete != nullptr) {
+    *complete = true;
+  }
   return sequences;
 }
 
@@ -749,11 +773,16 @@ BackendConnection::FrameLoopResult BackendConnection::runFrameLoop(const Session
   auto last_ack = std::chrono::steady_clock::now();
   std::uint64_t last_seq = seed_last_seq;  // resume cursor: last fully-delivered seq
   std::uint64_t batches_this_pass = 0;     // for the test-drop hook
+  bool cancel_sent = false;                // sent the wire Cancel this attempt
   std::vector<DecodedMessage> decoded;
 
   for (;;) {
-    // Honor a cancel request before blocking on the next frame.
-    if (cancel_requested_.exchange(false)) {
+    // Honor a cancel request before blocking on the next frame. The flag stays
+    // STICKY (not exchange(false)): if the socket drops before the server's
+    // Eos{CANCELLED} arrives, the resume loop must still see the cancel and stop
+    // — clearing it here would let a mid-cancel drop silently reconnect.
+    if (cancel_requested_.load() && !cancel_sent) {
+      cancel_sent = true;
       send_cancel();
       // Keep reading: the server replies with Eos{CANCELLED}, terminating below.
     }
@@ -772,6 +801,20 @@ BackendConnection::FrameLoopResult BackendConnection::runFrameLoop(const Session
 
     if (msg.has_batch()) {
       const auto& batch = msg.batch();
+      // Sequence continuity: the server numbers batches gaplessly from 1 (and
+      // replays gaplessly from resume_after_seq+1 on resume), so the only valid
+      // next seq is last_seq+1. A duplicate, backward, or gapped seq is a
+      // corrupt/misrouted stream — abort rather than import out-of-order or
+      // duplicate rows.
+      if (batch.seq() != last_seq + 1) {
+        send_cancel();
+        stats.error = "out-of-order batch seq " + std::to_string(batch.seq()) + " (expected " +
+                      std::to_string(last_seq + 1) + ")";
+        stats.eos = SessionEos::Error;
+        finish();
+        result.last_seq = last_seq;
+        return result;
+      }
       std::string derr;
       if (!decodeBatch(batch, &decoded, &derr)) {
         // Defensive decode failure (e.g. unknown body_encoding) — abort and

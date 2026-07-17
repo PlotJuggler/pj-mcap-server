@@ -86,7 +86,14 @@ class BackendConnection {
   // ListFiles RPC, paging through next_page_token, mapped to SequenceInfo. The
   // internal name->file_id index is rebuilt from the result so listTopics /
   // getTopicMetadata can resolve a sequence name back to its file id.
-  [[nodiscard]] std::vector<SequenceInfo> listSequences();
+  //
+  // complete (optional out): set false when pagination broke early (timeout,
+  // dead socket, or an unexpected reply) — the returned vector is then PARTIAL.
+  // On an incomplete listing the internal name->file_id index is NOT replaced
+  // with the partial snapshot (the last COMPLETE index is retained), so a
+  // dropped page can't silently shrink the browse index; the caller decides
+  // whether to surface the partial vector or discard it.
+  [[nodiscard]] std::vector<SequenceInfo> listSequences(bool* complete = nullptr);
 
   // GetFile RPC for the file backing `sequence_name`, addressed by s3_key
   // (sequence_name is sent verbatim as s3_key — see the key-addressing note

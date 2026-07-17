@@ -56,9 +56,16 @@ class FetchWorker {
 
   void requestCancel() {
     cancel_flag_.store(true, std::memory_order_relaxed);
-    // Also signal any in-flight wire session so downloadSession() returns.
-    if (auto* b = backend_session_for_cancel_.load(std::memory_order_acquire)) {
-      b->cancelSession();
+    // Also signal any in-flight wire session so downloadSession() returns. The
+    // pointer is guarded by cancel_mu_ (NOT a bare atomic): the worker clears it
+    // BEFORE destroying the session backend, all under the same lock, so
+    // cancelSession() can never run against a destroyed object (the prior bare
+    // atomic left a load→call window where the worker could destroy it — a
+    // use-after-free). cancelSession() only sets a flag + notifies, so holding
+    // the leaf lock across it does not block.
+    std::lock_guard<std::mutex> lock(cancel_mu_);
+    if (backend_session_for_cancel_ != nullptr) {
+      backend_session_for_cancel_->cancelSession();
     }
   }
   void resetCancel() {
@@ -244,9 +251,12 @@ class FetchWorker {
   std::mutex host_write_mu_;
 
   // The session BackendConnection in flight during a pull, exposed for
-  // requestCancel() to signal a wire CancelSession. Set under host_write_mu_
-  // around the download; cleared when the download returns.
-  std::atomic<BackendConnection*> backend_session_for_cancel_{nullptr};
+  // requestCancel() to signal a wire CancelSession. Guarded by cancel_mu_: the
+  // worker sets it before the download and CLEARS it (under the lock) before the
+  // owning unique_ptr is destroyed, so a concurrent requestCancel() from the GUI
+  // thread can never dereference a freed object.
+  std::mutex cancel_mu_;
+  BackendConnection* backend_session_for_cancel_{nullptr};
 
   // ---- in-memory SessionCache (Slice 8) ------------------------------------
   // Owned by the worker (per-plugin-instance lifetime; single worker thread, no
