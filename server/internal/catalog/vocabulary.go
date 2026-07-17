@@ -61,17 +61,20 @@ type Vocabulary struct {
 }
 
 // GetVocabulary assembles the vocabulary from the auryn dimension tables + the tag
-// facet query.
-//
-// Pins db := s.DB() ONCE and threads it through every phase below (B1 —
-// catalog-migration §6.2a review): the vocabulary is built from ~8 separate
-// queries (per-dimension counts, the robot/site/customer tree, sources, tag
-// facets) that must all describe the SAME generation — a swap landing mid-build
-// could otherwise pair one generation's file counts with another generation's
-// dimension rows.
+// facet query. Leases ONE snapshot for every phase (B1): the vocabulary is
+// built from ~8 separate queries (per-dimension counts, the robot/site/customer
+// tree, sources, tag facets) that must all describe the SAME generation.
 func GetVocabulary(ctx context.Context, s *Store) (*Vocabulary, error) {
-	db := s.DB()
+	lease := s.Acquire()
+	defer lease.Release()
+	return GetVocabularyDB(ctx, lease.DB())
+}
 
+// GetVocabularyDB is GetVocabulary against an already-leased snapshot handle:
+// the ws layer pins ONE Snapshot so the vocabulary rows and the generation
+// token stamped on the response are guaranteed to describe the same generation
+// (the dimension ids are only meaningful together with that token).
+func GetVocabularyDB(ctx context.Context, db *sql.DB) (*Vocabulary, error) {
 	custCount, err := groupCount(ctx, db, "customer_id")
 	if err != nil {
 		return nil, err

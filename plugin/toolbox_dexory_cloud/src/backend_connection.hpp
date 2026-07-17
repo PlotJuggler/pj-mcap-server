@@ -83,6 +83,10 @@ class BackendConnection {
   // when the value is PRESENT and false).
   [[nodiscard]] std::optional<ServerCaps> serverCapabilities() const;
 
+  // The opaque catalog generation of the last COMPLETE listSequences() (empty
+  // before one succeeds). Equality-only; echo it with any dimension-id filter.
+  [[nodiscard]] const std::string& catalogGeneration() const { return catalog_generation_; }
+
   // ListFiles RPC, paging through next_page_token, mapped to SequenceInfo. The
   // internal name->file_id index is rebuilt from the result so listTopics /
   // getTopicMetadata can resolve a sequence name back to its file id.
@@ -333,6 +337,13 @@ class BackendConnection {
   // name->file_id index built from the last listSequences(). std::less<> would
   // need transparent lookup; plain unordered_map with std::string keys is fine.
   std::unordered_map<std::string, std::uint64_t> file_id_by_name_;
+
+  // Opaque catalog generation the last COMPLETE listSequences() was served from
+  // (ListFilesResponse.catalog_generation). Dimension ids from GetVocabulary are
+  // only meaningful together with this token (echoed via
+  // ListFilesRequest.expected_catalog_generation) — kept for the facet-UI
+  // follow-up; equality-only, never parsed or logged as text.
+  std::string catalog_generation_;
 
   // ---- session routing -----------------------------------------------------
   // The receive thread fans inbound frames into two paths: request_id-keyed RPC

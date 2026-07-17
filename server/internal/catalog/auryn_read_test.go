@@ -216,12 +216,12 @@ func TestAurynReader_Hermetic(t *testing.T) {
 	ctx := context.Background()
 
 	// FilterFiles: rebuilt key, summed counts, topic_count, chunk_count, tags.
-	files, next, err := FilterFiles(ctx, st, FilterArgs{})
+	files, more, err := FilterFiles(ctx, st, FilterArgs{})
 	if err != nil {
 		t.Fatalf("FilterFiles: %v", err)
 	}
-	if next != "" || len(files) != 1 {
-		t.Fatalf("FilterFiles = %d files (next=%q), want 1", len(files), next)
+	if more || len(files) != 1 {
+		t.Fatalf("FilterFiles = %d files (more=%v), want exactly 1", len(files), more)
 	}
 	f := files[0]
 	wantKey := "customer=dexory/customer_site=london/robot=r1/source=ros-bags/date=2026-06-01/x.mcap"

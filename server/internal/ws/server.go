@@ -574,6 +574,14 @@ func (c *connState) handleListFiles(ctx context.Context, reqID uint64, req *pb.L
 
 	resp, err := c.catalogHandler().ListFiles(ctx, req)
 	if err != nil {
+		// Stale generation handles (a rebuild renumbered the ids) are RETRYABLE
+		// and get their own code so the client can transparently re-fetch the
+		// vocabulary + restart the listing; everything else is a bad request.
+		var stale errStaleCatalog
+		if errors.As(err, &stale) {
+			c.sendError(reqID, 0, pb.ErrorCode_ERROR_STALE_CATALOG, stale.Error(), "")
+			return
+		}
 		c.sendError(reqID, 0, pb.ErrorCode_ERROR_INVALID_REQUEST, "ListFiles failed", err.Error())
 		return
 	}

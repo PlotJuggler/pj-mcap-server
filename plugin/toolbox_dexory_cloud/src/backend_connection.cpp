@@ -60,6 +60,8 @@ std::string errorCodeName(pj_cloud::v1::ErrorCode code) {
       return "internal server error";
     case pj_cloud::v1::ERROR_RESUME_NOT_POSSIBLE:
       return "resume not possible";
+    case pj_cloud::v1::ERROR_STALE_CATALOG:
+      return "catalog changed during the request; refresh and retry";
     default:
       return "server error";
   }
@@ -409,38 +411,64 @@ std::vector<SequenceInfo> BackendConnection::listSequences(bool* complete) {
     return sequences;
   }
 
-  std::string page_token;
+  // Bounded stale-catalog retries: a builder rebuild landing MID-pagination
+  // makes the server reject the next page with ERROR_STALE_CATALOG (the
+  // generation-bound cursor). The correct, user-invisible recovery is to
+  // discard every page of the aborted attempt and restart from page one on the
+  // new generation. Two full retries; a catalog churning faster than we can
+  // list it ends as a PARTIAL result (complete=false) the caller surfaces.
+  constexpr int kMaxStaleRetries = 2;
   bool exhausted = false;
-  for (;;) {
-    pj_cloud::v1::ClientMessage request;
-    auto* list = request.mutable_list_files();
-    list->set_page_token(page_token);
+  for (int attempt = 0; attempt <= kMaxStaleRetries && !exhausted; ++attempt) {
+    sequences.clear();
+    file_ids.clear();
+    std::string page_token;
+    std::string generation;  // the generation attempt-page-1 was served from
+    bool stale = false;
+    for (;;) {
+      pj_cloud::v1::ClientMessage request;
+      auto* list = request.mutable_list_files();
+      list->set_page_token(page_token);
 
-    pj_cloud::v1::ServerMessage response;
-    if (!sendAndWait(request, &response)) {
-      break;  // timeout / closed — PARTIAL (exhausted stays false)
-    }
-    if (!response.has_list_files()) {
-      break;  // error or unexpected payload — PARTIAL
-    }
+      pj_cloud::v1::ServerMessage response;
+      if (!sendAndWait(request, &response)) {
+        return sequences;  // timeout / closed — PARTIAL (exhausted stays false)
+      }
+      if (response.has_error() &&
+          response.error().code() == pj_cloud::v1::ERROR_STALE_CATALOG) {
+        stale = true;  // rebuild raced the pagination — restart from page one
+        break;
+      }
+      if (!response.has_list_files()) {
+        return sequences;  // other error or unexpected payload — PARTIAL
+      }
 
-    const auto& list_response = response.list_files();
-    for (auto& mapped : mapListFilesResponse(list_response)) {
-      file_ids[mapped.info.name] = mapped.file_id;
-      sequences.push_back(std::move(mapped.info));
-    }
+      const auto& list_response = response.list_files();
+      if (page_token.empty()) {
+        generation = list_response.catalog_generation();
+      }
+      for (auto& mapped : mapListFilesResponse(list_response)) {
+        file_ids[mapped.info.name] = mapped.file_id;
+        sequences.push_back(std::move(mapped.info));
+      }
 
-    page_token = list_response.next_page_token();
-    if (page_token.empty()) {
-      exhausted = true;  // full listing
-      break;
+      page_token = list_response.next_page_token();
+      if (page_token.empty()) {
+        exhausted = true;  // full listing
+        catalog_generation_ = generation;
+        break;
+      }
+    }
+    if (!stale) {
+      break;  // either exhausted (success) or we returned above
     }
   }
 
   if (!exhausted) {
-    // Incomplete pagination: do NOT publish the partial index over the last
-    // complete one (a dropped page must not silently shrink the browse index).
-    // Return the partial vector so the caller can decide to warn/discard.
+    // Incomplete pagination (stale retries exhausted): do NOT publish the
+    // partial index over the last complete one (a dropped page must not
+    // silently shrink the browse index). Return the partial vector so the
+    // caller can decide to warn/discard.
     return sequences;
   }
   // Publish the freshly-built COMPLETE index atomically (listTopics reads it next).

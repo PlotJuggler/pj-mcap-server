@@ -21,10 +21,16 @@
 package ws
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"strconv"
+
+	"google.golang.org/protobuf/proto"
 
 	"pj-cloud/server/internal/catalog"
 	pb "pj-cloud/server/internal/wire/pj_cloud"
@@ -35,10 +41,94 @@ type CatalogHandler struct {
 	Store *catalog.Store
 }
 
-// ListFiles applies the FileFilter predicates + pagination and returns the wire
-// response including the flat metadata overlay map.
+// ── generation-bound pagination cursors ──────────────────────────────────────
+//
+// The wire page token is NOT a bare rowid: rowids renumber across a full
+// builder rebuild (CATALOG_CONTRACT.md §7), so continuing a listing from an
+// old rowid in a renumbered id-space would silently skip or repeat files. The
+// cursor binds the position to (a) the catalog GENERATION it was minted from
+// and (b) a hash of the filter it belongs to, and the server rejects any
+// mismatch: a foreign generation is ERROR_STALE_CATALOG (retryable — re-list
+// from page one), a foreign filter or malformed token is
+// ERROR_INVALID_REQUEST (a client bug).
+//
+// Encoding (versioned, explicit — never gob): base64url of
+//   [1B version=1][1B genLen][gen][8B BE afterID][8B BE filterHash]
+
+const listCursorVersion = 1
+
+type listCursor struct {
+	gen        []byte
+	afterID    uint64
+	filterHash uint64
+}
+
+func encodeListCursor(c listCursor) string {
+	buf := make([]byte, 0, 2+len(c.gen)+16)
+	buf = append(buf, listCursorVersion, byte(len(c.gen)))
+	buf = append(buf, c.gen...)
+	buf = binary.BigEndian.AppendUint64(buf, c.afterID)
+	buf = binary.BigEndian.AppendUint64(buf, c.filterHash)
+	return base64.RawURLEncoding.EncodeToString(buf)
+}
+
+func decodeListCursor(tok string) (listCursor, error) {
+	raw, err := base64.RawURLEncoding.DecodeString(tok)
+	if err != nil {
+		return listCursor{}, fmt.Errorf("not base64url: %w", err)
+	}
+	if len(raw) < 2 {
+		return listCursor{}, errors.New("truncated")
+	}
+	if raw[0] != listCursorVersion {
+		return listCursor{}, fmt.Errorf("unknown cursor version %d", raw[0])
+	}
+	genLen := int(raw[1])
+	if len(raw) != 2+genLen+16 {
+		return listCursor{}, errors.New("wrong length")
+	}
+	return listCursor{
+		gen:        append([]byte(nil), raw[2:2+genLen]...),
+		afterID:    binary.BigEndian.Uint64(raw[2+genLen:]),
+		filterHash: binary.BigEndian.Uint64(raw[2+genLen+8:]),
+	}, nil
+}
+
+// filterHash fingerprints the request's FileFilter so a cursor can never be
+// replayed against a DIFFERENT query (which would produce a silently wrong
+// page). Deterministic proto marshal + FNV-1a; stable within one server build,
+// which is all a generation-bound cursor needs (a restart changes the epoch and
+// invalidates every outstanding cursor anyway).
+func filterHash(f *pb.FileFilter) uint64 {
+	h := fnv.New64a()
+	if f != nil {
+		raw, err := proto.MarshalOptions{Deterministic: true}.Marshal(f)
+		if err == nil {
+			_, _ = h.Write(raw)
+		}
+	}
+	return h.Sum64()
+}
+
+// filterHasDimensionIDs reports whether the filter carries any dimension id —
+// the generation-scoped handles picked from a GetVocabulary response.
+func filterHasDimensionIDs(f *pb.FileFilter) bool {
+	return f != nil && (f.CustomerId != nil || f.SiteId != nil || f.RobotId != nil || f.SourceId != nil)
+}
+
+// ListFiles applies the FileFilter predicates + generation-checked pagination
+// and returns the wire response including the flat metadata overlay map and the
+// serving generation. The WHOLE request — generation checks, the filter query,
+// tag attach, and the next-cursor mint — runs against ONE leased snapshot, so a
+// concurrent rebuild can neither mix generations inside the response nor close
+// the handle mid-flight.
 func (h *CatalogHandler) ListFiles(ctx context.Context, req *pb.ListFilesRequest) (*pb.ListFilesResponse, error) {
-	args := catalog.FilterArgs{Limit: int(req.GetLimit()), PageToken: req.GetPageToken()}
+	lease := h.Store.Acquire()
+	defer lease.Release()
+	gen := lease.Generation()
+
+	fhash := filterHash(req.GetFilter())
+	args := catalog.FilterArgs{Limit: int(req.GetLimit())}
 	if f := req.GetFilter(); f != nil {
 		if tr := f.GetRecordedBetween(); tr != nil {
 			args.RecordedBetween = &catalog.TimeWindow{StartNs: tr.GetStartNs(), EndNs: tr.GetEndNs()}
@@ -56,13 +146,50 @@ func (h *CatalogHandler) ListFiles(ctx context.Context, req *pb.ListFilesRequest
 		args.RobotID = f.RobotId
 		args.SourceID = f.SourceId
 	}
-	files, next, err := catalog.FilterFiles(ctx, h.Store, args)
+
+	// Dimension ids are generation-scoped: a first-page request carrying one
+	// MUST also carry the generation the ids came from, or the server cannot
+	// detect a stale id silently selecting a renumbered dimension.
+	expected := req.GetExpectedCatalogGeneration()
+	if filterHasDimensionIDs(req.GetFilter()) && len(expected) == 0 && req.GetPageToken() == "" {
+		return nil, errGenerationRequired{}
+	}
+	if tok := req.GetPageToken(); tok != "" {
+		cur, err := decodeListCursor(tok)
+		if err != nil {
+			return nil, errBadPageToken{reason: err.Error()}
+		}
+		if len(expected) != 0 && !bytes.Equal(expected, cur.gen) {
+			// The client contradicts itself: the cursor and the explicit
+			// expectation name different generations. A client bug, not
+			// staleness.
+			return nil, errBadPageToken{reason: "page_token and expected_catalog_generation disagree"}
+		}
+		if cur.filterHash != fhash {
+			return nil, errBadPageToken{reason: "page_token was minted for a different filter"}
+		}
+		if !bytes.Equal(cur.gen, gen) {
+			return nil, errStaleCatalog{}
+		}
+		args.AfterID = cur.afterID
+	} else if len(expected) != 0 && !bytes.Equal(expected, gen) {
+		return nil, errStaleCatalog{}
+	}
+
+	files, more, err := catalog.FilterFilesDB(ctx, lease.DB(), args)
 	if err != nil {
 		return nil, fmt.Errorf("filter: %w", err)
 	}
 	resp := &pb.ListFilesResponse{
-		NextPageToken: next,
-		Metadata:      make(map[string]*pb.FlatMetadata, len(files)),
+		Metadata:          make(map[string]*pb.FlatMetadata, len(files)),
+		CatalogGeneration: gen,
+	}
+	if more && len(files) > 0 {
+		resp.NextPageToken = encodeListCursor(listCursor{
+			gen:        gen,
+			afterID:    files[len(files)-1].ID,
+			filterHash: fhash,
+		})
 	}
 	for _, f := range files {
 		resp.Files = append(resp.Files, fileSummaryToProto(f))
@@ -139,13 +266,18 @@ func (h *CatalogHandler) GetFile(ctx context.Context, req *pb.GetFileRequest) (*
 
 // GetVocabulary returns the filter vocabulary (catalog-vocabulary-rpc.md): the
 // strict customer->site->robot tree, the flat source dimension, and the tag facets.
-// Built from the dimension tables; empty on the legacy Go-schema store.
+// Built from the dimension tables against ONE leased snapshot, stamped with that
+// snapshot's generation — the dimension ids are generation-scoped handles, only
+// meaningful together with the token (echoed back via
+// ListFilesRequest.expected_catalog_generation).
 func (h *CatalogHandler) GetVocabulary(ctx context.Context, _ *pb.GetVocabularyRequest) (*pb.GetVocabularyResponse, error) {
-	v, err := catalog.GetVocabulary(ctx, h.Store)
+	lease := h.Store.Acquire()
+	defer lease.Release()
+	v, err := catalog.GetVocabularyDB(ctx, lease.DB())
 	if err != nil {
 		return nil, fmt.Errorf("vocabulary: %w", err)
 	}
-	resp := &pb.GetVocabularyResponse{}
+	resp := &pb.GetVocabularyResponse{CatalogGeneration: lease.Generation()}
 	for _, c := range v.Customers {
 		pc := &pb.DimCustomer{Id: c.ID, Name: c.Name, FileCount: c.FileCount}
 		for _, st := range c.Sites {
@@ -189,6 +321,31 @@ func (e errFileNotFoundByKey) Error() string { return fmt.Sprintf("no file with 
 type errEmptyS3Key struct{}
 
 func (errEmptyS3Key) Error() string { return "s3_key must be non-empty" }
+
+// errStaleCatalog: the request carried a generation-scoped handle (dimension id
+// or pagination cursor) from a generation the server no longer serves — mapped
+// to ERROR_STALE_CATALOG (retryable: re-fetch vocabulary, re-list from page one).
+type errStaleCatalog struct{}
+
+func (errStaleCatalog) Error() string {
+	return "catalog generation changed (a rebuild renumbered the ids); re-fetch the vocabulary and restart the listing"
+}
+
+// errGenerationRequired: a first-page filter carries dimension ids but no
+// expected_catalog_generation — the server could not detect a stale id, so the
+// request is rejected as invalid (a client bug, not staleness).
+type errGenerationRequired struct{}
+
+func (errGenerationRequired) Error() string {
+	return "filter carries dimension ids but no expected_catalog_generation (echo GetVocabularyResponse.catalog_generation)"
+}
+
+// errBadPageToken: a malformed cursor, a cursor minted for a different filter,
+// or a cursor contradicting the explicit generation expectation — invalid
+// request, never silently honored.
+type errBadPageToken struct{ reason string }
+
+func (e errBadPageToken) Error() string { return "invalid page_token: " + e.reason }
 
 func tagsToProto(tags []catalog.EffectiveTag) []*pb.Tag {
 	out := make([]*pb.Tag, 0, len(tags))

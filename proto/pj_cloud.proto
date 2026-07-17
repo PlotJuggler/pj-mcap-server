@@ -150,6 +150,13 @@ message GetVocabularyResponse {
   repeated DimCustomer customers = 1;              // hierarchical dimensions (tree)
   repeated DimSource   sources   = 2;              // flat normalized dimension (V7)
   repeated TagFacet    tags      = 3;              // flat EAV facets
+  // The catalog GENERATION these dimension ids belong to. Dimension ids are
+  // rowids and RENUMBER across a full builder rebuild, so a client-cached
+  // vocabulary is only meaningful together with this token: echo it in
+  // ListFilesRequest.expected_catalog_generation whenever a FileFilter carries
+  // a dimension id. Opaque bytes (server epoch + swap ordinal); equality-only —
+  // never ordered, never parsed, never logged as text. Always non-empty.
+  bytes catalog_generation = 4;
 }
 
 // Hierarchical dimensions — a strict tree so illegal states are unrepresentable
@@ -195,6 +202,16 @@ message ListFilesRequest {
   FileFilter filter   = 1;
   uint32 limit        = 2;                 // default 200, server-clamped to 1000
   string page_token   = 3;                 // empty for first page
+  // The catalog generation the client's dimension ids (filter.customer_id/
+  // site_id/robot_id/source_id) came from — REQUIRED on the FIRST page whenever
+  // any dimension id is present (a stale id can silently select a DIFFERENT
+  // dimension after a rebuild; the server must be able to detect that). Later
+  // pages carry the generation inside page_token, so this may stay empty there;
+  // if both are present and disagree it is ERROR_INVALID_REQUEST. A mismatch
+  // against the CURRENT generation is ERROR_STALE_CATALOG: re-fetch the
+  // vocabulary, re-resolve names -> ids, restart from page one. Empty with no
+  // dimension ids = "use the current generation".
+  bytes expected_catalog_generation = 4;
 }
 
 message FileSummary {
@@ -215,7 +232,13 @@ message Tag {
 
 message ListFilesResponse {
   repeated FileSummary files = 1;
-  string next_page_token     = 2;          // empty when exhausted
+  string next_page_token     = 2;          // empty when exhausted; generation-bound (see below)
+  // The catalog generation this page was served from. next_page_token embeds
+  // it, so a rebuild landing mid-pagination makes the NEXT page request fail
+  // ERROR_STALE_CATALOG instead of silently skipping/repeating files in the
+  // renumbered id-space; the client then discards the partial listing and
+  // restarts from page one. Opaque; equality-only. Always non-empty.
+  bytes catalog_generation   = 4;
   // SHAPE REQ (load-bearing, unified-plan §3.1): a FLAT key→value view of each
   // file's effective tags, keyed by file id (decimal string), each value the
   // file's tags_effective rendered as one map<string,string>. Maps 1:1 onto the
@@ -422,6 +445,12 @@ enum ErrorCode {
   reserved 8;
   reserved "ERROR_CANCELLED";              // cancellation reported via Eos.reason
   ERROR_RESUME_NOT_POSSIBLE = 9;
+  // The request carried a generation-scoped handle (a dimension id or a
+  // pagination cursor) from a catalog generation the server no longer serves —
+  // a builder rebuild renumbered the underlying rowids. Retryable and
+  // client-transparent: discard cached vocabulary/partial pages, re-fetch,
+  // restart the listing (bounded retries).
+  ERROR_STALE_CATALOG       = 10;
 }
 
 message Error {

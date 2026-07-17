@@ -31,9 +31,12 @@ import (
 //     handle keeps serving — fail-closed. This is deliberate: a rebuild-in-
 //     progress or a corrupt replacement must never interrupt service; the
 //     next tick (the caller polls on an interval) tries again.
-//   - Different identity and verification succeeds: the Store's handle is
-//     swapped to the new one, the stored identity is updated, the OLD handle is
-//     Close()d, and (true, nil) is returned.
+//   - Different identity and verification succeeds: a NEW snapshot
+//     {db, identity, generation} is published atomically (the generation
+//     ordinal advances — this is the ONLY event that changes the generation
+//     token), the OLD snapshot is retired, and (true, nil) is returned. The
+//     old handle closes only once every in-flight lease on it releases
+//     (drain-then-close — see Store.Acquire).
 func (s *Store) ReopenIfSwapped(ctx context.Context) (swapped bool, err error) {
 	// Serialize swaps: at most one ReopenIfSwapped does the stat-compare-open-swap
 	// sequence at a time. The caller today is a single ticker goroutine, so this
@@ -41,34 +44,30 @@ func (s *Store) ReopenIfSwapped(ctx context.Context) (swapped bool, err error) {
 	s.reopenMu.Lock()
 	defer s.reopenMu.Unlock()
 
-	cur := s.identity.Load()
+	cur := s.identitySnapshot()
 	stat, statErr := statIdentity(s.dbPath)
 	if statErr != nil {
 		return false, statErr
 	}
-	if cur != nil && *cur == stat {
+	if cur == stat {
 		return false, nil
 	}
 
-	// Identity differs (or this is somehow the first check with no cached
-	// identity — shouldn't happen post-OpenReadOnly, but treat it the same way):
-	// reopen+verify the new generation before touching anything the current
-	// readers depend on. openVerified's own bounded identity-race retry (C2)
-	// absorbs the case where the stat above landed astride a still-in-flight
-	// os.replace.
+	// Identity differs: reopen+verify the new generation before touching
+	// anything the current readers depend on. openVerified's own bounded
+	// identity-race retry (C2) absorbs the case where the stat above landed
+	// astride a still-in-flight os.replace.
 	newDB, newIdent, openErr := openVerified(ctx, s.dbPath)
 	if openErr != nil {
 		return false, openErr
 	}
 
-	old := s.dbPtr.Swap(newDB)
-	s.identity.Store(&newIdent)
-	if old != nil {
-		// The new handle is already live and correct; a failure to close the old
-		// one is at worst a leaked file descriptor, not a reason to report the
-		// swap itself as failed (the (swapped bool, err error) contract is
-		// exactly the three outcomes documented above — this is not a fourth).
-		_ = old.Close()
-	}
+	// Publish {db, identity, generation} as ONE snapshot. The ordinal advances
+	// exactly here — a failed verification above returns without touching it,
+	// so the token is stable across failed swaps and no-op checks.
+	s.ordinal++
+	next := &snapshot{db: newDB, ident: newIdent, gen: s.newGenToken(s.ordinal)}
+	next.refs.Store(1) // the "current" ref
+	s.publish(next)
 	return true, nil
 }

@@ -46,7 +46,9 @@ func GetFile(ctx context.Context, s *Store, id uint64) (FileRecord, error) {
 // (renumbered) ids with another generation's records. An unknown id fails the
 // whole batch with a wrapped ErrFileNotFound naming the id.
 func GetFiles(ctx context.Context, s *Store, ids []uint64) ([]FileRecord, error) {
-	db := s.DB() // pinned once for the whole batch
+	lease := s.Acquire() // one snapshot for the whole batch (and drain-then-close)
+	defer lease.Release()
+	db := lease.DB()
 	out := make([]FileRecord, 0, len(ids))
 	for _, id := range ids {
 		rec, err := aurynGetFile(ctx, db, id)
@@ -67,7 +69,9 @@ func GetFiles(ctx context.Context, s *Store, ids []uint64) ([]FileRecord, error)
 // ErrFileNotFound naming the key, before any caller touches storage or
 // registers a session.
 func GetFilesByKeys(ctx context.Context, s *Store, keys []string) ([]FileRecord, error) {
-	db := s.DB() // pinned once for the whole batch
+	lease := s.Acquire() // one snapshot for the whole batch (and drain-then-close)
+	defer lease.Release()
+	db := lease.DB()
 	out := make([]FileRecord, 0, len(keys))
 	for _, key := range keys {
 		id, err := FileIDForKey(ctx, db, key)

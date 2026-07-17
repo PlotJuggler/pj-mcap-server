@@ -295,31 +295,26 @@ func TestFilterFiles_Pagination(t *testing.T) {
 	}
 	st, _ := openFilterFixtureStore(t, fxs)
 
-	page1, next1, _ := FilterFiles(context.Background(), st, FilterArgs{Limit: 2})
+	page1, more1, _ := FilterFiles(context.Background(), st, FilterArgs{Limit: 2})
 	if len(page1) != 2 {
 		t.Fatalf("page1 len: %d", len(page1))
 	}
-	if next1 == "" {
-		t.Error("page1 should have a next token")
+	if !more1 {
+		t.Error("page1 should report more rows")
 	}
-	page2, next2, _ := FilterFiles(context.Background(), st, FilterArgs{Limit: 2, PageToken: next1})
+	page2, more2, _ := FilterFiles(context.Background(), st, FilterArgs{Limit: 2, AfterID: page1[len(page1)-1].ID})
 	if len(page2) != 2 {
 		t.Fatalf("page2 len: %d", len(page2))
 	}
-	page3, next3, _ := FilterFiles(context.Background(), st, FilterArgs{Limit: 2, PageToken: next2})
+	if !more2 {
+		t.Error("page2 should report more rows")
+	}
+	page3, more3, _ := FilterFiles(context.Background(), st, FilterArgs{Limit: 2, AfterID: page2[len(page2)-1].ID})
 	if len(page3) != 1 {
 		t.Fatalf("page3 len: %d", len(page3))
 	}
-	if next3 != "" {
-		t.Errorf("last page should have empty next, got %q", next3)
-	}
-}
-
-func TestFilterFiles_BadPageToken(t *testing.T) {
-	st, _ := openFilterFixtureStore(t, []filterFixtureFile{{name: "a.mcap", startNs: 1, endNs: 2}})
-	_, _, err := FilterFiles(context.Background(), st, FilterArgs{Limit: 2, PageToken: "!!!not-base64!!!"})
-	if err == nil {
-		t.Error("expected error for malformed page_token")
+	if more3 {
+		t.Error("last page must not report more rows")
 	}
 }
 

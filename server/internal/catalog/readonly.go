@@ -64,8 +64,10 @@ func OpenReadOnly(ctx context.Context, dbPath string) (*Store, error) {
 		return nil, err
 	}
 	s := &Store{dbPath: dbPath}
-	s.dbPtr.Store(db)
-	s.identity.Store(&ident)
+	if err := s.initSnapshots(db, ident); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 	return s, nil
 }
 

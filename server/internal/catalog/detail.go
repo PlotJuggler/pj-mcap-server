@@ -24,7 +24,9 @@ import (
 // EffectiveTags itself. Returns ErrFileNotFound (wrapped) when the summary
 // phase does.
 func GetFileDetail(ctx context.Context, s *Store, fileID uint64) (FileRecord, []TopicRecord, []EffectiveTag, error) {
-	return getFileDetailDB(ctx, s.DB(), fileID)
+	lease := s.Acquire()
+	defer lease.Release()
+	return getFileDetailDB(ctx, lease.DB(), fileID)
 }
 
 // GetFileDetailByKey is GetFileDetail addressed by the STABLE object key
@@ -36,7 +38,9 @@ func GetFileDetail(ctx context.Context, s *Store, fileID uint64) (FileRecord, []
 // with another's rows). Returns ErrFileNotFound when the key doesn't parse
 // as a Hive key or names no cataloged file.
 func GetFileDetailByKey(ctx context.Context, s *Store, key string) (FileRecord, []TopicRecord, []EffectiveTag, error) {
-	db := s.DB()
+	lease := s.Acquire()
+	defer lease.Release()
+	db := lease.DB()
 	id, err := FileIDForKey(ctx, db, key)
 	if err != nil {
 		return FileRecord{}, nil, nil, err

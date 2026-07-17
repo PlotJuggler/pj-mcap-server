@@ -153,12 +153,28 @@ func (h *pageHandler) renderOverview(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *pageHandler) renderFiles(w http.ResponseWriter, r *http.Request) {
-	page := r.URL.Query().Get("page")
-	files, next, err := catalog.FilterFiles(r.Context(), h.deps.Store,
-		catalog.FilterArgs{Limit: 100, PageToken: page})
+	// The dashboard's ?page= is the bare after-rowid position, NOT the wire
+	// cursor (this is a same-process operator page: a rebuild mid-browse just
+	// renders from the new generation — no cross-generation id hazard worth a
+	// generation-bound token here).
+	var afterID uint64
+	if page := r.URL.Query().Get("page"); page != "" {
+		v, perr := strconv.ParseUint(page, 10, 64)
+		if perr != nil {
+			http.Error(w, "bad page parameter", http.StatusBadRequest)
+			return
+		}
+		afterID = v
+	}
+	files, more, err := catalog.FilterFiles(r.Context(), h.deps.Store,
+		catalog.FilterArgs{Limit: 100, AfterID: afterID})
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
+	}
+	next := ""
+	if more && len(files) > 0 {
+		next = strconv.FormatUint(files[len(files)-1].ID, 10)
 	}
 	rows := make([]map[string]any, 0, len(files))
 	for _, f := range files {

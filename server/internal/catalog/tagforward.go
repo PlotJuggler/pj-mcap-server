@@ -77,7 +77,9 @@ func FileIDForKey(ctx context.Context, db *sql.DB, key string) (uint64, error) {
 // Returns ErrFileNotFound if key does not parse as a Hive key, or parses but
 // names no cataloged file (see FileIDForKey).
 func EffectiveTagsByKey(ctx context.Context, s *Store, key string) ([]EffectiveTag, error) {
-	db := s.DB()
+	lease := s.Acquire()
+	defer lease.Release()
+	db := lease.DB()
 	id, err := FileIDForKey(ctx, db, key)
 	if err != nil {
 		return nil, err

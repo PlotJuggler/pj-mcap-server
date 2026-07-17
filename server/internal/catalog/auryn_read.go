@@ -203,7 +203,7 @@ func aurynHasHierarchicalKey(ctx context.Context, db *sql.DB) (bool, error) {
 // swap must never let row N's tags come from a different generation than row N's
 // summary (old file ids reused/renumbered across a full rebuild would then pair
 // with the WRONG file's tags).
-func aurynFilterFiles(ctx context.Context, db *sql.DB, args FilterArgs) ([]FileSummary, string, error) {
+func aurynFilterFiles(ctx context.Context, db *sql.DB, args FilterArgs) ([]FileSummary, bool, error) {
 	limit := args.Limit
 	if limit <= 0 {
 		limit = 200
@@ -216,13 +216,9 @@ func aurynFilterFiles(ctx context.Context, db *sql.DB, args FilterArgs) ([]FileS
 		clauses []string
 		params  []interface{}
 	)
-	if args.PageToken != "" {
-		cursor, err := decodeCursor(args.PageToken)
-		if err != nil {
-			return nil, "", fmt.Errorf("invalid page_token: %w", err)
-		}
+	if args.AfterID != 0 {
 		clauses = append(clauses, "f.id > ?")
-		params = append(params, cursor)
+		params = append(params, args.AfterID)
 	}
 	if args.RecordedBetween != nil {
 		clauses = append(clauses, "f.end_time_ns >= ? AND f.start_time_ns <= ?")
@@ -304,7 +300,7 @@ func aurynFilterFiles(ctx context.Context, db *sql.DB, args FilterArgs) ([]FileS
 
 	rows, err := db.QueryContext(ctx, q, params...)
 	if err != nil {
-		return nil, "", fmt.Errorf("auryn filter query: %w", err)
+		return nil, false, fmt.Errorf("auryn filter query: %w", err)
 	}
 	defer rows.Close()
 
@@ -317,23 +313,23 @@ func aurynFilterFiles(ctx context.Context, db *sql.DB, args FilterArgs) ([]FileS
 		)
 		if err := rows.Scan(&f.ID, &customer, &site, &robot, &source, &date, &name,
 			&f.SizeBytes, &f.StartTimeNs, &f.EndTimeNs, &f.ChunkCount, &blob, &f.TopicCount); err != nil {
-			return nil, "", err
+			return nil, false, err
 		}
 		f.S3Key = rebuildHiveKey(customer, site, robot, source, date, name)
 		counts, derr := decodeCountsBlob(blob)
 		if derr != nil {
-			return nil, "", fmt.Errorf("auryn filter (file %d): %w", f.ID, derr)
+			return nil, false, fmt.Errorf("auryn filter (file %d): %w", f.ID, derr)
 		}
 		f.MessageCount = sumCounts(counts)
 		out = append(out, f)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, "", err
+		return nil, false, err
 	}
 
-	next := ""
+	more := false
 	if len(out) > limit {
-		next = encodeCursor(out[limit-1].ID)
+		more = true
 		out = out[:limit]
 	}
 	// Attach effective tags (tags_effective exists in both schemas). Uses the
@@ -343,9 +339,9 @@ func aurynFilterFiles(ctx context.Context, db *sql.DB, args FilterArgs) ([]FileS
 	for i := range out {
 		tags, err := effectiveTagsDB(ctx, db, out[i].ID)
 		if err != nil {
-			return nil, "", err
+			return nil, false, err
 		}
 		out[i].Tags = tags
 	}
-	return out, next, nil
+	return out, more, nil
 }

@@ -98,7 +98,9 @@ func HasHierarchicalKey(ctx context.Context, s *Store) (bool, error) {
 // swap landing between the two queries can never advertise a mixed-generation
 // view (e.g. one generation's vocabulary with another's hierarchy flag).
 func BackendCaps(ctx context.Context, s *Store) (vocab []string, hierarchy bool, err error) {
-	db := s.DB() // pinned once for both queries
+	lease := s.Acquire() // one snapshot for both queries (and drain-then-close)
+	defer lease.Release()
+	db := lease.DB()
 	vocab, err = distinctMetadataKeysDB(ctx, db)
 	if err != nil {
 		return nil, false, err
