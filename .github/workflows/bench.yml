@@ -37,30 +37,30 @@ jobs:
   bench:
     runs-on: ubuntu-latest
     timeout-minutes: 25
-    services:
-      minio:
-        image: minio/minio:RELEASE.2024-06-13T22-53-53Z
-        env:
-          MINIO_ROOT_USER: ciadmin
-          MINIO_ROOT_PASSWORD: cipassword123
-        ports:
-          - 9000:9000
-        options: >-
-          --health-cmd "mc ready local || exit 1"
-          --health-interval 3s
-          --health-timeout 3s
-          --health-retries 20
-      fakegcs:
-        image: fsouza/fake-gcs-server:1.49.2
-        ports:
-          - 4443:4443
-        options: >-
-          --health-cmd "wget -q -O - http://localhost:4443/storage/v1/b || exit 1"
-          --health-interval 3s
-          --health-timeout 3s
-          --health-retries 20
+    # Emulators are started via `docker run` steps below, NOT `services:`
+    # containers — a services block cannot override the image command, and
+    # minio/minio's default entrypoint does not start a server, so `mc ready
+    # local` never turns healthy (the whole job died at "Initialize
+    # containers"). Mirrors ci.yml + infra/{minio,fake-gcs}/docker-compose.yml.
     steps:
       - uses: actions/checkout@v4
+      - name: start emulators (minio + fake-gcs)
+        run: |
+          docker run -d --name minio --network host \
+            -e MINIO_ROOT_USER=ciadmin -e MINIO_ROOT_PASSWORD=cipassword123 \
+            minio/minio:RELEASE.2024-06-13T22-53-53Z server /data --console-address ":9001"
+          docker run -d --name fakegcs --network host \
+            fsouza/fake-gcs-server:1.49.2 \
+            -scheme http -port 4443 -host 0.0.0.0 -public-host localhost:4443 \
+            -backend memory -log-level warn
+          echo "waiting for minio + fake-gcs health…"
+          for i in $(seq 1 30); do
+            curl -sf http://localhost:9000/minio/health/live >/dev/null \
+              && curl -sf "http://localhost:4443/storage/v1/b?project=pj-cloud-bench" >/dev/null \
+              && { echo "both emulators ready"; exit 0; }
+            sleep 1
+          done
+          echo "emulators did not become healthy"; docker logs minio || true; docker logs fakegcs || true; exit 1
       - uses: actions/setup-go@v5
         with:
           go-version: "1.23"
