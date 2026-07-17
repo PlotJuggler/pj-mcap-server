@@ -91,4 +91,3 @@ func (s FileSummary) FlatMetadata() map[string]string {
 	}
 	return m
 }
-

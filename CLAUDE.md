@@ -11,8 +11,10 @@ PlotJuggler-class clients on demand.
 
 This repo (`pj-mcap-server`, a git repo on branch `main`) holds the design spec, the
 implementation plans, the commercial proposal, the **Go server + connector plugin**
-implementation, and (2026-06-22) the **vendored auryn Python catalog builder** (the
-`mcap_catalog/` submodule). **[LOCAL DECISION 2026-06-04]** The
+implementation, and (2026-06-22) the **vendored auryn Python catalog builder** (in
+`mcap_catalog/` — VENDORED directly as of 2026-07-17; formerly a submodule of
+`AurynRobotics/mcap_server`, de-submoduled so this repo is fully self-contained).
+**[LOCAL DECISION 2026-06-04]** The
 implementation code goes **in this repo**: every `pj-cloud/<path>` reference in the
 plans maps to `/home/gn/ws/PJ4_Server_Template/pj-mcap-server/<path>` (the plans were
 originally written for a separate `pj-cloud/` repo at
@@ -24,7 +26,7 @@ new repo).
 
 **The auryn catalog migration (M1–M6 incl. the full M6 tail) is DONE and pushed.** The
 production architecture is a **two-process system**: the Python **`mcap_catalog/`**
-builder (submodule) is the SOLE catalog writer (schema v3, atomic publish via temp+rename,
+builder (vendored) is the SOLE catalog writer (schema v3, atomic publish via temp+rename,
 `--tag-socket` tag-edit IPC, `--no-watch` rescan-only daemon mode) and the Go server is a
 **pure read-only catalog reader + unchanged streamer** — `catalog.OpenReadOnly` is the
 ONLY constructor, `internal/indexer/` and every catalog write API are DELETED (−2k LOC),
@@ -36,9 +38,9 @@ reads are generation-pinned). `-external-builder`/`-poll-interval` are deprecate
 and `mcap_catalog/`) is the cross-language contract — schema/IPC changes MUST update it.
 
 - **Remaining follow-ups:** `matrix.sh` migration (fail-fasts with exit 2 today; needs the
-  `jkk_dataset02` corpus machine); GitHub CI activation (needs a read-only deploy key on
-  the private `AurynRobotics/mcap_server` submodule as the `MCAP_CATALOG_DEPLOY_KEY`
-  secret, plus the push decision); the C++ facet UI (client-side `GetVocabulary` —
+  `jkk_dataset02` corpus machine); the CI `integration` legs' service containers (minio +
+  fake-gcs) fail their health checks on the GitHub runner (pre-existing infra, not a code
+  regression); the C++ facet UI (client-side `GetVocabulary` —
   `docs/catalog-vocabulary-rpc.md`); real-bucket GCE smoke (`docs/gce-deploy-smoke.md`);
   builder gaps by design: `derive_tags()` stub, GCS Pub/Sub discovery, `file_metrics`.
 - **Team rule:** technical decisions are cross-checked with a standing Codex instance
@@ -145,7 +147,7 @@ local codebases first. Do not guess SDK/plugin APIs — read the real headers.
 > `plotjuggler_sdk-cloud/`). The connector plugin builds **standalone** at
 > `plugin/toolbox_dexory_cloud/` against the SDK Conan package (**0.11.0** — built on
 > this machine 2026-07-06 from `~/ws_plotjuggler/plotjuggler_sdk-cloud`). The ONLY
-> submodule of this repo is **`mcap_catalog/`**. Prose below that mentions `PJ4/` as a
+> directory `mcap_catalog/` is VENDORED (formerly the only submodule). Prose below that mentions `PJ4/` as a
 > submodule or SDK 0.8.1 is a stale reference-reading aid — the fork/vendoring history
 > lives in `docs/history.md`. Paths below were verified 2026-06-04 on the original
 > machine (`/home/gn/...`).
@@ -407,7 +409,7 @@ in batches so the client can show already-received data while the rest downloads
 cancel-mid-stream.
 
 - **Two-process backend** (the "one static binary" property is GONE — M6):
-  - **Python `mcap_catalog` builder** (submodule; sole SQLite writer): discovers bucket
+  - **Python `mcap_catalog` builder** (vendored; sole SQLite writer): discovers bucket
     objects (S3 SQS events / rescan; `--no-watch` = rescan-only), extracts MCAP
     footer/summary metadata (1–2 range-GETs), writes the auryn schema (v3: Hive
     dimensions, topic-set dedup, `tags_effective` override layer, `catalog_failures`

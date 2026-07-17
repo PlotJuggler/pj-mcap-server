@@ -1,0 +1,320 @@
+"""CLI entry point: ``python3 -m mcap_catalog_builder <watch_root> [options]``.
+
+Architecture: the producers (the watchdog observer + debounce Timers for local,
+or the SQS event drainer for S3, plus the periodic rescan thread) only enqueue
+WatchEvents. ``worker_loop`` (run on the main thread) is the single CONSUMER and
+the only DB writer. It is driven by a storage ``Source`` and is identical for
+both backends.
+"""
+
+import argparse
+import logging
+import os
+import queue
+import signal
+import sqlite3
+import threading
+
+from .db import Caches, load_caches, open_db
+from .builder import catalog_object, delete_by_key
+from .publish import build_and_publish
+from .reconcile import full_reconcile
+from .storage import LocalSource
+from .tag_ipc import TagEditItem, TagEditServer, handle_tag_edit
+from .watcher import McapEventHandler, WatchEvent, start_observer
+from .writer_lock import WriterLockError, acquire_writer_lock
+
+logger = logging.getLogger(__name__)
+
+DEFAULT_DB = "/tmp/pj-cloud-catalog.db"
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """Build the CLI argument parser."""
+    p = argparse.ArgumentParser(
+        prog="mcap_catalog_builder",
+        description="Watch a folder (or S3 bucket) of .mcap files and keep the SQLite catalog in sync.",
+    )
+    p.add_argument("watch_root", nargs="?", default=".",
+                   help="folder of .mcap recordings to watch (local source)")
+    p.add_argument("--source", choices=["local", "s3", "gcs"], default="local",
+                   help="storage backend (default: local)")
+    p.add_argument("--s3-bucket", default=None, help="[s3] bucket name")
+    p.add_argument("--s3-prefix", default="", help="[s3] key prefix to scope listing")
+    p.add_argument("--sqs-url", default=None, help="[s3] SQS queue URL for S3 event notifications")
+    p.add_argument("--gcs-bucket", default=None, help="[gcs] bucket name")
+    p.add_argument("--gcs-prefix", default="", help="[gcs] object-name prefix to scope listing")
+    p.add_argument("--db", default=DEFAULT_DB, help=f"catalog DB path (default: {DEFAULT_DB})")
+    p.add_argument("--tag-socket", default=None,
+                   help="path for the tag-edit IPC unix socket (default: off). Daemon "
+                        "mode only — started after the startup reconcile/publish "
+                        "completes; ignored with --once. See CATALOG_CONTRACT.md's "
+                        "'Tag-edit IPC' section (catalog-migration DECISION D2(a)).")
+    p.add_argument("--once", action="store_true",
+                   help="run one synchronous full reconcile, then exit (no watching). "
+                        "Used by the cross-language e2e / CI to build a DB and hand it "
+                        "to the Go read-only server.")
+    p.add_argument("--rebuild", action="store_true",
+                   help="force a from-scratch rebuild published atomically (build to a "
+                        "temp DB, checkpoint-gate any existing served DB, then rename "
+                        "into place — catalog-migration §6.2a), instead of mutating the "
+                        "served DB in place. Implied automatically when --db does not "
+                        "exist yet. Valid with --once (the primary use) or in daemon "
+                        "mode (rebuilds first, then watches the published path in place).")
+    p.add_argument("--rescan-interval", type=float, default=300.0,
+                   help="seconds between safety re-scans (default: 300)")
+    p.add_argument("--no-watch", action="store_true",
+                   help="daemon mode: start no live event producer at all — no "
+                        "local watchdog/inotify observer, no S3 SQS long-poll "
+                        "thread. Discovery is then rescan-only, driven purely by "
+                        "--rescan-interval (useful on hosts where inotify is "
+                        "unavailable/exhausted, or where SQS is not wired up). "
+                        "With --source s3 in daemon mode, also relaxes the "
+                        "--sqs-url requirement. GCS daemon mode is already "
+                        "rescan-only, so this is a no-op there. No-op with "
+                        "--once (which never starts a producer anyway).")
+    p.add_argument("--debounce", type=float, default=2.0,
+                   help="[local] seconds to debounce file events (default: 2)")
+    p.add_argument("--stability-checks", type=int, default=3,
+                   help="[local] size-stability poll count before cataloging (default: 3)")
+    p.add_argument("--stability-interval", type=float, default=0.5,
+                   help="[local] seconds between size-stability polls (default: 0.5)")
+    p.add_argument("--extract-workers", type=int, default=8,
+                   help="number of threads that fetch MCAP summaries during a full "
+                        "reconcile (the network-bound, out-of-transaction read). DB "
+                        "writes stay single-threaded; this only parallelizes reads. "
+                        "1 = sequential. Higher values hide per-file round-trip "
+                        "latency on a remote bucket (default: 8).")
+    p.add_argument("--log-level", default="INFO",
+                   choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+    return p
+
+
+def worker_loop(
+    conn: sqlite3.Connection,
+    caches: Caches,
+    source,
+    work_q: "queue.Queue[WatchEvent | TagEditItem]",
+    workers: int = 1,
+) -> None:
+    """Drain the work queue and perform all DB writes (the single writer).
+
+    Backend-agnostic: each event's payload is mapped to a key via the source,
+    stability is gated by the source (local polls; S3 is atomic), and every event
+    is handled under a try/except so the worker never dies. Alongside
+    ``WatchEvent`` (file-system/S3-driven), the queue also carries
+    ``TagEditItem`` — a client tag edit forwarded here from the tag-edit IPC
+    server (D2(a)); it is dispatched to ``handle_tag_edit`` instead of the
+    ``ev.kind`` chain below (it needs to reply on its own ``event``, which
+    ``WatchEvent`` never carries).
+    """
+    while True:
+        ev = work_q.get()
+        try:
+            if isinstance(ev, TagEditItem):
+                handle_tag_edit(conn, caches, ev)
+                continue
+            if ev.kind == "stop":
+                break
+            if ev.kind == "catalog":
+                if source.wait_for_stable(ev.path):
+                    catalog_object(conn, caches, source.event_key(ev.path), source)
+                else:
+                    logger.warning("file not stable, dropping (retries on rescan): %s", ev.path)
+            elif ev.kind == "delete":
+                delete_by_key(conn, caches, source.event_key(ev.path))
+            elif ev.kind == "rescan":
+                full_reconcile(conn, caches, source, workers=workers)
+            else:
+                logger.warning("unknown event: %r", ev)
+        except Exception:  # noqa: BLE001 - the worker must never die
+            logger.exception("worker error handling %r", ev)
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Entry point. Returns a process exit code."""
+    args = build_parser().parse_args(argv)
+    logging.basicConfig(
+        level=getattr(logging, args.log_level),
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
+
+    work_q: "queue.Queue[WatchEvent | TagEditItem]" = queue.Queue()
+    stop_event = threading.Event()
+    observer = None
+    handler = None
+    tag_server = None
+    start_producer = None  # deferred until after the startup reconcile
+
+    # --- build + validate the source (producers are started later) -----------
+    if args.source == "s3":
+        # --once does a single full_reconcile (a LIST + catalog sweep) and exits, so
+        # it needs only the bucket — no SQS event queue. The watch daemon still
+        # requires --sqs-url to drain live S3 events, unless --no-watch says to
+        # skip live event producers altogether (rescan-only daemon).
+        if not args.s3_bucket:
+            logger.error("--source s3 requires --s3-bucket")
+            return 2
+        if not args.once and not args.no_watch and not args.sqs_url:
+            logger.error(
+                "--source s3 requires --sqs-url (or pass --once for a one-shot "
+                "reconcile, or --no-watch for a rescan-only daemon)"
+            )
+            return 2
+        import boto3  # imported lazily so local mode has no boto3 dependency
+        from .s3_storage import S3Source
+        from .s3_producer import s3_event_producer
+
+        source = S3Source(boto3.client("s3"), args.s3_bucket, args.s3_prefix)
+
+        def start_producer() -> None:
+            threading.Thread(
+                target=s3_event_producer,
+                args=(boto3.client("sqs"), args.sqs_url, work_q, stop_event),
+                daemon=True,
+            ).start()
+            logger.info("watching s3://%s/%s via %s", args.s3_bucket, args.s3_prefix, args.sqs_url)
+    elif args.source == "gcs":
+        if not args.gcs_bucket:
+            logger.error("--source gcs requires --gcs-bucket")
+            return 2
+        from google.cloud import storage as gcs_storage_lib  # lazy: no google dep for local/s3
+        from .gcs_storage import GCSSource
+
+        # STORAGE_EMULATOR_HOST is auto-handled by the SDK (the fake-gcs leg).
+        source = GCSSource(gcs_storage_lib.Client(), args.gcs_bucket, args.gcs_prefix)
+
+        def start_producer() -> None:
+            # GCS has no live-event producer wired today (Pub/Sub is future work,
+            # mirroring S3's SQS); the periodic rescan keeps the catalog in sync.
+            logger.info("watching gcs://%s/%s (rescan-only; --once for a one-shot build)",
+                        args.gcs_bucket, args.gcs_prefix)
+    else:
+        if not os.path.isdir(args.watch_root):
+            logger.error("watch_root is not a directory: %s", args.watch_root)
+            return 2
+        source = LocalSource(args.watch_root, args.stability_checks, args.stability_interval)
+
+        def start_producer() -> None:
+            nonlocal observer, handler
+            handler = McapEventHandler(work_q, args.debounce)
+            observer = start_observer(args.watch_root, handler)
+            logger.info("watching %s", args.watch_root)
+
+    # Single-writer enforcement (CATALOG_CONTRACT.md §11): acquire the per-DB
+    # writer lock BEFORE any DB write or tag-socket bind, in BOTH daemon and
+    # --once modes. A second builder on the same --db (e.g. a --once --rebuild
+    # racing a live daemon, or a double-started deploy) fails fast here with
+    # exit code 3 instead of interleaving writes / stealing the tag socket.
+    # Held for the process lifetime (released in the finally below for
+    # in-process callers like the tests; the kernel also auto-releases it on
+    # any process death, so a crash never leaves a stale lock).
+    try:
+        writer_lock = acquire_writer_lock(args.db)
+    except WriterLockError as e:
+        logger.error("%s", e)
+        return 3
+    try:
+        return _locked_main(args, source, start_producer, work_q, stop_event,
+                            lambda: observer, lambda: handler)
+    finally:
+        writer_lock.release()
+
+
+def _locked_main(args, source, start_producer, work_q, stop_event,
+                 get_observer, get_handler) -> int:
+    """The post-lock body of main(): everything that reads or writes the served
+    DB / binds the tag socket runs under the single-writer lock. The observer/
+    handler are read through GETTERS because the local-source start_producer
+    closure assigns them in main()'s scope (nonlocal) after this function has
+    already been entered."""
+    tag_server = None
+
+    # Create/rebuild path: the served DB does not exist yet, or --rebuild forces a
+    # from-scratch build. Either way, a reader must never observe a half-built
+    # catalog at the served path — build to a temp DB and publish atomically
+    # (catalog-migration §6.2a), instead of creating/mutating args.db directly.
+    use_publish = args.rebuild or not os.path.exists(args.db)
+
+    if use_publish:
+        logger.info("rebuild-publish (db=%s, rebuild=%s)", args.db, args.rebuild)
+        build_and_publish(
+            args.db, lambda c, ca: full_reconcile(c, ca, source, workers=args.extract_workers)
+        )
+        # One-shot mode: the publish above already built + published the full
+        # catalog. Exit cleanly without starting any producer/rescan thread — the
+        # caller (the Go read-only server, the cross-language e2e, CI) takes over
+        # the DB from here.
+        if args.once:
+            logger.info("--once --rebuild: publish complete, exiting")
+            return 0
+        # Daemon mode: continue watching the just-PUBLISHED path in place (the
+        # normal in-place-mutation norm resumes from here on).
+        conn = open_db(args.db)
+        caches = load_caches(conn)
+    else:
+        conn = open_db(args.db)
+        caches = load_caches(conn)
+
+        logger.info("startup reconcile (db=%s)", args.db)
+        full_reconcile(conn, caches, source, workers=args.extract_workers)  # synchronous, before watching
+
+        # One-shot mode: the synchronous reconcile above already built the full catalog.
+        # Exit cleanly without starting any producer/rescan thread — the caller (the
+        # Go read-only server, the cross-language e2e, CI) takes over the DB from here.
+        if args.once:
+            conn.close()
+            logger.info("--once: reconcile complete, exiting")
+            return 0
+
+    # Tag-edit IPC (D2(a)): daemon mode only (both --once early-returns above
+    # already skip this), and only after the served DB is open in-place — a
+    # client edit must never race the initial reconcile/publish.
+    if args.tag_socket:
+        tag_server = TagEditServer(args.tag_socket, work_q)
+        threading.Thread(target=tag_server.serve_forever, daemon=True).start()
+        logger.info("tag-edit IPC listening on %s", args.tag_socket)
+
+    if args.no_watch:
+        # Rescan-only daemon: no watchdog/inotify observer, no SQS long-poll
+        # thread — files are discovered purely by the periodic rescan thread
+        # started below. `observer`/`handler` stay None, so the shutdown
+        # `finally` block below is naturally a no-op for them.
+        logger.info(
+            "discovery is rescan-only (--no-watch): interval=%ss", args.rescan_interval
+        )
+    else:
+        start_producer()  # begin enqueuing live events only after the reconcile
+
+    def rescan_loop() -> None:
+        while not stop_event.wait(args.rescan_interval):
+            work_q.put(WatchEvent("rescan"))
+
+    threading.Thread(target=rescan_loop, daemon=True).start()
+
+    def _on_signal(_signum, _frame) -> None:
+        work_q.put(WatchEvent("stop"))
+
+    signal.signal(signal.SIGINT, _on_signal)
+    signal.signal(signal.SIGTERM, _on_signal)
+
+    try:
+        worker_loop(conn, caches, source, work_q, workers=args.extract_workers)
+    finally:
+        stop_event.set()
+        if tag_server is not None:
+            tag_server.shutdown()
+            tag_server.server_close()  # also unlinks the socket file
+        handler = get_handler()
+        if handler is not None:
+            handler.cancel_timers()
+        observer = get_observer()
+        if observer is not None:
+            observer.stop()
+            observer.join()
+        conn.close()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

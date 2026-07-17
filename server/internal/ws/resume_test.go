@@ -300,7 +300,6 @@ func TestSession_OverlapRejected(t *testing.T) {
 	c := dialClient(t, ts.url)
 	c.hello()
 
-
 	c.send(&pb.ClientMessage{RequestId: 40, Payload: &pb.ClientMessage_OpenSession{
 		OpenSession: &pb.OpenSessionRequest{Mode: &pb.OpenSessionRequest_Fresh{
 			Fresh: &pb.OpenFresh{S3Keys: fileKeys("a_"+zegTestKey, "b_"+zegTestKey)},

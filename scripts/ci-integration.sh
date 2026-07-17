@@ -54,7 +54,7 @@ export GOTOOLCHAIN=local
 export PJ_CI_BUILDER_PYTHON
 [[ -x "${PJ_CI_BUILDER_PYTHON}" ]] || { echo "[ci-integration] ERROR: PJ_CI_BUILDER_PYTHON=${PJ_CI_BUILDER_PYTHON} is not an executable file" >&2; exit 1; }
 [[ -f "${MCAP_CATALOG_DIR}/mcap_catalog_builder/__main__.py" ]] \
-  || { echo "[ci-integration] ERROR: mcap_catalog submodule not initialized at ${MCAP_CATALOG_DIR} (git submodule update --init)" >&2; exit 1; }
+  || { echo "[ci-integration] ERROR: vendored builder not found at ${MCAP_CATALOG_DIR}/mcap_catalog_builder (expected in-repo under mcap_catalog/)" >&2; exit 1; }
 
 # ── tunables ─────────────────────────────────────────────────────────────────
 MINIO_PORT="${PJ_CI_MINIO_PORT:-19010}"

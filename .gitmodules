@@ -1,3 +1,0 @@
-[submodule "mcap_catalog"]
-	path = mcap_catalog
-	url = git@github.com:AurynRobotics/mcap_server.git

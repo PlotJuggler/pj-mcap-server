@@ -100,33 +100,17 @@ jobs:
   builder-tests:
     # M6 §5.4: the Python mcap_catalog builder's own pytest suite (schema,
     # key-parsing round-trip, reconcile, dedup/topic-set, tag-edit IPC,
-    # atomic-publish/rebuild, ...). Needs the submodule checked out. No cloud
-    # SDKs required: the S3/GCS clients are injected/test-doubled (see
-    # mcap_catalog/CLAUDE.md's storage `Source` seam) — this job proves the
-    # builder library itself, independent of the {s3,gcs} integration legs
-    # below (which exercise it as a real subprocess against real emulators).
+    # atomic-publish/rebuild, single-writer lock, ...). The builder is now
+    # VENDORED directly in this repo (mcap_catalog/, no longer a submodule), so
+    # a plain checkout has it. No cloud SDKs required: the S3/GCS clients are
+    # injected/test-doubled (see mcap_catalog/CLAUDE.md's storage `Source`
+    # seam) — this job proves the builder library itself, independent of the
+    # {s3,gcs} integration legs below (which exercise it as a real subprocess
+    # against real emulators).
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
-        with:
-          submodules: true
-          # ⚠️ FORWARD-PROVISIONING (read before activating this workflow on
-          # GitHub): mcap_catalog's .gitmodules URL is
-          # git@github.com:AurynRobotics/mcap_server.git — a PRIVATE repo in a
-          # DIFFERENT org (AurynRobotics) than this repo's org (PlotJuggler).
-          # actions/checkout's default GITHUB_TOKEN can only fetch submodules
-          # within the SAME repo/org it was minted for, so `submodules: true`
-          # alone CANNOT fetch this one. Before CI is ever activated on GitHub:
-          #   1. Create a READ-ONLY deploy key on AurynRobotics/mcap_server
-          #      (repo Settings -> Deploy keys -> Add deploy key; do NOT allow
-          #      write access).
-          #   2. Add its PRIVATE half as the `MCAP_CATALOG_DEPLOY_KEY` secret on
-          #      THIS repo (Settings -> Secrets and variables -> Actions).
-          # Without both steps this job's checkout step fails immediately (a
-          # submodule-fetch permission error), before any test runs — expected
-          # and by design until the secret is provisioned.
-          ssh-key: ${{ secrets.MCAP_CATALOG_DEPLOY_KEY }}
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -177,21 +161,10 @@ jobs:
           --health-timeout 3s
           --health-retries 20
     steps:
+      # M6 §5.4: the ci_integration test invokes the Python builder as a real
+      # subprocess (mcap_catalog/mcap_catalog_builder), now VENDORED in this
+      # repo — a plain checkout has it (no submodule, no deploy key).
       - uses: actions/checkout@v4
-        with:
-          # M6 §5.4: the ci_integration test invokes the Python builder as a real
-          # subprocess (mcap_catalog/mcap_catalog_builder), so the submodule must
-          # actually be checked out here (unlike unit/race/seam, which never touch it).
-          submodules: true
-          # ⚠️ FORWARD-PROVISIONING (see the identical note on the builder-tests
-          # job above): mcap_catalog is a PRIVATE submodule in a DIFFERENT org
-          # (AurynRobotics) than this repo (PlotJuggler) — the default
-          # GITHUB_TOKEN cannot fetch it. A READ-ONLY deploy key on
-          # AurynRobotics/mcap_server must be created and its private half
-          # stored as the `MCAP_CATALOG_DEPLOY_KEY` secret on THIS repo BEFORE
-          # CI is activated on GitHub; until then this checkout step fails at
-          # the submodule-fetch step, by design.
-          ssh-key: ${{ secrets.MCAP_CATALOG_DEPLOY_KEY }}
       - uses: actions/setup-go@v5
         with:
           go-version: "1.23"

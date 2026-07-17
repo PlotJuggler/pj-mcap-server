@@ -1,0 +1,125 @@
+# mcap_server — Catalog & Builder: Requirements
+
+Plain and intentionally lightweight for now. The executable schema in
+[`mcap_catalog_builder/schema.sql`](mcap_catalog_builder/schema.sql) is the source of truth for
+table structure; this file is the *why* and the *what*. Requirements are numbered
+(`R1`…) so they can be cited.
+
+## The pipeline (vision)
+
+1. MCAP recordings are **uploaded to the server** (today: a watched folder;
+   later: an S3/GCS bucket).
+2. The **catalog builder** detects each new / changed / removed file and keeps a
+   **SQLite catalog** in sync. It is the *single writer*.
+3. A **query / data server** (likely Go — not decided yet) reads that same
+   catalog and serves clients.
+4. A **client** (PlotJuggler plugin / CLI) asks which tags & metadata exist,
+   builds a query — *"give me the files in this time range matching these
+   tags"* — and gets back the matching files.
+5. The client selects a subset of those files and **streams their content
+   directly** — only the chosen topics, not whole files. *(Streaming is a
+   separate subsystem, not in this repo yet — see "Not in scope".)*
+
+The catalog is the hinge: browsing and filtering MUST be a fast database query,
+**never** a scan of the recordings themselves.
+
+## What the catalog stores
+
+Metadata *about* recordings — never the recorded messages:
+
+- **identity & location** — filename plus the path labels
+  `customer / site / robot / source / date` (the full object key is rebuildable
+  from these, so it isn't stored twice);
+- a **change fingerprint** — free from the storage listing, so detecting a change
+  needs no file read;
+- the **time span** (start / end);
+- the **set of signals** it contains (topic name + schema) and the **per-signal
+  message counts**;
+- **tags** (open-ended `key=value`) and a **health flag**.
+
+## Use cases (the queries the catalog must answer)
+
+- Enumerate available filter options (which customers / sites / robots / tags
+  exist) **without scanning the file list**.
+- Filter recordings by: **time-window overlap**; **"contains signal X"**; **tag**
+  (`key`, or `key=value`); **path dimensions**. Combine with AND.
+- **Page** through results at constant cost, however deep.
+- **Inspect one recording** (its signals, counts, time span, tags) with no file
+  read.
+- List recordings that **failed validation**, and — separately — files that
+  **could not be cataloged** at all.
+- Filter by a **numeric threshold on a signal** (e.g. *velocity > X*) — answered
+  from **cached per-signal aggregates**, not by reading files at query time
+  (*planned*; see R11–R13).
+
+## Requirements
+
+**Catalog builder**
+- **R1** — Single writer to the catalog; readers (the query server) run
+  concurrently (SQLite WAL).
+- **R2** — To catalog a file, read **only its MCAP summary/footer** (a few KB) plus
+  the path — never the whole file.
+- **R3** — Derive labels from the file's Hive-partitioned key; trust the parse
+  only if it **round-trips** back to the original key, else log a failure (keep
+  the raw key, skip the file) — never guess a wrong row.
+- **R4** — Detect change with a cheap **fingerprint from the listing** (S3 ETag /
+  GCS generation; locally `size + mtime`). Unchanged → skip with no read; a
+  restart over an cataloged lake re-reads **zero** files.
+- **R5** — Keep the catalog in sync: **insert** new, **re-catalog** changed,
+  **hard-delete** vanished; **reconcile** on startup. Each file's update is one
+  transaction.
+
+**Catalog**
+- **R6** — Store metadata only — **never** message payloads.
+- **R7** — **Deduplicate** the set of channels across files (most files share a
+  layout): store each layout once, point files at it, keep only the per-file
+  counts per file.
+- **R8** — Tags are **open-ended yet index-seekable** (arbitrary keys *and*
+  filterable at scale) — not a JSON blob.
+- **R9** — Browsing/filtering hits the catalog **only** (zero object-store reads)
+  and uses **keyset pagination** (a cursor on `id`), not `OFFSET`.
+
+**Scale**
+- **R10** — A filtered page costs the same at 100 files or 8,000,000 (pre-built
+  index + paginated seek → single-digit ms). Catalog size tracks file *count*,
+  not bytes (~0.7 GB per 1M files, thanks to R7). The cost that scales with the
+  lake is the **cold catalog build**, not queries — the main lever there is
+  cataloging files in parallel (not done yet).
+
+**Derived metrics (planned — schema forward-declared, not yet populated)**
+- **R11** — Expensive, payload-derived facts (per-signal `min`/`max`/`mean`/
+  percentiles) are computed **once** by a separate **content-aware** pass —
+  distinct from the metadata catalog builder, which never reads payloads (R2) — and cached
+  in `file_metrics`. A threshold query (*signal > X*) is then a fast catalog
+  range-scan for **any** X, never a re-read. Cache the **scalar** (e.g. the max),
+  not the boolean answer to one X.
+- **R12** — A cached metric is valid only for the exact file content it was
+  computed from: every row is stamped with the same change fingerprint (`etag`,
+  R4) and is stale the moment that changes (`ON DELETE CASCADE` drops metrics with
+  the file).
+- **R13** — Extraction is **asynchronous and off the query path** (R9's "fast
+  query, never a scan" still holds): client queries only **read** cached metrics;
+  a query against an un-computed metric reports *pending*, it never triggers a
+  scan. The ~90% of files with no queryable numeric data are detected once
+  (largely from the schema definitions already in the summary) and flagged in
+  `file_metric_status`, so they are never re-scanned; the ~10% are recomputed only
+  when their fingerprint changes.
+
+## Not in scope yet
+
+- The **streaming / download** path (reading chunks, filtering to the selected
+  topics/time, compressing, resume).
+- The **S3/GCS backend** — the catalog builder is local-filesystem today; the schema and
+  fingerprint requirements are already storage-agnostic.
+- **Human-edited tags** that survive a re-catalog.
+- **Parallel** cataloging.
+- The **metric-extraction pass** that populates `file_metrics` (R11–R13): the
+  tables are forward-declared in `schema.sql`, but nothing writes them yet.
+
+## See also
+
+- [`mcap_catalog_builder/`](mcap_catalog_builder/) — the running catalog builder + tests.
+- [`mcap_catalog_builder/schema.sql`](mcap_catalog_builder/schema.sql) — the executable catalog
+  schema (source of truth for tables).
+- [`mcap_catalog_builder/README.md`](mcap_catalog_builder/README.md) — the daemon's CLI and
+  behavior.
