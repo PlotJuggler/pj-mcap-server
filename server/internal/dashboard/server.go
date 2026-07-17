@@ -201,13 +201,15 @@ func (h *pageHandler) renderFileDetail(w http.ResponseWriter, r *http.Request, i
 		http.NotFound(w, r)
 		return
 	}
-	rec, err := catalog.GetFile(r.Context(), h.deps.Store, id)
+	// One leased snapshot for summary+topics+tags: three separate GetFile/
+	// ListTopicsForFile/EffectiveTags calls each lease independently, so a
+	// rebuild landing between them could render a mismatched or blank detail
+	// page (and topics.go itself runs two queries). GetFileDetail pins one.
+	rec, topics, tags, err := catalog.GetFileDetail(r.Context(), h.deps.Store, id)
 	if err != nil {
 		http.NotFound(w, r)
 		return
 	}
-	topics, _ := catalog.ListTopicsForFile(r.Context(), h.deps.Store, id)
-	tags, _ := catalog.EffectiveTags(r.Context(), h.deps.Store, id)
 	data := h.base(rec.S3Key)
 	data["ID"] = rec.ID
 	data["S3Key"] = rec.S3Key

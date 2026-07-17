@@ -273,7 +273,15 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer helloTimer.Stop()
 	// Per-connection panic recovery (spec §8.1): a panic in the write loop is
 	// recovered + counted; the connection tears down but the process survives.
-	go metrics.Guard(h.metrics, h.log, "ws-write-loop", func() { c.conn.runWriteLoop(writeCtx) })
+	// closeDone on EXIT (incl. a recovered panic) is mandatory now that Send* is
+	// BLOCKING: if the write loop dies without closing done, session consumers
+	// parked on bulkCh/priorityCh would hang forever (the read loop may be idle,
+	// so its teardown-time closeDone might not come soon). Idempotent (sync.Once),
+	// so it's a harmless no-op on the normal path where the read loop closes it.
+	go func() {
+		defer c.conn.closeDone()
+		metrics.Guard(h.metrics, h.log, "ws-write-loop", func() { c.conn.runWriteLoop(writeCtx) })
+	}()
 
 	// The read loop is likewise guarded: a panic dispatching one bad frame closes
 	// only THIS connection (loopErr stays nil so it's treated as a clean close —

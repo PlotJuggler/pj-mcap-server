@@ -16,6 +16,7 @@ package ws
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sort"
@@ -197,7 +198,13 @@ func (c *connState) openFresh(ctx context.Context, reqID uint64, fresh *pb.OpenF
 	// key => NOT_FOUND, before any storage read or session registration.
 	recs, err := catalog.GetFilesByKeys(ctx, d.Store, selKeys)
 	if err != nil {
-		c.sendError(reqID, 0, pb.ErrorCode_ERROR_NOT_FOUND, err.Error(), "")
+		// A well-formed but unknown key is NOT_FOUND; a SQLite/context/corrupt-
+		// catalog failure is INTERNAL (the client's selection was fine).
+		if errors.Is(err, catalog.ErrFileNotFound) {
+			c.sendError(reqID, 0, pb.ErrorCode_ERROR_NOT_FOUND, err.Error(), "")
+		} else {
+			c.sendError(reqID, 0, pb.ErrorCode_ERROR_INTERNAL, "catalog lookup failed", err.Error())
+		}
 		return
 	}
 	files := make([]session.FileRecord, 0, len(recs))
@@ -500,10 +507,18 @@ func (c *connState) spawnConsumer(state *session.SessionState, startAfterSeq uin
 	d := c.h.sess
 	consCtx, consCancel := context.WithCancel(context.Background())
 	handle := &subHandle{cancel: consCancel}
-	// BindConsumer atomically takes over the binding (cancelling any prior
+	// BindConsumerChecked atomically takes over the binding (cancelling any prior
 	// consumer, e.g. one on a half-open old connection) and returns the ownership
-	// token this connection's teardown presents to Detach.
-	handle.gen = d.Registry.BindConsumer(state.ID, consCancel)
+	// token this connection's teardown presents to Detach. ok=false means a
+	// Cancel/eviction removed the session in the window between Register/Reattach
+	// and here (a fast client Cancel racing the async open) — do NOT track or
+	// spawn a consumer, or it would orphan and emit a spurious Eos{COMPLETE}.
+	gen, ok := d.Registry.BindConsumerChecked(state.ID, consCancel)
+	if !ok {
+		consCancel()
+		return
+	}
+	handle.gen = gen
 	c.trackSubscription(state.ID, handle)
 
 	// Carry forward the cumulative delivered counters THROUGH startAfterSeq so the

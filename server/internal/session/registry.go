@@ -161,8 +161,14 @@ type Registry struct {
 	mu       sync.Mutex
 	sessions map[uint64]*SessionState
 	evictAt  map[uint64]*time.Timer
-	nextID   atomic.Uint64
-	opts     RegistryOpts
+	// evictEpoch guards against an eviction timer that has ALREADY FIRED and is
+	// blocked on r.mu when a Reattach (or a re-arm) supersedes it: every arming
+	// captures the current epoch, and the fired callback only proceeds when the
+	// epoch still matches. Reattach/arm bump it, so a stale fired timer becomes
+	// a no-op instead of cancelling a just-reattached session.
+	evictEpoch map[uint64]uint64
+	nextID     atomic.Uint64
+	opts       RegistryOpts
 
 	// onEvict, if set, is called (outside the registry lock) when a session is
 	// removed (cancel or eviction). The WS layer uses it to discard the retain
@@ -175,9 +181,10 @@ func NewRegistry(opts RegistryOpts) *Registry {
 		opts.MaxConcurrent = 64
 	}
 	return &Registry{
-		sessions: make(map[uint64]*SessionState),
-		evictAt:  make(map[uint64]*time.Timer),
-		opts:     opts,
+		sessions:   make(map[uint64]*SessionState),
+		evictAt:    make(map[uint64]*time.Timer),
+		evictEpoch: make(map[uint64]uint64),
+		opts:       opts,
 	}
 }
 
@@ -206,17 +213,27 @@ func (r *Registry) Lookup(id uint64) (*SessionState, bool) {
 	return s, ok
 }
 
-// BindConsumer records the active consumer's cancel func (called right after
-// spawning Consumer.Run) and CANCELS any prior binding — a resume takeover must
-// never leave two consumers draining the same retain buffer. Returns the new
-// binding's generation token; the owning connection presents it to Detach so a
-// stale teardown cannot touch a successor's binding.
+// BindConsumer is the (gen)-only convenience form; gen 0 means the session was
+// gone. Prefer BindConsumerChecked when the caller must distinguish "gone".
 func (r *Registry) BindConsumer(id uint64, cancel context.CancelFunc) uint64 {
+	gen, _ := r.BindConsumerChecked(id, cancel)
+	return gen
+}
+
+// BindConsumerChecked records the active consumer's cancel func (called right
+// after spawning Consumer.Run) and CANCELS any prior binding — a resume takeover
+// must never leave two consumers draining the same retain buffer. The
+// membership check and the install are ONE critical section under r.mu, so a
+// Cancel/eviction cannot remove the session between them (which would strand an
+// orphan consumer that later emits a spurious Eos{COMPLETE}). Returns
+// (generation, ok): ok=false means the session is gone and NOTHING was bound —
+// the caller must not track or spawn a consumer.
+func (r *Registry) BindConsumerChecked(id uint64, cancel context.CancelFunc) (uint64, bool) {
 	r.mu.Lock()
 	s, ok := r.sessions[id]
-	r.mu.Unlock()
 	if !ok {
-		return 0
+		r.mu.Unlock()
+		return 0, false
 	}
 	s.mu.Lock()
 	prev := s.consumerCancel
@@ -224,10 +241,11 @@ func (r *Registry) BindConsumer(id uint64, cancel context.CancelFunc) uint64 {
 	s.consumerGen++
 	gen := s.consumerGen
 	s.mu.Unlock()
+	r.mu.Unlock()
 	if prev != nil {
 		prev() // the replaced consumer exits via its ctx; the session stays live
 	}
-	return gen
+	return gen, true
 }
 
 // Detach marks the session as having no active WS consumer: it cancels the
@@ -264,16 +282,44 @@ func (r *Registry) armEvictLocked(id uint64) {
 	if t, ok := r.evictAt[id]; ok {
 		t.Stop()
 	}
-	if r.opts.RetainAfterDisconnect <= 0 {
-		// No retain window: evict immediately on the next tick of the scheduler.
-		r.evictAt[id] = time.AfterFunc(time.Nanosecond, func() { r.Cancel(id) })
+	// Bump the epoch and capture it: a timer callback that has already fired and
+	// is blocked on r.mu when a later Reattach/arm runs will see a stale epoch
+	// and no-op (evictFire), instead of cancelling a reattached session.
+	r.evictEpoch[id]++
+	epoch := r.evictEpoch[id]
+	d := r.opts.RetainAfterDisconnect
+	if d <= 0 {
+		d = time.Nanosecond // no retain window: evict on the next scheduler tick
+	}
+	r.evictAt[id] = time.AfterFunc(d, func() { r.evictFire(id, epoch) })
+}
+
+// evictFire is the retain-window eviction callback. It cancels the session ONLY
+// if the arming that scheduled it is still current (epoch match) — a Reattach or
+// a re-arm between the timer firing and this acquiring r.mu bumps the epoch,
+// making a stale fired timer a no-op.
+func (r *Registry) evictFire(id, epoch uint64) {
+	r.mu.Lock()
+	if r.evictEpoch[id] != epoch {
+		r.mu.Unlock()
+		return // superseded by a Reattach / re-arm
+	}
+	s, ok := r.sessions[id]
+	if !ok {
+		r.mu.Unlock()
 		return
 	}
-	r.evictAt[id] = time.AfterFunc(r.opts.RetainAfterDisconnect, func() { r.Cancel(id) })
+	delete(r.sessions, id)
+	delete(r.evictAt, id)
+	delete(r.evictEpoch, id)
+	r.mu.Unlock()
+	r.teardown(s)
 }
 
 // Reattach cancels any pending eviction so the producer's buffered batches can
-// be replayed to a new consumer. Returns ErrSessionMissing if already evicted.
+// be replayed to a new consumer. Bumps the eviction epoch so an
+// already-fired-but-pending eviction timer becomes a no-op (see evictFire).
+// Returns ErrSessionMissing if already evicted.
 func (r *Registry) Reattach(id uint64) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -284,6 +330,7 @@ func (r *Registry) Reattach(id uint64) error {
 		t.Stop()
 		delete(r.evictAt, id)
 	}
+	r.evictEpoch[id]++ // invalidate any fired-but-pending eviction timer
 	return nil
 }
 
@@ -302,9 +349,16 @@ func (r *Registry) Cancel(id uint64) {
 		t.Stop()
 		delete(r.evictAt, id)
 	}
+	delete(r.evictEpoch, id)
 	delete(r.sessions, id)
 	r.mu.Unlock()
+	r.teardown(s)
+}
 
+// teardown cancels a removed session's consumer + producer, discards its retain
+// buffer, and fires onEvict. Called (exactly once per session) by Cancel and
+// evictFire AFTER the session has been removed from the registry under r.mu.
+func (r *Registry) teardown(s *SessionState) {
 	s.mu.Lock()
 	if s.consumerCancel != nil {
 		s.consumerCancel()

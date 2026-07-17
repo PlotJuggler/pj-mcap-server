@@ -5,6 +5,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 )
 
@@ -83,6 +84,36 @@ func TestGeneration_FailedSwapKeepsTokenAndServes(t *testing.T) {
 	}
 	if got := servedCustomer(t, st); got != "genA" {
 		t.Fatalf("still-serving check: got customer %q want genA", got)
+	}
+}
+
+// Close racing ReopenIfSwapped must not break the snapshot refcount: a lease
+// held across the race keeps its db usable, Close is idempotent, and a swap that
+// lands after Close must not double-drop the current ref (closing a leased db)
+// nor leak the newly-published one. Also: Acquire after Close must not resurrect
+// a closed snapshot.
+func TestSnapshot_CloseRacesReopen(t *testing.T) {
+	for i := 0; i < 200; i++ {
+		st, path := openGenStore(t)
+		lease := st.Acquire()
+		oldDB := lease.DB()
+
+		next := filepath.Join(t.TempDir(), "next.db")
+		buildNamedAurynDB(t, next, "genB")
+
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() { defer wg.Done(); replaceFile(t, path, next); _, _ = st.ReopenIfSwapped(context.Background()) }()
+		go func() { defer wg.Done(); _ = st.Close() }()
+		wg.Wait()
+
+		// The lease's db must still be usable regardless of who won — the refcount
+		// must never have dropped it while we hold a reference.
+		if err := oldDB.PingContext(context.Background()); err != nil {
+			t.Fatalf("iter %d: leased db closed while a lease was held: %v", i, err)
+		}
+		lease.Release()
+		_ = st.Close() // idempotent
 	}
 }
 

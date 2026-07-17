@@ -16,6 +16,62 @@ func newState() *SessionState {
 	}
 }
 
+// Reattach must survive an eviction timer that has ALREADY fired and is blocked
+// on the registry mutex: the retain window expiring at the same instant a resume
+// reattaches must NOT destroy the just-reattached session (Codex fast-follow #1).
+func TestRegistry_ReattachBeatsFiredEvictionTimer(t *testing.T) {
+	// Zero retain window => armEvictLocked schedules the eviction on the next
+	// scheduler tick (time.Nanosecond), so it is essentially always "already
+	// firing" by the time we reattach — the exact race.
+	reg := NewRegistry(RegistryOpts{MaxConcurrent: 4, RetainAfterDisconnect: 0})
+	var evicted atomic.Bool
+	reg.SetOnEvict(func(*SessionState) { evicted.Store(true) })
+
+	for i := 0; i < 500; i++ {
+		s := newState()
+		reg.Register(context.Background(), s)
+		gen := reg.BindConsumer(s.ID, func() {})
+		reg.Detach(s.ID, gen) // arms the (immediate) eviction timer
+		// Reattach in the tiny window before/around the timer firing.
+		if err := reg.Reattach(s.ID); err != nil {
+			// The timer won the race and evicted first — acceptable outcome, the
+			// session is gone; skip this iteration.
+			reg.Cancel(s.ID)
+			continue
+		}
+		// Reattach SUCCEEDED: the session MUST still be alive a moment later —
+		// a fired eviction timer must not cancel it out from under us.
+		time.Sleep(2 * time.Millisecond)
+		if _, ok := reg.Lookup(s.ID); !ok {
+			t.Fatalf("iter %d: session evicted AFTER a successful Reattach (fired timer won)", i)
+		}
+		reg.Cancel(s.ID)
+	}
+	_ = evicted
+}
+
+// BindConsumer must be membership-atomic: a Cancel racing the bind either binds
+// to a live session (returns ok) or reports the session gone (ok=false) — it
+// must never install a consumer on an already-removed session, and the caller
+// must be able to tell.
+func TestRegistry_BindConsumerReportsMissingSession(t *testing.T) {
+	reg := NewRegistry(RegistryOpts{MaxConcurrent: 4})
+	// Never registered.
+	if _, ok := reg.BindConsumerChecked(999, func() {}); ok {
+		t.Fatal("BindConsumerChecked on a missing session must report ok=false")
+	}
+	s := newState()
+	reg.Register(context.Background(), s)
+	gen, ok := reg.BindConsumerChecked(s.ID, func() {})
+	if !ok || gen == 0 {
+		t.Fatalf("BindConsumerChecked on a live session: gen=%d ok=%v", gen, ok)
+	}
+	reg.Cancel(s.ID)
+	if _, ok := reg.BindConsumerChecked(s.ID, func() {}); ok {
+		t.Fatal("BindConsumerChecked after Cancel must report ok=false")
+	}
+}
+
 func TestRegistry_RegisterLookupCapacity(t *testing.T) {
 	reg := NewRegistry(RegistryOpts{MaxConcurrent: 2, RetainAfterDisconnect: time.Minute})
 	ctx := context.Background()

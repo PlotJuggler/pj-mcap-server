@@ -55,11 +55,17 @@ func (sn *snapshot) release() {
 // for single-shot reads (health ping, one-query lookups) where a transient
 // closed-handle error on a swap boundary is acceptable.
 type Store struct {
-	// mu guards cur (the published snapshot pointer) and closed. Acquire/swap/
-	// Close are all sub-microsecond critical sections.
-	mu     sync.Mutex
-	cur    *snapshot
-	closed bool
+	// mu guards cur (the published snapshot pointer), closed, and curRefLive.
+	// Acquire/swap/Close are all sub-microsecond critical sections.
+	mu  sync.Mutex
+	cur *snapshot
+	// curRefLive is true while s.cur still holds an un-dropped "current" ref.
+	// publish (on swap) and Close both want to drop that ref exactly once;
+	// whichever flips this from true under s.mu does the single drop, so a
+	// Close racing a ReopenIfSwapped can neither double-drop (closing a
+	// still-leased db) nor leak the retired snapshot.
+	curRefLive bool
+	closed     bool
 
 	// epoch is this server process's random 128-bit generation namespace; the
 	// token is epoch||ordinal, so tokens can never collide across restarts and
@@ -90,13 +96,23 @@ func (s *Store) newGenToken(ordinal uint64) []byte {
 
 // publish installs sn as the current snapshot (holding its "current" ref) and
 // retires the previous one, whose db then closes once its last lease releases.
+// If the Store has already been Closed, sn is NOT installed — its current ref is
+// dropped so it closes cleanly (a ReopenIfSwapped that raced shutdown must not
+// leak the db it just opened).
 func (s *Store) publish(sn *snapshot) {
 	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		sn.release() // never became current; drop its ref so it closes
+		return
+	}
 	old := s.cur
+	oldLive := s.curRefLive
 	s.cur = sn
+	s.curRefLive = true
 	s.mu.Unlock()
-	if old != nil {
-		old.release() // drop the "current" ref; leases keep it alive until they finish
+	if old != nil && oldLive {
+		old.release() // drop the retired "current" ref; leases keep it alive until they finish
 	}
 }
 
@@ -134,6 +150,16 @@ func (l *Snapshot) Release() {
 func (s *Store) Acquire() *Snapshot {
 	s.mu.Lock()
 	sn := s.cur
+	if s.closed {
+		// Shutting down: do NOT resurrect a possibly-zero-ref snapshot. Hand back
+		// a pre-released lease over the (closed) handle — DB() then yields the
+		// closed *sql.DB and the caller's query fails cleanly, the accepted
+		// shutdown transient. No refcount is touched.
+		s.mu.Unlock()
+		l := &Snapshot{sn: sn}
+		l.released.Store(true)
+		return l
+	}
 	sn.refs.Add(1)
 	s.mu.Unlock()
 	return &Snapshot{sn: sn}
@@ -168,7 +194,9 @@ func (s *Store) identitySnapshot() fileIdentity {
 }
 
 // Close retires the current snapshot. Idempotent: a second Close (a shutdown
-// race) is a no-op. Held leases keep their handle alive until they Release.
+// race) is a no-op. Held leases keep their handle alive until they Release
+// (drain-then-close); the current ref is dropped exactly once (curRefLive),
+// so a concurrent ReopenIfSwapped can't also drop it.
 func (s *Store) Close() error {
 	s.mu.Lock()
 	if s.closed {
@@ -177,8 +205,12 @@ func (s *Store) Close() error {
 	}
 	s.closed = true
 	cur := s.cur
+	live := s.curRefLive
+	s.curRefLive = false
 	s.mu.Unlock()
-	cur.release() // drop the "current" ref
+	if cur != nil && live {
+		cur.release() // drop the "current" ref
+	}
 	return nil
 }
 
@@ -192,5 +224,6 @@ func (s *Store) initSnapshots(db *sql.DB, ident fileIdentity) error {
 	first := &snapshot{db: db, ident: ident, gen: s.newGenToken(s.ordinal)}
 	first.refs.Store(1) // the "current" ref
 	s.cur = first
+	s.curRefLive = true
 	return nil
 }

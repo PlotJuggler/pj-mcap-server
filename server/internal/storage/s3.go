@@ -193,7 +193,12 @@ func classify(err error) error {
 	if errors.As(err, &apiErr) {
 		switch code := apiErr.ErrorCode(); {
 		case code == "NoSuchKey" || code == "NotFound" || code == "NoSuchBucket" ||
-			code == "AccessDenied" || code == "Forbidden" || strings.HasPrefix(code, "InvalidAccessKeyId"):
+			code == "AccessDenied" || code == "Forbidden" || strings.HasPrefix(code, "InvalidAccessKeyId") ||
+			// PreconditionFailed = a GetRangeVersioned If-Match miss: the object
+			// was overwritten (a new version). Retrying can NEVER succeed against
+			// this ETag, so it is PERMANENT — retrying just delays the clean
+			// "object changed mid-session" failure.
+			code == "PreconditionFailed" || code == "412":
 			return fmt.Errorf("%w: %v", ErrPermanent, err)
 		default:
 			return fmt.Errorf("%w: %v", ErrTransient, err)

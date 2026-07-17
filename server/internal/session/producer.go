@@ -139,6 +139,15 @@ func (p *Producer) Run(ctx context.Context) error {
 		if mErr != nil {
 			return fmt.Errorf("session: marshal batch: %w", mErr)
 		}
+		// Record the ledger (the resume watermark) BEFORE making the batch
+		// visible: Retain.Append wakes a parked consumer, which can deliver this
+		// seq to the client before we return. If the ledger lagged (OnAppend
+		// after Append), a drop in that window would let openResume reject a
+		// VALID cursor N as "beyond watermark N-1". Ledger-first makes
+		// HighestAppendedSeq always >= any seq a consumer could have delivered.
+		if p.OnAppend != nil {
+			p.OnAppend(batch.Seq, uint64(len(msgs)), uint64(len(payload)))
+		}
 		p.Retain.Append(BatchEnvelope{
 			Seq:          batch.Seq,
 			SourceFileID: sourceFileID,
@@ -146,9 +155,6 @@ func (p *Producer) Run(ctx context.Context) error {
 			Messages:     uint64(len(msgs)),
 			Payload:      payload,
 		})
-		if p.OnAppend != nil {
-			p.OnAppend(batch.Seq, uint64(len(msgs)), uint64(len(payload)))
-		}
 		return nil
 	}
 
