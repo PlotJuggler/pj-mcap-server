@@ -156,8 +156,13 @@ void BackendConnection::onBinaryFrame(const std::string& bytes) {
   if (session_active_ &&
       (message->has_batch() || message->has_progress() || message->has_eos() || message->has_error())) {
     const std::uint64_t sub = message->subscription_id();
-    if (sub != 0 && session_subscription_id_ != 0 && sub != session_subscription_id_) {
-      return;  // frame for a different subscription — drop
+    if (session_subscription_id_ != 0 && sub != session_subscription_id_) {
+      // We know our active subscription id: drop anything that isn't it —
+      // including a zero-id frame (a misbehaving/duplicate peer could otherwise
+      // terminate the wrong stream with a zero-id Eos/Error). A zero-id frame is
+      // accepted ONLY when we ourselves don't yet know a nonzero id (older
+      // server that omits the field, matched against session_subscription_id_==0).
+      return;
     }
     // Account the wire size (compressed batch body + framing) BEFORE the decode
     // in the download loop turns it into the larger decompressed payload total.
@@ -634,7 +639,12 @@ bool BackendConnection::sendFrame(const pj_cloud::v1::ClientMessage& request) {
 
 bool BackendConnection::waitSessionFrame(std::chrono::milliseconds timeout, pj_cloud::v1::ServerMessage* out) {
   std::unique_lock<std::mutex> lock(mu_);
-  const bool got = cv_.wait_for(lock, timeout, [&] { return socket_closed_ || !session_inbox_.empty(); });
+  // Wake on cancellation too, so cancelSession()'s notify_all promptly unblocks
+  // this wait instead of stranding it for the full frame timeout (the caller
+  // re-checks cancel_requested_ on the false return).
+  const bool got = cv_.wait_for(lock, timeout, [&] {
+    return socket_closed_ || !session_inbox_.empty() || cancel_requested_.load();
+  });
   if (!got) {
     return false;  // timeout with nothing queued
   }
@@ -806,6 +816,19 @@ BackendConnection::FrameLoopResult BackendConnection::runFrameLoop(const Session
 
     pj_cloud::v1::ServerMessage msg;
     if (!waitSessionFrame(kFrameTimeout, &msg)) {
+      // A cancel that woke the wait (empty inbox, socket still up) is NOT a
+      // transport drop — do not classify it resumable (which would reconnect a
+      // session the user is trying to stop). Send the wire Cancel (if not yet)
+      // and terminate as Cancelled; the resume loop then stops.
+      if (cancel_requested_.load()) {
+        if (!cancel_sent) {
+          send_cancel();
+        }
+        stats.eos = SessionEos::Cancelled;
+        finish();
+        result.last_seq = last_seq;
+        return result;
+      }
       // Transport drop / timeout with no terminal Eos -> RESUMABLE.
       stats.error = "session frame timeout or socket closed mid-stream";
       stats.eos = SessionEos::Unset;
@@ -994,12 +1017,26 @@ bool BackendConnection::openSessionResume(std::uint64_t subscription_id, std::ui
 
   // Arm the inbox BEFORE sending (same race fix as openSessionFresh): the server
   // may begin replaying batches immediately after the OpenSessionResponse.
+  // Do NOT clear cancel_requested_ here: a cancel that arrived during the
+  // reconnect (after the resume loop's pre-reconnect checks) must SURVIVE into
+  // the resumed frame loop and stop it — clearing it would let a cancelled
+  // download silently continue. (openSessionFresh clears it because a fresh
+  // download legitimately starts a new cancel scope; a resume does not.)
   {
     std::lock_guard<std::mutex> lock(mu_);
     session_active_ = true;
     session_subscription_id_ = subscription_id;
     session_inbox_.clear();
-    cancel_requested_.store(false);
+  }
+  // A cancel that landed just before we arm must not be missed: re-check and, if
+  // set, bail before sending OpenResume (the caller treats a false return during
+  // an active cancel as Cancelled).
+  if (cancel_requested_.load()) {
+    std::lock_guard<std::mutex> lock(mu_);
+    session_active_ = false;
+    session_inbox_.clear();
+    set_error("cancelled during resume");
+    return false;
   }
 
   pj_cloud::v1::ServerMessage response;
@@ -1063,33 +1100,40 @@ SessionStats BackendConnection::downloadSessionResumable(const SessionInfo& info
     return cumulative;
   };
 
+  // armed = a live session is ready to stream. The initial session was armed by
+  // openSessionFresh before this call. A failed reconnect/resume sets it false so
+  // the loop skips runFrameLoop (which would otherwise block the full frame
+  // timeout on a dead socket — a pointless ~60s delay before the next retry) and
+  // goes straight to the next backoff attempt.
+  bool armed = true;
   for (;;) {
-    const bool first_attempt = (attempts_used == 0);
-    FrameLoopResult result = runFrameLoop(info, on_message, resume_cursor, first_attempt);
-    resume_cursor = result.last_seq;
+    if (armed) {
+      const bool first_attempt = (attempts_used == 0);
+      FrameLoopResult result = runFrameLoop(info, on_message, resume_cursor, first_attempt);
+      resume_cursor = result.last_seq;
 
-    // Fold this leg's running counters into the cumulative total.
-    cumulative.messages_received += result.stats.messages_received;
-    cumulative.bytes_received += result.stats.bytes_received;
-    cumulative.batches_received += result.stats.batches_received;
+      // Fold this leg's running counters into the cumulative total.
+      cumulative.messages_received += result.stats.messages_received;
+      cumulative.bytes_received += result.stats.bytes_received;
+      cumulative.batches_received += result.stats.batches_received;
 
-    if (!result.resumable) {
-      // Terminal leg: carry its Eos totals + reason as the cumulative result.
-      cumulative.eos = result.stats.eos;
-      cumulative.eos_total_messages_sent = result.stats.eos_total_messages_sent;
-      cumulative.eos_total_bytes_sent = result.stats.eos_total_bytes_sent;
-      cumulative.error = result.stats.error;
-      cumulative.wire_bytes_received = session_wire_bytes_.load(std::memory_order_relaxed);
-      return cumulative;
-    }
+      if (!result.resumable) {
+        // Terminal leg: carry its Eos totals + reason as the cumulative result.
+        cumulative.eos = result.stats.eos;
+        cumulative.eos_total_messages_sent = result.stats.eos_total_messages_sent;
+        cumulative.eos_total_bytes_sent = result.stats.eos_total_bytes_sent;
+        cumulative.error = result.stats.error;
+        cumulative.wire_bytes_received = session_wire_bytes_.load(std::memory_order_relaxed);
+        return cumulative;
+      }
 
-    // Resumable transport drop. A cancel observed (or requested) before/around
-    // the drop means the user wants to stop — do NOT reconnect.
-    if (cancel_requested_.load() || result.stats.eos == SessionEos::Cancelled) {
-      return finalize(SessionEos::Cancelled, {});
-    }
-
-    last_reason = result.stats.error;
+      // Resumable transport drop. A cancel observed (or requested) before/around
+      // the drop means the user wants to stop — do NOT reconnect.
+      if (cancel_requested_.load() || result.stats.eos == SessionEos::Cancelled) {
+        return finalize(SessionEos::Cancelled, {});
+      }
+      last_reason = result.stats.error;
+    }  // end if (armed)
 
     if (attempts_used >= kMaxResumeAttempts) {
       // Out of attempts: fail cleanly, partial rows kept (eos stays Unset).
@@ -1122,7 +1166,8 @@ SessionStats BackendConnection::downloadSessionResumable(const SessionInfo& info
     std::string reconnect_err;
     if (!reconnectAndHello(&reconnect_err)) {
       last_reason = reconnect_err.empty() ? std::string("reconnect failed") : reconnect_err;
-      continue;  // next attempt (or out-of-attempts on the next loop)
+      armed = false;  // skip runFrameLoop; go straight to the next backoff attempt
+      continue;
     }
 
     // OpenResume with the last fully-delivered seq.
@@ -1135,9 +1180,11 @@ SessionStats BackendConnection::downloadSessionResumable(const SessionInfo& info
         return finalize(SessionEos::Error, resume_err);
       }
       last_reason = resume_err.empty() ? std::string("resume failed") : resume_err;
-      continue;  // transport failure on resume -> next attempt
+      armed = false;  // skip runFrameLoop; go straight to the next backoff attempt
+      continue;
     }
     // Re-armed: loop back into runFrameLoop seeded with resume_cursor.
+    armed = true;
   }
 }
 

@@ -254,7 +254,20 @@ void FetchWorker::updateTagsAsync(std::string sequence_name,
     return;
   }
 
-  std::vector<SequenceInfo> sequences = backend_->listSequences();
+  // Re-list to refresh the flat metadata + Lua filter view. Guard on the
+  // `complete` flag exactly like the browse path (listSequencesAsync): a PARTIAL
+  // re-list (a page dropped, or a rebuild racing the pagination) must NOT replace
+  // the dialog's authoritative catalog with a truncated snapshot — surface it as
+  // an error and keep the existing view instead.
+  bool complete = false;
+  std::vector<SequenceInfo> sequences = backend_->listSequences(&complete);
+  if (!complete) {
+    if (errorOccurred) {
+      errorOccurred("Tag saved, but the recording-list refresh was incomplete "
+                    "(server paging error) — the list may be stale; retry to refresh.");
+    }
+    return;
+  }
   std::vector<std::string> names;
   names.reserve(sequences.size());
   for (const auto& s : sequences) {
