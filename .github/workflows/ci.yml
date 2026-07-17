@@ -201,7 +201,10 @@ jobs:
 
       # ── S3 leg seed: create bucket + upload fixtures via the mc image,
       # preserving each fixture's Hive-partitioned RELATIVE key (not just its
-      # basename) — the auryn builder only catalogs Hive-partitioned keys. ────
+      # basename) — the auryn builder only catalogs Hive-partitioned keys.
+      # Uses `mc cp --recursive` (which mirrors the directory tree, keeping the
+      # Hive path) rather than a `find | mc cp` loop: the minio/mc image has NO
+      # `find` binary, so the loop silently uploaded nothing. ─────────────────
       - name: seed Minio (s3 leg)
         if: matrix.backend == 's3'
         run: |
@@ -211,11 +214,7 @@ jobs:
               set -e
               mc alias set local http://localhost:9000 ciadmin cipassword123
               mc mb -p local/ci-fixtures
-              cd /fixtures
-              find . -name "*.mcap" | while read -r f; do
-                rel="${f#./}"
-                mc cp -q "$f" "local/ci-fixtures/$rel"
-              done
+              mc cp --recursive /fixtures/ local/ci-fixtures/
               echo "seeded:"; mc ls --recursive local/ci-fixtures
             '
 
