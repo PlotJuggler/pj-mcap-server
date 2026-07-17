@@ -23,6 +23,7 @@ import (
 	"log/slog"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"nhooyr.io/websocket"
@@ -60,6 +61,14 @@ const (
 	// readLimit caps inbound frames. Session control frames are tiny; the cap is
 	// generous for OpenFresh with many file_ids.
 	readLimit = 8 << 20 // 8 MiB
+	// defaultHelloDeadline bounds how long a connection may sit unauthenticated:
+	// a peer that never completes a successful Hello is closed at the deadline
+	// rather than lingering until the keepalive reaper notices it.
+	defaultHelloDeadline = 10 * time.Second
+	// authFailFlushGrace is the short window closeAfterAuthFailure gives the
+	// write loop to flush the queued AUTH_FAILED error frame before the socket
+	// is torn down.
+	authFailFlushGrace = 250 * time.Millisecond
 )
 
 // readOnlyTagEditMessage is the operator-facing message for "tag editing is
@@ -115,7 +124,13 @@ type Handler struct {
 	// is off (the default until SetResponseCompression is called; catalog-only
 	// test handlers stay raw).
 	compressor *responseCompressor
+	// helloDeadline overrides defaultHelloDeadline when > 0 (tests).
+	helloDeadline time.Duration
 }
+
+// SetHelloDeadline overrides the unauthenticated-connection deadline (tests;
+// 0 keeps the default).
+func (h *Handler) SetHelloDeadline(d time.Duration) { h.helloDeadline = d }
 
 // SetResponseCompression enables (or disables) the compressed-envelope path from
 // the transport config. Builds the shared zstd encoder once; a disabled config
@@ -239,6 +254,20 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		remote: remote,
 		subs:   map[uint64]*subHandle{},
 	}
+	// Hello deadline: a connection that never authenticates must not linger
+	// until the keepalive reaper notices it — close it at the deadline. Checked
+	// at fire time so a successful Hello simply lets the timer lapse.
+	hd := h.helloDeadline
+	if hd <= 0 {
+		hd = defaultHelloDeadline
+	}
+	helloTimer := time.AfterFunc(hd, func() {
+		if !c.authenticated.Load() {
+			h.log.Warn("ws: no successful Hello within deadline; closing", "remote", remote, "deadline", hd)
+			_ = wsConn.Close(websocket.StatusPolicyViolation, "Hello deadline exceeded")
+		}
+	})
+	defer helloTimer.Stop()
 	// Per-connection panic recovery (spec §8.1): a panic in the write loop is
 	// recovered + counted; the connection tears down but the process survives.
 	go metrics.Guard(h.metrics, h.log, "ws-write-loop", func() { c.conn.runWriteLoop(writeCtx) })
@@ -263,10 +292,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 type connState struct {
-	h             *Handler
-	conn          *conn
-	remote        string
-	authenticated bool
+	h      *Handler
+	conn   *conn
+	remote string
+	// authenticated flips true on the first successful Hello. Atomic because the
+	// Hello-deadline timer goroutine reads it while the read loop writes it.
+	authenticated atomic.Bool
 
 	// subs maps each subscription id whose consumer is attached to this connection
 	// to its handle (consumer cancel + a "detaching" flag). disconnect detaches
@@ -281,6 +312,10 @@ type connState struct {
 type subHandle struct {
 	cancel    context.CancelFunc
 	detaching bool // set true by detachAll before cancelling: "keep session, resume"
+	// gen is the registry ownership token from BindConsumer: detachAll presents
+	// it so a stale connection's teardown cannot detach a consumer that a newer
+	// connection has since taken over (resume takeover).
+	gen uint64
 }
 
 func (c *connState) trackSubscription(id uint64, h *subHandle) {
@@ -312,15 +347,18 @@ func (c *connState) detachAll() {
 	if c.h.sess == nil {
 		return
 	}
+	type ownedSub struct{ id, gen uint64 }
 	c.mu.Lock()
-	ids := make([]uint64, 0, len(c.subs))
+	subs := make([]ownedSub, 0, len(c.subs))
 	for id, h := range c.subs {
 		h.detaching = true
-		ids = append(ids, id)
+		subs = append(subs, ownedSub{id: id, gen: h.gen})
 	}
 	c.mu.Unlock()
-	for _, id := range ids {
-		c.h.sess.Registry.Detach(id)
+	for _, s := range subs {
+		// Generation-checked: a no-op if a resume on another connection has
+		// since taken the binding over (this connection is a stale owner).
+		c.h.sess.Registry.Detach(s.id, s.gen)
 	}
 }
 
@@ -407,11 +445,34 @@ func (c *connState) dispatch(ctx context.Context, msg *pb.ClientMessage) {
 }
 
 func (c *connState) requireAuth(reqID uint64) bool {
-	if c.authenticated {
+	if c.authenticated.Load() {
 		return true
 	}
 	c.sendError(reqID, 0, pb.ErrorCode_ERROR_AUTH_FAILED, "Hello handshake required before this operation", "")
 	return false
+}
+
+// closeAfterAuthFailure tears the socket down after a failed Hello credential
+// check, giving the write loop a short window to flush the queued AUTH_FAILED
+// error frame first. Closing unblocks the read loop, so a peer with a bad token
+// gets exactly one Error frame per connection — never an in-connection retry
+// loop against the constant-time compare.
+func (c *connState) closeAfterAuthFailure() {
+	ws := c.conn.ws
+	if ws == nil {
+		return // write-only unit fixtures have no real socket
+	}
+	go func() {
+		deadline := time.Now().Add(authFailFlushGrace)
+		for time.Now().Before(deadline) && len(c.conn.priorityCh) > 0 {
+			time.Sleep(2 * time.Millisecond)
+		}
+		// The channel empties when the write loop DEQUEUES the frame, not when
+		// the socket write completes — settle briefly so the in-flight error
+		// write finishes before the close frame follows it onto the wire.
+		time.Sleep(50 * time.Millisecond)
+		_ = ws.Close(websocket.StatusPolicyViolation, "authentication failed")
+	}()
 }
 
 // clientAcceptsZstd reports whether the client's Hello advertised the ZSTD
@@ -443,10 +504,11 @@ func (c *connState) handleHello(reqID uint64, hello *pb.Hello) {
 		if _, err := c.h.auth.Verify(context.Background(), hello.GetAuthToken(), c.remote); err != nil {
 			c.h.log.Warn("ws: auth failed", "remote", c.remote)
 			c.sendError(reqID, 0, pb.ErrorCode_ERROR_AUTH_FAILED, "invalid bearer token", "")
+			c.closeAfterAuthFailure()
 			return
 		}
 	}
-	c.authenticated = true
+	c.authenticated.Store(true)
 
 	// Negotiate the compressed-envelope path AFTER auth: record whether this
 	// client advertised a compression encoding the server supports. Effective only
@@ -459,18 +521,15 @@ func (c *connState) handleHello(reqID uint64, hello *pb.Hello) {
 	// catalog's distinct effective-tag keys, and supports_file_hierarchy is true
 	// iff any indexed OBJECT key bears a '/'. The flat Dexory nissan corpus thus
 	// reports hierarchy=false + the derived-key vocabulary (the C++ B3 live test's
-	// ground truth). A query error is non-fatal: fall back to the stable derived
-	// floor / no-hierarchy so a transient DB hiccup never blocks connect.
+	// ground truth). BackendCaps pins ONE db handle for both queries (B1) so a
+	// catalog swap between them cannot advertise a mixed-generation view. A query
+	// error is non-fatal: fall back to the stable derived floor / no-hierarchy so
+	// a transient DB hiccup never blocks connect.
 	ctx := context.Background()
-	vocab, err := catalog.DistinctMetadataKeys(ctx, c.h.store)
+	vocab, hierarchy, err := catalog.BackendCaps(ctx, c.h.store)
 	if err != nil {
-		c.h.log.Warn("ws: metadata vocabulary derive failed; using derived floor", "err", err)
-		vocab = catalog.DerivedMetadataKeys()
-	}
-	hierarchy, err := catalog.HasHierarchicalKey(ctx, c.h.store)
-	if err != nil {
-		c.h.log.Warn("ws: hierarchy derive failed; defaulting false", "err", err)
-		hierarchy = false
+		c.h.log.Warn("ws: backend-capabilities derive failed; using derived floor", "err", err)
+		vocab, hierarchy = catalog.DerivedMetadataKeys(), false
 	}
 
 	c.conn.SendPriority(&pb.ServerMessage{
@@ -643,6 +702,13 @@ func (c *connState) handleUpdateTagsForwarded(ctx context.Context, reqID uint64,
 			return
 		}
 	} else {
+		// NOTE on generations: this request intentionally spans MULTIPLE db
+		// pinning windows — phase 1 resolves id→key on the current generation,
+		// phase 2 forwards over the IPC (the builder may publish a rebuild), and
+		// phase 3 deliberately reopens to the NEWEST generation to re-read the
+		// authoritative tags. A rebuild landing between phases degrades cleanly:
+		// key vanished => ERROR_NOT_FOUND (tagIPCKeyGoneMessage, S1); re-read
+		// failed => the IPC response's own tags are returned as the fallback.
 		var err error
 		key, err = catalog.ObjectKeyForFile(ctx, c.h.store.DB(), req.GetFileId())
 		if err != nil {

@@ -161,6 +161,64 @@ func TestSession_ResumeNoGapsNoDupes(t *testing.T) {
 // Without acks the producer would park at the cap; steady acking keeps it
 // draining to COMPLETE with the full message count and the retain buffer stays
 // bounded.
+// A resume cursor BEYOND the produced watermark is a client bug or a forged
+// cursor — honoring it would prune every retained batch and silently skip all
+// future ones. It must fail RESUME_NOT_POSSIBLE with the session left intact.
+func TestSession_ResumeCursorBeyondWatermarkRejected(t *testing.T) {
+	cfg := defaultTestSessionCfg()
+	cfg.RetainAfterDisconnect = 30 * time.Second
+	ts := newTestServer(t, map[string][]byte{zegTestKey: loadZegFile(t)}, cfg)
+
+	c1 := dialClient(t, ts.url)
+	c1.hello()
+	id := c1.fileID(t, zegTestKey)
+	c1.send(&pb.ClientMessage{RequestId: 30, Payload: &pb.ClientMessage_OpenSession{
+		OpenSession: &pb.OpenSessionRequest{Mode: &pb.OpenSessionRequest_Fresh{
+			Fresh: &pb.OpenFresh{FileIds: []uint64{id}},
+		}},
+	}})
+	or := c1.recv().GetOpenSession()
+	if or == nil {
+		t.Fatal("expected OpenSessionResponse")
+	}
+	subID := or.GetSubscriptionId()
+
+	// Read one batch so the session is streaming, then drop the connection.
+	for {
+		if c1.recv().GetBatch() != nil {
+			break
+		}
+	}
+	_ = c1.conn.Close(websocket.StatusGoingAway, "simulated drop")
+
+	// Resume with an absurd cursor far beyond anything produced.
+	c2 := dialClient(t, ts.url)
+	c2.hello()
+	c2.send(&pb.ClientMessage{RequestId: 31, Payload: &pb.ClientMessage_OpenSession{
+		OpenSession: &pb.OpenSessionRequest{Mode: &pb.OpenSessionRequest_Resume{
+			Resume: &pb.OpenResume{SubscriptionId: subID, ResumeAfterSeq: 1 << 60},
+		}},
+	}})
+	resp := c2.recv()
+	e := resp.GetError()
+	if e == nil {
+		t.Fatalf("expected Error{RESUME_NOT_POSSIBLE}, got %T", resp.GetPayload())
+	}
+	if e.GetCode() != pb.ErrorCode_ERROR_RESUME_NOT_POSSIBLE {
+		t.Fatalf("expected RESUME_NOT_POSSIBLE, got %v (%q)", e.GetCode(), e.GetMessage())
+	}
+	// The bogus cursor must not have destroyed the session: a valid resume
+	// (cursor 0 => replay from the start of retain) still works.
+	c2.send(&pb.ClientMessage{RequestId: 32, Payload: &pb.ClientMessage_OpenSession{
+		OpenSession: &pb.OpenSessionRequest{Mode: &pb.OpenSessionRequest_Resume{
+			Resume: &pb.OpenResume{SubscriptionId: subID, ResumeAfterSeq: 0},
+		}},
+	}})
+	if or2 := c2.recv().GetOpenSession(); or2 == nil {
+		t.Fatal("valid resume after a rejected cursor must still succeed")
+	}
+}
+
 func TestSession_AckPruneUnderTinyCaps(t *testing.T) {
 	cfg := defaultTestSessionCfg()
 	cfg.RetainMaxSeqs = 3

@@ -151,6 +151,32 @@ func buildMinimalAurynDB(t *testing.T, path string) {
 	}
 }
 
+// GetFiles resolves ALL ids against ONE pinned db handle (B1): a catalog swap
+// mid-request must never mix generations within one OpenSession resolve. An
+// unknown id fails the whole batch with ErrFileNotFound naming the id.
+func TestGetFiles_BatchResolve(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "auryn.db")
+	buildMinimalAurynDB(t, path)
+	st, err := OpenReadOnly(context.Background(), path)
+	if err != nil {
+		t.Fatalf("OpenReadOnly: %v", err)
+	}
+	defer st.Close()
+	ctx := context.Background()
+
+	recs, err := GetFiles(ctx, st, []uint64{1})
+	if err != nil {
+		t.Fatalf("GetFiles: %v", err)
+	}
+	if len(recs) != 1 || recs[0].ID != 1 || recs[0].S3ETag != "etag1" {
+		t.Fatalf("GetFiles = %+v, want the one fixture file", recs)
+	}
+
+	if _, err := GetFiles(ctx, st, []uint64{1, 999}); !errors.Is(err, ErrFileNotFound) {
+		t.Fatalf("GetFiles with unknown id: err = %v, want ErrFileNotFound", err)
+	}
+}
+
 func TestAurynReader_Hermetic(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "auryn.db")
 	buildMinimalAurynDB(t, path)

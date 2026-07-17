@@ -82,6 +82,17 @@ func (w *Warmer) Run(ctx context.Context) error {
 		}
 		scheduled++
 		g.Go(func() error {
+			// The codec parses UNTRUSTED bucket bytes; a panic on one pathological
+			// file must count as a per-file error, not escape the errgroup goroutine
+			// (which would kill the whole server — Run is launched as a bare
+			// goroutine in main).
+			defer func() {
+				if r := recover(); r != nil {
+					errored.Add(1)
+					w.inc(func(m *metrics.Metrics) { m.ChunkIndexWarmErrors.Inc() })
+					log.Warn("warm: chunk-index load panicked", "key", e.Key, "panic", r)
+				}
+			}()
 			if gctx.Err() != nil {
 				return nil
 			}

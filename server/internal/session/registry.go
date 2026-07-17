@@ -30,9 +30,19 @@ type SessionState struct {
 	// Producer lifetime is independent of the WS (spec 8.1): it keeps running
 	// after the consumer detaches, until the retain caps block it or ctx is
 	// cancelled (Cancel / eviction / shutdown).
+	//
+	// ProducerCancel MUST be set BEFORE Register publishes the state: Cancel
+	// reads it with no per-field synchronization, so a post-Register write is a
+	// data race AND a missed-cancellation window (a fast client Cancel would
+	// observe nil and leave the producer running unbounded).
 	Producer       *Producer
 	ProducerCancel context.CancelFunc
 	ProducerDone   chan struct{}
+
+	// DroppedMessages counts messages the producer dropped for exceeding
+	// MaxMessageBytes. It lives on the SESSION (not the attachment) so the count
+	// survives detach/resume; the consumer surfaces it live in Progress.
+	DroppedMessages atomic.Uint64
 
 	// Wire bindings (echoed verbatim on resume, spec 6.6): the same
 	// subscription_id + topic_id_map + schemas the fresh-open returned. The WS
@@ -44,6 +54,13 @@ type SessionState struct {
 
 	mu             sync.Mutex
 	consumerCancel context.CancelFunc
+	// consumerGen is the ownership token for the CURRENT consumer binding: it
+	// increments on every BindConsumer, and Detach is a no-op unless the caller
+	// presents the matching generation. This makes detach→attach an atomic
+	// ownership transition — a stale connection's late teardown can neither
+	// cancel a successor consumer nor arm eviction on an actively-attached
+	// session.
+	consumerGen uint64
 
 	// ledger is the per-seq cumulative (messages, bytes) record the producer
 	// builds as it appends batches (it is the single writer of seq/Messages, in
@@ -81,6 +98,18 @@ func (s *SessionState) RecordAppend(seq, messages, bytes uint64) {
 		CumMsgs:  cumMsgs + messages,
 		CumBytes: cumBytes + bytes,
 	})
+}
+
+// HighestAppendedSeq returns the largest seq the producer has appended (0 before
+// any append) — the watermark a resume cursor is validated against: a client
+// cannot have durably received a batch that was never produced.
+func (s *SessionState) HighestAppendedSeq() uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if n := len(s.ledger); n > 0 {
+		return s.ledger[n-1].Seq
+	}
+	return 0
 }
 
 // CountersThrough returns the cumulative (messages, bytes) delivered through
@@ -178,24 +207,40 @@ func (r *Registry) Lookup(id uint64) (*SessionState, bool) {
 }
 
 // BindConsumer records the active consumer's cancel func (called right after
-// spawning Consumer.Run). Replaces any prior binding (resume).
-func (r *Registry) BindConsumer(id uint64, cancel context.CancelFunc) {
+// spawning Consumer.Run) and CANCELS any prior binding — a resume takeover must
+// never leave two consumers draining the same retain buffer. Returns the new
+// binding's generation token; the owning connection presents it to Detach so a
+// stale teardown cannot touch a successor's binding.
+func (r *Registry) BindConsumer(id uint64, cancel context.CancelFunc) uint64 {
 	r.mu.Lock()
 	s, ok := r.sessions[id]
 	r.mu.Unlock()
 	if !ok {
-		return
+		return 0
 	}
 	s.mu.Lock()
+	prev := s.consumerCancel
 	s.consumerCancel = cancel
+	s.consumerGen++
+	gen := s.consumerGen
 	s.mu.Unlock()
+	if prev != nil {
+		prev() // the replaced consumer exits via its ctx; the session stays live
+	}
+	return gen
 }
 
 // Detach marks the session as having no active WS consumer: it cancels the
 // consumer goroutine (the producer keeps running) and arms the
 // retain-after-disconnect eviction timer (spec 6.5). The producer fills the
 // retain buffer until the caps block it.
-func (r *Registry) Detach(id uint64) {
+//
+// gen is the ownership token BindConsumer returned to this caller. A stale gen
+// (the binding has since been taken over by a newer consumer, e.g. a resume on
+// another connection) makes Detach a NO-OP: the late teardown of a zombie
+// connection must not cancel the successor nor arm eviction on a session that
+// has a live attachment. gen 0 matches a never-bound session.
+func (r *Registry) Detach(id uint64, gen uint64) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	s, ok := r.sessions[id]
@@ -203,6 +248,10 @@ func (r *Registry) Detach(id uint64) {
 		return
 	}
 	s.mu.Lock()
+	if s.consumerGen != gen {
+		s.mu.Unlock()
+		return // stale owner: a newer consumer holds the binding
+	}
 	if s.consumerCancel != nil {
 		s.consumerCancel()
 		s.consumerCancel = nil

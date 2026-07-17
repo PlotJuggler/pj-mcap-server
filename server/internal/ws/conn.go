@@ -2,6 +2,7 @@ package ws
 
 import (
 	"context"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -18,9 +19,12 @@ import (
 // SendBulk carries MessageBatch (the only thing on the bulk channel).
 // Per design spec §6.4, the write loop drains priority before bulk at every
 // frame boundary, and the bulk channel's small capacity (16) lets a slow client
-// backpressure the producer naturally. Both return false when the frame could
-// not be queued (channel full or connection torn down) — the session consumer
-// treats a false from SendBulk as "WS dropped" and detaches.
+// backpressure the producer naturally: a send on a full channel BLOCKS until the
+// write loop frees a slot or the connection dies. Both return false ONLY when
+// the connection is gone (done closed) — never for a momentarily-full queue —
+// so the session consumer's "false from SendBulk => WS dropped, detach" logic
+// can't be tripped by a transient burst. The block is bounded: a stalled write
+// trips writeTimeout, which closes done and unblocks every parked sender.
 type ConnAPI interface {
 	SendPriority(m *pb.ServerMessage) bool
 	SendBulk(m *pb.ServerMessage) bool
@@ -60,7 +64,10 @@ type conn struct {
 	ws *websocket.Conn
 	// done is closed by the read loop when the connection is finished; Send*
 	// observe it so a queue attempt cannot block forever after teardown.
-	done chan struct{}
+	// closeOnce makes closeDone safe against the write loop (write failure) and
+	// the read loop (teardown) racing to close it.
+	done      chan struct{}
+	closeOnce sync.Once
 	// compressor wraps allowlisted RPC responses in an EncodedServerMessage when
 	// the peer negotiated it. nil => the compressed-envelope path is off and every
 	// response marshals raw (the default for write-only unit tests).
@@ -167,8 +174,6 @@ func (c *conn) SendPriority(m *pb.ServerMessage) bool {
 		return true
 	case <-c.done:
 		return false
-	default:
-		return false
 	}
 }
 
@@ -185,8 +190,6 @@ func (c *conn) SendBulk(m *pb.ServerMessage) bool {
 		return true
 	case <-c.done:
 		return false
-	default:
-		return false
 	}
 }
 
@@ -199,12 +202,8 @@ func (c *conn) isDone() bool {
 	}
 }
 
-// closeDone signals Send* that the connection is gone (idempotent). The write
-// loop is stopped separately by cancelling its context.
+// closeDone signals Send* that the connection is gone (concurrently idempotent).
+// The write loop is stopped separately by cancelling its context.
 func (c *conn) closeDone() {
-	select {
-	case <-c.done:
-	default:
-		close(c.done)
-	}
+	c.closeOnce.Do(func() { close(c.done) })
 }

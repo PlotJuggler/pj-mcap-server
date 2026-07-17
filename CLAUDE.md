@@ -422,7 +422,9 @@ cancel-mid-stream.
     IPC configured), chunk-index warmer, Dashboard (HTML + Prometheus + `/health`,
     catalog freshness + quarantine). Pure-Go SQLite (no cgo). Seams unchanged:
     `BlobStore` (S3 + GCS), `FormatCodec` (MCAP), `ClientAuthenticator`. Only
-    `internal/storage` may import a cloud SDK. The tag socket bypasses WS bearer auth —
+    `internal/storage` may import a cloud SDK **in the server binary's path**; the
+    standalone dev tool `cmd/seed` (a throwaway S3 fixture uploader) imports the AWS
+    SDK directly by design — it is not part of the serving path. The tag socket bypasses WS bearer auth —
     the Go layer is the auth boundary (deploy mounts the socket volume into only the
     two processes; never on NFS/EFS — SQLite WAL).
 - **Qt C++ client** — `client-core` owns the WS/protocol/decompression and exposes a

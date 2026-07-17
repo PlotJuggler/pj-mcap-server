@@ -29,6 +29,13 @@ type Config struct {
 	Session   SessionConfig   `yaml:"session"`
 	Dashboard DashboardConfig `yaml:"dashboard"`
 	Metrics   MetricsConfig   `yaml:"metrics"`
+
+	// DeprecatedIndexerInFile is set by Load when the file carries an indexer:
+	// block. Every indexer.* field is a no-op since the M6 cutover (the Python
+	// builder owns the catalog); main warns once so an operator who kept
+	// indexer.startup_scan etc. in an old config learns it does nothing. Not a
+	// YAML field itself (Load derives it by probing the raw file).
+	DeprecatedIndexerInFile bool `yaml:"-"`
 }
 
 // CatalogConfig holds the SQLite-WAL catalog settings (Plan A Task 19).
@@ -343,6 +350,15 @@ func Load(path string) (Config, error) {
 	if err := yaml.Unmarshal(expandEnv(raw), &cfg); err != nil {
 		return Config{}, fmt.Errorf("parse config %q: %w", path, err)
 	}
+	// Deprecated-block probe: Default() pre-seeds cfg.Indexer, so the overlaid
+	// struct can't tell "file set it" from "default" — probe the raw file for an
+	// indexer: key instead (a second tiny unmarshal, only into pointers).
+	var probe struct {
+		Indexer *IndexerConfig `yaml:"indexer"`
+	}
+	if err := yaml.Unmarshal(expandEnv(raw), &probe); err == nil && probe.Indexer != nil {
+		cfg.DeprecatedIndexerInFile = true
+	}
 	// A YAML file may set only a subset of the session block (or omit it). Fill
 	// the gaps with spec defaults so streaming always has valid tuning.
 	cfg.Session.withSessionDefaults()
@@ -394,5 +410,13 @@ func (c Config) Validate() error {
 	// and an unset env var must DISABLE the dashboard (spec §8.5 "empty disables
 	// dashboard"), not fail startup. The gate is DashboardConfig.Active(): the
 	// dashboard registers only when enabled AND both credentials are present.
+	//
+	// metrics.require_auth is different: it EXPLICITLY asked for an auth gate, so
+	// missing credentials must fail startup — metrics.Handler("","") would
+	// otherwise serve /metrics unauthenticated, silently ignoring the ask.
+	if c.Metrics.Enabled && c.Metrics.RequireAuth &&
+		(c.Dashboard.BasicAuth.Username == "" || c.Dashboard.BasicAuth.Password == "") {
+		return fmt.Errorf("metrics.require_auth needs dashboard.basic_auth.username and .password (it reuses those credentials)")
+	}
 	return nil
 }
