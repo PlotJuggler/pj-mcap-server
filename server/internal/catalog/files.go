@@ -3,6 +3,7 @@ package catalog
 import (
 	"context"
 	"errors"
+	"fmt"
 )
 
 // FileRecord is the catalog representation of one MCAP file in S3.
@@ -37,4 +38,22 @@ var ErrFileNotFound = errors.New("file not found")
 // See GetFileDetail.
 func GetFile(ctx context.Context, s *Store, id uint64) (FileRecord, error) {
 	return aurynGetFile(ctx, s.DB(), id)
+}
+
+// GetFiles resolves every id against ONE pinned db handle (B1): all records in
+// an OpenSession selection come from the SAME catalog generation, so a
+// ReopenIfSwapped landing mid-request can never pair one generation's
+// (renumbered) ids with another generation's records. An unknown id fails the
+// whole batch with a wrapped ErrFileNotFound naming the id.
+func GetFiles(ctx context.Context, s *Store, ids []uint64) ([]FileRecord, error) {
+	db := s.DB() // pinned once for the whole batch
+	out := make([]FileRecord, 0, len(ids))
+	for _, id := range ids {
+		rec, err := aurynGetFile(ctx, db, id)
+		if err != nil {
+			return nil, fmt.Errorf("file id %d: %w", id, err)
+		}
+		out = append(out, rec)
+	}
+	return out, nil
 }

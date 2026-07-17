@@ -134,11 +134,20 @@ void FetchWorker::listSequencesAsync() {
     return;
   }
 
-  std::vector<SequenceInfo> sequences = backend_->listSequences();
+  bool complete = false;
+  std::vector<SequenceInfo> sequences = backend_->listSequences(&complete);
   if (backend_->isClosed()) {
     // A dead browse socket reads as an empty/short list; tell the dialog the
     // connection is gone instead of letting it render a silently empty table.
     notifyConnectionLostOnce();
+  } else if (!complete) {
+    // Pagination broke mid-way but the socket is still up: the list is PARTIAL.
+    // Surface it as an error rather than presenting a silently-truncated catalog
+    // as authoritative (the browse name->file_id index kept its last COMPLETE
+    // snapshot inside listSequences()).
+    if (errorOccurred) {
+      errorOccurred("Recording list is incomplete (server paging error); showing a partial catalog — retry to refresh.");
+    }
   }
 
   // Name-only convenience callback (used by code paths that only want names),
@@ -550,8 +559,13 @@ void FetchWorker::pullTopicsAsync(std::vector<std::string> sequence_names, std::
   std::chrono::steady_clock::time_point last_wire_emit{};
   const auto kProgressInterval = std::chrono::milliseconds(100);
 
-  // Expose the session backend so requestCancel() can fire a wire Cancel.
-  backend_session_for_cancel_.store(session_backend, std::memory_order_release);
+  // Expose the session backend so requestCancel() can fire a wire Cancel
+  // (guarded by cancel_mu_ — the pointer is cleared under the same lock before
+  // session_owned is destroyed, closing the UAF window).
+  {
+    std::lock_guard<std::mutex> lock(cancel_mu_);
+    backend_session_for_cancel_ = session_backend;
+  }
 
   // Surface "Resuming (attempt N/max)…" through the worker->dialog path on each
   // reconnect attempt during a mid-pull transport drop.
@@ -593,7 +607,10 @@ void FetchWorker::pullTopicsAsync(std::vector<std::string> sequence_names, std::
         return true;
       });
 
-  backend_session_for_cancel_.store(nullptr, std::memory_order_release);
+  {
+    std::lock_guard<std::mutex> lock(cancel_mu_);
+    backend_session_for_cancel_ = nullptr;
+  }
 
   // Seal the host-side parser writes (releaseParserIngest -> flushAll) while
   // still inside the host-write critical section, so the GUI-thread
@@ -656,11 +673,17 @@ void FetchWorker::pullTopicsAsync(std::vector<std::string> sequence_names, std::
     } else {
       const std::uint64_t decoded = counts.count(*tid_opt) ? counts.at(*tid_opt) : 0;
       const std::uint64_t errc = errors.count(*tid_opt) ? errors.at(*tid_opt) : 0;
-      ok = true;
       if (errc > 0) {
-        // Some messages dropped but the topic still imported — keep ok=true,
-        // append a note so the dialog ledger surfaces it.
-        (void)decoded;
+        // Decode errors (parser push/bind failures) mean the host holds FEWER
+        // rows than the server sent — logical equality is violated. Report the
+        // topic as PARTIAL (not-ok) so the ledger surfaces it and the user is
+        // not told a lossy import "Done". The count of dropped messages is in
+        // the message; the cache store below is suppressed for the whole
+        // session so a repeat fetch does not become a false zero-transport HIT.
+        error = std::to_string(errc) + " message(s) failed to decode (partial import of " +
+                std::to_string(decoded) + " ok)";
+      } else {
+        ok = true;
       }
     }
     if (pullFinished) {
@@ -668,15 +691,26 @@ void FetchWorker::pullTopicsAsync(std::vector<std::string> sequence_names, std::
     }
   }
 
+  // Any per-topic decode error means the host holds FEWER rows than the server
+  // sent, so a cached counts entry would undercount and a future fetch would be
+  // a false zero-transport HIT that never re-pulls the missing rows. Suppress
+  // the cache store for the WHOLE session in that case (mirrors the cancel /
+  // error suppression below).
+  std::uint64_t total_decode_errors = 0;
+  for (const auto& [tid, ec] : errors) {
+    (void)tid;
+    total_decode_errors += ec;
+  }
+
   // ---- SessionCache store: COMPLETE-only (Slice 8) --------------------------
   // Store the per-topic counts ONLY on a clean COMPLETE download (no cancel, no
-  // error/Unset). cancel / error / no-terminal-Eos -> NO entry (no half-cached
-  // state). The key is the SAME tuple the HIT path computes — `sequence_names`
-  // directly, never a resolved file_id (post-M6 rowids renumber across catalog
-  // rebuilds; see session_key.hpp). The datastore now owns the decoded rows
-  // under group_name; the cache records only counts metadata so a repeat fetch
-  // is a zero-transport HIT.
-  if (stats.eos == SessionEos::Complete && !cancelled && !session_failed) {
+  // error/Unset, no decode errors). cancel / error / no-terminal-Eos / partial
+  // decode -> NO entry (no half-cached state). The key is the SAME tuple the HIT
+  // path computes — `sequence_names` directly, never a resolved file_id (post-M6
+  // rowids renumber across catalog rebuilds; see session_key.hpp). The datastore
+  // now owns the decoded rows under group_name; the cache records only counts
+  // metadata so a repeat fetch is a zero-transport HIT.
+  if (stats.eos == SessionEos::Complete && !cancelled && !session_failed && total_decode_errors == 0) {
     const PJ::cloud::SessionKey key =
         PJ::cloud::computeSessionKey(conn_uri_, sequence_names, topic_names, {start_ns, end_ns});
     CachedSession entry;

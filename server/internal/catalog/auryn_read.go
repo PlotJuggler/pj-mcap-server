@@ -180,9 +180,9 @@ func aurynListTopicsForFile(ctx context.Context, db *sql.DB, fileID uint64) ([]T
 // aurynHasHierarchicalKey: every auryn object key is Hive-partitioned (contains
 // '/'), so the hierarchy flag is simply "are there any files". (M3's GetVocabulary
 // replaces this boolean with the real dimension tree.)
-func aurynHasHierarchicalKey(ctx context.Context, s *Store) (bool, error) {
+func aurynHasHierarchicalKey(ctx context.Context, db *sql.DB) (bool, error) {
 	var one int
-	err := s.DB().QueryRowContext(ctx, `SELECT 1 FROM files LIMIT 1`).Scan(&one)
+	err := db.QueryRowContext(ctx, `SELECT 1 FROM files LIMIT 1`).Scan(&one)
 	switch {
 	case err == nil:
 		return true, nil

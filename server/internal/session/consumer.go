@@ -11,9 +11,10 @@ import (
 
 // FrameWriter is the WS write side seen by the session. SendPriority carries
 // control frames (Progress, Eos, Error) and wins over SendBulk (MessageBatch) at
-// frame boundaries (spec 6.4 multiplexing fairness). Either returns false when
-// the underlying WS write failed (the connection dropped) — the consumer then
-// detaches and the producer keeps filling the retain buffer for resume.
+// frame boundaries (spec 6.4 multiplexing fairness). A send on a momentarily
+// full queue BLOCKS (backpressure); either returns false ONLY when the
+// connection is gone — the consumer then detaches and the producer keeps
+// filling the retain buffer for resume.
 type FrameWriter interface {
 	SendPriority(m *pb.ServerMessage) bool
 	SendBulk(m *pb.ServerMessage) bool
@@ -44,6 +45,11 @@ type Consumer struct {
 	BytesSent    uint64
 	MessagesSent uint64
 	Dropped      uint64
+
+	// DroppedFn, when set, supplies the LIVE producer-side dropped-message count
+	// for Progress (the producer runs concurrently, so a value snapshotted at
+	// spawn time would under-report). Overrides Dropped.
+	DroppedFn func() uint64
 
 	// Detached is set true when the consumer exits because a WS write failed (vs
 	// ctx cancellation / clean Eos). The handler uses it to decide whether to arm
@@ -120,12 +126,16 @@ func (c *Consumer) Run(ctx context.Context) {
 }
 
 func (c *Consumer) sendProgress() bool {
+	dropped := c.Dropped
+	if c.DroppedFn != nil {
+		dropped = c.DroppedFn()
+	}
 	return c.Writer.SendPriority(&pb.ServerMessage{
 		SubscriptionId: c.SubscriptionID,
 		Payload: &pb.ServerMessage_Progress{Progress: &pb.Progress{
 			BytesSent:              c.BytesSent,
 			MessagesSent:           c.MessagesSent,
-			DroppedMessages:        c.Dropped,
+			DroppedMessages:        dropped,
 			EstimatedTotalBytes:    c.EstimatedBytes,
 			EstimatedTotalMessages: c.EstimatedMessages,
 		}},

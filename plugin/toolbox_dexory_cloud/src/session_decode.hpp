@@ -35,13 +35,22 @@
 
 namespace dexory_cloud {
 
+// kMaxDecodedBatchBytes is the hard ceiling on any single decoded batch body or
+// per-message payload. The server's MaxBatchBytes default is 512 KiB, so 512 MiB
+// is far above any legitimate frame while capping a decompression bomb (a forged
+// frame header can otherwise declare multi-GiB and force the allocation before
+// the decode fails). Also keeps every decoded size below INT_MAX, so the
+// protobuf ParseFromArray int cast can never truncate.
+inline constexpr std::uint64_t kMaxDecodedBatchBytes = 512ull * 1024 * 1024;
+
 // Decode one MessageBatch into its messages. Returns true on success (out filled,
 // in batch order). On failure returns false and sets *error to a clean,
 // human-readable reason; *out is left in an unspecified-but-safe state and must
 // not be consumed. Stateless: no decoder context is carried across calls (the
-// one-shot-per-batch resume invariant, spec §6.4).
+// one-shot-per-batch resume invariant, spec §6.4). max_decoded_bytes bounds every
+// decompressed body/payload (tests override it; production uses the default).
 [[nodiscard]] bool decodeBatch(const pj_cloud::v1::MessageBatch& batch, std::vector<DecodedMessage>* out,
-                               std::string* error);
+                               std::string* error, std::uint64_t max_decoded_bytes = kMaxDecodedBatchBytes);
 
 // kMaxDecodedEnvelopeBytes is the hard ceiling on a decoded EncodedServerMessage
 // (the compressed-envelope RPC path). A catalog RPC response is pagination-bounded,

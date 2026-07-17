@@ -53,18 +53,40 @@ func NewS3(ctx context.Context, cfg config.S3Config) (BlobStore, error) {
 }
 
 func (s *s3Store) GetRange(ctx context.Context, key string, off, length int64) ([]byte, error) {
+	return s.getRange(ctx, key, "", off, length)
+}
+
+// GetRangeVersioned is the conditional-read arm of the seam: the ranged GET
+// carries If-Match on the catalog's ETag, so an overwrite of the key mid-session
+// fails the read (412 => ErrPermanent) instead of serving bytes from a different
+// object version than the chunk index was built from. The catalog stores the
+// ETag UNQUOTED (the Python builder strips the quotes); If-Match wants the
+// quoted wire form, so it is re-quoted here.
+func (s *s3Store) GetRangeVersioned(ctx context.Context, key, version string, off, length int64) ([]byte, error) {
+	return s.getRange(ctx, key, version, off, length)
+}
+
+func (s *s3Store) getRange(ctx context.Context, key, ifMatchETag string, off, length int64) ([]byte, error) {
 	var rng *string
 	if length > 0 {
 		rng = aws.String(fmt.Sprintf("bytes=%d-%d", off, off+length-1))
 	} else if off > 0 {
 		rng = aws.String(fmt.Sprintf("bytes=%d-", off))
 	}
+	var ifMatch *string
+	if ifMatchETag != "" {
+		if ifMatchETag[0] != '"' {
+			ifMatchETag = `"` + ifMatchETag + `"`
+		}
+		ifMatch = aws.String(ifMatchETag)
+	}
 	var data []byte
 	err := retryWith(ctx, func(ctx context.Context) error {
 		out, gErr := s.client.GetObject(ctx, &s3.GetObjectInput{
-			Bucket: aws.String(s.bucket),
-			Key:    aws.String(key),
-			Range:  rng,
+			Bucket:  aws.String(s.bucket),
+			Key:     aws.String(key),
+			Range:   rng,
+			IfMatch: ifMatch,
 		})
 		if gErr != nil {
 			return classify(fmt.Errorf("get %q range %v: %w", key, rng, gErr))

@@ -151,6 +151,60 @@ server:
 	}
 }
 
+// An indexer: block in a config file is a deprecated no-op (the in-process Go
+// indexer was deleted in the M6 cutover). Load must FLAG it so main can warn —
+// an operator setting indexer.startup_scan today gets silence otherwise.
+func TestLoad_DeprecatedIndexerBlockFlagged(t *testing.T) {
+	with := writeTemp(t, `
+indexer:
+  startup_scan: true
+`)
+	cfg, err := Load(with)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !cfg.DeprecatedIndexerInFile {
+		t.Error("config with an indexer: block must set DeprecatedIndexerInFile")
+	}
+
+	without := writeTemp(t, `
+server:
+  listen: ":8080"
+`)
+	cfg, err = Load(without)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.DeprecatedIndexerInFile {
+		t.Error("config without an indexer: block must NOT set DeprecatedIndexerInFile")
+	}
+}
+
+// metrics.require_auth borrows the dashboard Basic credentials; asking for auth
+// with no credentials configured must be a startup error, not a silently
+// UNAUTHENTICATED /metrics handler (metrics.Handler("","") skips the wrap).
+func TestValidate_MetricsRequireAuthNeedsCredentials(t *testing.T) {
+	p := writeTemp(t, `
+metrics:
+  require_auth: true
+`)
+	if _, err := Load(p); err == nil {
+		t.Fatalf("expected error for metrics.require_auth without dashboard basic_auth credentials")
+	}
+
+	ok := writeTemp(t, `
+metrics:
+  require_auth: true
+dashboard:
+  basic_auth:
+    username: admin
+    password: s3cret
+`)
+	if _, err := Load(ok); err != nil {
+		t.Fatalf("require_auth with full credentials should validate, got: %v", err)
+	}
+}
+
 // TestLoad_GCSOnly: a storage.gcs-only config (the Asensus M1b leg) loads and
 // validates when the S3 arm is explicitly cleared. Default() seeds S3, so a GCS
 // config must null it (storage: { s3: null, gcs: {...} }) to satisfy the

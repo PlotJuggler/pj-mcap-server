@@ -14,6 +14,7 @@
 package ws
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"log/slog"
@@ -82,15 +83,13 @@ func (d *SessionDeps) cachedChunkIndex(
 	if idx, ok := d.IdxCache.Get(key, etag, fileID); ok {
 		return idx, nil
 	}
-	// Dedup the load: one leader fetches + caches, the rest wait + share. The
-	// leader runs detached from any single caller's cancellation
-	// (context.WithoutCancel) so a bailing leader doesn't fail the waiters; DoChan +
-	// a per-caller select lets each waiter still bail on its OWN ctx.
-	sfKey := key + "|" + etag
-	ch := d.idxSF.DoChan(sfKey, func() (interface{}, error) {
-		// Detach from any single caller's cancellation (WithoutCancel) BUT keep a
-		// bound: WithoutCancel also drops the deadline, so a hung WAN summary read
-		// would otherwise strand this goroutine forever. The per-load timeout caps it.
+	// loadAndCache is the ONE bounded load path: detached from any single
+	// caller's cancellation (WithoutCancel — a bailing leader must not fail the
+	// waiters) but capped by the per-load timeout (WithoutCancel also drops the
+	// deadline, so a hung WAN summary read would otherwise strand the goroutine
+	// forever). The singleflight leader AND the eviction-race fallback below both
+	// use it, so their timeout semantics cannot drift apart.
+	loadAndCache := func() (session.FileChunkIndex, error) {
 		loadCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), chunkIndexLoadTimeout)
 		defer cancel()
 		idx, err := d.Codec.ChunkIndex(loadCtx, d.Blob, key, fileID)
@@ -99,6 +98,12 @@ func (d *SessionDeps) cachedChunkIndex(
 		}
 		d.IdxCache.Put(key, etag, idx)
 		return idx, nil
+	}
+	// Dedup the load: one leader fetches + caches, the rest wait + share. DoChan +
+	// a per-caller select lets each waiter still bail on its OWN ctx.
+	sfKey := key + "|" + etag
+	ch := d.idxSF.DoChan(sfKey, func() (interface{}, error) {
+		return loadAndCache()
 	})
 	select {
 	case res := <-ch:
@@ -106,16 +111,12 @@ func (d *SessionDeps) cachedChunkIndex(
 			return session.FileChunkIndex{}, res.Err
 		}
 		// The cache restamps for THIS caller's fileID. On the rare race where the
-		// entry was already evicted between Put and this Get, load directly.
+		// entry was already evicted between Put and this Get, reload via the same
+		// bounded path.
 		if idx, ok := d.IdxCache.Get(key, etag, fileID); ok {
 			return idx, nil
 		}
-		idx, err := d.Codec.ChunkIndex(ctx, d.Blob, key, fileID)
-		if err != nil {
-			return session.FileChunkIndex{}, err
-		}
-		d.IdxCache.Put(key, etag, idx)
-		return idx, nil
+		return loadAndCache()
 	case <-ctx.Done():
 		return session.FileChunkIndex{}, ctx.Err()
 	}
@@ -172,16 +173,18 @@ func (c *connState) openFresh(ctx context.Context, reqID uint64, fresh *pb.OpenF
 	}
 
 	// (a) Resolve file records (id + time bounds) and object keys from the SQLite
-	// catalog. Unknown id => NOT_FOUND.
-	files := make([]session.FileRecord, 0, len(fresh.GetFileIds()))
-	keys := make(session.FileKeys, len(fresh.GetFileIds()))
-	etags := make(map[uint64]string, len(fresh.GetFileIds()))
-	for _, id := range fresh.GetFileIds() {
-		rec, err := catalog.GetFile(ctx, d.Store, id)
-		if err != nil {
-			c.sendError(reqID, 0, pb.ErrorCode_ERROR_NOT_FOUND, fmt.Sprintf("no file with id %d", id), "")
-			return
-		}
+	// catalog. GetFiles pins ONE db handle for the whole batch (B1): a catalog
+	// rebuild swapping in renumbered file ids mid-loop can never mix generations
+	// within one session plan. Unknown id => NOT_FOUND.
+	recs, err := catalog.GetFiles(ctx, d.Store, fresh.GetFileIds())
+	if err != nil {
+		c.sendError(reqID, 0, pb.ErrorCode_ERROR_NOT_FOUND, err.Error(), "")
+		return
+	}
+	files := make([]session.FileRecord, 0, len(recs))
+	keys := make(session.FileKeys, len(recs))
+	etags := make(map[uint64]string, len(recs))
+	for _, rec := range recs {
 		files = append(files, session.FileRecord{
 			ID:          rec.ID,
 			StartTimeNs: rec.StartTimeNs,
@@ -250,11 +253,27 @@ func (c *connState) openFresh(ctx context.Context, reqID uint64, fresh *pb.OpenF
 		c.sendError(reqID, 0, pb.ErrorCode_ERROR_S3_UNAVAILABLE, msg, err.Error())
 		return
 	}
+	// Collect the per-topic schema bindings across the stitched files. The
+	// session model binds exactly ONE schema per topic, so cross-file schema
+	// DRIFT (same topic, different schema name/encoding/data or message
+	// encoding) is unrepresentable — first-occurrence-wins would silently decode
+	// the other file's bytes with the wrong type definition. Reject the open;
+	// the client can split the selection at the drift boundary.
 	topicSchemas := map[string]format.TopicSchemaInfo{}
 	for _, idx := range indexes {
 		for _, ts := range idx.Schemas {
-			if _, ok := topicSchemas[ts.TopicName]; !ok {
+			prev, ok := topicSchemas[ts.TopicName]
+			if !ok {
 				topicSchemas[ts.TopicName] = ts
+				continue
+			}
+			if prev.SchemaName != ts.SchemaName || prev.SchemaEncoding != ts.SchemaEncoding ||
+				prev.MessageEncoding != ts.MessageEncoding || !bytes.Equal(prev.SchemaData, ts.SchemaData) {
+				c.sendError(reqID, 0, pb.ErrorCode_ERROR_INVALID_REQUEST, fmt.Sprintf(
+					"schema drift on topic %q across the selected files (%q/%s vs %q/%s): "+
+						"a session binds one schema per topic — split the selection at the drift boundary",
+					ts.TopicName, prev.SchemaName, prev.SchemaEncoding, ts.SchemaName, ts.SchemaEncoding), "")
+				return
 			}
 		}
 	}
@@ -297,25 +316,37 @@ func (c *connState) openFresh(ctx context.Context, reqID uint64, fresh *pb.OpenF
 		SchemaBindings: toSessionSchemaBindings(schemaBindings),
 	}
 	state.Producer = &session.Producer{
-		Plan:        plan,
-		ChunkReader: session.NewChunkReader(d.Blob, keys),
+		Plan: plan,
+		// Version-pinned chunk reads (etags = the catalog change tokens): an
+		// object overwritten mid-session fails the read instead of mixing the
+		// old chunk index with new bytes.
+		ChunkReader: session.NewChunkReaderVersioned(d.Blob, keys, etags),
 		ChunkIter:   session.NewChunkIterator(indexes),
 		Retain:      retain,
 		Opts:        d.producerOpts(tw),
 		TopicID:     topicIDByName,
 		SchemaID:    schemaIDByName,
 	}
-	dropped := &droppedCounter{}
-	state.Producer.OnDrop = func(string) { dropped.inc() }
+	// Dropped oversized messages are counted on the SESSION so the count survives
+	// detach/resume; the consumer surfaces it live in Progress (DroppedFn) and the
+	// completion log reports it (a drop silently violates logical equality, so it
+	// must at least be visible).
+	state.Producer.OnDrop = func(string) { state.DroppedMessages.Add(1) }
 	// Build the per-seq cumulative ledger as batches are appended; it seeds resume
 	// counter carry-forward so the terminal Eos totals stay monotonic AND count
 	// each delivered message exactly once across a reconnect-resume.
 	state.Producer.OnAppend = func(seq, messages, bytes uint64) {
 		state.RecordAppend(seq, messages, bytes)
 	}
+	// The producer ctx MUST exist before Register publishes the state: a client
+	// Cancel racing this open would otherwise read a nil ProducerCancel (missed
+	// cancellation + data race — see the SessionState field doc).
+	prodCtx, prodCancel := context.WithCancel(context.Background())
+	state.ProducerCancel = prodCancel
 
 	registered, err := d.Registry.Register(ctx, state)
 	if err != nil {
+		prodCancel()
 		retain.Close()
 		c.sendError(reqID, 0, pb.ErrorCode_ERROR_RESOURCE_LIMIT, err.Error(), "")
 		return
@@ -347,15 +378,14 @@ func (c *connState) openFresh(ctx context.Context, reqID uint64, fresh *pb.OpenF
 	// (g) Spawn the consumer bound to THIS connection FIRST, so the producer's
 	// stream-fatal path can cancel it (preventing a spurious Eos{COMPLETE} from
 	// racing the Eos{ERROR}).
-	c.spawnConsumer(registered, dropped, 0)
+	c.spawnConsumer(registered, 0)
 
-	// (h) Spawn the producer (detached from WS lifetime). The whole body runs
-	// inside a per-session Guard (spec §8.1): a producer panic must not crash the
-	// process nor break sibling sessions — it is recovered, logged + counted, and
-	// treated as a stream-fatal error (Error + Eos{ERROR}), while ProducerDone is
-	// ALWAYS closed (deferred) so the consumer never hangs waiting on it.
-	prodCtx, prodCancel := context.WithCancel(context.Background())
-	registered.ProducerCancel = prodCancel
+	// (h) Spawn the producer (detached from WS lifetime; its ctx was created
+	// before Register — see above). The whole body runs inside a per-session
+	// Guard (spec §8.1): a producer panic must not crash the process nor break
+	// sibling sessions — it is recovered, logged + counted, and treated as a
+	// stream-fatal error (Error + Eos{ERROR}), while ProducerDone is ALWAYS
+	// closed (deferred) so the consumer never hangs waiting on it.
 	go func() {
 		defer close(registered.ProducerDone)
 		var runErr error
@@ -401,6 +431,16 @@ func (c *connState) openResume(ctx context.Context, reqID uint64, r *pb.OpenResu
 		c.sendError(reqID, 0, pb.ErrorCode_ERROR_RESUME_NOT_POSSIBLE, "session evicted or never existed", "")
 		return
 	}
+	// Validate the client cursor BEFORE touching any state: a cursor beyond the
+	// produced watermark cannot correspond to a batch the client durably
+	// received — honoring it would prune every retained batch and silently skip
+	// all future ones. Reject and leave the session intact (the client can retry
+	// with a sane cursor).
+	if cursor, high := r.GetResumeAfterSeq(), state.HighestAppendedSeq(); cursor > high {
+		c.sendError(reqID, 0, pb.ErrorCode_ERROR_RESUME_NOT_POSSIBLE,
+			fmt.Sprintf("resume_after_seq %d is beyond the produced watermark %d", cursor, high), "")
+		return
+	}
 	if err := d.Registry.Reattach(r.GetSubscriptionId()); err != nil {
 		c.sendError(reqID, 0, pb.ErrorCode_ERROR_RESUME_NOT_POSSIBLE, err.Error(), "")
 		return
@@ -421,7 +461,7 @@ func (c *connState) openResume(ctx context.Context, reqID uint64, r *pb.OpenResu
 		}},
 	})
 
-	c.spawnConsumer(state, &droppedCounter{}, r.GetResumeAfterSeq())
+	c.spawnConsumer(state, r.GetResumeAfterSeq())
 }
 
 // spawnConsumer attaches a fresh consumer to this connection for the given
@@ -437,11 +477,14 @@ func (c *connState) openResume(ctx context.Context, reqID uint64, r *pb.OpenResu
 //     eviction timer governs whether a later OpenResume can reattach;
 //   - WS write failed mid-stream (consumer.Detached): same as detach — keep the
 //     session; the read loop will Detach it (arm eviction) on teardown.
-func (c *connState) spawnConsumer(state *session.SessionState, dropped *droppedCounter, startAfterSeq uint64) {
+func (c *connState) spawnConsumer(state *session.SessionState, startAfterSeq uint64) {
 	d := c.h.sess
 	consCtx, consCancel := context.WithCancel(context.Background())
 	handle := &subHandle{cancel: consCancel}
-	d.Registry.BindConsumer(state.ID, consCancel)
+	// BindConsumer atomically takes over the binding (cancelling any prior
+	// consumer, e.g. one on a half-open old connection) and returns the ownership
+	// token this connection's teardown presents to Detach.
+	handle.gen = d.Registry.BindConsumer(state.ID, consCancel)
 	c.trackSubscription(state.ID, handle)
 
 	// Carry forward the cumulative delivered counters THROUGH startAfterSeq so the
@@ -464,6 +507,7 @@ func (c *connState) spawnConsumer(state *session.SessionState, dropped *droppedC
 		EstimatedMessages: state.Plan.ApproximateMessages,
 		MessagesSent:      priorMsgs,
 		BytesSent:         priorBytes,
+		DroppedFn:         state.DroppedMessages.Load, // live producer-side drop count
 	}
 	go func() {
 		// Per-session consumer panic recovery (spec §8.1): a panic here must not
@@ -507,10 +551,13 @@ func (c *connState) spawnConsumer(state *session.SessionState, dropped *droppedC
 				m.BytesSentTotal.Add(float64(consumer.BytesSent))
 			}
 			logSessionAccounting(d.Log, state, consumer.MessagesSent, consumer.BytesSent)
+			if n := state.DroppedMessages.Load(); n > 0 {
+				d.Log.Warn("session: completed WITH dropped oversized messages (logical equality violated)",
+					"sub", state.ID, "dropped_messages", n)
+			}
 			c.untrackSubscription(state.ID)
 			d.Registry.Cancel(state.ID)
 		}
-		_ = dropped
 	}()
 }
 
@@ -692,15 +739,6 @@ func (c *connState) handleAck(req *pb.SessionAck) {
 	default:
 	}
 }
-
-// droppedCounter is a tiny concurrency-safe counter wired into Producer.OnDrop.
-// (The Progress dropped count is surfaced by the engine's consumer via its own
-// Dropped field; this counter exists for logging/observability symmetry.)
-type droppedCounter struct {
-	n int64
-}
-
-func (d *droppedCounter) inc() { d.n++ }
 
 func truncate(s string, max int) string {
 	if len(s) > max {

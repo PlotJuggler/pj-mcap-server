@@ -16,6 +16,7 @@
 #include <zstd.h>
 
 #include <cstring>
+#include <limits>
 
 namespace dexory_cloud {
 
@@ -24,7 +25,9 @@ namespace {
 // One-shot ZSTD frame decode (NO persistent context — spec §6.4 one-shot-per-batch
 // invariant). On the default path the caller separately checks the decompressed
 // size against body_uncompressed_size; here we just produce the bytes.
-bool zstdDecodeAll(const std::string& in, std::string* out, std::string* error) {
+// max_bytes caps the allocation: a forged header declaring multi-GiB must fail
+// cleanly BEFORE the resize, not OOM the host.
+bool zstdDecodeAll(const std::string& in, std::string* out, std::string* error, std::uint64_t max_bytes) {
   const unsigned long long content = ZSTD_getFrameContentSize(in.data(), in.size());
   if (content == ZSTD_CONTENTSIZE_ERROR) {
     *error = "invalid ZSTD frame";
@@ -33,9 +36,16 @@ bool zstdDecodeAll(const std::string& in, std::string* out, std::string* error) 
   std::size_t cap = 0;
   if (content == ZSTD_CONTENTSIZE_UNKNOWN) {
     // The v1 server always writes content size in its frames; this is only a
-    // safety net for an unframed input. Grow generously.
+    // safety net for an unframed input. Grow generously, within the ceiling.
     cap = in.size() * 8 + 1024;
+    if (cap > max_bytes) {
+      cap = static_cast<std::size_t>(max_bytes);
+    }
   } else {
+    if (content > max_bytes) {
+      *error = "ZSTD frame declares " + std::to_string(content) + " bytes (over the decode ceiling)";
+      return false;
+    }
     cap = static_cast<std::size_t>(content);
   }
   out->resize(cap);
@@ -54,7 +64,7 @@ bool zstdDecodeAll(const std::string& in, std::string* out, std::string* error) 
 // per call so there is no carried state. NATIVE-ONLY: lz4 is not linked into the
 // wasm decode core (the wasm build never reaches this path against a v1 server);
 // the guard is additive and leaves the native build unchanged.
-bool lz4DecodeAll(const std::string& in, std::string* out, std::string* error) {
+bool lz4DecodeAll(const std::string& in, std::string* out, std::string* error, std::uint64_t max_bytes) {
   LZ4F_dctx* dctx = nullptr;
   const LZ4F_errorCode_t cr = LZ4F_createDecompressionContext(&dctx, LZ4F_VERSION);
   if (LZ4F_isError(cr)) {
@@ -80,10 +90,23 @@ bool lz4DecodeAll(const std::string& in, std::string* out, std::string* error) {
       break;
     }
     out->append(scratch.data(), dst_size);
+    if (out->size() > max_bytes) {
+      *error = "LZ4 decode exceeds the decode ceiling";
+      ok = false;
+      break;
+    }
     src += this_src;
     src_remaining -= this_src;
     if (hint == 0) {
-      break;  // frame complete
+      // Frame complete. Trailing bytes after the frame are a protocol
+      // violation (the payload is EXACTLY one frame — mirror the envelope
+      // decoder's exactly-one-frame rule): silently ignoring them would
+      // accept a corrupt/concatenated payload as clean.
+      if (src_remaining != 0) {
+        *error = "LZ4 decode failed: trailing data after frame end";
+        ok = false;
+      }
+      break;
     }
     if (this_src == 0 && dst_size == 0) {
       // No progress and not complete — truncated/garbage input.
@@ -128,20 +151,28 @@ bool decodeEncodedEnvelope(const std::string& body, std::uint64_t announced_size
   return true;
 }
 
-bool decodeBatch(const pj_cloud::v1::MessageBatch& batch, std::vector<DecodedMessage>* out, std::string* error) {
+bool decodeBatch(const pj_cloud::v1::MessageBatch& batch, std::vector<DecodedMessage>* out, std::string* error,
+                 std::uint64_t max_decoded_bytes) {
   out->clear();
 
   switch (batch.body_encoding()) {
     case pj_cloud::v1::BODY_ENCODING_ZSTD: {
       // Default path: one self-contained ZSTD frame -> marshaled MessageBatchBody.
       std::string raw;
-      if (!zstdDecodeAll(batch.body(), &raw, error)) {
+      if (!zstdDecodeAll(batch.body(), &raw, error, max_decoded_bytes)) {
         return false;
       }
       // Hard check: the server announced the uncompressed size; a mismatch means
       // a corrupt/forged frame (spec: verify body_uncompressed_size).
       if (raw.size() != batch.body_uncompressed_size()) {
         *error = "batch body_uncompressed_size mismatch";
+        return false;
+      }
+      // ParseFromArray takes an int; raw.size() is bounded by max_decoded_bytes
+      // (<= 512 MiB < INT_MAX above), but guard explicitly so a future ceiling
+      // bump can't silently truncate the size into a negative int.
+      if (raw.size() > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+        *error = "batch body too large to parse";
         return false;
       }
       pj_cloud::v1::MessageBatchBody body;
@@ -179,7 +210,7 @@ bool decodeBatch(const pj_cloud::v1::MessageBatch& batch, std::vector<DecodedMes
         switch (m.payload_encoding()) {
           case pj_cloud::v1::PAYLOAD_ENCODING_ZSTD: {
             std::string dec;
-            if (!zstdDecodeAll(m.payload(), &dec, error)) {
+            if (!zstdDecodeAll(m.payload(), &dec, error, max_decoded_bytes)) {
               return false;
             }
             dm.payload = std::move(dec);
@@ -194,7 +225,7 @@ bool decodeBatch(const pj_cloud::v1::MessageBatch& batch, std::vector<DecodedMes
             return false;
 #else
             std::string dec;
-            if (!lz4DecodeAll(m.payload(), &dec, error)) {
+            if (!lz4DecodeAll(m.payload(), &dec, error, max_decoded_bytes)) {
               return false;
             }
             dm.payload = std::move(dec);

@@ -405,7 +405,7 @@ if [ "$MODE" = cloud ]; then
 
     if ensure_builder "$TARGET" "$DB_PATH" 1200 "${BARGS[@]}"; then
       echo "==> [2/2] Starting the Go server on $LISTEN (read-only catalog reader)"
-      start_server -config "$CONFIG" -db "$DB_PATH" -tag-ipc-socket "$TAG_SOCKET"
+      start_server -config "$CONFIG" -db "$DB_PATH" -tag-ipc-socket "$TAG_SOCKET" -allow-anonymous
     else
       echo "ERROR: catalog builder did not complete its initial build within 20 minutes."
       echo "  It is still running in the background (pid $(cat "$BUILDER_PIDFILE" 2>/dev/null || echo '?'); log $BUILDER_LOGFILE)."
@@ -484,6 +484,6 @@ else
   echo "==> [3/4] Starting the Python catalog builder daemon (sole catalog writer + tag-edit IPC)"
   start_local_builder || { echo "ERROR: catalog builder did not complete its initial build within 60s — see $BUILDER_LOGFILE"; exit 1; }
   echo "==> [4/4] Starting the Go server on :8080  (read-only catalog reader; no credentials needed)"
-  start_server -listen :8080 -db /tmp/pj-cloud-catalog.db -tag-ipc-socket "$TAG_SOCKET"
+  start_server -listen :8080 -db /tmp/pj-cloud-catalog.db -tag-ipc-socket "$TAG_SOCKET" -allow-anonymous
 fi
 launch_app :8080

@@ -2,6 +2,7 @@ package catalog
 
 import (
 	"context"
+	"database/sql"
 	"sort"
 )
 
@@ -43,6 +44,10 @@ func DerivedMetadataKeys() []string {
 // advertises (Plan D Task 8 — the Lua query-assist dropdown source). The cap on
 // size keeps a pathological tag set from bloating the Hello frame.
 func DistinctMetadataKeys(ctx context.Context, s *Store) ([]string, error) {
+	return distinctMetadataKeysDB(ctx, s.DB())
+}
+
+func distinctMetadataKeysDB(ctx context.Context, db *sql.DB) ([]string, error) {
 	const maxVocabKeys = 256
 
 	seen := make(map[string]struct{}, len(derivedMetadataKeys)+16)
@@ -50,7 +55,7 @@ func DistinctMetadataKeys(ctx context.Context, s *Store) ([]string, error) {
 		seen[k] = struct{}{}
 	}
 
-	rows, err := s.DB().QueryContext(ctx,
+	rows, err := db.QueryContext(ctx,
 		`SELECT DISTINCT key FROM tags_effective ORDER BY key`)
 	if err != nil {
 		return nil, err
@@ -85,5 +90,22 @@ func DistinctMetadataKeys(ctx context.Context, s *Store) ([]string, error) {
 // customer/site/robot/source/date + filename), so in practice this is simply
 // "does the catalog have any files at all" — see aurynHasHierarchicalKey.
 func HasHierarchicalKey(ctx context.Context, s *Store) (bool, error) {
-	return aurynHasHierarchicalKey(ctx, s)
+	return aurynHasHierarchicalKey(ctx, s.DB())
+}
+
+// BackendCaps derives the Hello BackendCapabilities pair — metadata-key
+// vocabulary + hierarchy flag — against ONE pinned db handle (B1), so a catalog
+// swap landing between the two queries can never advertise a mixed-generation
+// view (e.g. one generation's vocabulary with another's hierarchy flag).
+func BackendCaps(ctx context.Context, s *Store) (vocab []string, hierarchy bool, err error) {
+	db := s.DB() // pinned once for both queries
+	vocab, err = distinctMetadataKeysDB(ctx, db)
+	if err != nil {
+		return nil, false, err
+	}
+	hierarchy, err = aurynHasHierarchicalKey(ctx, db)
+	if err != nil {
+		return nil, false, err
+	}
+	return vocab, hierarchy, nil
 }

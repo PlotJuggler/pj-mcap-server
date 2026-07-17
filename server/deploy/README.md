@@ -178,7 +178,10 @@ has no TLS concept.
 server (server incl. TLS + `response_compression`, auth, storage.s3,
 catalog.db_path, catalog.tag_ipc_socket, session, dashboard.basic_auth,
 metrics). Defaults: dashboard OFF (empty password disables it gracefully),
-metrics ON and unauthenticated, plaintext transport, tag-edit forwarding OFF
+metrics ON and unauthenticated, plaintext transport, client auth **FAIL-CLOSED**
+(the server REFUSES to start unless `bearer_token` / `PJ_CLOUD_TOKEN` is set, or
+`-allow-anonymous` / `PJ_CLOUD_ALLOW_ANONYMOUS=1` is passed to run with no auth on
+purpose), tag-edit forwarding OFF
 (empty `tag_ipc_socket` — UpdateTags is rejected outright until it's set to a
 reachable builder socket), and `response_compression` ON (opt-in per client via
 Hello — the server only wraps a bulky catalog RPC response when the client

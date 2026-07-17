@@ -2,6 +2,7 @@ package ws
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -104,6 +105,83 @@ func TestHello_CorrectTokenAccepted(t *testing.T) {
 	if resp.GetHelloResponse() == nil {
 		t.Fatalf("expected HelloResponse, got %T (err=%v)", resp.GetPayload(), resp.GetError())
 	}
+}
+
+// expectServerClose asserts the next read observes a SERVER-initiated close (or
+// EOF) rather than idling until the local budget expires: a local
+// context.DeadlineExceeded means the server left the connection open.
+func expectServerClose(t *testing.T, conn *websocket.Conn, budget time.Duration, what string) {
+	t.Helper()
+	rctx, rcancel := context.WithTimeout(context.Background(), budget)
+	defer rcancel()
+	_, _, err := conn.Read(rctx)
+	if err == nil {
+		t.Fatalf("%s: expected the server to close the connection, got a frame", what)
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("%s: connection still open (local read timeout, no server close)", what)
+	}
+}
+
+// TestHello_WrongTokenClosesConnection: after the AUTH_FAILED error frame the
+// server must CLOSE the socket — a peer with a bad token must not be able to
+// retry Hello forever (or hold the connection) inside one connection.
+func TestHello_WrongTokenClosesConnection(t *testing.T) {
+	url := newAuthTestServer(t, "correct-secret")
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	conn, _, err := websocket.Dial(ctx, url, nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.CloseNow()
+	conn.SetReadLimit(1 << 20)
+
+	hello := &pb.ClientMessage{
+		RequestId: 1,
+		Payload:   &pb.ClientMessage_Hello{Hello: &pb.Hello{ProtocolVersion: 1, AuthToken: "wrong-secret"}},
+	}
+	data, _ := proto.Marshal(hello)
+	if err := conn.Write(ctx, websocket.MessageBinary, data); err != nil {
+		t.Fatalf("write hello: %v", err)
+	}
+	_, raw, err := conn.Read(ctx)
+	if err != nil {
+		t.Fatalf("read error frame: %v", err)
+	}
+	var resp pb.ServerMessage
+	if err := proto.Unmarshal(raw, &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if resp.GetError().GetCode() != pb.ErrorCode_ERROR_AUTH_FAILED {
+		t.Fatalf("expected ERROR_AUTH_FAILED first, got %T (%v)", resp.GetPayload(), resp.GetError())
+	}
+	expectServerClose(t, conn, 3*time.Second, "post-auth-failure")
+}
+
+// TestHello_DeadlineClosesUnauthenticated: a connection that never sends a
+// successful Hello is closed at the Hello deadline instead of lingering until
+// the keepalive reaper notices.
+func TestHello_DeadlineClosesUnauthenticated(t *testing.T) {
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	cat := openAurynReadStore(t)
+	h := NewHandler(cat, "correct-secret", log)
+	h.SetHelloDeadline(200 * time.Millisecond)
+	mux := http.NewServeMux()
+	mux.Handle("/api/ws", h)
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	url := "ws" + strings.TrimPrefix(srv.URL, "http") + "/api/ws"
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	conn, _, err := websocket.Dial(ctx, url, nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.CloseNow()
+	// Send nothing: the server must close at the deadline.
+	expectServerClose(t, conn, 3*time.Second, "hello-deadline")
 }
 
 // TestHello_DevAnonymousAcceptsAll: a server with NO token (dev-anonymous) accepts

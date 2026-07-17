@@ -597,7 +597,7 @@ step_server() {
   # with an empty api_key). `exec` so the server process REPLACES the subshell.
   ( cd "${SERVER_DIR}" && exec env -u PJ_CLOUD_TOKEN ./bin/pj-cloud-server \
       -config "${SMOKE_CONFIG}" -listen ":${SMOKE_PORT}" -db "${SMOKE_DB}" \
-      -tag-ipc-socket "${TAG_SOCKET}" \
+      -tag-ipc-socket "${TAG_SOCKET}" -allow-anonymous \
       >>"${SMOKE_LOG}" 2>&1 ) &
   SMOKE_SERVER_PID=$!
 
@@ -1023,7 +1023,7 @@ step_restart_persistence() {
   : > "${SMOKE_LOG2}"
   ( cd "${SERVER_DIR}" && exec env -u PJ_CLOUD_TOKEN ./bin/pj-cloud-server \
       -config "${SMOKE_CONFIG}" -listen ":${SMOKE_PORT}" -db "${SMOKE_DB}" \
-      -tag-ipc-socket "${TAG_SOCKET}" \
+      -tag-ipc-socket "${TAG_SOCKET}" -allow-anonymous \
       >>"${SMOKE_LOG2}" 2>&1 ) &
   SMOKE_SERVER_PID=$!
   if ! wait_http "http://localhost:${SMOKE_PORT}/health" 60; then

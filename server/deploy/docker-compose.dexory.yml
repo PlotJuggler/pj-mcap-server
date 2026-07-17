@@ -60,7 +60,10 @@ services:
       builder:
         condition: service_healthy   # waits for the builder's FIRST published catalog
     environment:
-      PJ_CLOUD_TOKEN: ${PJ_CLOUD_TOKEN:-}                       # unset => DEV ANONYMOUS
+      # Auth is FAIL-CLOSED: with no token the server refuses to start. Set a
+      # token, or opt into no-auth on purpose with PJ_CLOUD_ALLOW_ANONYMOUS=1.
+      PJ_CLOUD_TOKEN: ${PJ_CLOUD_TOKEN:-}                       # unset => server won't start (unless allow-anonymous)
+      PJ_CLOUD_ALLOW_ANONYMOUS: ${PJ_CLOUD_ALLOW_ANONYMOUS:-}   # "1" => run with NO authentication (never on a public port)
       PJ_CLOUD_DASHBOARD_PASSWORD: ${PJ_CLOUD_DASHBOARD_PASSWORD:-}   # empty => dashboard disabled
       AWS_REGION: eu-west-2
       AWS_DEFAULT_REGION: eu-west-2

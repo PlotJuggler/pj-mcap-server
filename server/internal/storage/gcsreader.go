@@ -47,6 +47,22 @@ func NewGCS(ctx context.Context, cfg config.GCSConfig) (BlobStore, error) {
 }
 
 func (g *gcsStore) GetRange(ctx context.Context, key string, off, length int64) ([]byte, error) {
+	return g.getRange(ctx, key, 0, off, length)
+}
+
+// GetRangeVersioned pins the ranged read to one exact object generation (the
+// catalog's change token for GCS is the Generation decimal string — the
+// change-detect pin). A version that does not parse as a generation falls back
+// to an unconditional read rather than failing the stream.
+func (g *gcsStore) GetRangeVersioned(ctx context.Context, key, version string, off, length int64) ([]byte, error) {
+	gen, err := strconv.ParseInt(version, 10, 64)
+	if err != nil || gen <= 0 {
+		return g.getRange(ctx, key, 0, off, length)
+	}
+	return g.getRange(ctx, key, gen, off, length)
+}
+
+func (g *gcsStore) getRange(ctx context.Context, key string, generation, off, length int64) ([]byte, error) {
 	// GCS NewRangeReader: length < 0 means "to end of object" (mirror the S3 arm's
 	// length<=0 => off..EOF contract).
 	readLen := length
@@ -55,7 +71,11 @@ func (g *gcsStore) GetRange(ctx context.Context, key string, off, length int64) 
 	}
 	var data []byte
 	err := retryWith(ctx, func(ctx context.Context) error {
-		r, rErr := g.client.Bucket(g.bucket).Object(key).NewRangeReader(ctx, off, readLen)
+		obj := g.client.Bucket(g.bucket).Object(key)
+		if generation > 0 {
+			obj = obj.Generation(generation)
+		}
+		r, rErr := obj.NewRangeReader(ctx, off, readLen)
 		if rErr != nil {
 			return classifyGCS(fmt.Errorf("gcs get %q range [%d,%d): %w", key, off, off+length, rErr))
 		}

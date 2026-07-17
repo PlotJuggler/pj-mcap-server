@@ -4,8 +4,40 @@ import (
 	"context"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"testing"
 )
+
+// BackendCaps must derive the vocabulary + hierarchy pair against ONE catalog
+// generation and agree with the individual calls on a quiescent store.
+func TestBackendCaps_SingleGeneration(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "caps.db")
+	buildCapsFixtureDB(t, path, []string{"a.mcap"}, []TagKV{{Key: "quality", Value: "good"}})
+	st, err := OpenReadOnly(context.Background(), path)
+	if err != nil {
+		t.Fatalf("OpenReadOnly: %v", err)
+	}
+	defer st.Close()
+	ctx := context.Background()
+
+	vocab, hierarchy, err := BackendCaps(ctx, st)
+	if err != nil {
+		t.Fatalf("BackendCaps: %v", err)
+	}
+	if !hierarchy {
+		t.Error("hierarchy = false, want true (auryn keys are Hive-partitioned)")
+	}
+	if !sort.StringsAreSorted(vocab) {
+		t.Errorf("vocab not sorted: %v", vocab)
+	}
+	wantVocab, err := DistinctMetadataKeys(ctx, st)
+	if err != nil {
+		t.Fatalf("DistinctMetadataKeys: %v", err)
+	}
+	if !reflect.DeepEqual(vocab, wantVocab) {
+		t.Errorf("BackendCaps vocab %v != DistinctMetadataKeys %v", vocab, wantVocab)
+	}
+}
 
 // buildCapsFixtureDB writes a fresh auryn-schema (v3) DB at path with the given
 // files (sharing one dimension tuple) and, optionally, override tags on the

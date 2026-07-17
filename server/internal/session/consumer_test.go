@@ -121,6 +121,38 @@ func TestConsumer_EmitsProgressOnPriorityPath(t *testing.T) {
 	}
 }
 
+// The producer's oversized-message drop counter must reach the wire: Progress
+// and the terminal Eos read the LIVE count via DroppedFn (the producer runs
+// concurrently, so a snapshot at spawn time would under-report).
+func TestConsumer_ProgressCarriesLiveDroppedCount(t *testing.T) {
+	r := NewRetainBuffer(RetainOpts{MaxSeqs: 8, MaxBytes: 1024})
+	r.Append(batchEnv(1, 2))
+	w := &recWriter{}
+	pd := make(chan struct{})
+	c := &Consumer{
+		SubscriptionID: 6, Writer: w, Retain: r,
+		ProducerDone: pd, AckCh: make(chan uint64, 4),
+		ProgressEvery: 15 * time.Millisecond,
+		DroppedFn:     func() uint64 { return 7 },
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 80*time.Millisecond)
+	defer cancel()
+	c.Run(ctx)
+
+	var sawProgress bool
+	for _, f := range w.snapshot() {
+		if p := f.GetProgress(); p != nil {
+			sawProgress = true
+			if p.GetDroppedMessages() != 7 {
+				t.Errorf("Progress.dropped_messages: got %d want 7 (live DroppedFn)", p.GetDroppedMessages())
+			}
+		}
+	}
+	if !sawProgress {
+		t.Error("expected at least one Progress frame")
+	}
+}
+
 func TestConsumer_DetachesOnWriteFailure(t *testing.T) {
 	r := NewRetainBuffer(RetainOpts{MaxSeqs: 8, MaxBytes: 1024})
 	r.Append(batchEnv(1, 1))

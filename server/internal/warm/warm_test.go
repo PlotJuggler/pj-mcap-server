@@ -26,15 +26,16 @@ func warmFixtureKey(i int) string {
 	return fmt.Sprintf("customer=t/customer_site=t/robot=t/source=t/date=2026-01-01/k%d.mcap", i)
 }
 
-// fakeCodec counts ChunkIndex calls per key and can fail selected keys.
+// fakeCodec counts ChunkIndex calls per key and can fail or panic on selected keys.
 type fakeCodec struct {
-	mu       sync.Mutex
-	calls    map[string]int
-	failKeys map[string]bool
+	mu        sync.Mutex
+	calls     map[string]int
+	failKeys  map[string]bool
+	panicKeys map[string]bool
 }
 
 func newFakeCodec(fail ...string) *fakeCodec {
-	fc := &fakeCodec{calls: map[string]int{}, failKeys: map[string]bool{}}
+	fc := &fakeCodec{calls: map[string]int{}, failKeys: map[string]bool{}, panicKeys: map[string]bool{}}
 	for _, k := range fail {
 		fc.failKeys[k] = true
 	}
@@ -49,7 +50,11 @@ func (f *fakeCodec) ChunkIndex(_ context.Context, _ storage.BlobStore, key strin
 	f.mu.Lock()
 	f.calls[key]++
 	fail := f.failKeys[key]
+	panicky := f.panicKeys[key]
 	f.mu.Unlock()
+	if panicky {
+		panic("codec bug: malformed MCAP")
+	}
 	if fail {
 		return format.FileChunkIndex{}, errors.New("boom")
 	}
@@ -214,6 +219,33 @@ func TestWarmer_PoisonFileDoesNotAbort(t *testing.T) {
 		t.Fatal("k2 should NOT be cached (it failed)")
 	}
 	for _, i := range []int{0, 1, 3} {
+		if _, ok := cache.Get(warmFixtureKey(i), "e", 0); !ok {
+			t.Fatalf("k%d should be cached", i)
+		}
+	}
+}
+
+// A codec PANIC on one pathological file must behave exactly like a per-file
+// error: counted, skipped, sweep continues. Without in-closure recovery the
+// panic escapes the errgroup goroutine and kills the whole server process
+// (main.go runs the warmer as a bare goroutine).
+func TestWarmer_PanicFileDoesNotCrash(t *testing.T) {
+	store := seedStore(t, 4)
+	codec := newFakeCodec()
+	codec.panicKeys[warmFixtureKey(1)] = true // k1 panics the codec
+	cache := format.NewChunkIndexCache(64)
+	w := &Warmer{Store: store, Codec: codec, Blob: nil, Cache: cache, Concurrency: 2, Metrics: metrics.New()}
+
+	if err := w.Run(context.Background()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if cache.Len() != 3 {
+		t.Fatalf("cache len = %d, want 3 (k1 panicked, others warmed)", cache.Len())
+	}
+	if _, ok := cache.Get(warmFixtureKey(1), "e", 0); ok {
+		t.Fatal("k1 should NOT be cached (its load panicked)")
+	}
+	for _, i := range []int{0, 2, 3} {
 		if _, ok := cache.Get(warmFixtureKey(i), "e", 0); !ok {
 			t.Fatalf("k%d should be cached", i)
 		}

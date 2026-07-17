@@ -288,7 +288,7 @@ setup() {
   log "setup: starting matrix server on :${MATRIX_PORT} (db ${MATRIX_DB}, log ${MATRIX_LOG})"
   : > "${MATRIX_LOG}"
   ( cd "${SERVER_DIR}" && exec env -u PJ_CLOUD_TOKEN ./bin/pj-cloud-server \
-      -listen ":${MATRIX_PORT}" -db "${MATRIX_DB}" -poll-interval "${MATRIX_POLL_INTERVAL}" \
+      -listen ":${MATRIX_PORT}" -db "${MATRIX_DB}" -poll-interval "${MATRIX_POLL_INTERVAL}" -allow-anonymous \
       >>"${MATRIX_LOG}" 2>&1 ) &
   MATRIX_SERVER_PID=$!
   if ! wait_http "http://localhost:${MATRIX_PORT}/health" 60; then
@@ -535,7 +535,7 @@ YAML
   : > "${GCS_LOG}"
   ( cd "${SERVER_DIR}" \
       && exec env -u PJ_CLOUD_TOKEN STORAGE_EMULATOR_HOST="${FAKE_GCS_HOST}" \
-         ./bin/pj-cloud-server -config "${gcfg}" \
+         ./bin/pj-cloud-server -config "${gcfg}" -allow-anonymous \
          >>"${GCS_LOG}" 2>&1 ) &
   GCS_SERVER_PID=$!
   if ! wait_http "http://localhost:${MATRIX_PORT}/health" 60; then
@@ -591,7 +591,7 @@ YAML
   log "m8: warm-start restart on SAME GCS DB (change-detect via Generation)"
   ( cd "${SERVER_DIR}" \
       && exec env -u PJ_CLOUD_TOKEN STORAGE_EMULATOR_HOST="${FAKE_GCS_HOST}" \
-         ./bin/pj-cloud-server -config "${gcfg}" \
+         ./bin/pj-cloud-server -config "${gcfg}" -allow-anonymous \
          >>"${GCS_LOG}" 2>&1 ) &
   GCS_SERVER_PID=$!
   if ! wait_http "http://localhost:${MATRIX_PORT}/health" 60; then

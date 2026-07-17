@@ -100,6 +100,12 @@ doubt, but don't relitigate the decision itself.
   re-catalog, and rebuilds carry it forward by composite identity (not rowid).
 - **The tag-edit unix socket bypasses WS bearer auth** — the Go layer is the auth
   boundary. The catalog volume (SQLite WAL) must never sit on NFS/EFS.
+- **Client auth = ONE shared bearer token, enforced FAIL-CLOSED** (checked at the
+  WS `Hello` via the `ClientAuthenticator` seam, constant-time compare). The
+  server binary REFUSES to start when no token is configured; running with no
+  auth requires an explicit `-allow-anonymous` flag / `PJ_CLOUD_ALLOW_ANONYMOUS=1`
+  (the dev scripts `run.sh`/`smoke.sh` pass it). Per-client identity / permissions
+  / multi-tenancy stay an M1 non-goal — the seam is where real auth slots in.
 - **The MCAP `FormatCodec` REJECTS unsummarized files** — fixtures must be chunked
   + summarized + carry Statistics, or the codec refuses them outright.
 - **A `FileSourceBase` without `file_extensions` is UNREACHABLE in the host**
@@ -416,7 +422,9 @@ cancel-mid-stream.
     IPC configured), chunk-index warmer, Dashboard (HTML + Prometheus + `/health`,
     catalog freshness + quarantine). Pure-Go SQLite (no cgo). Seams unchanged:
     `BlobStore` (S3 + GCS), `FormatCodec` (MCAP), `ClientAuthenticator`. Only
-    `internal/storage` may import a cloud SDK. The tag socket bypasses WS bearer auth —
+    `internal/storage` may import a cloud SDK **in the server binary's path**; the
+    standalone dev tool `cmd/seed` (a throwaway S3 fixture uploader) imports the AWS
+    SDK directly by design — it is not part of the serving path. The tag socket bypasses WS bearer auth —
     the Go layer is the auth boundary (deploy mounts the socket volume into only the
     two processes; never on NFS/EFS — SQLite WAL).
 - **Qt C++ client** — `client-core` owns the WS/protocol/decompression and exposes a

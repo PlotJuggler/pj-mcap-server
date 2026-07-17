@@ -48,6 +48,7 @@ func main() {
 		pollInterval = flag.Duration("poll-interval", 0, "DEPRECATED no-op: the in-process indexer this tuned no longer exists")
 		tlsCert      = flag.String("tls-cert", "", "TLS cert path (overrides config / PJ_CLOUD_TLS_CERT; set with -tls-key to serve TLS)")
 		tlsKey       = flag.String("tls-key", "", "TLS key path (overrides config / PJ_CLOUD_TLS_KEY)")
+		allowAnon    = flag.Bool("allow-anonymous", false, "start with NO client authentication (accept every client). REQUIRED to run without a bearer token; also via PJ_CLOUD_ALLOW_ANONYMOUS=1")
 	)
 	flag.Parse()
 
@@ -74,12 +75,15 @@ func main() {
 	// external-builder is now the only mode; the flag/env/config field are
 	// deprecated no-ops (see the flag doc above) — warn once if anything asked
 	// for the old opt-in, but do not act on it.
-	envExternalBld := os.Getenv("PJ_CLOUD_EXTERNAL_BUILDER")
-	if *externalBld || envExternalBld == "1" || envExternalBld == "true" || cfg.Catalog.ExternalBuilder {
+	if *externalBld || envTruthy(os.Getenv("PJ_CLOUD_EXTERNAL_BUILDER")) || cfg.Catalog.ExternalBuilder {
 		log.Warn("external-builder is now the only mode; flag is deprecated")
 	}
 	if *pollInterval != 0 {
 		log.Warn("-poll-interval is deprecated and ignored; the in-process indexer it tuned no longer exists")
+	}
+	if cfg.DeprecatedIndexerInFile {
+		log.Warn("config: the indexer.* block is a deprecated no-op (the in-process indexer was deleted in the M6 cutover; " +
+			"the Python mcap_catalog builder owns the catalog) — remove it from the config file")
 	}
 	// D2 tag-edit IPC socket: -tag-ipc-socket flag wins, else PJ_CLOUD_TAG_IPC_SOCKET
 	// env, else config/default (empty => forwarding stays off).
@@ -104,8 +108,27 @@ func main() {
 		cfg.Auth.BearerToken = tok
 	}
 
+	// Re-validate AFTER every flag/env override has been applied: config.Load
+	// validated the file, but a flag/env override (e.g. -tls-cert with no
+	// -tls-key) can re-break an invariant — a half-configured TLS pair must be a
+	// startup error, never a silent plaintext fallback.
+	if err := cfg.Validate(); err != nil {
+		log.Error("config invalid after flag/env overrides", "err", err)
+		os.Exit(1)
+	}
+
+	// Fail CLOSED on a missing bearer token: without one the server accepts EVERY
+	// client, so refuse to start unless anonymous mode is explicitly opted into
+	// (flag or env). This turns "forgot PJ_CLOUD_TOKEN" from a silently wide-open
+	// deploy into a hard startup error. The env parse is STRICT ("1"/"true"):
+	// PJ_CLOUD_ALLOW_ANONYMOUS=0 must not fail open.
 	if cfg.Auth.BearerToken == "" {
-		log.Warn("PJ_CLOUD_TOKEN not set: running in DEV ANONYMOUS mode (any token accepted)")
+		if !*allowAnon && !envTruthy(os.Getenv("PJ_CLOUD_ALLOW_ANONYMOUS")) {
+			log.Error("refusing to start: no bearer token configured (set PJ_CLOUD_TOKEN or auth.bearer_token). " +
+				"To run with NO authentication on purpose, pass -allow-anonymous or set PJ_CLOUD_ALLOW_ANONYMOUS=1")
+			os.Exit(1)
+		}
+		log.Warn("authentication DISABLED (anonymous mode): every client is accepted — never expose this port publicly")
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -370,6 +393,14 @@ func storageIdentity(c config.StorageConfig) (backend, bucket, prefix, endpoint 
 	default:
 		return "none", "", "", ""
 	}
+}
+
+// envTruthy is the strict boolean-env parse ("1"/"true" exactly) shared by every
+// PJ_CLOUD_* opt-in. Anything else — including "0", "false", or padded values —
+// is false, so a fail-closed feature can never be switched off by a value that
+// was meant to disable it.
+func envTruthy(v string) bool {
+	return v == "1" || v == "true"
 }
 
 func newLogger(level string) *slog.Logger {
