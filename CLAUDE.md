@@ -438,7 +438,9 @@ cancel-mid-stream.
 
 Server-side **stitching**: selecting N consecutive MCAPs presents one continuous logical
 session (one time range, union of topics, ordered stream). The client commits to
-`(file_ids[], topic_names[], time_range)` before streaming; the server returns pre-flight
+`(s3_keys[], topic_names[], time_range)` before streaming (wire v2: key-addressed —
+catalog rowids renumber across builder rebuilds, so ids never cross the wire for
+session opens); the server returns pre-flight
 estimates (`estimated_chunk_bytes`, `approximate_messages`).
 
 ## Working conventions

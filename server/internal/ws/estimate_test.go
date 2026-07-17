@@ -143,16 +143,14 @@ func assertWithin5Pct(t *testing.T, leg string, estimated uint64, fetched int64)
 // fetch budget.
 func TestEstimateWithin5Pct_SingleFile(t *testing.T) {
 	zeg := loadZegFile(t)
-	freshLeg := func() (*testServer, *metrics.Metrics, uint64) {
+	freshLeg := func() (*testServer, *metrics.Metrics, string) {
 		ts, mx := newCountingTestServer(t, map[string][]byte{zegTestKey: zeg}, defaultTestSessionCfg())
-		c := dialClient(t, ts.url)
-		c.hello()
-		return ts, mx, c.fileID(t, zegTestKey)
+		return ts, mx, hiveKeyFor(zegTestKey)
 	}
 
 	t.Run("full", func(t *testing.T) {
-		ts, mx, id := freshLeg()
-		est, fetched, msgs := estimateLeg(t, ts, mx, &pb.OpenFresh{FileIds: []uint64{id}})
+		ts, mx, key := freshLeg()
+		est, fetched, msgs := estimateLeg(t, ts, mx, &pb.OpenFresh{S3Keys: []string{key}})
 		if msgs != zegTotalMessages {
 			t.Errorf("full: got %d msgs want %d", msgs, zegTotalMessages)
 		}
@@ -160,9 +158,9 @@ func TestEstimateWithin5Pct_SingleFile(t *testing.T) {
 	})
 
 	t.Run("topic-subset", func(t *testing.T) {
-		ts, mx, id := freshLeg()
+		ts, mx, key := freshLeg()
 		est, fetched, msgs := estimateLeg(t, ts, mx,
-			&pb.OpenFresh{FileIds: []uint64{id}, TopicNames: []string{zegSpeedTopic}})
+			&pb.OpenFresh{S3Keys: []string{key}, TopicNames: []string{zegSpeedTopic}})
 		if msgs != zegSpeedMessages {
 			t.Errorf("subset: got %d msgs want %d", msgs, zegSpeedMessages)
 		}
@@ -170,13 +168,13 @@ func TestEstimateWithin5Pct_SingleFile(t *testing.T) {
 	})
 
 	t.Run("time-window", func(t *testing.T) {
-		ts, mx, id := freshLeg()
+		ts, mx, key := freshLeg()
 		// The middle ~30% of zeg_1 (the smoke f4 window). Crossing chunk boundaries
 		// means the estimate (whole-chunk lengths) over-counts vs. messages, but the
 		// producer still FETCHES the whole intersecting chunks — so estimated_chunk_bytes
 		// and fetched bytes track each other (both are whole-chunk sums).
 		est, fetched, _ := estimateLeg(t, ts, mx, &pb.OpenFresh{
-			FileIds:   []uint64{id},
+			S3Keys:    []string{key},
 			TimeRange: &pb.TimeRange{StartNs: 1696577469299761084, EndNs: 1696577514415840735},
 		})
 		if fetched == 0 {
@@ -200,12 +198,8 @@ func TestEstimateWithin5Pct_Stitched(t *testing.T) {
 	}
 	ts, mx := newCountingTestServer(t, map[string][]byte{keyA: rawA, keyB: rawB}, defaultTestSessionCfg())
 
-	c := dialClient(t, ts.url)
-	c.hello()
-	idA := c.fileID(t, keyA)
-	idB := c.fileID(t, keyB)
-
-	est, fetched, msgs := estimateLeg(t, ts, mx, &pb.OpenFresh{FileIds: []uint64{idA, idB}})
+	est, fetched, msgs := estimateLeg(t, ts, mx,
+		&pb.OpenFresh{S3Keys: []string{hiveKeyFor(keyA), hiveKeyFor(keyB)}})
 	if msgs == 0 {
 		t.Fatal("stitched: streamed 0 messages")
 	}

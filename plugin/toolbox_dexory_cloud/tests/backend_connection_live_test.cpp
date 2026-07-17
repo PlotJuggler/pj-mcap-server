@@ -259,12 +259,16 @@ TEST(DexoryCloudBackendLive, StitchedGroundTruth) {
   const bool disjoint = (a->max_ts_ns <= b->min_ts_ns) || (b->max_ts_ns <= a->min_ts_ns);
   EXPECT_TRUE(disjoint) << "ci_synth_big.mcap / ci_synth_b.mcap time ranges overlap — stitching would be rejected";
 
-  // Both resolve to file_ids in the order requested.
+  // Both keys are present in the listing (OpenFresh is key-addressed in wire
+  // v2, so presence in the catalog listing is the client-side sanity check).
   ASSERT_FALSE(sequences.empty());
-  std::vector<std::string> missing;
-  const auto ids = conn.resolveFileIds({kStitchKeyA, kStitchKeyB}, &missing);
-  EXPECT_TRUE(missing.empty());
-  EXPECT_EQ(ids.size(), 2u);
+  bool have_a = false, have_b = false;
+  for (const auto& s : sequences) {
+    have_a = have_a || (s.name == kStitchKeyA);
+    have_b = have_b || (s.name == kStitchKeyB);
+  }
+  EXPECT_TRUE(have_a) << "stitch key A missing from listing";
+  EXPECT_TRUE(have_b) << "stitch key B missing from listing";
 }
 
 // UpdateTags round-trip (Slice 6): set an override tag on the known sequence,

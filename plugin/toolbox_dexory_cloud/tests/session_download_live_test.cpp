@@ -55,15 +55,10 @@ constexpr std::uint64_t kStitchMessages = 3130;  // A + B
 // it to completion, counting messages client-side. Asserts the session opened.
 dexory_cloud::SessionStats download(dexory_cloud::BackendConnection& conn, const std::vector<std::string>& topics,
                                     std::uint64_t* counted) {
-  // listSequences() builds the name->file_id index resolveFileIds() reads.
-  (void)conn.listSequences();
-  std::vector<std::string> missing;
-  const auto file_ids = conn.resolveFileIds({kKnownSequence}, &missing);
-  EXPECT_TRUE(missing.empty());
-  EXPECT_EQ(file_ids.size(), 1u);
-
+  // Key-addressed OpenFresh (wire v2): the sequence key goes straight through;
+  // no name->file_id resolution round trip.
   dexory_cloud::OpenSessionParams params;
-  params.file_ids = file_ids;
+  params.s3_keys = {kKnownSequence};
   params.topic_names = topics;
 
   dexory_cloud::SessionInfo info;
@@ -111,14 +106,8 @@ dexory_cloud::SessionStats downloadByTopic(dexory_cloud::BackendConnection& conn
                                            const std::vector<std::string>& keys,
                                            std::unordered_map<std::string, std::uint64_t>* by_topic,
                                            std::uint64_t* sub_id) {
-  (void)conn.listSequences();
-  std::vector<std::string> missing;
-  const auto file_ids = conn.resolveFileIds(keys, &missing);
-  EXPECT_TRUE(missing.empty());
-  EXPECT_EQ(file_ids.size(), keys.size());
-
   dexory_cloud::OpenSessionParams params;
-  params.file_ids = file_ids;
+  params.s3_keys = keys;
 
   dexory_cloud::SessionInfo info;
   std::string err;
@@ -200,14 +189,8 @@ TEST(DexoryCloudSessionDownloadLive, DebugVerbFirstN) {
   std::string error;
   ASSERT_TRUE(conn.connect(&error)) << "connect failed: " << error;
 
-  (void)conn.listSequences();
-  std::vector<std::string> missing;
-  const auto file_ids = conn.resolveFileIds({kKnownSequence}, &missing);
-  ASSERT_TRUE(missing.empty());
-  ASSERT_EQ(file_ids.size(), 1u);
-
   dexory_cloud::OpenSessionParams params;
-  params.file_ids = file_ids;
+  params.s3_keys = {kKnownSequence};
   dexory_cloud::SessionInfo info;
   std::string err;
   ASSERT_TRUE(conn.openSessionFresh(params, &info, &err)) << "openSessionFresh failed: " << err;

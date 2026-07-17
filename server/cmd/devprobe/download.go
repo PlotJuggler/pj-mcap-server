@@ -70,7 +70,7 @@ func runDownload(url, token, s3key, outPath, topicsCSV, timeRangeCSV string) err
 	// Hello.
 	helloResp, err := rpc(ctx, conn, &pb.ClientMessage{
 		RequestId: 1,
-		Payload:   &pb.ClientMessage_Hello{Hello: &pb.Hello{ProtocolVersion: 1, AuthToken: token}},
+		Payload:   &pb.ClientMessage_Hello{Hello: &pb.Hello{ProtocolVersion: 2, AuthToken: token}},
 	})
 	if err != nil {
 		return err
@@ -79,42 +79,22 @@ func runDownload(url, token, s3key, outPath, topicsCSV, timeRangeCSV string) err
 		return fmt.Errorf("expected HelloResponse, got error %v", helloResp.GetError())
 	}
 
-	// Resolve the file id from the s3_key via ListFiles.
-	listResp, err := rpc(ctx, conn, &pb.ClientMessage{
-		RequestId: 2,
-		Payload:   &pb.ClientMessage_ListFiles{ListFiles: &pb.ListFilesRequest{Limit: 1000}},
-	})
-	if err != nil {
-		return err
-	}
-	lf := listResp.GetListFiles()
-	if lf == nil {
-		return fmt.Errorf("expected ListFilesResponse, got error %v", listResp.GetError())
-	}
-	byKey := map[string]uint64{}
-	for _, f := range lf.GetFiles() {
-		byKey[f.GetS3Key()] = f.GetId()
-	}
-	// -download accepts a comma-separated list of keys (stitched session).
-	var fileIDs []uint64
+	// OpenFresh is key-addressed (v2): pass the s3_keys straight through — the
+	// server resolves each against its current catalog snapshot, so no local
+	// ListFiles -> file_id resolution is needed. -download accepts a
+	// comma-separated list of keys (stitched session).
+	var keys []string
 	for _, k := range strings.Split(s3key, ",") {
-		k = strings.TrimSpace(k)
-		if k == "" {
-			continue
+		if k = strings.TrimSpace(k); k != "" {
+			keys = append(keys, k)
 		}
-		id, ok := byKey[k]
-		if !ok || id == 0 {
-			return fmt.Errorf("s3_key %q not found in catalog", k)
-		}
-		fileIDs = append(fileIDs, id)
 	}
-	if len(fileIDs) == 0 {
-		return fmt.Errorf("no s3_keys resolved from %q", s3key)
+	if len(keys) == 0 {
+		return fmt.Errorf("no s3_keys parsed from %q", s3key)
 	}
-	fileID := fileIDs[0]
 
 	// Build OpenFresh.
-	fresh := &pb.OpenFresh{FileIds: fileIDs}
+	fresh := &pb.OpenFresh{S3Keys: keys}
 	if topicsCSV != "" {
 		for _, t := range strings.Split(topicsCSV, ",") {
 			if t = strings.TrimSpace(t); t != "" {
@@ -201,7 +181,6 @@ func runDownload(url, token, s3key, outPath, topicsCSV, timeRangeCSV string) err
 
 	sum := downloadSummary{
 		S3Key:   s3key,
-		FileID:  fileID,
 		Out:     outPath,
 		Topics:  len(or.GetTopicIdMap()),
 		Schemas: len(or.GetSchemas()),

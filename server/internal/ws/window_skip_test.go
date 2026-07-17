@@ -79,7 +79,6 @@ func TestOpenSession_PrewarmedPlanReadsNoStorage(t *testing.T) {
 	ts := newTestServerWithBlob(t, counter, defaultTestSessionCfg()) // fixture build pre-warms the cache
 	c := dialClient(t, ts.url)
 	c.hello()
-	id := c.fileID(t, "only.mcap")
 
 	counter.reset() // ignore the fixture-build scan reads
 
@@ -88,7 +87,7 @@ func TestOpenSession_PrewarmedPlanReadsNoStorage(t *testing.T) {
 	// pre-warm already cached.
 	c.send(&pb.ClientMessage{RequestId: 40, Payload: &pb.ClientMessage_OpenSession{
 		OpenSession: &pb.OpenSessionRequest{Mode: &pb.OpenSessionRequest_Fresh{
-			Fresh: &pb.OpenFresh{FileIds: []uint64{id}, TopicNames: []string{"/does-not-exist"}},
+			Fresh: &pb.OpenFresh{S3Keys: fileKeys("only.mcap"), TopicNames: []string{"/does-not-exist"}},
 		}},
 	}})
 	open := c.recv()
@@ -119,9 +118,6 @@ func TestOpenSession_WindowSkipsNonOverlappingFiles(t *testing.T) {
 	ts := newTestServerWithBlob(t, counter, defaultTestSessionCfg())
 	c := dialClient(t, ts.url)
 	c.hello()
-	idA := c.fileID(t, "a.mcap")
-	idB := c.fileID(t, "b.mcap")
-	idC := c.fileID(t, "c.mcap")
 
 	counter.reset() // ignore the fixture-build scan + ListFiles reads
 
@@ -129,7 +125,7 @@ func TestOpenSession_WindowSkipsNonOverlappingFiles(t *testing.T) {
 	c.send(&pb.ClientMessage{RequestId: 30, Payload: &pb.ClientMessage_OpenSession{
 		OpenSession: &pb.OpenSessionRequest{Mode: &pb.OpenSessionRequest_Fresh{
 			Fresh: &pb.OpenFresh{
-				FileIds:   []uint64{idA, idB, idC},
+				S3Keys:    fileKeys("a.mcap", "b.mcap", "c.mcap"),
 				TimeRange: &pb.TimeRange{StartNs: 2002 * sec, EndNs: 2008 * sec},
 			},
 		}},

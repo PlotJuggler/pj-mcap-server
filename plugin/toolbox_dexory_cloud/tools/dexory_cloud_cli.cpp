@@ -310,10 +310,14 @@ int runDownload(dexory_cloud::BackendConnection& conn, const std::vector<std::st
     }
   }
 
-  // listSequences() builds the name->file_id index that resolveFileIds() reads.
+  // The listing supplies the per-sequence time ranges the ordering + overlap
+  // guard needs (OpenFresh itself is key-addressed in wire v2 — no file_id
+  // resolution).
   const std::vector<dexory_cloud::SequenceInfo> sequences = conn.listSequences();
 
-  // Build a name -> SequenceInfo lookup for the time-ordering + overlap guard.
+  // Build a name -> SequenceInfo lookup for the time-ordering + overlap guard,
+  // and reject unknown names with a clean CLI error up front (the server would
+  // also reject them, but "unknown sequence 'x'" beats a wire error here).
   std::unordered_map<std::string, const dexory_cloud::SequenceInfo*> by_name;
   for (const auto& seq : sequences) {
     by_name.emplace(seq.name, &seq);
@@ -324,6 +328,7 @@ int runDownload(dexory_cloud::BackendConnection& conn, const std::vector<std::st
   // regardless of the order names were typed on the command line.
   std::vector<dexory_cloud::SelInput> sel_inputs;
   sel_inputs.reserve(sequence_names.size());
+  std::vector<std::string> missing;
   for (const auto& name : sequence_names) {
     dexory_cloud::SelInput in;
     in.name = name;
@@ -331,8 +336,18 @@ int runDownload(dexory_cloud::BackendConnection& conn, const std::vector<std::st
       in.min_ts_ns = it->second->min_ts_ns;
       in.max_ts_ns = it->second->max_ts_ns;
       in.size_bytes = it->second->total_size_bytes;
+    } else {
+      missing.push_back(name);
     }
     sel_inputs.push_back(std::move(in));
+  }
+  if (!missing.empty()) {
+    std::cerr << "download: unknown sequence(s):";
+    for (const auto& m : missing) {
+      std::cerr << " '" << m << "'";
+    }
+    std::cerr << '\n';
+    return kExitFailure;
   }
 
   // Client-side overlap guard (mirrors the GUI; the server stays authoritative).
@@ -343,24 +358,8 @@ int runDownload(dexory_cloud::BackendConnection& conn, const std::vector<std::st
 
   const dexory_cloud::StitchedSelection stitched = dexory_cloud::buildStitchedSelection(sel_inputs);
 
-  // Resolve the time-ordered names to file_ids (resolveFileIds preserves input
-  // order). ALL ids go into ONE OpenFresh — the server stitches them.
-  std::vector<std::string> missing;
-  const auto file_ids = conn.resolveFileIds(stitched.ordered_names, &missing);
-  if (!missing.empty() || file_ids.size() != stitched.ordered_names.size() || file_ids.empty()) {
-    std::cerr << "download: unknown sequence";
-    if (!missing.empty()) {
-      std::cerr << "(s):";
-      for (const auto& m : missing) {
-        std::cerr << " '" << m << "'";
-      }
-    }
-    std::cerr << '\n';
-    return kExitFailure;
-  }
-
   dexory_cloud::OpenSessionParams params;
-  params.file_ids = file_ids;
+  params.s3_keys = stitched.ordered_names;
   params.topic_names = topics;
   params.start_ns = start_ns;
   params.end_ns = end_ns;
@@ -447,6 +446,7 @@ bool resolveStitchedParams(dexory_cloud::BackendConnection& conn, const std::vec
 
   std::vector<dexory_cloud::SelInput> sel_inputs;
   sel_inputs.reserve(sequence_names.size());
+  std::vector<std::string> missing;
   for (const auto& name : sequence_names) {
     dexory_cloud::SelInput in;
     in.name = name;
@@ -454,8 +454,19 @@ bool resolveStitchedParams(dexory_cloud::BackendConnection& conn, const std::vec
       in.min_ts_ns = it->second->min_ts_ns;
       in.max_ts_ns = it->second->max_ts_ns;
       in.size_bytes = it->second->total_size_bytes;
+    } else {
+      missing.push_back(name);
     }
     sel_inputs.push_back(std::move(in));
+  }
+  if (!missing.empty()) {
+    std::cerr << "debug: unknown sequence(s):";
+    for (const auto& m : missing) {
+      std::cerr << " '" << m << "'";
+    }
+    std::cerr << '\n';
+    *exit_code = kExitFailure;
+    return false;
   }
 
   if (const std::string overlap = dexory_cloud::validateNonOverlapping(sel_inputs); !overlap.empty()) {
@@ -464,23 +475,9 @@ bool resolveStitchedParams(dexory_cloud::BackendConnection& conn, const std::vec
     return false;
   }
 
+  // Key-addressed OpenFresh (wire v2): the time-ordered names ARE the s3_keys.
   const dexory_cloud::StitchedSelection stitched = dexory_cloud::buildStitchedSelection(sel_inputs);
-  std::vector<std::string> missing;
-  const auto file_ids = conn.resolveFileIds(stitched.ordered_names, &missing);
-  if (!missing.empty() || file_ids.size() != stitched.ordered_names.size() || file_ids.empty()) {
-    std::cerr << "debug: unknown sequence";
-    if (!missing.empty()) {
-      std::cerr << "(s):";
-      for (const auto& m : missing) {
-        std::cerr << " '" << m << "'";
-      }
-    }
-    std::cerr << '\n';
-    *exit_code = kExitFailure;
-    return false;
-  }
-
-  params->file_ids = file_ids;
+  params->s3_keys = stitched.ordered_names;
   params->topic_names = topics;
   params->start_ns = start_ns;
   params->end_ns = end_ns;

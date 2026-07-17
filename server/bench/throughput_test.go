@@ -257,7 +257,7 @@ func resolveFileID(wsURL, key string) uint64 {
 	conn.SetReadLimit(64 << 20)
 	if _, err := rpc(ctx, conn, &pb.ClientMessage{
 		RequestId: 1,
-		Payload:   &pb.ClientMessage_Hello{Hello: &pb.Hello{ProtocolVersion: 1}},
+		Payload:   &pb.ClientMessage_Hello{Hello: &pb.Hello{ProtocolVersion: 2}},
 	}); err != nil {
 		return 0
 	}
@@ -294,19 +294,19 @@ func downloadOnce(t *testing.T, wsURL, key string) (uint64, error) {
 
 	if _, err := rpc(ctx, conn, &pb.ClientMessage{
 		RequestId: 1,
-		Payload:   &pb.ClientMessage_Hello{Hello: &pb.Hello{ProtocolVersion: 1}},
+		Payload:   &pb.ClientMessage_Hello{Hello: &pb.Hello{ProtocolVersion: 2}},
 	}); err != nil {
 		return 0, err
 	}
-	id := resolveFileIDOnConn(ctx, conn, key)
-	if id == 0 {
-		return 0, fmt.Errorf("file id for %q not found", key)
+	// Confirm the key exists (nice client-side error), then open BY KEY (v2).
+	if resolveFileIDOnConn(ctx, conn, key) == 0 {
+		return 0, fmt.Errorf("file %q not found", key)
 	}
 
 	if err := writeMsg(ctx, conn, &pb.ClientMessage{
 		RequestId: 3,
 		Payload: &pb.ClientMessage_OpenSession{OpenSession: &pb.OpenSessionRequest{
-			Mode: &pb.OpenSessionRequest_Fresh{Fresh: &pb.OpenFresh{FileIds: []uint64{id}}},
+			Mode: &pb.OpenSessionRequest_Fresh{Fresh: &pb.OpenFresh{S3Keys: []string{key}}},
 		}},
 	}); err != nil {
 		return 0, err

@@ -99,11 +99,10 @@ func TestProducerPanic_RecoversAndCounts(t *testing.T) {
 
 	c := dialClient(t, ts.url)
 	c.hello()
-	id := c.fileID(t, zegTestKey)
 
 	c.send(&pb.ClientMessage{RequestId: 10, Payload: &pb.ClientMessage_OpenSession{
 		OpenSession: &pb.OpenSessionRequest{Mode: &pb.OpenSessionRequest_Fresh{
-			Fresh: &pb.OpenFresh{FileIds: []uint64{id}},
+			Fresh: &pb.OpenFresh{S3Keys: fileKeys(zegTestKey)},
 		}},
 	}})
 	if c.recv().GetOpenSession() == nil {

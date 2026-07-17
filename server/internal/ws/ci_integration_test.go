@@ -461,8 +461,8 @@ func runCILeg(t *testing.T, backend, python, mcapDir string) {
 
 	// ── assertion 2: full single-file download round-trip (exact counts) ─────
 	specA := specs[0]
-	idA := byKey[flatToHive[specA.Key]].GetId()
-	gotA := ciDownload(t, ts, &pb.OpenFresh{FileIds: []uint64{idA}})
+	keyA := flatToHive[specA.Key]
+	gotA := ciDownload(t, ts, &pb.OpenFresh{S3Keys: []string{keyA}})
 	if gotA.total != int(specA.TotalMessages()) {
 		t.Errorf("%s: full download %q: got %d msgs want %d", backend, specA.Key, gotA.total, specA.TotalMessages())
 	}
@@ -476,7 +476,7 @@ func runCILeg(t *testing.T, backend, python, mcapDir string) {
 	// ── assertion 3: topic-subset download (exact per-topic count, no over-deliver)
 	subTopic := specA.Topics[0].Topic // /clock
 	subWant := specA.Topics[0].MessageCount
-	gotSub := ciDownload(t, ts, &pb.OpenFresh{FileIds: []uint64{idA}, TopicNames: []string{subTopic}})
+	gotSub := ciDownload(t, ts, &pb.OpenFresh{S3Keys: []string{keyA}, TopicNames: []string{subTopic}})
 	if gotSub.total != subWant {
 		t.Errorf("%s: subset %q@%q: got %d msgs want %d (over/under-delivery)", backend, specA.Key, subTopic, gotSub.total, subWant)
 	}
@@ -488,7 +488,7 @@ func runCILeg(t *testing.T, backend, python, mcapDir string) {
 	half := specA.StartNs + (specA.EndNs()-specA.StartNs)/2
 	wantWindow := countInWindow(specA, specA.StartNs, half)
 	gotWin := ciDownload(t, ts, &pb.OpenFresh{
-		FileIds:   []uint64{idA},
+		S3Keys:    []string{keyA},
 		TimeRange: &pb.TimeRange{StartNs: specA.StartNs, EndNs: half},
 	})
 	if gotWin.total != wantWindow {
@@ -497,13 +497,13 @@ func runCILeg(t *testing.T, backend, python, mcapDir string) {
 
 	// ── assertion 5: stitched multi-file download (union, monotonic, exact) ──
 	// All fixtures are time-disjoint, so the stitch is the sum.
-	allIDs := make([]uint64, 0, len(specs))
+	allKeys := make([]string, 0, len(specs))
 	wantStitch := 0
 	for _, s := range specs {
-		allIDs = append(allIDs, byKey[flatToHive[s.Key]].GetId())
+		allKeys = append(allKeys, flatToHive[s.Key])
 		wantStitch += int(s.TotalMessages())
 	}
-	gotStitch := ciDownload(t, ts, &pb.OpenFresh{FileIds: allIDs})
+	gotStitch := ciDownload(t, ts, &pb.OpenFresh{S3Keys: allKeys})
 	if gotStitch.total != wantStitch {
 		t.Errorf("%s: stitched download: got %d msgs want %d", backend, gotStitch.total, wantStitch)
 	}
@@ -533,7 +533,7 @@ func runCILeg(t *testing.T, backend, python, mcapDir string) {
 				want = int(s.TotalMessages())
 			}
 		}
-		got := ciDownload(t, ts, &pb.OpenFresh{FileIds: []uint64{f.GetId()}})
+		got := ciDownload(t, ts, &pb.OpenFresh{S3Keys: []string{f.GetS3Key()}})
 		if got.total != want {
 			t.Errorf("%s: dimension %q download: got %d msgs want %d", backend, key, got.total, want)
 		}

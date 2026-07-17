@@ -71,7 +71,10 @@ message EncodedServerMessage {
 // -----------------------------------------------------------------------------
 
 message Hello {
-  uint32 protocol_version = 1;             // current = 1
+  // current = 2. v2 (2026-07-17) made OpenFresh key-addressed (s3_keys, not
+  // file_ids); a v1 client that would send catalog rowids fails cleanly at the
+  // handshake (ERROR_PROTOCOL_VERSION) instead of later with "no s3_keys".
+  uint32 protocol_version = 1;
   string auth_token       = 2;             // bearer token from config
   // Response encodings the client can decode for the ADDITIVE compressed-envelope
   // path (EncodedServerMessage). Empty ⇒ raw ServerMessage frames only (old
@@ -96,7 +99,7 @@ message Capabilities {
 // learning which storage backend is behind the server (S3 vs GCS stays
 // invisible — these are abstract capability flags, NOT storage-specific fields).
 //   supports_file_hierarchy  → client may render a tree/breadcrumb browser
-//                              (Asensus GCS prefixes); false ⇒ flat table (Dexory).
+//                              (GCS prefixes); false ⇒ flat table (S3 use case).
 //   metadata_key_vocabulary  → keys the server knows are searchable (e.g.
 //                              "robot_id","procedure_date","operator"); populates
 //                              the Lua query-assist dropdowns.
@@ -284,7 +287,17 @@ message OpenSessionRequest {
 }
 
 message OpenFresh {
-  repeated uint64 file_ids    = 1;
+  // KEY-ADDRESSED (v2). Selection is by durable object key, never catalog
+  // rowid: a full builder rebuild RENUMBERS file rowids (CATALOG_CONTRACT.md
+  // §7), so a rowid captured at browse time can name a DIFFERENT object by the
+  // time the client opens. s3_key is the durable identity; the server resolves
+  // every key against one pinned catalog snapshot in its CURRENT generation. A
+  // missing key fails the whole open (ERROR_NOT_FOUND) before any storage read
+  // or session registration — never substituting the current occupant of an old
+  // rowid. Field 1 (the old repeated uint64 file_ids) is RESERVED.
+  reserved 1;
+  reserved "file_ids";
+  repeated string s3_keys     = 5;          // >=1; no empty/duplicate keys
   repeated string topic_names = 2;          // empty = all union topics
   TimeRange       time_range  = 3;          // optional; default = stitched union
   // Latched / transient-local replay. When true AND time_range is set, the

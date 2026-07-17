@@ -1208,6 +1208,87 @@ PY
   log "step h: OK (tag flow set -> visible -> survives rebuild -> unset -> gone, via the tag-edit IPC forwarder)"
 }
 
+# ── step i: key-addressed OpenFresh (wire v2) survives a rowid-SHIFTING
+# rebuild. Seed ONE extra fixture whose Hive key sorts lexically FIRST, run a
+# full `--once --rebuild` (renumbers rowids, CATALOG_CONTRACT.md §7 — the extra
+# file takes the low rowid and SHIFTS every other file's id), wait for the Go
+# server's reopen, then download the ORIGINAL target BY KEY and mcapdiff it
+# against the local original. Under the old id-addressed wire this exact race
+# could stream the WRONG file (the new occupant of a stale rowid); the
+# key-addressed open must resolve the key in the server's CURRENT generation. ──
+step_key_addressed_open() {
+  log "step i: key-addressed open survives a rowid-shifting rebuild (wire v2)"
+  local probe="${SERVER_DIR}/bin/devprobe"
+  local mcapdiff="${SERVER_DIR}/bin/mcapdiff"
+  local sdk_cli="${CTEST_DIR}/bin/dexory-cloud-cli"
+  local extra_key="customer=aaa/customer_site=lab/robot=r1/source=synthetic/date=2026-06-22/aaa_shift.mcap"
+
+  local id_before
+  id_before="$(db_query "${SMOKE_DB}" "SELECT id FROM files WHERE filename='${TARGET_FILE}'")" \
+    || fail "keyaddr: could not read the target's pre-rebuild rowid"
+
+  # Seed the lexically-first extra fixture (a copy of the target original —
+  # content is irrelevant, only its KEY position in the scan order matters).
+  local extra_dir
+  extra_dir="$(mktemp -d)" || fail "keyaddr: mktemp -d failed"
+  mkdir -p "${extra_dir}/$(dirname "${extra_key}")"
+  cp "${GROUND_TRUTH_TARGET}" "${extra_dir}/${extra_key}" || fail "keyaddr: could not stage the extra fixture"
+  "${SERVER_DIR}/bin/seed" -dir "${extra_dir}" -bucket "${SMOKE_BUCKET}" \
+      -endpoint "${SMOKE_S3_ENDPOINT}" -access-key "${SMOKE_S3_ACCESS_KEY}" -secret-key "${SMOKE_S3_SECRET_KEY}" \
+      -region "${SMOKE_S3_REGION}" -force >/dev/null \
+    || fail "keyaddr: seeding the extra fixture failed"
+  rm -rf "${extra_dir}"
+
+  # Full rebuild (atomic publish, new inode) + daemon restart, mirroring h3.
+  local ident_before ident_after
+  ident_before="$(stat -c '%d:%i' "${SMOKE_DB}")" || fail "keyaddr: stat before rebuild failed"
+  stop_builder_daemon
+  : > "${REBUILD_LOG}"
+  run_builder_once_rebuild "${REBUILD_LOG}" || {
+    log "----- rebuild log -----"; cat "${REBUILD_LOG}" || true
+    fail "keyaddr: --once --rebuild failed"
+  }
+  ident_after="$(stat -c '%d:%i' "${SMOKE_DB}")" || fail "keyaddr: stat after rebuild failed"
+  [[ "${ident_before}" != "${ident_after}" ]] \
+    || fail "keyaddr: rebuild did not swap the served DB identity"
+  rm -f "${TAG_SOCKET}"
+  start_builder_daemon "${BUILDER_LOG2}"
+
+  # The rebuild must have SHIFTED the target's rowid — that renumbering is the
+  # very hazard key-addressing removes; without it this step proves nothing.
+  local id_after
+  id_after="$(db_query "${SMOKE_DB}" "SELECT id FROM files WHERE filename='${TARGET_FILE}'")" \
+    || fail "keyaddr: could not read the target's post-rebuild rowid"
+  [[ "${id_before}" != "${id_after}" ]] \
+    || fail "keyaddr: target rowid did NOT shift (${id_before} -> ${id_after}); the lexically-first extra fixture did not renumber the scan"
+  log "step i: target rowid shifted ${id_before} -> ${id_after} (extra key ${extra_key})"
+
+  # Wait (<=40s, the 30s freshness tick + slack) for the server to serve the
+  # new generation: the extra key appearing in the listing proves the reopen.
+  local reopened=0 i
+  for i in $(seq 1 20); do
+    local poll_json
+    if poll_json="$("${probe}" -url "${SMOKE_WS}" 2>/dev/null)" \
+       && grep -q "aaa_shift.mcap" <<<"${poll_json}"; then
+      reopened=1
+      break
+    fi
+    sleep 2
+  done
+  [[ "${reopened}" == "1" ]] || fail "keyaddr: server did not serve the new generation within 40s"
+
+  # THE assertion: open the ORIGINAL target BY KEY on the new generation and
+  # prove logical equality with the local original — the key resolved to the
+  # right object despite its rowid having moved underneath it.
+  [[ -n "${SMOKE_WORKDIR}" && -d "${SMOKE_WORKDIR}" ]] || SMOKE_WORKDIR="$(mktemp -d)"
+  local out="${SMOKE_WORKDIR}/keyaddr_after_rebuild.mcap"
+  "${sdk_cli}" --url "ws://localhost:${SMOKE_PORT}" download "${TARGET_KEY}" --output "${out}" >/dev/null 2>&1 \
+    || fail "keyaddr: C++ CLI download by key failed after the rowid-shifting rebuild"
+  "${mcapdiff}" "${GROUND_TRUTH_TARGET}" "${out}" \
+    || fail "keyaddr: post-rebuild download NOT logically equal to the original (wrong object for the key?)"
+  log "step i: OK (open-by-key streamed the correct object across a rowid-shifting rebuild; mcapdiff clean)"
+}
+
 # ─────────────────────────────────────────────────────────────────────────────
 main() {
   log "PJ Cloud Connector SDK smoke harness starting (repo: ${REPO_ROOT}) — catalog-migration cutover: Python builder + external-builder Go server"
@@ -1220,6 +1301,7 @@ main() {
   step_roundtrip
   step_restart_persistence
   step_tag_flow
+  step_key_addressed_open
   # Do NOT print the verdict here — the EXIT trap (cleanup) prints it, LAST,
   # after every teardown log line (B1: the final-line contract).
   SMOKE_VERDICT="SMOKE PASS"

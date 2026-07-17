@@ -50,7 +50,7 @@ func helloRoundTrip(t *testing.T, url, authToken string) *pb.ServerMessage {
 
 	hello := &pb.ClientMessage{
 		RequestId: 1,
-		Payload:   &pb.ClientMessage_Hello{Hello: &pb.Hello{ProtocolVersion: 1, AuthToken: authToken}},
+		Payload:   &pb.ClientMessage_Hello{Hello: &pb.Hello{ProtocolVersion: 2, AuthToken: authToken}},
 	}
 	data, err := proto.Marshal(hello)
 	if err != nil {
@@ -139,7 +139,7 @@ func TestHello_WrongTokenClosesConnection(t *testing.T) {
 
 	hello := &pb.ClientMessage{
 		RequestId: 1,
-		Payload:   &pb.ClientMessage_Hello{Hello: &pb.Hello{ProtocolVersion: 1, AuthToken: "wrong-secret"}},
+		Payload:   &pb.ClientMessage_Hello{Hello: &pb.Hello{ProtocolVersion: 2, AuthToken: "wrong-secret"}},
 	}
 	data, _ := proto.Marshal(hello)
 	if err := conn.Write(ctx, websocket.MessageBinary, data); err != nil {

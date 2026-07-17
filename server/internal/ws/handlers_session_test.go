@@ -192,7 +192,7 @@ func (c *wsClient) recv() *pb.ServerMessage {
 
 func (c *wsClient) hello() {
 	c.t.Helper()
-	c.send(&pb.ClientMessage{RequestId: 1, Payload: &pb.ClientMessage_Hello{Hello: &pb.Hello{ProtocolVersion: 1}}})
+	c.send(&pb.ClientMessage{RequestId: 1, Payload: &pb.ClientMessage_Hello{Hello: &pb.Hello{ProtocolVersion: 2}}})
 	resp := c.recv()
 	if resp.GetHelloResponse() == nil {
 		c.t.Fatalf("expected HelloResponse, got %T (err=%v)", resp.GetPayload(), resp.GetError())
@@ -220,6 +220,17 @@ func (c *wsClient) fileID(t *testing.T, key string) uint64 {
 	}
 	t.Fatalf("file %q (hive key %q) not in listing", key, want)
 	return 0
+}
+
+// fileKeys maps flat fixture keys to the rebuilt Hive s3_keys the catalog
+// serves — the durable identity OpenFresh is addressed by (v2). Call sites that
+// used to resolve a wire file_id (fileID) now pass keys straight through.
+func fileKeys(flat ...string) []string {
+	out := make([]string, len(flat))
+	for i, k := range flat {
+		out[i] = hiveKeyFor(k)
+	}
+	return out
 }
 
 // collectResult tallies a streamed session: total messages, per-topic counts,
@@ -312,11 +323,10 @@ func TestSession_FullLifecycle_AllTopics(t *testing.T) {
 	ts := newTestServer(t, map[string][]byte{zegTestKey: loadZegFile(t)}, defaultTestSessionCfg())
 	c := dialClient(t, ts.url)
 	c.hello()
-	id := c.fileID(t, zegTestKey)
 
 	c.send(&pb.ClientMessage{RequestId: 10, Payload: &pb.ClientMessage_OpenSession{
 		OpenSession: &pb.OpenSessionRequest{Mode: &pb.OpenSessionRequest_Fresh{
-			Fresh: &pb.OpenFresh{FileIds: []uint64{id}},
+			Fresh: &pb.OpenFresh{S3Keys: fileKeys(zegTestKey)},
 		}},
 	}})
 	open := c.recv()
@@ -361,11 +371,10 @@ func TestSession_TopicSubset(t *testing.T) {
 	ts := newTestServer(t, map[string][]byte{zegTestKey: loadZegFile(t)}, defaultTestSessionCfg())
 	c := dialClient(t, ts.url)
 	c.hello()
-	id := c.fileID(t, zegTestKey)
 
 	c.send(&pb.ClientMessage{RequestId: 11, Payload: &pb.ClientMessage_OpenSession{
 		OpenSession: &pb.OpenSessionRequest{Mode: &pb.OpenSessionRequest_Fresh{
-			Fresh: &pb.OpenFresh{FileIds: []uint64{id}, TopicNames: []string{zegSpeedTopic}},
+			Fresh: &pb.OpenFresh{S3Keys: fileKeys(zegTestKey), TopicNames: []string{zegSpeedTopic}},
 		}},
 	}})
 	or := c.recv().GetOpenSession()
@@ -399,12 +408,11 @@ func TestSession_EmptyPlan(t *testing.T) {
 	ts := newTestServer(t, map[string][]byte{zegTestKey: loadZegFile(t)}, defaultTestSessionCfg())
 	c := dialClient(t, ts.url)
 	c.hello()
-	id := c.fileID(t, zegTestKey)
 
 	// A topic that exists in no file -> silently dropped -> empty plan.
 	c.send(&pb.ClientMessage{RequestId: 12, Payload: &pb.ClientMessage_OpenSession{
 		OpenSession: &pb.OpenSessionRequest{Mode: &pb.OpenSessionRequest_Fresh{
-			Fresh: &pb.OpenFresh{FileIds: []uint64{id}, TopicNames: []string{"/does/not/exist"}},
+			Fresh: &pb.OpenFresh{S3Keys: fileKeys(zegTestKey), TopicNames: []string{"/does/not/exist"}},
 		}},
 	}})
 	or := c.recv().GetOpenSession()
@@ -441,11 +449,10 @@ func TestSession_ResourceLimit(t *testing.T) {
 	ts := newTestServer(t, map[string][]byte{zegTestKey: loadZegFile(t)}, cfg)
 	c := dialClient(t, ts.url)
 	c.hello()
-	id := c.fileID(t, zegTestKey)
 
 	c.send(&pb.ClientMessage{RequestId: 50, Payload: &pb.ClientMessage_OpenSession{
 		OpenSession: &pb.OpenSessionRequest{Mode: &pb.OpenSessionRequest_Fresh{
-			Fresh: &pb.OpenFresh{FileIds: []uint64{id}},
+			Fresh: &pb.OpenFresh{S3Keys: fileKeys(zegTestKey)},
 		}},
 	}})
 	if c.recv().GetOpenSession() == nil {
@@ -454,7 +461,7 @@ func TestSession_ResourceLimit(t *testing.T) {
 	// Do not drain: the first session stays active (producer parks at the cap).
 	c.send(&pb.ClientMessage{RequestId: 51, Payload: &pb.ClientMessage_OpenSession{
 		OpenSession: &pb.OpenSessionRequest{Mode: &pb.OpenSessionRequest_Fresh{
-			Fresh: &pb.OpenFresh{FileIds: []uint64{id}, TopicNames: []string{zegSpeedTopic}},
+			Fresh: &pb.OpenFresh{S3Keys: fileKeys(zegTestKey), TopicNames: []string{zegSpeedTopic}},
 		}},
 	}})
 	// The second response may be preceded by in-flight batches/progress from the
@@ -479,7 +486,7 @@ func TestSession_UnknownFileID(t *testing.T) {
 
 	c.send(&pb.ClientMessage{RequestId: 13, Payload: &pb.ClientMessage_OpenSession{
 		OpenSession: &pb.OpenSessionRequest{Mode: &pb.OpenSessionRequest_Fresh{
-			Fresh: &pb.OpenFresh{FileIds: []uint64{99999}},
+			Fresh: &pb.OpenFresh{S3Keys: []string{"customer=x/customer_site=y/robot=z/source=s/date=2026-01-01/nope.mcap"}},
 		}},
 	}})
 	e := c.recv().GetError()
@@ -496,11 +503,10 @@ func TestSession_Cancel(t *testing.T) {
 	ts := newTestServer(t, map[string][]byte{zegTestKey: loadZegFile(t)}, cfg)
 	c := dialClient(t, ts.url)
 	c.hello()
-	id := c.fileID(t, zegTestKey)
 
 	c.send(&pb.ClientMessage{RequestId: 14, Payload: &pb.ClientMessage_OpenSession{
 		OpenSession: &pb.OpenSessionRequest{Mode: &pb.OpenSessionRequest_Fresh{
-			Fresh: &pb.OpenFresh{FileIds: []uint64{id}},
+			Fresh: &pb.OpenFresh{S3Keys: fileKeys(zegTestKey)},
 		}},
 	}})
 	or := c.recv().GetOpenSession()

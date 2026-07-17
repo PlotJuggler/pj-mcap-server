@@ -177,6 +177,33 @@ func TestGetFiles_BatchResolve(t *testing.T) {
 	}
 }
 
+// GetFilesByKeys resolves an OpenFresh selection by durable object key against
+// ONE pinned snapshot (v2 key-addressing): each key -> its CURRENT rowid+record,
+// order preserved, unknown key -> ErrFileNotFound naming the key.
+func TestGetFilesByKeys(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "auryn.db")
+	buildMinimalAurynDB(t, path)
+	st, err := OpenReadOnly(context.Background(), path)
+	if err != nil {
+		t.Fatalf("OpenReadOnly: %v", err)
+	}
+	defer st.Close()
+	ctx := context.Background()
+
+	key := "customer=dexory/customer_site=london/robot=r1/source=ros-bags/date=2026-06-01/x.mcap"
+	recs, err := GetFilesByKeys(ctx, st, []string{key})
+	if err != nil {
+		t.Fatalf("GetFilesByKeys: %v", err)
+	}
+	if len(recs) != 1 || recs[0].S3Key != key || recs[0].ID != 1 || recs[0].S3ETag != "etag1" {
+		t.Fatalf("GetFilesByKeys = %+v, want the one fixture file resolved by key", recs)
+	}
+
+	if _, err := GetFilesByKeys(ctx, st, []string{key, "customer=x/customer_site=y/robot=z/source=s/date=2026-01-01/missing.mcap"}); !errors.Is(err, ErrFileNotFound) {
+		t.Fatalf("GetFilesByKeys with unknown key: err = %v, want ErrFileNotFound", err)
+	}
+}
+
 func TestAurynReader_Hermetic(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "auryn.db")
 	buildMinimalAurynDB(t, path)

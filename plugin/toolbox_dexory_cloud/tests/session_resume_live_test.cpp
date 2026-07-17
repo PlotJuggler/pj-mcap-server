@@ -65,16 +65,11 @@ const std::vector<std::string>& allTopics() {
   return kTopics;
 }
 
-// Connect + resolve + OpenFresh over the whole sequence (all topics). Fills
-// *info; asserts the open succeeded.
+// Connect + OpenFresh over the whole sequence (all topics), key-addressed
+// (wire v2). Fills *info; asserts the open succeeded.
 bool openFreshAll(BackendConnection& conn, SessionInfo* info) {
-  (void)conn.listSequences();
-  std::vector<std::string> missing;
-  const auto file_ids = conn.resolveFileIds({kSeq}, &missing);
-  EXPECT_TRUE(missing.empty());
-  EXPECT_EQ(file_ids.size(), 1u);
   OpenSessionParams params;
-  params.file_ids = file_ids;
+  params.s3_keys = {kSeq};
   std::string err;
   const bool ok = conn.openSessionFresh(params, info, &err);
   EXPECT_TRUE(ok) << "openSessionFresh failed: " << err;

@@ -57,3 +57,28 @@ func GetFiles(ctx context.Context, s *Store, ids []uint64) ([]FileRecord, error)
 	}
 	return out, nil
 }
+
+// GetFilesByKeys resolves an OpenFresh selection by DURABLE OBJECT KEY against
+// ONE pinned snapshot (v2 key-addressing). Each key is resolved to its CURRENT
+// rowid (FileIDForKey) and full record, all on the same handle, so a rebuild
+// that renumbers rowids can never redirect a selected key to whichever object
+// inherited its old rowid — and can never mix generations across the batch.
+// Order is preserved. An unknown key fails the WHOLE batch with a wrapped
+// ErrFileNotFound naming the key, before any caller touches storage or
+// registers a session.
+func GetFilesByKeys(ctx context.Context, s *Store, keys []string) ([]FileRecord, error) {
+	db := s.DB() // pinned once for the whole batch
+	out := make([]FileRecord, 0, len(keys))
+	for _, key := range keys {
+		id, err := FileIDForKey(ctx, db, key)
+		if err != nil {
+			return nil, fmt.Errorf("file key %q: %w", key, err)
+		}
+		rec, err := aurynGetFile(ctx, db, id)
+		if err != nil {
+			return nil, fmt.Errorf("file key %q: %w", key, err)
+		}
+		out = append(out, rec)
+	}
+	return out, nil
+}

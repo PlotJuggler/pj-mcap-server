@@ -150,13 +150,30 @@ func (c *connState) handleOpenSession(ctx context.Context, reqID uint64, req *pb
 // chunk indexes, build the plan, register, reply, spawn producer + consumer.
 func (c *connState) openFresh(ctx context.Context, reqID uint64, fresh *pb.OpenFresh) {
 	d := c.h.sess
-	if len(fresh.GetFileIds()) == 0 {
-		c.sendError(reqID, 0, pb.ErrorCode_ERROR_INVALID_REQUEST, "no file_ids in OpenFresh", "")
+	// (v2) Selection is KEY-ADDRESSED (durable s3_key, never catalog rowid).
+	// Validate the key list before any catalog/storage work: non-empty, no empty
+	// key, no duplicates. A malformed selection is a client bug (INVALID_REQUEST),
+	// distinct from a well-formed key that names no file (NOT_FOUND, below).
+	selKeys := fresh.GetS3Keys()
+	if len(selKeys) == 0 {
+		c.sendError(reqID, 0, pb.ErrorCode_ERROR_INVALID_REQUEST, "no s3_keys in OpenFresh", "")
 		return
+	}
+	seenKey := make(map[string]struct{}, len(selKeys))
+	for _, k := range selKeys {
+		if k == "" {
+			c.sendError(reqID, 0, pb.ErrorCode_ERROR_INVALID_REQUEST, "empty s3_key in OpenFresh", "")
+			return
+		}
+		if _, dup := seenKey[k]; dup {
+			c.sendError(reqID, 0, pb.ErrorCode_ERROR_INVALID_REQUEST, fmt.Sprintf("duplicate s3_key %q in OpenFresh", k), "")
+			return
+		}
+		seenKey[k] = struct{}{}
 	}
 
 	// DEBUG: log the request verbatim so an empty plan (chunks=0) can be traced
-	// to exactly which file_ids / topics / time-range the client asked for.
+	// to exactly which keys / topics / time-range the client asked for.
 	{
 		tw := fresh.GetTimeRange()
 		trStr := "whole-range"
@@ -168,15 +185,17 @@ func (c *connState) openFresh(ctx context.Context, reqID uint64, fresh *pb.OpenF
 		if len(shown) > 8 {
 			shown = shown[:8]
 		}
-		d.Log.Info("ws: OpenFresh request", "remote", c.remote, "file_ids", fresh.GetFileIds(),
+		d.Log.Info("ws: OpenFresh request", "remote", c.remote, "s3_keys", selKeys,
 			"topic_count", len(names), "topics", shown, "time_range", trStr)
 	}
 
 	// (a) Resolve file records (id + time bounds) and object keys from the SQLite
-	// catalog. GetFiles pins ONE db handle for the whole batch (B1): a catalog
-	// rebuild swapping in renumbered file ids mid-loop can never mix generations
-	// within one session plan. Unknown id => NOT_FOUND.
-	recs, err := catalog.GetFiles(ctx, d.Store, fresh.GetFileIds())
+	// catalog BY KEY. GetFilesByKeys pins ONE db handle for the whole batch (B1)
+	// and resolves each durable key to its CURRENT rowid+record, so a rebuild
+	// that renumbers rowids can never redirect a selected key to the object that
+	// inherited its old rowid, nor mix generations. A well-formed but unknown
+	// key => NOT_FOUND, before any storage read or session registration.
+	recs, err := catalog.GetFilesByKeys(ctx, d.Store, selKeys)
 	if err != nil {
 		c.sendError(reqID, 0, pb.ErrorCode_ERROR_NOT_FOUND, err.Error(), "")
 		return

@@ -41,7 +41,10 @@ import (
 func ServerVersion() string { return serverVersion }
 
 const (
-	protocolVersion  = 1
+	// protocolVersion 2 (2026-07-17): OpenFresh is key-addressed (s3_keys, not
+	// file_ids). A v1 client that would send catalog rowids is rejected at Hello
+	// with ERROR_PROTOCOL_VERSION rather than failing later with "no s3_keys".
+	protocolVersion  = 2
 	serverVersion    = "0.2.0-session-slice"
 	defaultListLimit = 200
 	maxListLimit     = 1000
@@ -59,7 +62,7 @@ const (
 	keepalivePingTimeout = 10 * time.Second
 	keepaliveFailLimit   = 2
 	// readLimit caps inbound frames. Session control frames are tiny; the cap is
-	// generous for OpenFresh with many file_ids.
+	// generous for OpenFresh with many s3_keys.
 	readLimit = 8 << 20 // 8 MiB
 	// defaultHelloDeadline bounds how long a connection may sit unauthenticated:
 	// a peer that never completes a successful Hello is closed at the deadline
@@ -519,7 +522,7 @@ func (c *connState) handleHello(reqID uint64, hello *pb.Hello) {
 	// BackendCapabilities are DERIVED LIVE from the catalog (Plan D Task 8), not
 	// hardcoded: the metadata-key vocabulary is the constant derived keys UNION the
 	// catalog's distinct effective-tag keys, and supports_file_hierarchy is true
-	// iff any indexed OBJECT key bears a '/'. The flat Dexory nissan corpus thus
+	// iff any indexed OBJECT key bears a '/'. The flat S3 nissan corpus thus
 	// reports hierarchy=false + the derived-key vocabulary (the C++ B3 live test's
 	// ground truth). BackendCaps pins ONE db handle for both queries (B1) so a
 	// catalog swap between them cannot advertise a mixed-generation view. A query

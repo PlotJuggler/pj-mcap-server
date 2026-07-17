@@ -1,7 +1,7 @@
 // Copyright 2026 Davide Faconti
 // SPDX-License-Identifier: MIT
 //
-// BackendConnection — the real WS+Protobuf transport for the Dexory Cloud
+// BackendConnection — the real WS+Protobuf transport for the cloud connector
 // plugin. It speaks the canonical pj_cloud.v1 wire protocol over a single
 // ixwebsocket connection: a Hello/HelloResponse handshake, then synchronous
 // blocking ListFiles / GetFile request/response RPCs correlated by request_id.
@@ -143,12 +143,6 @@ class BackendConnection {
   // unchanged; these add the bounded-horizon download path of design spec §6.
   // -------------------------------------------------------------------------
 
-  // Resolve sequence NAMES (s3_keys, as listed by listSequences()) to their
-  // catalog file_ids using the index built by the last listSequences(). Names
-  // that don't resolve are reported via *missing (if non-null) and skipped.
-  // Returns the resolved ids in input order.
-  [[nodiscard]] std::vector<std::uint64_t> resolveFileIds(const std::vector<std::string>& sequence_names,
-                                                          std::vector<std::string>* missing) const;
 
   // OpenSessionRequest{fresh}: open a streaming session over the given file_ids
   // (time-ordered), an optional topic subset (empty = all union topics), and an

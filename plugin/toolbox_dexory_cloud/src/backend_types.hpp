@@ -1,8 +1,8 @@
 // Copyright 2026 Davide Faconti
 // SPDX-License-Identifier: MIT
 //
-// Local replacements for the mosaico_sdk flight/types.hpp structs. The Dexory
-// Cloud plugin is a visual copy of toolbox_mosaico with the Apache Arrow /
+// Local replacements for the mosaico_sdk flight/types.hpp structs. The cloud
+// connector plugin is a visual copy of toolbox_mosaico with the Apache Arrow /
 // Arrow Flight / gRPC / mosaico_sdk transport removed and replaced by an inert
 // stub (backend_connection.hpp). These structs carry only the fields the
 // dialog + worker actually read; the arrow::Schema field of the SDK's TopicInfo
@@ -205,7 +205,11 @@ struct SessionStats {
 // start_ns/end_ns set together select an optional time window (default = the
 // stitched union of the selected files).
 struct OpenSessionParams {
-  std::vector<std::uint64_t> file_ids;
+  // KEY-ADDRESSED (wire v2): the selection is the durable s3_keys (sequence
+  // names verbatim), never catalog rowids — rowids renumber across builder
+  // rebuilds, so an id captured at browse time could name a DIFFERENT object
+  // by open time. The server resolves the keys in its CURRENT generation.
+  std::vector<std::string> s3_keys;
   std::vector<std::string> topic_names;
   std::optional<std::int64_t> start_ns;
   std::optional<std::int64_t> end_ns;

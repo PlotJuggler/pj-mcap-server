@@ -20,7 +20,9 @@ namespace dexory_cloud {
 
 namespace {
 
-constexpr std::uint32_t kProtocolVersion = 1;
+// v2 (2026-07-17): OpenFresh is key-addressed (s3_keys, not file_ids). A v1
+// peer fails cleanly at the Hello handshake (ERROR_PROTOCOL_VERSION).
+constexpr std::uint32_t kProtocolVersion = 2;
 
 // The canonical wire mounts the WebSocket at /api/ws on top of the user's host
 // URI. Accept ws:// and wss://; append the path (avoiding a double slash if the
@@ -617,23 +619,6 @@ bool BackendConnection::waitSessionFrame(std::chrono::milliseconds timeout, pj_c
   return true;
 }
 
-std::vector<std::uint64_t> BackendConnection::resolveFileIds(const std::vector<std::string>& sequence_names,
-                                                             std::vector<std::string>* missing) const {
-  std::vector<std::uint64_t> ids;
-  ids.reserve(sequence_names.size());
-  for (const auto& name : sequence_names) {
-    auto it = file_id_by_name_.find(name);
-    if (it == file_id_by_name_.end()) {
-      if (missing != nullptr) {
-        missing->push_back(name);
-      }
-      continue;
-    }
-    ids.push_back(it->second);
-  }
-  return ids;
-}
-
 bool BackendConnection::openSessionFresh(const OpenSessionParams& params, SessionInfo* info, std::string* error) {
   auto set_error = [error](const std::string& msg) {
     if (error != nullptr) {
@@ -644,16 +629,20 @@ bool BackendConnection::openSessionFresh(const OpenSessionParams& params, Sessio
     set_error("not connected");
     return false;
   }
-  if (params.file_ids.empty()) {
-    set_error("no file ids selected for session");
+  if (params.s3_keys.empty()) {
+    set_error("no recordings selected for session");
     return false;
   }
 
+  // Key-addressed OpenFresh (wire v2): the durable s3_keys go straight through;
+  // the server resolves them in its CURRENT catalog generation, so no local
+  // name->file_id index (nor its freshness) is involved. An unknown key comes
+  // back as a verbatim ERROR_NOT_FOUND naming the key.
   pj_cloud::v1::ClientMessage request;
   auto* open = request.mutable_open_session();
   auto* fresh = open->mutable_fresh();
-  for (const std::uint64_t id : params.file_ids) {
-    fresh->add_file_ids(id);
+  for (const auto& key : params.s3_keys) {
+    fresh->add_s3_keys(key);
   }
   for (const auto& topic : params.topic_names) {
     fresh->add_topic_names(topic);

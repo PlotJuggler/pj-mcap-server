@@ -43,12 +43,10 @@ func TestOpenSession_SchemaDriftAcrossFilesRejected(t *testing.T) {
 	ts := newTestServer(t, files, defaultTestSessionCfg())
 	c := dialClient(t, ts.url)
 	c.hello()
-	ida := c.fileID(t, "a.mcap")
-	idb := c.fileID(t, "b.mcap")
 
 	c.send(&pb.ClientMessage{RequestId: 50, Payload: &pb.ClientMessage_OpenSession{
 		OpenSession: &pb.OpenSessionRequest{Mode: &pb.OpenSessionRequest_Fresh{
-			Fresh: &pb.OpenFresh{FileIds: []uint64{ida, idb}},
+			Fresh: &pb.OpenFresh{S3Keys: fileKeys("a.mcap", "b.mcap")},
 		}},
 	}})
 	resp := c.recv()
@@ -73,12 +71,10 @@ func TestOpenSession_SameSchemaAcrossFilesAccepted(t *testing.T) {
 	ts := newTestServer(t, files, defaultTestSessionCfg())
 	c := dialClient(t, ts.url)
 	c.hello()
-	ida := c.fileID(t, "a.mcap")
-	idb := c.fileID(t, "b.mcap")
 
 	c.send(&pb.ClientMessage{RequestId: 51, Payload: &pb.ClientMessage_OpenSession{
 		OpenSession: &pb.OpenSessionRequest{Mode: &pb.OpenSessionRequest_Fresh{
-			Fresh: &pb.OpenFresh{FileIds: []uint64{ida, idb}},
+			Fresh: &pb.OpenFresh{S3Keys: fileKeys("a.mcap", "b.mcap")},
 		}},
 	}})
 	resp := c.recv()

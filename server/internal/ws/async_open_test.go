@@ -60,14 +60,13 @@ func TestOpenSession_DoesNotBlockCatalogRPCsOnTheSameConnection(t *testing.T) {
 	ts := newTestServerWithBlob(t, blob, defaultTestSessionCfg())
 	c := dialClient(t, ts.url)
 	c.hello()
-	id := c.fileID(t, zegTestKey)
 
 	ts.idxCache.Clear()   // force a COLD plan (the fixture-build scan pre-warmed it)
 	blob.slow.Store(true) // WAN-shaped from here on
 
 	c.send(&pb.ClientMessage{RequestId: 10, Payload: &pb.ClientMessage_OpenSession{
 		OpenSession: &pb.OpenSessionRequest{Mode: &pb.OpenSessionRequest_Fresh{
-			Fresh: &pb.OpenFresh{FileIds: []uint64{id}},
+			Fresh: &pb.OpenFresh{S3Keys: fileKeys(zegTestKey)},
 		}},
 	}})
 	c.send(&pb.ClientMessage{RequestId: 11, Payload: &pb.ClientMessage_ListFiles{ListFiles: &pb.ListFilesRequest{}}})
@@ -101,11 +100,10 @@ func TestOpenSession_SecondOpenServesChunkIndexFromCache(t *testing.T) {
 	ts := newTestServerWithBlob(t, blob, defaultTestSessionCfg())
 	c := dialClient(t, ts.url)
 	c.hello()
-	id := c.fileID(t, zegTestKey)
 
 	c.send(&pb.ClientMessage{RequestId: 20, Payload: &pb.ClientMessage_OpenSession{
 		OpenSession: &pb.OpenSessionRequest{Mode: &pb.OpenSessionRequest_Fresh{
-			Fresh: &pb.OpenFresh{FileIds: []uint64{id}},
+			Fresh: &pb.OpenFresh{S3Keys: fileKeys(zegTestKey)},
 		}},
 	}})
 	open := c.recv()
@@ -123,7 +121,7 @@ func TestOpenSession_SecondOpenServesChunkIndexFromCache(t *testing.T) {
 
 	c.send(&pb.ClientMessage{RequestId: 21, Payload: &pb.ClientMessage_OpenSession{
 		OpenSession: &pb.OpenSessionRequest{Mode: &pb.OpenSessionRequest_Fresh{
-			Fresh: &pb.OpenFresh{FileIds: []uint64{id}},
+			Fresh: &pb.OpenFresh{S3Keys: fileKeys(zegTestKey)},
 		}},
 	}})
 	for {

@@ -23,11 +23,10 @@ func TestSession_ResumeNoGapsNoDupes(t *testing.T) {
 
 	c1 := dialClient(t, ts.url)
 	c1.hello()
-	id := c1.fileID(t, zegTestKey)
 
 	c1.send(&pb.ClientMessage{RequestId: 20, Payload: &pb.ClientMessage_OpenSession{
 		OpenSession: &pb.OpenSessionRequest{Mode: &pb.OpenSessionRequest_Fresh{
-			Fresh: &pb.OpenFresh{FileIds: []uint64{id}},
+			Fresh: &pb.OpenFresh{S3Keys: fileKeys(zegTestKey)},
 		}},
 	}})
 	or := c1.recv().GetOpenSession()
@@ -171,10 +170,9 @@ func TestSession_ResumeCursorBeyondWatermarkRejected(t *testing.T) {
 
 	c1 := dialClient(t, ts.url)
 	c1.hello()
-	id := c1.fileID(t, zegTestKey)
 	c1.send(&pb.ClientMessage{RequestId: 30, Payload: &pb.ClientMessage_OpenSession{
 		OpenSession: &pb.OpenSessionRequest{Mode: &pb.OpenSessionRequest_Fresh{
-			Fresh: &pb.OpenFresh{FileIds: []uint64{id}},
+			Fresh: &pb.OpenFresh{S3Keys: fileKeys(zegTestKey)},
 		}},
 	}})
 	or := c1.recv().GetOpenSession()
@@ -227,11 +225,10 @@ func TestSession_AckPruneUnderTinyCaps(t *testing.T) {
 
 	c := dialClient(t, ts.url)
 	c.hello()
-	id := c.fileID(t, zegTestKey)
 
 	c.send(&pb.ClientMessage{RequestId: 30, Payload: &pb.ClientMessage_OpenSession{
 		OpenSession: &pb.OpenSessionRequest{Mode: &pb.OpenSessionRequest_Fresh{
-			Fresh: &pb.OpenFresh{FileIds: []uint64{id}, TopicNames: []string{zegSpeedTopic}},
+			Fresh: &pb.OpenFresh{S3Keys: fileKeys(zegTestKey), TopicNames: []string{zegSpeedTopic}},
 		}},
 	}})
 	or := c.recv().GetOpenSession()
@@ -303,12 +300,10 @@ func TestSession_OverlapRejected(t *testing.T) {
 	c := dialClient(t, ts.url)
 	c.hello()
 
-	idA := c.fileID(t, "a_"+zegTestKey)
-	idB := c.fileID(t, "b_"+zegTestKey)
 
 	c.send(&pb.ClientMessage{RequestId: 40, Payload: &pb.ClientMessage_OpenSession{
 		OpenSession: &pb.OpenSessionRequest{Mode: &pb.OpenSessionRequest_Fresh{
-			Fresh: &pb.OpenFresh{FileIds: []uint64{idA, idB}},
+			Fresh: &pb.OpenFresh{S3Keys: fileKeys("a_"+zegTestKey, "b_"+zegTestKey)},
 		}},
 	}})
 	e := c.recv().GetError()

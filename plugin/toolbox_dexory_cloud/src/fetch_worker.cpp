@@ -378,33 +378,14 @@ void FetchWorker::pullTopicsAsync(std::vector<std::string> sequence_names, std::
   }
   BackendConnection* session_backend = session_owned.get();
 
-  // Resolve sequence name(s) -> file_id(s), preserving the input (time-ordered)
-  // order. The fresh connection has no index yet, so list first, then resolve.
-  // For a stitched selection ALL file_ids go into ONE OpenFresh (the server
-  // stitches them into one continuous logical stream).
-  std::vector<std::string> missing;
-  std::vector<std::uint64_t> file_ids = session_backend->resolveFileIds(sequence_names, &missing);
-  if (file_ids.size() != sequence_names.size()) {
-    (void)session_backend->listSequences();
-    missing.clear();
-    file_ids = session_backend->resolveFileIds(sequence_names, &missing);
-  }
-  if (!missing.empty() || file_ids.empty()) {
-    std::string unknown;
-    for (const auto& m : missing) {
-      if (!unknown.empty()) {
-        unknown += ", ";
-      }
-      unknown += "'" + m + "'";
-    }
-    finish_all_topics(false, unknown.empty() ? std::string("no resolvable sequences in catalog")
-                                             : ("unknown sequence(s) " + unknown + " (not in catalog)"));
-    finish_all();
-    return;
-  }
-
+  // Key-addressed OpenFresh (wire v2): the sequence names ARE the durable
+  // s3_keys, so they go into the request verbatim — no list -> file_id
+  // resolution round trip, no staleness window. For a stitched selection ALL
+  // keys go into ONE OpenFresh (the server stitches them into one continuous
+  // logical stream) and the SERVER is authoritative for unknown keys
+  // (ERROR_NOT_FOUND naming the key, surfaced verbatim below).
   OpenSessionParams params;
-  params.file_ids = std::move(file_ids);
+  params.s3_keys = sequence_names;
   params.topic_names = topic_names;
   if (start_ns != 0 || end_ns != 0) {
     params.start_ns = start_ns;
@@ -422,7 +403,7 @@ void FetchWorker::pullTopicsAsync(std::vector<std::string> sequence_names, std::
   // froze at "0.00 MiB/s" for up to minutes with zero explanation.
   if (pullPhase) {
     pullPhase(
-        "Opening session: " + std::to_string(params.file_ids.size()) + " file(s), " +
+        "Opening session: " + std::to_string(params.s3_keys.size()) + " file(s), " +
         std::to_string(topic_names.size()) + " topic(s) - waiting for the server's plan");
   }
 
@@ -459,7 +440,7 @@ void FetchWorker::pullTopicsAsync(std::vector<std::string> sequence_names, std::
   // EMPTY-PLAN contract (spec slice 2): the server answers OpenSession with an
   // EMPTY topic dictionary when no selected topic has any message in the
   // selected files/time range — common when zero-message catalog topics are
-  // selected (75 of 171 on the Dexory staging bags) or the slider window
+  // selected (75 of 171 on the S3-use-case staging bags) or the slider window
   // misses the data. That is "nothing to download", NOT a decoder problem:
   // report it as such (the old path fell through to a bogus per-topic
   // "no decoder for topic").
@@ -471,7 +452,7 @@ void FetchWorker::pullTopicsAsync(std::vector<std::string> sequence_names, std::
       }
       errorOccurred(
           "Dexory Cloud: the server returned an EMPTY plan (no data matches the selection): " +
-          std::to_string(params.file_ids.size()) + " file(s), " + std::to_string(topic_names.size()) +
+          std::to_string(params.s3_keys.size()) + " file(s), " + std::to_string(topic_names.size()) +
           " topic(s) requested, " + window +
           ". The selected topics have no recorded messages in that selection.");
     }

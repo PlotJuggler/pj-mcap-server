@@ -211,7 +211,7 @@ func run(url, token string, getFileID uint64, flt *listFilter) error {
 	// Hello (payload arm 10)
 	helloResp, err := rpc(ctx, conn, &pb.ClientMessage{
 		RequestId: 1,
-		Payload:   &pb.ClientMessage_Hello{Hello: &pb.Hello{ProtocolVersion: 1, AuthToken: token}},
+		Payload:   &pb.ClientMessage_Hello{Hello: &pb.Hello{ProtocolVersion: 2, AuthToken: token}},
 	})
 	if err != nil {
 		return err
@@ -335,7 +335,7 @@ func runTagEdit(url, token string, fileID uint64, key string, setTags, unsetKeys
 
 	helloResp, err := rpc(ctx, conn, &pb.ClientMessage{
 		RequestId: 1,
-		Payload:   &pb.ClientMessage_Hello{Hello: &pb.Hello{ProtocolVersion: 1, AuthToken: token}},
+		Payload:   &pb.ClientMessage_Hello{Hello: &pb.Hello{ProtocolVersion: 2, AuthToken: token}},
 	})
 	if err != nil {
 		return err
