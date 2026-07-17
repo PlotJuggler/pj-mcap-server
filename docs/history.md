@@ -7,6 +7,41 @@ same file). Content below is preserved verbatim from earlier `CLAUDE.md` revisio
 (only section-heading levels were adjusted for standalone navigation; no wording
 was changed).
 
+## Merge to main + hardening day (2026-07-17)
+
+The whole project was merged to `main` and pushed, preceded and followed by a
+day of review-driven hardening (dual Claude + Codex). In order:
+
+- **Pre-merge review fixes** (`ea3941e` server, `862563e` plugin): Go session
+  lifecycle (Send\* block-not-drop, generation-token consumer takeover,
+  ProducerCancel-before-Register, resume-cursor watermark validation, live
+  dropped-message count), one-pinned-snapshot generation reads, fail-closed
+  hardening (strict `ALLOW_ANONYMOUS`, post-override re-Validate, Hello deadline +
+  close-on-auth-fail, `closeDone` `sync.Once`, warmer panic-recover), schema-drift
+  rejection, version-pinned blob reads; C++ decode-error surfacing + no cache
+  poison, `requestCancel` lifetime, sticky cancel, frame validation, LZ4 hardening.
+- **Wire v2** (`7148975`): `OpenFresh` key-addressed (`s3_keys`; `file_ids`
+  removed/reserved), Hello `protocol_version` 1→2, `catalog.GetFilesByKeys`
+  pinned resolve; both clients migrated; smoke step i proves open-by-key across a
+  rowid-shifting rebuild.
+- **Company-name genericization** (`3b25bc0`): docs + code comments say "S3 use
+  case" / "GCS use case"; identifiers, config filenames, and branding strings
+  kept.
+- **Generation token + snapshot-lease store** (`3a1594f`): `{db, identity,
+  generation}` leased atomically (drain-then-close), opaque token on `ListFiles`/
+  `GetVocabulary`, generation-bound cursors + strict dimension-id echo, new
+  `ERROR_STALE_CATALOG`, C++ transparent stale-restart.
+- **Builder single-writer lock** (submodule `a0c3d5c`, bump `062e7f5`): flock on
+  `<db>.writer.lock`; a second builder on the same `--db` exits 3
+  (CATALOG_CONTRACT.md §11).
+- **De-submodule + CI green** (`a6bfeb7` + CI fixes): `mcap_catalog/` VENDORED
+  directly (no longer a submodule of `AurynRobotics/mcap_server`); CI stripped of
+  the deploy-key machinery; the `integration`/`bench` emulators fixed (start via
+  `docker run`, not `services:`; `mc cp --recursive` since the mc image has no
+  `find`); wasm path + stale `hierarchy_prefix.h` rot fixed. All GitHub workflows
+  (`ci`, `wasm-compile`, `bench`) now pass. (This supersedes the "only submodule
+  is `mcap_catalog/`" note in the 2026-06-13 vendoring section below.)
+
 ## Approach (2026-06-04, historical): two endpoints first, then plumbing
 
 The active build order stands up the pipeline's two **ends** before the middle:

@@ -194,6 +194,13 @@ The shell gates reap their server on exit, but a hard kill can leave one behind.
   them in its EXIT trap).
 
 **Stale catalog DBs.**
+The Python builder holds an exclusive single-writer lock (`<db>.writer.lock`,
+CATALOG_CONTRACT.md §11) for its lifetime, so **only one builder may run per
+served DB** — a second builder on the same `--db` exits code 3 (naming the
+holder PID). The gates below each use a DISTINCT DB path precisely so their
+builders never contend; if you start a builder by hand, don't point a second
+one at a DB a gate (or the interactive instance) is already building.
+
 Each gate uses its OWN SQLite DB so they never share state:
 - smoke: `/tmp/pj-cloud-smoke-catalog.db` (owned by the Python builder daemon
   now — smoke wipes it at the start of every run; the Go server only reads it).

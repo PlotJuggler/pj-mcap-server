@@ -4,10 +4,10 @@ Operational artifacts for shipping the PJ Cloud Connector backend. Since the M6
 catalog-migration cutover this is a **TWO-PROCESS system** — say this plainly,
 because it wasn't always true:
 
-- **`builder`** — the Python `mcap_catalog` package (vendored as the
-  `mcap_catalog/` submodule; `pip install`-able deps only, no repo checkout
-  needed at runtime beyond the package itself). It is the **SOLE catalog
-  writer**: it scans the bucket, writes the SQLite catalog, and serves the
+- **`builder`** — the Python `mcap_catalog` package (vendored directly under
+  `mcap_catalog/` as regular source files, NOT a git submodule; `pip install`-able
+  deps only, no repo checkout needed at runtime beyond the package itself). It is
+  the **SOLE catalog writer**: it scans the bucket, writes the SQLite catalog, and serves the
   tag-edit UNIX-socket IPC (`docs/CATALOG_CONTRACT.md` §10) that is now the
   *only* way a tag edit can be applied.
 - **`server`** (`pj-cloud-server`, the Go binary) — a **pure read-only catalog
@@ -92,12 +92,21 @@ corruption or a tag-edit path that silently stops working:
    remote address.** The WS `UpdateTags` handler logs `remote` before
    forwarding to the builder's IPC socket; the failure paths (bad file id,
    IPC unavailable, ...) log the same field too — nothing to enable here.
+6. **Exactly ONE builder per served DB — now kernel-enforced.** The builder
+   takes an exclusive `flock` on `<db_path>.writer.lock` at startup (before any
+   DB write or socket bind) and holds it for its lifetime; a SECOND builder
+   started on the same `--db` fails fast with **exit code 3** (naming the holder
+   PID) instead of interleaving writes or stealing the tag socket
+   (CATALOG_CONTRACT.md §11). No config needed — but keep restart policies from
+   double-starting it: Compose uses `restart: unless-stopped` on the builder,
+   and a systemd deploy must run a single builder unit per DB. The kernel drops
+   the lock on any process death, so a crash never leaves a stale lock.
 
 ## Container images
 
-Prerequisite for the builder image: `mcap_catalog/` is a git submodule — run
-`git submodule update --init mcap_catalog` from the repo root first, or its
-`COPY` step finds an empty directory and the build fails.
+Prerequisite for the builder image: `mcap_catalog/` is now VENDORED directly in
+this repo (regular source files, not a git submodule), so a plain `git clone`
+already contains it — no submodule init is needed and the `COPY` step just works.
 
 ```bash
 # Go server (build context is server/, Dockerfile lives under deploy/)

@@ -22,25 +22,35 @@ originally written for a separate `pj-cloud/` repo at
 rewritten to this repo, and Plan A Task 1 Step 1 was amended — do **not** `git init` a
 new repo).
 
-## Current state (2026-07-06): the catalog migration is COMPLETE
+## Current state (2026-07-17): catalog migration COMPLETE + merged to main + wire v2
 
-**The auryn catalog migration (M1–M6 incl. the full M6 tail) is DONE and pushed.** The
-production architecture is a **two-process system**: the Python **`mcap_catalog/`**
-builder (vendored) is the SOLE catalog writer (schema v3, atomic publish via temp+rename,
-`--tag-socket` tag-edit IPC, `--no-watch` rescan-only daemon mode) and the Go server is a
+**The auryn catalog migration (M1–M6 incl. the full M6 tail) is DONE, and the whole
+project has been merged to `main` and pushed.** The 2026-07-17 pre-merge review (dual
+Claude + Codex) fixes and the follow-on wire/catalog hardening are all landed; **GitHub
+CI is fully green** (unit/builder-tests/integration-{s3,gcs}/race/seam + wasm-compile +
+bench). The production architecture is a **two-process system**: the Python
+**`mcap_catalog/`** builder (VENDORED directly in this repo — no longer a submodule) is
+the SOLE catalog writer (schema v3, atomic publish via temp+rename, `--tag-socket`
+tag-edit IPC, `--no-watch` rescan-only daemon mode, and a **single-writer flock** on
+`<db>.writer.lock` so a second builder on the same `--db` exits 3) and the Go server is a
 **pure read-only catalog reader + unchanged streamer** — `catalog.OpenReadOnly` is the
 ONLY constructor, `internal/indexer/` and every catalog write API are DELETED (−2k LOC),
 `UpdateTags` forwards over a unix-socket IPC to the builder (key-addressed; rowids
 renumber across rebuilds), and the server detects an atomically-published rebuild by
-(dev,inode) file identity and reopens live (`ReopenIfSwapped`, 30s tick; all multi-query
-reads are generation-pinned). `-external-builder`/`-poll-interval` are deprecated no-ops.
-`CATALOG_CONTRACT.md` (§9 publish/reopen, §10 tag IPC; byte-identical copies in `docs/`
-and `mcap_catalog/`) is the cross-language contract — schema/IPC changes MUST update it.
+(dev,inode) file identity and reopens live (`ReopenIfSwapped`, 30s tick). Cross-request
+generation safety is now explicit: reads lease a **snapshot** (`Store.Acquire`,
+drain-then-close), and a **generation token** (opaque bytes) rides `ListFiles`/
+`GetVocabulary` responses so a stale pagination cursor or dimension-id filter fails
+`ERROR_STALE_CATALOG` instead of silently mis-serving a renumbered id. `OpenFresh` is
+**key-addressed** (wire v2: `s3_keys`, `file_ids` removed; Hello `protocol_version` = 2).
+`-external-builder`/`-poll-interval` are deprecated no-ops.
+`CATALOG_CONTRACT.md` (§9 publish/reopen, §10 tag IPC, §11 single-writer lock;
+byte-identical copies in `docs/` and `mcap_catalog/`) is the cross-language contract —
+schema/IPC changes MUST update it.
 
 - **Remaining follow-ups:** `matrix.sh` migration (fail-fasts with exit 2 today; needs the
-  `jkk_dataset02` corpus machine); the CI `integration` legs' service containers (minio +
-  fake-gcs) fail their health checks on the GitHub runner (pre-existing infra, not a code
-  regression); the C++ facet UI (client-side `GetVocabulary` —
+  `jkk_dataset02` corpus machine); the C++ facet UI (client-side `GetVocabulary`, now that
+  the generation token makes cached dimension ids safe to echo —
   `docs/catalog-vocabulary-rpc.md`); real-bucket GCE smoke (`docs/gce-deploy-smoke.md`);
   builder gaps by design: `derive_tags()` stub, GCS Pub/Sub discovery, `file_metrics`.
 - **Team rule:** technical decisions are cross-checked with a standing Codex instance
@@ -89,9 +99,13 @@ doubt, but don't relitigate the decision itself.
   MD5/CRC32C — slotted into the existing `(etag,size,last_modified)` triple with
   zero indexer/schema change.
 - **Catalog reader swap trigger = (dev,inode) file identity, NEVER `build_id`**
-  (freshness-only signal). File rowids renumber across rebuilds, so files must be
-  addressed by object key (not rowid) across process boundaries; multi-query reads
-  must pin `db := s.DB()` once per request to stay generation-consistent.
+  (freshness-only signal). File rowids renumber across rebuilds, so anything crossing
+  a request/process boundary is addressed by DURABLE identity, never rowid: sessions
+  by `s3_key` (OpenFresh v2), and any RPC that still carries rowids (ListFiles cursors,
+  GetVocabulary dimension ids) is bound to the **generation token** and rejects a
+  stale one with `ERROR_STALE_CATALOG`. Multi-query reads lease ONE snapshot
+  (`Store.Acquire` — atomic `{db, identity, generation}`, drain-then-close) rather
+  than re-fetching `s.DB()` per query.
 - **`database/sql` connection pools lazily open new connections BY PATH** — the
   read-only catalog store pins `MaxOpenConns(1)` with verified identity so a
   second pooled connection can't silently read a stale/swapped file.

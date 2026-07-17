@@ -13,7 +13,7 @@ session — with reconnect-resume and a repeat-fetch cache.
 |---|---|
 | `proto/pj_cloud.proto` | Canonical wire schema (WS + Protobuf envelope) |
 | `server/` | Go server: read-only catalog reader, session streaming, tag-edit IPC forwarding |
-| `mcap_catalog/` | Python `mcap_catalog` builder (submodule) — the SOLE catalog writer + tag-edit IPC server |
+| `mcap_catalog/` | Python `mcap_catalog` builder (vendored in-repo) — the SOLE catalog writer + tag-edit IPC server |
 | `plugin/toolbox_dexory_cloud/` | Cloud connector toolbox plugin + `dexory-cloud-cli` (builds standalone) |
 | `infra/minio/` | Local S3 (Minio) — development storage endpoint |
 | `scripts/smoke.sh` | `make smoke` — end-to-end regression gate |

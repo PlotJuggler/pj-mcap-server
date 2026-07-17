@@ -109,17 +109,17 @@ docker compose version    # verify v2
 
 ---
 
-## 3. Get the code (with the builder submodule)
+## 3. Get the code
 
 ```bash
 git clone <your-repo-url> pj-mcap-server
 cd pj-mcap-server
-git submodule update --init mcap_catalog     # REQUIRED — the builder image COPYs it
 ```
 
-No Go/Python toolchain needed on the box — the images build everything. (The
-builder image needs `mcap_catalog/`, which is why the submodule init above is
-mandatory; its build context is the repo root.)
+No Go/Python toolchain needed on the box — the images build everything. The
+builder source (`mcap_catalog/`) is VENDORED directly in the repo (not a
+submodule), so a plain clone already contains it and the builder image's `COPY`
+step just works — its build context is the repo root.
 
 ---
 
@@ -155,6 +155,11 @@ PJ_CLOUD_TOKEN='<a-long-random-shared-bearer-token>' \
   dashboard stays disabled).
 - Put these in a `.env` file next to the compose file if you prefer (`docker
   compose` auto-loads it) — keep it `chmod 600`, don't commit it.
+- **One builder per catalog DB.** The builder takes an exclusive lock on the
+  catalog DB at startup (CATALOG_CONTRACT.md §11); a second builder on the same
+  DB exits code 3. `docker-compose.dexory.yml` uses `restart: unless-stopped`
+  on the builder (not `always`) so a transient exit never double-starts it — keep
+  it that way, and don't run a manual `--rebuild` builder against the live DB.
 
 Compose builds both images, starts `builder`, waits for its first catalog to
 publish (its healthcheck), then starts `server`.
@@ -218,8 +223,8 @@ $C down                       # stop (keeps the catalog-data volume)
 $C down -v                    # stop AND wipe the catalog (forces a full re-scan next up)
 ```
 
-**Updating:** `git pull && git submodule update --init mcap_catalog`, then
-`$C up -d --build` rebuilds the changed image(s) and restarts.
+**Updating:** `git pull`, then `$C up -d --build` rebuilds the changed image(s)
+and restarts (`mcap_catalog/` is vendored — `git pull` brings it along).
 
 **Widening the served data:** edit the `prefix` in **both** artifacts (§4),
 `$C restart`. The builder's next reconcile picks up the newly-in-scope objects;

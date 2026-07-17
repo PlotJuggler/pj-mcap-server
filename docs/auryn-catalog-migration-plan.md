@@ -1,16 +1,29 @@
-# Auryn Catalog Migration — Deferred Implementation Plan
+# Auryn Catalog Migration — Implementation Plan (EXECUTED)
 
-**Status:** PREPARED FOR EXECUTION (planned 2026-06-22; decisions locked). The auryn
-Python builder is vendored in this repo as the **`mcap_catalog/`** submodule.
+> **STATUS: FULLY EXECUTED and merged to `main` (M1–M6 complete, 2026-07-06;
+> merged 2026-07-17).** This document is kept as the **design record** of the
+> migration — the checkbox/milestone prose below is the plan as it stood
+> mid-execution (2026-06-22) and is NOT maintained as live status. For the
+> current, authoritative system state — including the post-migration deltas that
+> POST-DATE this plan (wire v2 key-addressed `OpenFresh`, the catalog generation
+> token + snapshot lease, the builder single-writer flock, and `mcap_catalog/`
+> being VENDORED rather than a submodule) — see **`../CLAUDE.md`** "Current state"
+> and **`CATALOG_CONTRACT.md`** (§9–§11). Do not read the checkboxes below as
+> open work.
+
+**Planned 2026-06-22 (decisions locked); executed through 2026-07-06.** The auryn
+Python builder lives in this repo under **`mcap_catalog/`** (VENDORED directly as
+regular source files — it was a git submodule during execution, de-submoduled
+2026-07-17).
 **Authors:** Davide + Claude + Codex (three-way review; see investigation 2026-06-22).
-**Supersedes for the catalog subsystem:** the Go `internal/indexer` write path.
+**Superseded for the catalog subsystem:** the Go `internal/indexer` write path (now deleted).
 
 > Required execution sub-skill when this plan is picked up:
 > `superpowers:executing-plans`. Tasks are `- [ ]` checkboxes; follow the spec's
 > §13 build order where it still applies. Keep `make smoke` / `make matrix` green
 > at every task boundary.
 
-### Execution status (2026-06-22 — UNDER EXECUTION)
+### Execution status (2026-06-22 snapshot — kept as the design record; see the banner above for current state)
 
 - **M1 DONE** (§1.0/§1.2/§2.1/§5.1): `schema_version` interlock (Python writer +
   Go `OpenReadOnly`, both fail-fast), `--once` builder mode, `gen-ci-fixtures
@@ -29,9 +42,10 @@ Python builder is vendored in this repo as the **`mcap_catalog/`** submodule.
 
 ### Execution entry point (read this first)
 
-- **Python builder (sole writer):** the **`mcap_catalog/`** submodule = the auryn
-  `mcap_catalog_builder` (`schema.sql`, `db.py`, `builder.py`, `storage.py`, …),
-  pinned at auryn `main`. Fresh clone: `git submodule update --init mcap_catalog`.
+- **Python builder (sole writer):** the **`mcap_catalog/`** directory (VENDORED
+  in-repo, not a submodule) = the auryn `mcap_catalog_builder` (`schema.sql`,
+  `db.py`, `builder.py`, `storage.py`, …). A fresh clone already contains it — no
+  submodule init needed (during execution it was a submodule; de-submoduled 2026-07-17).
 - **Go server (read-only reader + UNCHANGED streamer):** `server/` (this repo).
 - **The two specs:** this doc (the migration) + `catalog-vocabulary-rpc.md` (the
   `GetVocabulary` filter RPC, locked V1–V7). Both are self-contained — execution

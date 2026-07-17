@@ -139,6 +139,10 @@ message GetVocabularyResponse {
   repeated DimCustomer customers = 1;              // hierarchical dimensions (tree)
   repeated DimSource   sources   = 2;              // flat normalized dimension (V7)
   repeated TagFacet    tags      = 3;              // flat EAV facets
+  bytes catalog_generation       = 4;              // (LANDED 2026-07-17) the generation
+                                                   // these dimension ids belong to — echo it
+                                                   // in ListFilesRequest.expected_catalog_generation
+                                                   // (see "Generation-scoped ids" below).
 }
 
 // --- Hierarchical dimensions (strict tree: customer → site → robot) ----------
@@ -196,10 +200,13 @@ message FileFilter {
 
   // NEW — dimension selection (V1: by id; V5: proto3 `optional` = explicit
   // presence). Send the ids the user picked from the most recent
-  // GetVocabularyResponse (same-session handles). Strict hierarchy ⇒ a set
-  // robot_id already implies its site+customer; the server ANDs whatever is
-  // present, so the deepest is sufficient. `source_id` (V7) is an INDEPENDENT
-  // flat dimension, ANDed in alongside the hierarchy.
+  // GetVocabularyResponse, PAIRED with that response's catalog_generation
+  // (echo it in ListFilesRequest.expected_catalog_generation). The ids are
+  // GENERATION-SCOPED rowids that RENUMBER on a builder rebuild; a stale echo
+  // returns ERROR_STALE_CATALOG (re-fetch the vocabulary). Strict hierarchy ⇒
+  // a set robot_id already implies its site+customer; the server ANDs whatever
+  // is present, so the deepest is sufficient. `source_id` (V7) is an
+  // INDEPENDENT flat dimension, ANDed in alongside the hierarchy.
   optional uint64 customer_id = 5;
   optional uint64 site_id     = 6;
   optional uint64 robot_id    = 7;
@@ -220,10 +227,17 @@ deliberate asymmetry from principle 2: dimensions filter by id, tags by string.
   — it is cheap, so a manual refresh button or a periodic re-fetch is fine.
 - **Caching:** the client caches the whole response and drives the cascading
   combos + facet widgets locally. No round-trip per combobox interaction.
-- **Session-scoped ids:** dimension `id`s are valid within the connection that
-  fetched them (same contract as `file_id` from `ListFiles`). A client filters
-  using ids from the *same* `GetVocabularyResponse` snapshot — so rowid stability
-  across catalog rebuilds is a non-issue.
+- **Generation-scoped ids (LANDED 2026-07-17 — the generation token):** dimension
+  `id`s are rowids that RENUMBER across a full builder rebuild, so they are valid
+  only within the catalog GENERATION that issued them. `GetVocabularyResponse`
+  carries an opaque `catalog_generation` (server epoch + swap ordinal;
+  equality-only). A client that filters by a dimension id MUST echo that token in
+  `ListFilesRequest.expected_catalog_generation`; a builder rebuild between the
+  vocabulary fetch and the filter returns **`ERROR_STALE_CATALOG`**, and the
+  client transparently re-fetches the vocabulary + restarts the listing. (This
+  replaced the earlier "session-scoped ids" framing, which held only because a
+  rebuild used to force a reconnect — the token makes the binding explicit and
+  survives across the live `ReopenIfSwapped`.)
 - **Errors:** standard `Error` envelope. An empty catalog returns empty
   `customers`/`tags` (not an error).
 
