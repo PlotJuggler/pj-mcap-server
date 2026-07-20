@@ -58,6 +58,47 @@ def test_reconcile_warm_noop(tmp_db, tmp_path):
     assert conn.execute("SELECT COUNT(*) FROM files").fetchone()[0] == 1
 
 
+def test_full_reconcile_process_mode_matches_thread_mode(tmp_path):
+    """The process-pool extraction path must produce a catalog IDENTICAL to the
+    thread path — same file rows AND same per-file quarantine. This proves the GIL
+    bypass changes only WHERE the parse runs, never WHAT gets written."""
+    from mcap_catalog_builder.reconcile import SourceSpec
+
+    root = str(tmp_path / "lake")
+    _hive(root, "a.mcap")
+    _hive(root, "b.mcap", channels=[("/x", "S", "ros2msg", 3)])
+    _hive(root, "c.mcap")
+    # A flat (non-Hive) key -> must quarantine into catalog_failures in BOTH modes.
+    write_minimal_mcap(os.path.join(root, "flat_bad.mcap"))
+
+    def run(spec):
+        conn = open_db(str(tmp_path / ("proc.db" if spec else "thr.db")))
+        caches = load_caches(conn)
+        tally = full_reconcile(conn, caches, LocalSource(root), workers=4, source_spec=spec)
+        rows = conn.execute(
+            """SELECT c.name, si.name, r.name, so.name, f.date, f.filename,
+                      f.chunk_count, f.start_time_ns, f.end_time_ns, hex(f.topic_counts)
+               FROM files f
+               JOIN customers c ON c.id = f.customer_id
+               JOIN sites si   ON si.id = f.site_id
+               JOIN robots r   ON r.id  = f.robot_id
+               JOIN sources so ON so.id = f.source_id
+               ORDER BY f.filename"""
+        ).fetchall()
+        fails = [r[0] for r in conn.execute("SELECT s3_key FROM catalog_failures ORDER BY s3_key")]
+        conn.close()
+        return tally, rows, fails
+
+    t_tally, t_rows, t_fails = run(None)                                   # thread pool
+    p_tally, p_rows, p_fails = run(SourceSpec(kind="local", root=root))    # PROCESS pool
+
+    assert p_rows == t_rows, "process-mode file rows differ from thread-mode"
+    assert p_fails == t_fails, "process-mode quarantine differs from thread-mode"
+    assert t_tally["cataloged"] == p_tally["cataloged"] == 3
+    assert t_tally["failed"] == p_tally["failed"] >= 1
+    assert len(t_rows) == 3
+
+
 def _catalog_snapshot(conn) -> dict:
     """An order-independent view of the catalog: per file, its dims + fingerprint +
     ``{topic_name: count}``. Independent of lookup-id assignment order, so a parallel

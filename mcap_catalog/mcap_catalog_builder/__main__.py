@@ -18,7 +18,7 @@ import threading
 from .db import Caches, load_caches, open_db
 from .builder import catalog_object, delete_by_key
 from .publish import build_and_publish
-from .reconcile import full_reconcile
+from .reconcile import SourceSpec, full_reconcile
 from .storage import LocalSource
 from .tag_ipc import TagEditItem, TagEditServer, handle_tag_edit
 from .watcher import McapEventHandler, WatchEvent, start_observer
@@ -79,15 +79,13 @@ def build_parser() -> argparse.ArgumentParser:
                    help="[local] size-stability poll count before cataloging (default: 3)")
     p.add_argument("--stability-interval", type=float, default=0.5,
                    help="[local] seconds between size-stability polls (default: 0.5)")
-    p.add_argument("--extract-workers", type=int, default=64,
-                   help="number of threads that fetch MCAP summaries during a full "
-                        "reconcile (the network-bound, out-of-transaction read). DB "
-                        "writes stay single-threaded; this only parallelizes reads. "
-                        "1 = sequential. Extraction is latency-bound (each file is "
-                        "1-2 sequential range GETs), so throughput scales ~linearly "
-                        "with this until S3's per-prefix limits — the S3 client's HTTP "
-                        "connection pool is sized to match. Lower it for a tiny or "
-                        "local bucket (default: 64).")
+    p.add_argument("--extract-workers", type=int, default=min(2 * (os.cpu_count() or 1), 32),
+                   help="concurrency for the full-reconcile read phase (fetch+parse "
+                        "summaries). For a remote bucket (--source s3) these are worker "
+                        "PROCESSES — each with its own client and its own GIL, so the "
+                        "pure-Python MCAP parse scales across cores; for a local watch "
+                        "root they are threads. The DB apply stays serial either way. "
+                        "Default: 2x CPU cores, capped at 32 — rarely needs tuning.")
     p.add_argument("--log-level", default="INFO",
                    choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     return p
@@ -99,6 +97,7 @@ def worker_loop(
     source,
     work_q: "queue.Queue[WatchEvent | TagEditItem]",
     workers: int = 1,
+    source_spec: "SourceSpec | None" = None,
 ) -> None:
     """Drain the work queue and perform all DB writes (the single writer).
 
@@ -127,7 +126,7 @@ def worker_loop(
             elif ev.kind == "delete":
                 delete_by_key(conn, caches, source.event_key(ev.path))
             elif ev.kind == "rescan":
-                full_reconcile(conn, caches, source, workers=workers)
+                full_reconcile(conn, caches, source, workers=workers, source_spec=source_spec)
             else:
                 logger.warning("unknown event: %r", ev)
         except Exception:  # noqa: BLE001 - the worker must never die
@@ -168,24 +167,11 @@ def main(argv: list[str] | None = None) -> int:
         from .s3_storage import S3Source
         from .s3_producer import s3_event_producer
 
-        # Size the HTTP connection pool to the extract concurrency: extraction fans
-        # out --extract-workers threads of range GETs, and boto3's default pool of 10
-        # would throttle anything above ~10 (pool-full warnings + retries → SLOWER,
-        # not faster). Never drop below the default 10 for a low worker count.
-        # botocore is imported defensively so the s3 path stays exercisable with a
-        # bare fake boto3 (no botocore) in tests / no-AWS environments.
-        client_kwargs: dict = {}
-        try:
-            from botocore.config import Config
-
-            client_kwargs["config"] = Config(
-                max_pool_connections=max(args.extract_workers, 10)
-            )
-        except ImportError:
-            pass  # no botocore -> fall back to boto3's default connection pool
-        source = S3Source(
-            boto3.client("s3", **client_kwargs), args.s3_bucket, args.s3_prefix
-        )
+        # This client does only the serial LIST (reconcile classify) + serial
+        # per-event single-file catalogs. The parallel range-GET extraction now runs
+        # in worker PROCESSES with their own clients (see reconcile.SourceSpec), so
+        # boto3's default connection pool is ample here — no explicit sizing needed.
+        source = S3Source(boto3.client("s3"), args.s3_bucket, args.s3_prefix)
 
         def start_producer() -> None:
             threading.Thread(
@@ -250,6 +236,18 @@ def _locked_main(args, source, start_producer, work_q, stop_event,
     already been entered."""
     tag_server = None
 
+    # Sensible default, no knob: a remote bucket extracts in a PROCESS pool so the
+    # GIL-bound MCAP parse scales across cores (the reason the read phase is slow on a
+    # big first scan). A local watch root stays on threads — dev/tests/small file
+    # counts, where process overhead isn't worth it. (--source gcs is not yet wired
+    # for processes, so it stays on threads too.) The picklable SourceSpec lets each
+    # worker rebuild the read-only Source, whose live boto3 client can't be pickled.
+    extract_spec = (
+        SourceSpec(kind="s3", bucket=args.s3_bucket, prefix=args.s3_prefix)
+        if args.source == "s3"
+        else None
+    )
+
     # Create/rebuild path: the served DB does not exist yet, or --rebuild forces a
     # from-scratch build. Either way, a reader must never observe a half-built
     # catalog at the served path — build to a temp DB and publish atomically
@@ -259,7 +257,10 @@ def _locked_main(args, source, start_producer, work_q, stop_event,
     if use_publish:
         logger.info("rebuild-publish (db=%s, rebuild=%s)", args.db, args.rebuild)
         build_and_publish(
-            args.db, lambda c, ca: full_reconcile(c, ca, source, workers=args.extract_workers)
+            args.db,
+            lambda c, ca: full_reconcile(
+                c, ca, source, workers=args.extract_workers, source_spec=extract_spec
+            ),
         )
         # One-shot mode: the publish above already built + published the full
         # catalog. Exit cleanly without starting any producer/rescan thread — the
@@ -277,7 +278,8 @@ def _locked_main(args, source, start_producer, work_q, stop_event,
         caches = load_caches(conn)
 
         logger.info("startup reconcile (db=%s)", args.db)
-        full_reconcile(conn, caches, source, workers=args.extract_workers)  # synchronous, before watching
+        full_reconcile(conn, caches, source, workers=args.extract_workers,
+                       source_spec=extract_spec)  # synchronous, before watching
 
         # One-shot mode: the synchronous reconcile above already built the full catalog.
         # Exit cleanly without starting any producer/rescan thread — the caller (the
@@ -319,7 +321,8 @@ def _locked_main(args, source, start_producer, work_q, stop_event,
     signal.signal(signal.SIGTERM, _on_signal)
 
     try:
-        worker_loop(conn, caches, source, work_q, workers=args.extract_workers)
+        worker_loop(conn, caches, source, work_q, workers=args.extract_workers,
+                    source_spec=extract_spec)
     finally:
         stop_event.set()
         if tag_server is not None:
