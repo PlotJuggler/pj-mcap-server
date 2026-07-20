@@ -215,7 +215,7 @@ func TestLoad_GCSOnly(t *testing.T) {
 storage:
   s3: null
   gcs:
-    bucket: asensus-recordings
+    bucket: gcs-recordings
     prefix: site-a/
     credentials_file: ${PJ_CLOUD_GCS_KEY}
 `)
@@ -229,7 +229,7 @@ storage:
 	if c.Storage.GCS == nil {
 		t.Fatal("GCS arm must be set")
 	}
-	if c.Storage.GCS.Bucket != "asensus-recordings" {
+	if c.Storage.GCS.Bucket != "gcs-recordings" {
 		t.Errorf("gcs bucket: %q", c.Storage.GCS.Bucket)
 	}
 	if c.Storage.GCS.Prefix != "site-a/" {

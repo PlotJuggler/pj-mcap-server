@@ -5,11 +5,11 @@ import os
 from mcap_catalog_builder.keyparse import parse_hive_key, rebuild_hive_key, relpath_key
 
 VALID = (
-    "customer=dexory/customer_site=nashville/robot=arri-182/"
+    "customer=globex/customer_site=nashville/robot=arri-182/"
     "source=ros-bags/date=2026-05-19/rosbox_2026-05-19_16-43-46.mcap"
 )
 DIMS = {
-    "customer": "dexory",
+    "customer": "globex",
     "site": "nashville",
     "robot": "arri-182",
     "source": "ros-bags",
@@ -32,7 +32,7 @@ def test_parse_flat_name_is_none():
 
 def test_parse_partial_key_missing_date_is_none():
     partial = (
-        "customer=dexory/customer_site=nashville/robot=arri-182/"
+        "customer=globex/customer_site=nashville/robot=arri-182/"
         "source=ros-bags/rosbox.mcap"
     )
     assert parse_hive_key(partial) is None
@@ -53,5 +53,5 @@ def test_rebuild_roundtrip_strips_leading_slash():
 
 def test_relpath_key_posix():
     root = "/data/watch"
-    p = os.path.join(root, "customer=dexory", "customer_site=nashville", "x.mcap")
-    assert relpath_key(p, root) == "customer=dexory/customer_site=nashville/x.mcap"
+    p = os.path.join(root, "customer=globex", "customer_site=nashville", "x.mcap")
+    assert relpath_key(p, root) == "customer=globex/customer_site=nashville/x.mcap"

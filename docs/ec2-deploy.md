@@ -4,15 +4,14 @@ Step-by-step for standing up the **two-process backend** on a single EC2
 instance, serving MCAP recordings from the S3 bucket to PlotJuggler
 clients over WebSocket, using the container/compose deploy shape.
 
-> **This runbook is SPECIFIC TO THE S3 USE CASE.** The bucket
-> (`dexory-data-offload-staging-bucket`), region (`eu-west-2`), the Hive prefix,
-> and the S3 backend are all specific to this deployment. **The GCS use case is a
-> separate GCS-on-GCE deploy** — see `docs/gce-deploy-smoke.md`, not this file.
-> The S3 constants are
-> baked into two committed artifacts you'll use below:
-> `server/deploy/config.dexory-ec2.yaml` and
-> `server/deploy/docker-compose.dexory.yml`. The only per-environment knob is the
-> S3 **prefix** (how much data to serve) — call out below.
+> **This runbook is SPECIFIC TO THE S3 USE CASE.** The bucket, region, the Hive
+> prefix, and the S3 backend are all specific to your deployment. **The GCS use
+> case is a separate GCS-on-GCE deploy** — see `docs/gce-deploy-smoke.md`, not
+> this file. The S3 settings are supplied via two committed template artifacts you
+> fill in below: `server/deploy/config.aws-ec2.yaml` and
+> `server/deploy/docker-compose.aws.yml` (both ship with `REPLACE_ME` placeholders
+> for the bucket + prefix). The main per-environment knobs are the bucket, region,
+> and the S3 **prefix** (how much data to serve) — called out below.
 
 The systemd (bare-metal) shape is an alternative for a box without Docker — see
 `server/deploy/pj-cloud-{server,builder}.service`. This runbook uses Compose
@@ -63,9 +62,9 @@ keys are ever stored. Minimal policy:
   "Version": "2012-10-17",
   "Statement": [
     { "Sid": "List", "Effect": "Allow", "Action": ["s3:ListBucket"],
-      "Resource": "arn:aws:s3:::dexory-data-offload-staging-bucket" },
+      "Resource": "arn:aws:s3:::YOUR_S3_BUCKET" },
     { "Sid": "Read", "Effect": "Allow", "Action": ["s3:GetObject"],
-      "Resource": "arn:aws:s3:::dexory-data-offload-staging-bucket/*" }
+      "Resource": "arn:aws:s3:::YOUR_S3_BUCKET/*" }
   ]
 }
 ```
@@ -131,11 +130,11 @@ artifacts. The one thing to decide is **how much data to serve** — the S3
 Widen it deliberately (an unscoped scan of the whole Hive lake blows the scan
 budget). Edit **both** files, keeping them in sync:
 
-- `server/deploy/config.dexory-ec2.yaml` → `storage.s3.prefix`
-- `server/deploy/docker-compose.dexory.yml` → the builder's `--s3-prefix=` arg
+- `server/deploy/config.aws-ec2.yaml` → `storage.s3.prefix`
+- `server/deploy/docker-compose.aws.yml` → the builder's `--s3-prefix=` arg
 
 Example — all ROS bags for one site:
-`customer=dexory/customer_site=nashville/robot=arri-182/source=ros-bags/`
+`customer=<x>/customer_site=<y>/robot=<z>/source=ros-bags/`
 
 ---
 
@@ -144,7 +143,7 @@ Example — all ROS bags for one site:
 ```bash
 cd server/deploy
 PJ_CLOUD_TOKEN='<a-long-random-shared-bearer-token>' \
-  docker compose -f docker-compose.dexory.yml up -d --build
+  docker compose -f docker-compose.aws.yml up -d --build
 ```
 
 - `PJ_CLOUD_TOKEN` is the single shared bearer token clients must present. **Auth
@@ -157,7 +156,7 @@ PJ_CLOUD_TOKEN='<a-long-random-shared-bearer-token>' \
   compose` auto-loads it) — keep it `chmod 600`, don't commit it.
 - **One builder per catalog DB.** The builder takes an exclusive lock on the
   catalog DB at startup (CATALOG_CONTRACT.md §11); a second builder on the same
-  DB exits code 3. `docker-compose.dexory.yml` uses `restart: unless-stopped`
+  DB exits code 3. `docker-compose.aws.yml` uses `restart: unless-stopped`
   on the builder (not `always`) so a transient exit never double-starts it — keep
   it that way, and don't run a manual `--rebuild` builder against the live DB.
 
@@ -172,16 +171,16 @@ publish (its healthcheck), then starts `server`.
 cd server/deploy
 
 # 1. Builder scanning / publishing (cold WAN scan is minutes — ~7-12s/file):
-docker compose -f docker-compose.dexory.yml logs -f builder
+docker compose -f docker-compose.aws.yml logs -f builder
 
 # 2. Server (only starts once the builder is healthy):
-docker compose -f docker-compose.dexory.yml logs -f server
+docker compose -f docker-compose.aws.yml logs -f server
 
 # 3. Health endpoint (external probe — the distroless image has no curl inside):
 curl -fsS http://localhost:8080/health          # -> ok
 
 # 4. End-to-end through the real client stack (from a box with the CLI built):
-dexory-cloud-cli --url ws://<ec2-host>:8080 list
+mcap-cloud-cli --url ws://<ec2-host>:8080 list
 ```
 
 **AWS gotchas:**
@@ -189,7 +188,7 @@ dexory-cloud-cli --url ws://<ec2-host>:8080 list
   timeouts to `169.254.169.254` → the **IMDS hop limit** is still 1 (§1). Fix it,
   then `docker compose ... restart`.
 - **301 / PermanentRedirect on the first List** → wrong region. The error names
-  the real one; fix `region:` in `config.dexory-ec2.yaml` and `AWS_REGION` in the
+  the real one; fix `region:` in `config.aws-ec2.yaml` and `AWS_REGION` in the
   compose file, then restart.
 - **Scan never finishes** → the `prefix` is too broad (§4). Narrow it.
 
@@ -214,7 +213,7 @@ The tag-edit IPC is a local UNIX socket with no TLS concept.
 
 ```bash
 cd server/deploy
-C="docker compose -f docker-compose.dexory.yml"
+C="docker compose -f docker-compose.aws.yml"
 
 $C logs -f builder            # / server
 $C ps                         # status + health
@@ -236,8 +235,8 @@ atomically-published rebuild without a restart.
 
 ## Reference
 
-- `server/deploy/docker-compose.dexory.yml` — the S3-use-case compose (this deploy).
-- `server/deploy/config.dexory-ec2.yaml` — the S3-use-case server config (this deploy).
+- `server/deploy/docker-compose.aws.yml` — the S3-use-case compose (this deploy).
+- `server/deploy/config.aws-ec2.yaml` — the S3-use-case server config (this deploy).
 - `server/deploy/README.md` — deploy-kit overview + the base local-dev compose + the systemd shape.
 - `server/deploy/pj-cloud-{server,builder}.service` — the systemd alternative.
 - `docs/CATALOG_CONTRACT.md` — the cross-process contract (schema, publish/reopen, tag IPC).

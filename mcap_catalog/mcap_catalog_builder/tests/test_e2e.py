@@ -1,6 +1,6 @@
 """End-to-end tests: full reconcile lifecycle against real + synthetic MCAPs.
 
-``test_e2e_reconcile`` needs the real Dexory data and auto-skips if absent; the
+``test_e2e_reconcile`` needs the real sample data and auto-skips if absent; the
 other two are synthetic and always run.
 """
 
@@ -9,7 +9,7 @@ import os
 from mcap_catalog_builder.db import load_caches, open_db
 from mcap_catalog_builder.reconcile import full_reconcile
 from mcap_catalog_builder.tests.fixtures import (
-    dexory_file,
+    sample_file,
     make_hive_fixture,
     write_flat_no_metadata,
     write_minimal_mcap,
@@ -19,7 +19,7 @@ from mcap_catalog_builder.varint import decode_counts_blob
 F197 = "197_continuous_2026_06_01-04_43_33.mcap"
 F198 = "198_continuous_2026_06_01-05_03_33.mcap"
 DIMS = {
-    "customer": "dexory",
+    "customer": "globex",
     "site": "london",
     "robot": "rob01",
     "source": "ros-bags",
@@ -29,7 +29,7 @@ DIMS = {
 
 
 def test_e2e_reconcile(tmp_path):
-    src = dexory_file(F197)  # skips the test if the Dexory dir is absent
+    src = sample_file(F197)  # skips the test if the sample dir is absent
     watch = str(tmp_path / "watch")
     dest197 = make_hive_fixture(src, watch, DIMS)
 
@@ -60,7 +60,7 @@ def test_e2e_reconcile(tmp_path):
         assert conn.execute("SELECT COUNT(*) FROM files").fetchone()[0] == 1
 
         # add 198 → 2 files, 1 topic set (identical layout → deduped)
-        dest198 = make_hive_fixture(dexory_file(F198), watch, {**DIMS, "filename": F198})
+        dest198 = make_hive_fixture(sample_file(F198), watch, {**DIMS, "filename": F198})
         full_reconcile(conn, caches, watch)
         assert conn.execute("SELECT COUNT(*) FROM files").fetchone()[0] == 2
         assert conn.execute("SELECT COUNT(*) FROM topic_sets").fetchone()[0] == 1

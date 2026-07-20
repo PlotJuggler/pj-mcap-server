@@ -55,7 +55,7 @@ Each file's `customer/site/robot/source/date` come from, in order:
 The parse is trusted only if `rebuild_hive_key(dims) == key` (round-trip), so a
 near-miss key is never guessed into a wrong row.
 
-> **Caveat:** the real sample files in `../DATA/dexory` are **flat** and carry **no
+> **Caveat:** the real sample files in `../DATA/samples` are **flat** and carry **no
 > `s3_key`**, so they route to `catalog_failures` as-is. The tests therefore copy
 > them into a Hive tree (`make_hive_fixture`) or synthesize MCAPs with an injected
 > `s3_key`. Per-file stats come only from the MCAP **summary** — never the embedded
@@ -170,4 +170,4 @@ python3 -m compileall mcap_catalog_builder
 python3 -m pytest mcap_catalog_builder/tests/ -v
 ```
 
-The real-data end-to-end case is skipped (never failed) when `../DATA/dexory` is absent.
+The real-data end-to-end case is skipped (never failed) when `../DATA/samples` is absent.

@@ -1,0 +1,52 @@
+# pj-cloud-server — S3-use-case STAGING bucket (real AWS S3).  TEMPLATE — fill in before use.
+#
+# Used by:  ./run.sh --aws   (it refuses to start while the REPLACE_ME
+# placeholder below is present, and points you here).
+#
+# CREDENTIALS ARE NOT IN THIS FILE (it is committed). Resolution order:
+#   access_key/secret_key are left empty -> storage.NewS3 falls back to the
+#   AWS default credential chain: AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY env,
+#   then ~/.aws/credentials (use AWS_PROFILE to pick a profile), then IAM role.
+#   See scripts/RUNBOOK.md "Real AWS staging bucket".
+#
+# The explicit EMPTY endpoint/access_key/secret_key below are LOAD-BEARING:
+# the loader overlays this YAML onto config.Default(), which is the Minio dev
+# profile (endpoint http://localhost:9000, static creds admin/password123).
+# An ABSENT key keeps the Minio default; only a present-but-empty key clears
+# it. Empty endpoint = real AWS S3 with virtual-hosted addressing (path-style
+# is Minio-only — see storage/s3.go); empty access_key = the AWS default
+# credential chain.
+#
+# The connector only READS the bucket (List/Head/GetRange). It never writes.
+
+server:
+  listen: ":8084"          # staging instance; dev :8080 / smoke :8081 / matrix :8082 / 3d-demo :8083 stay untouched
+
+auth:
+  bearer_token: ${PJ_CLOUD_TOKEN}   # fail-closed: unset => server won't start unless PJ_CLOUD_ALLOW_ANONYMOUS=1
+
+format: mcap
+
+storage:
+  s3:
+    bucket: REPLACE_ME_with_your_s3_bucket
+    region: us-east-1        # MUST match the bucket's region (a 301 on first List names the real one)
+    # If the bucket is a Hive-partitioned data lake (customer=<x>/customer_site=<y>/
+    # robot=<z>/source=<s>/date=<d>/...), an UNSCOPED scan lists every partition and
+    # can blow the scan budget — scope the connector to one MCAP partition and widen
+    # deliberately, e.g.:
+    #   prefix: "customer=<x>/customer_site=<y>/robot=<z>/source=ros-bags/date=<d>/"
+    prefix: ""               # "" = scan the whole bucket; scope it if the bucket is large
+    endpoint: ""             # MUST stay present-and-empty: clears the Minio default
+    access_key: ""           # MUST stay present-and-empty: default credential chain
+    secret_key: ""
+
+catalog:
+  db_path: /tmp/pj-cloud-aws-staging.db
+
+indexer:
+  poll_interval: 60s
+  startup_scan: true
+  # WAN budget: real-bucket extraction can be ~7-12s/file over the network (vs
+  # milliseconds on localhost Minio) — give the synchronous first scan headroom.
+  warm_start_timeout: 20m

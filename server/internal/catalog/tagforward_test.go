@@ -8,7 +8,7 @@ import (
 )
 
 // buildMinimalAurynDB (auryn_read_test.go) seeds one file: id=1,
-// customer=dexory/site=london/robot=r1/source=ros-bags/date=2026-06-01/
+// customer=globex/site=london/robot=r1/source=ros-bags/date=2026-06-01/
 // x.mcap, with embedded tags site=london,masked=x, an override quality=good
 // and a NULL-mask override on "masked" — so tags_effective = {quality:good
 // (override), site:london (embedded)}, "masked" hidden.
@@ -25,7 +25,7 @@ func openMinimalAurynStore(t *testing.T) *Store {
 	return st
 }
 
-const minimalAurynKey = "customer=dexory/customer_site=london/robot=r1/source=ros-bags/date=2026-06-01/x.mcap"
+const minimalAurynKey = "customer=globex/customer_site=london/robot=r1/source=ros-bags/date=2026-06-01/x.mcap"
 
 func TestObjectKeyForFile(t *testing.T) {
 	st := openMinimalAurynStore(t)

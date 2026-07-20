@@ -46,7 +46,7 @@ day of review-driven hardening (dual Claude + Codex). In order:
 
 The active build order stands up the pipeline's two **ends** before the middle:
 
-1. **START endpoint — `PJ4/pj-official-plugins/toolbox_dexory_cloud/`**: a PJ4 Toolbox
+1. **START endpoint — `PJ4/pj-official-plugins/toolbox_mcap_cloud/`**: a PJ4 Toolbox
    plugin that is a 1:1 visual copy of `toolbox_mosaico` with all Arrow/Flight/gRPC/
    `mosaico_sdk` removed and an **inert transport stub** ("backend not implemented").
    Lives only in the vendored tree, never in the official upstream repos. Mosaico
@@ -61,7 +61,7 @@ The active build order stands up the pipeline's two **ends** before the middle:
    one-shot-ZSTD batch bodies + singleton fallback, producer/consumer split, registry +
    eviction), WS priority/bulk channels, OpenSession Fresh/**Resume**, Cancel, Ack,
    Progress, Eos. The C++ SDK downloads sessions (`session_decode` + vendored-mcap
-   writer; `dexory-cloud-cli download <seq> [--topics …] [--time-range …] --output …`);
+   writer; `mcap-cloud-cli download <seq> [--topics …] [--time-range …] --output …`);
    `server/cmd/mcapdiff` asserts logical round-trip equality; smoke step f covers
    full/subset/time-range/dual-stack round-trips. **Slice 3 (GUI ingest, scoped) DONE
    (2026-06-04):** the dialog's Fetch now streams for real — `fetch_worker` wires
@@ -72,7 +72,7 @@ The active build order stands up the pipeline's two **ends** before the middle:
    Float32 read is a hard-gated fixed 8-byte layout in `cdr_float32.hpp`, one exact
    schema). **Slices 4+5 (ingest shape, final) DONE (2026-06-04):** after a brief
    DataSource/Streaming-combo detour (Slice 4), the **USER PRODUCT DECISION** landed
-   the permanent shape — **"Dexory Cloud" IS a cloud TOOLBOX, forever** (Mosaico-style
+   the permanent shape — **"MCAP Cloud" IS a cloud TOOLBOX, forever** (Mosaico-style
    non-modal panel; sidecar family=toolbox; positively verified NOT a
    stream/file source via the real `PluginRuntimeCatalog`). **ALL 6 topics ingest**
    via the in-plugin `RosDecodeDriver` (`src/ros_decode_driver.*`): rosx_introspection
@@ -97,7 +97,7 @@ The active build order stands up the pipeline's two **ends** before the middle:
    wins, documented in `handlers_catalog.go`). DB at `-db`/`PJ_CLOUD_DB`
    (default `/tmp/pj-cloud-catalog.db`); smoke gained steps g (restart
    persistence) + h (tag flow incl. override-survives-forced-reindex).
-   **Slice 7 (stitched multi-file selection) DONE (2026-06-05):** the Dexory
+   **Slice 7 (stitched multi-file selection) DONE (2026-06-05):** the S3-use-case
    headline — seqTable is ExtendedSelection; N selected sequences present as ONE
    synthetic stitched record (`src/stitch_select.h`: sorted by (min_ts,name) so
    reordered selection → identical request; client-side pairwise non-overlap
@@ -147,7 +147,7 @@ The active build order stands up the pipeline's two **ends** before the middle:
    Wiring-order bug found+fixed in main: observability must attach BEFORE
    `loop.Start` or warm-start indexer counters are lost. All 9 verify gates
    PASS; :8080 upgraded to the new binary (warm-start zero re-extracts).
-   **Slice 11 (GCS leg — Plan A 14b + 46a, Asensus M1b) DONE (2026-06-05):**
+   **Slice 11 (GCS leg — Plan A 14b + 46a, GCS-use-case M1b) DONE (2026-06-05):**
    `internal/storage/gcsreader.go` behind the IDENTICAL BlobStore seam —
    **ETag-mapping pin**: change-detect identity = GCS `Generation` (monotonic
    int64 as a decimal string) + `Updated`, NOT MD5/CRC32C; slots into the
@@ -249,7 +249,7 @@ The active build order stands up the pipeline's two **ends** before the middle:
    3x — verification was re-run INLINE (full -race, smoke, matrix,
    ci-integration, scope/UI/proto checks all green).
    **Slice 15 (WASM compile path — M2c-DEX minimum + risk-8 spike) DONE
-   (2026-06-06):** `toolbox_dexory_cloud/wasm/` — `build.sh` compiles the
+   (2026-06-06):** `toolbox_mcap_cloud/wasm/` — `build.sh` compiles the
    PURE client decode core (session_key/session_cache/stitch_select/
    hierarchy_prefix/cli_url_resolve + a vendored, source-regenerated
    zstd-1.5.7 DECODER amalgamation matching the native pin) to a ~146KB
@@ -291,7 +291,7 @@ The active build order stands up the pipeline's two **ends** before the middle:
    (`tf2_msgs/msg/TFMessage`; parser_ros normalizes internally). tf payloads
    classify kFrameTransforms end-to-end (metadata `builtin_object_type` is
    "kFrameTransforms" — enum-style `sdk::name()`). Live gates: worker-level
-   `DexoryCloudParserIngestLiveTest` (33670 pushes / imu 14904 via the
+   `McapCloudParserIngestLiveTest` (33670 pushes / imu 14904 via the
    FakeIngestHost recorder; cancel releases the context) + the cache-HIT
    resume leg reworked to the recorder; smoke step d gained the
    parser-ingest live leg. Host tests 11/11 + real-ros test; plugin ctest
@@ -316,7 +316,7 @@ The active build order stands up the pipeline's two **ends** before the middle:
    **From the 2026-06-05 verbatim audit (47 reqs checked):** all technical
    follow-ups landed in Slice 10 (estimate gate, L3 matrix legs); the one
    recorded clarification stands — `{s3,gcs}` dual-leg gate text in
-   unified-plan M1c is Asensus-M1b scope, not a Dexory M1 gate.
+   unified-plan M1c is GCS-M1b scope, not an S3 M1 gate.
 
 **Plugin-shape note:** the endpoint plugin is a Toolbox (like Mosaico) — settled by
 Slice 16 (the host parser-delegation tail slots let a Toolbox reach the full parser
@@ -328,7 +328,7 @@ pipeline, so no DataSource shape is needed).
 > `pj-official-plugins/` submodules described just below were **REMOVED from this repo**
 > (commit `82a8c2f`). PJ4 + the plugins are now managed **externally** as sibling
 > checkouts (e.g. `~/ws_plotjuggler/PJ4-cloud`); the connector plugin builds standalone at
-> `plugin/toolbox_dexory_cloud/` against the SDK Conan package (now **0.11.0**, not 0.8.1).
+> `plugin/toolbox_mcap_cloud/` against the SDK Conan package (now **0.11.0**, not 0.8.1).
 > The **only submodule of this repo today is `mcap_catalog/`** (the auryn Python catalog
 > builder). The table below is retained only as a historical reference to the fork structure.
 
@@ -345,7 +345,7 @@ public — see [[private-repos-only]]):
 
 Each `cloud` branch = `upstream-base + our-delta`; `git log <upstream-base>..cloud` in a
 fork is exactly our changes (`git submodule status` records the pinned commit). The
-**connector plugin lives in THIS repo** at `plugin/toolbox_dexory_cloud/` — it builds
+**connector plugin lives in THIS repo** at `plugin/toolbox_mcap_cloud/` — it builds
 standalone against the forked SDK Conan package (0.8.1), NOT inside the plugins submodule.
 The original `/home/gn/ws/PJ4` is the pristine upstream — read it for reference, **never
 modify it**. The reference section below cites pristine `/home/gn/ws/PJ4/...` paths for

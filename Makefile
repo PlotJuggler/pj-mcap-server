@@ -122,7 +122,7 @@ ci-integration:
 # target to build against — use `./run.sh` for a full two-process bring-up;
 # server-start is a bare-server convenience for relaunching against a catalog
 # DB an earlier `./run.sh` already built). CAVEAT: it only ever passes
-# `-listen :8080` — no `-db`, so it only matches the LOCAL --dexory_minio
+# `-listen :8080` — no `-db`, so it only matches the LOCAL --local
 # target's default DB path (/tmp/pj-cloud-catalog.db); relaunching against a
 # cloud target's own DB path needs a manual `-db` flag. It ALSO passes no
 # `-tag-ipc-socket` at all, so tag-edit forwarding is SILENTLY disabled

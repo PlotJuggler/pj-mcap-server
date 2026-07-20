@@ -35,11 +35,11 @@ if ! conan list "plotjuggler_sdk/$SDK_VER" 2>/dev/null | grep -q "plotjuggler_sd
   echo "    cd /path/to/plotjuggler_sdk && conan create . --build=missing"
   exit 1
 fi
-( cd "$ROOT/plugin/toolbox_dexory_cloud" \
+( cd "$ROOT/plugin/toolbox_mcap_cloud" \
     && conan install . --output-folder=build --build=missing -s compiler.cppstd=20 \
     && cmake -B build -DCMAKE_TOOLCHAIN_FILE=build/conan_toolchain.cmake -DCMAKE_BUILD_TYPE=Release \
     && cmake --build build -j"$(nproc)" )
-echo "    plugin -> plugin/toolbox_dexory_cloud/build/bin/libtoolbox_dexory_cloud_plugin.so"
+echo "    plugin -> plugin/toolbox_mcap_cloud/build/bin/libtoolbox_mcap_cloud_plugin.so"
 
 echo
 echo "==> build complete.  Next:  ./run.sh   (starts Minio + synthetic data + the catalog builder + the server)"

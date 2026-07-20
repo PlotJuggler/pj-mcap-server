@@ -6,7 +6,7 @@ from mcap_catalog_builder.mcap_summary import (
     read_file_summary,
     summary_from_stream,
 )
-from mcap_catalog_builder.tests.fixtures import dexory_file, write_minimal_mcap
+from mcap_catalog_builder.tests.fixtures import sample_file, write_minimal_mcap
 
 
 def test_summary_from_stream_matches_path_read(tmp_path):
@@ -58,8 +58,8 @@ def test_derive_tags_empty(tmp_path):
     assert derive_tags(read_file_summary(dest)) == []
 
 
-def test_real_dexory_summary():
-    path = dexory_file("197_continuous_2026_06_01-04_43_33.mcap")
+def test_real_sample_summary():
+    path = sample_file("197_continuous_2026_06_01-04_43_33.mcap")
     summary = read_file_summary(path)
     assert len(summary.channels) == 162
     assert sum(c.message_count for c in summary.channels) == 1283397

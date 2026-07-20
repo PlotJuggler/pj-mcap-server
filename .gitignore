@@ -6,13 +6,13 @@ PJ4/.cache/
 PJ4/pj-official-plugins/*/CMakeUserPresets.json
 PJ4/pj-official-plugins/.cpm-cache/
 
-# Relocated connector plugin (plugin/toolbox_dexory_cloud): build + conan artifacts
-plugin/toolbox_dexory_cloud/build/
-plugin/toolbox_dexory_cloud/CMakeUserPresets.json
-plugin/toolbox_dexory_cloud/.cpm-cache/
+# Relocated connector plugin (plugin/toolbox_mcap_cloud): build + conan artifacts
+plugin/toolbox_mcap_cloud/build/
+plugin/toolbox_mcap_cloud/CMakeUserPresets.json
+plugin/toolbox_mcap_cloud/.cpm-cache/
 # Conan 2 env-activation scripts written to the plugin root by `conan install`
-plugin/toolbox_dexory_cloud/conan*.sh
-plugin/toolbox_dexory_cloud/deactivate_conan*.sh
+plugin/toolbox_mcap_cloud/conan*.sh
+plugin/toolbox_mcap_cloud/deactivate_conan*.sh
 
 server/bin/
 

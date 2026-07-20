@@ -1,0 +1,21 @@
+{
+  "id": "mcap-cloud",
+  "name": "MCAP Cloud",
+  "version": "0.2.0",
+  "description": "Cloud toolbox panel for MCAP Cloud servers. Open it from the Toolbox menu (it does NOT appear in the Streaming combo): browse the catalog (Lua metadata predicate filter, multi-topic selection, time-range), then Fetch to bounded-horizon download the selected session right there. Topic decoding is delegated to the host's MessageParser plugins (parser_ros) via the toolbox parser-ingest API; tf, pointclouds and images arrive as 3D/2D-capable object topics. The plugin ships no message decoders.",
+  "author": "PlotJuggler Team",
+  "publisher": "PlotJuggler",
+  "website": "https://github.com/PlotJuggler/pj-official-plugins",
+  "repository": "https://github.com/PlotJuggler/pj-official-plugins",
+  "license": "MIT",
+  "icon_url": "",
+  "category": "toolbox",
+  "tags": [
+    "cloud",
+    "s3",
+    "stream",
+    "mcap",
+    "ros"
+  ],
+  "min_plotjuggler_version": "4.0.0"
+}

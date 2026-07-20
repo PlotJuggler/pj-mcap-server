@@ -1,0 +1,32 @@
+# pj-cloud-server — GCS use case (Google Cloud Storage).  TEMPLATE — fill in before use.
+#
+# Used by:  ./run.sh --gcs   (it refuses to start while the REPLACE_ME
+# placeholders below are present, and points you here).
+#
+# CREDENTIALS ARE NOT IN THIS FILE. The server resolves them via Application
+# Default Credentials (ADC): `gcloud auth application-default login` for dev, or an
+# attached service account / Workload Identity on GCE (the prod baseline). The
+# optional `credentials_file` below is DEV-ONLY. The connector only READS the bucket
+# (it needs storage.objects.get + storage.objects.list).
+#
+# STORAGE_EMULATOR_HOST is honored automatically by the GCS SDK (for infra/fake-gcs).
+server:
+  listen: ":8085"          # GCS instance; dev :8080 / smoke :8081 / matrix :8082 / 3d-demo :8083 / aws :8084
+auth:
+  bearer_token: ${PJ_CLOUD_TOKEN}   # fail-closed: unset => server won't start unless PJ_CLOUD_ALLOW_ANONYMOUS=1
+format: mcap
+storage:
+  gcs:
+    bucket: REPLACE_ME_with_your_gcs_bucket
+    # Scope to a sub-path so the first scan of a large bucket stays bounded
+    # (mirrors the S3-use-case Hive prefix). Leave "" to scan the whole bucket.
+    prefix: ""
+    # credentials_file: /path/to/service-account.json   # DEV ONLY; prod uses ADC / Workload Identity
+catalog:
+  db_path: /tmp/pj-cloud-gcs-staging.db
+indexer:
+  poll_interval: 60s
+  startup_scan: true
+  # WAN budget: GCS extraction over the network is ~seconds/file (vs ms on a local
+  # emulator). Give headroom for the synchronous first scan.
+  warm_start_timeout: 20m

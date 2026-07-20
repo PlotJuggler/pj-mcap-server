@@ -17,7 +17,7 @@ from mcap_catalog_builder.tests.fixtures import write_minimal_mcap, write_unsumm
 from mcap_catalog_builder.varint import decode_counts_blob
 
 DIMS = {
-    "customer": "dexory",
+    "customer": "globex",
     "site": "london",
     "robot": "rob01",
     "source": "ros-bags",
@@ -175,7 +175,7 @@ def test_catalog_vanished_file_does_not_crash(tmp_db, tmp_path):
     conn, caches = tmp_db
     root = str(tmp_path / "watch")
     missing = os.path.join(
-        root, "customer=dexory", "customer_site=london", "robot=rob01",
+        root, "customer=globex", "customer_site=london", "robot=rob01",
         "source=ros-bags", "date=2026-06-01", "ghost.mcap",
     )
     assert catalog_file(conn, caches, missing, root).status == "failed"

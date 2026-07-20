@@ -11,7 +11,7 @@ from mcap_catalog_builder.varint import (
 
 
 def test_encode_known_value():
-    # The real Dexory file 197 has message_count == 1283397.
+    # The real sample file 197 has message_count == 1283397.
     assert encode_varint(1283397).hex() == "c5aa4e"
 
 

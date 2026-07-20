@@ -46,7 +46,7 @@ func bigListFiles(n int) *pb.ServerMessage {
 	for i := range files {
 		files[i] = &pb.FileSummary{
 			Id:           uint64(i),
-			S3Key:        "customer=dexory/customer_site=warehouse-01/robot=r7/source=lidar/date=2026-05-19/rosbox_2026-05-19_18-27-17.mcap",
+			S3Key:        "customer=globex/customer_site=warehouse-01/robot=r7/source=lidar/date=2026-05-19/rosbox_2026-05-19_18-27-17.mcap",
 			SizeBytes:    21_900_000,
 			Recorded:     &pb.TimeRange{StartNs: 1_700_000_000_000_000_000, EndNs: 1_700_000_600_000_000_000},
 			TopicCount:   6,

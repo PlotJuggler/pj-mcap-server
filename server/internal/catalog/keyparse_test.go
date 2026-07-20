@@ -9,7 +9,7 @@ import (
 // rebuildHiveKey: rebuild(parse(k)) == k for every well-formed k.
 func TestParseHiveKey_RoundTrip(t *testing.T) {
 	cases := []hiveDims{
-		{Customer: "dexory", Site: "london", Robot: "r1", Source: "ros-bags", Date: "2026-06-01", Filename: "x.mcap"},
+		{Customer: "globex", Site: "london", Robot: "r1", Source: "ros-bags", Date: "2026-06-01", Filename: "x.mcap"},
 		{Customer: "a", Site: "b", Robot: "c", Source: "d", Date: "2026-01-01", Filename: "f.mcap"},
 		{Customer: "cust with spaces", Site: "s", Robot: "r", Source: "src-2", Date: "2026-12-31", Filename: "a.b.c.mcap"},
 	}

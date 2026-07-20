@@ -14,7 +14,7 @@ name: wasm-compile
 #
 # It does NOT touch the native plugin build, the smoke/matrix/ctest gates, or the
 # Go server CI (those stay exactly as ci.yml defines them). See
-# plugin/toolbox_dexory_cloud/wasm/README.md for the full
+# plugin/toolbox_mcap_cloud/wasm/README.md for the full
 # transport / TLS / protobuf / zstd constraint write-up.
 
 on:
@@ -60,15 +60,15 @@ jobs:
 
       - name: build + run the wasm decode-core smoke
         run: |
-          cd plugin/toolbox_dexory_cloud/wasm
+          cd plugin/toolbox_mcap_cloud/wasm
           ./build.sh
 
       - name: upload .wasm artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: dexory-cloud-wasm-decode-core
+          name: mcap-cloud-wasm-decode-core
           path: |
-            plugin/toolbox_dexory_cloud/wasm/build/dexory_cloud_wasm_smoke.wasm
-            plugin/toolbox_dexory_cloud/wasm/build/dexory_cloud_wasm_smoke.js
+            plugin/toolbox_mcap_cloud/wasm/build/mcap_cloud_wasm_smoke.wasm
+            plugin/toolbox_mcap_cloud/wasm/build/mcap_cloud_wasm_smoke.js
           if-no-files-found: warn

@@ -23,7 +23,7 @@ from mcap_catalog_builder.tests.fixtures import write_minimal_mcap
 from mcap_catalog_builder.watcher import WatchEvent
 
 KEY = (
-    "customer=dexory/customer_site=london/robot=rob01/"
+    "customer=globex/customer_site=london/robot=rob01/"
     "source=ros-bags/date=2026-06-01/x.mcap"
 )
 
@@ -87,7 +87,7 @@ def _raw_request(socket_path: str, request_bytes: bytes, timeout: float = 5.0):
 
 def _hive(root, filename="x.mcap"):
     dest = os.path.join(
-        root, "customer=dexory", "customer_site=london", "robot=rob01",
+        root, "customer=globex", "customer_site=london", "robot=rob01",
         "source=ros-bags", "date=2026-06-01", filename,
     )
     write_minimal_mcap(dest, channels=[("/a", "S", "ros2msg", 2)])
@@ -184,7 +184,7 @@ def test_unknown_key_returns_404(worker, sock_path):
     t = _run_server(server)
     try:
         missing_key = (
-            "customer=dexory/customer_site=london/robot=rob01/"
+            "customer=globex/customer_site=london/robot=rob01/"
             "source=ros-bags/date=2026-06-01/does-not-exist.mcap"
         )
         status, data = _post(sock_path, {"key": missing_key, "set_tags": {"a": "b"}})

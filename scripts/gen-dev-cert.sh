@@ -5,7 +5,7 @@
 # server.tls.cert + server.tls.key are set (spec §8.6). This produces a
 # throwaway self-signed pair valid for localhost / 127.0.0.1 / ::1 so you can
 # exercise the TLS path locally. Clients verify against it with skip-verify:
-#   - dexory-cloud-cli: allow_insecure (ixwebsocket TLS option)
+#   - mcap-cloud-cli: allow_insecure (ixwebsocket TLS option)
 #   - devprobe:         -insecure
 #
 # Usage:

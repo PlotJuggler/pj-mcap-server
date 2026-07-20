@@ -24,7 +24,7 @@ func writeStampedDB(t *testing.T, path string, version int) {
 		"CREATE TABLE schema_version (id INTEGER PRIMARY KEY CHECK (id = 1), version INTEGER NOT NULL)",
 		fmt.Sprintf("INSERT INTO schema_version(id, version) VALUES (1, %d)", version),
 		"CREATE TABLE customers (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE)",
-		"INSERT INTO customers(id, name) VALUES (1, 'dexory')",
+		"INSERT INTO customers(id, name) VALUES (1, 'globex')",
 	}
 	for _, s := range stmts {
 		if _, err := db.Exec(s); err != nil {
@@ -48,8 +48,8 @@ func TestOpenReadOnly_HappyPath(t *testing.T) {
 	if err := st.DB().QueryRow("SELECT name FROM customers WHERE id = 1").Scan(&name); err != nil {
 		t.Fatalf("read customers: %v", err)
 	}
-	if name != "dexory" {
-		t.Fatalf("customer name = %q, want dexory", name)
+	if name != "globex" {
+		t.Fatalf("customer name = %q, want globex", name)
 	}
 }
 

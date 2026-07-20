@@ -9,10 +9,10 @@
 #   always starts the builder FIRST and waits for its initial build before
 #   starting the server.
 #
-#   ./run.sh                    same as --dexory_minio
-#   ./run.sh --dexory_minio     LOCAL: Minio (S3) + synthetic recordings + builder + server on :8080.
-#   ./run.sh --dexory_aws       S3 staging bucket on AWS S3 (config.dexory-staging.yaml, :8084).
-#   ./run.sh --asensus_google   GCS staging bucket on Google Cloud Storage (config.asensus-staging.yaml).
+#   ./run.sh                    same as --local
+#   ./run.sh --local     LOCAL: Minio (S3) + synthetic recordings + builder + server on :8080.
+#   ./run.sh --aws       S3 staging bucket on AWS S3 (config.aws-staging.yaml, :8084).
+#   ./run.sh --gcs   GCS staging bucket on Google Cloud Storage (config.gcs-staging.yaml).
 #   ./run.sh <path/to.yaml>     power user: any S3/GCS server config file.
 #
 # Idempotent: if the target's server is ALREADY running it is reused (and its
@@ -93,7 +93,7 @@ yaml_val() {
 # parse_storage_config CONFIG — sets STORAGE_KIND/BUCKET/PREFIX/REGION/ENDPOINT/
 # ACCESSKEY/SECRETKEY/CREDFILE. ACCESSKEY/SECRETKEY are ONLY present for a
 # power-user config that inlines static creds (e.g. a self-hosted S3 with a
-# fixed key pair, or dev Minio) — the committed dexory-staging/asensus-staging
+# fixed key pair, or dev Minio) — the committed aws-staging/gcs-staging
 # configs deliberately leave them empty/absent so both the Go server AND (via
 # these) the builder fall back to the AWS default credential chain / ADC.
 parse_storage_config() {
@@ -307,9 +307,9 @@ cloud_builder_args() {
     [ -n "$ENDPOINT" ] && export AWS_ENDPOINT_URL="$ENDPOINT"
     if [ -n "$REGION" ]; then export AWS_REGION="$REGION" AWS_DEFAULT_REGION="$REGION"; fi
     # Static creds ONLY if the config inlines them (power-user / self-hosted
-    # S3); absent (the dexory-staging/asensus-staging norm) means fall back
+    # S3); absent (the aws-staging/gcs-staging norm) means fall back
     # to whatever AWS credential chain is already in the environment
-    # (AWS_PROFILE, exported above for --dexory_aws; ~/.aws/credentials; IAM role).
+    # (AWS_PROFILE, exported above for --aws; ~/.aws/credentials; IAM role).
     [ -n "$ACCESSKEY" ] && export AWS_ACCESS_KEY_ID="$ACCESSKEY"
     [ -n "$SECRETKEY" ] && export AWS_SECRET_ACCESS_KEY="$SECRETKEY"
     BARGS=(--source s3 --s3-bucket "$BUCKET")
@@ -319,7 +319,7 @@ cloud_builder_args() {
 }
 
 # start_local_builder — ensures the Minio-backed catalog builder for
-# --dexory_minio is running. Called from both the fresh-start path and the
+# --local is running. Called from both the fresh-start path and the
 # "server up, builder dead" repair path, so both ever start the SAME builder.
 start_local_builder() {
   export AWS_ENDPOINT_URL="http://localhost:9000" AWS_ACCESS_KEY_ID="admin" AWS_SECRET_ACCESS_KEY="password123"
@@ -334,7 +334,7 @@ launch_app() {  # $1 = port like :8084
   cat <<EOF
 
   Backend ready:  $url   (server log: $LOGFILE, builder log: $BUILDER_LOGFILE)
-  CLI check:      plugin/toolbox_dexory_cloud/build/bin/dexory-cloud-cli --url $url list
+  CLI check:      plugin/toolbox_mcap_cloud/build/bin/mcap-cloud-cli --url $url list
   Stop:           make server-stop   (reaps both the server and the catalog builder)
 EOF
 }
@@ -347,7 +347,7 @@ for a in "$@"; do
     *) if [ -z "$TARGET" ]; then TARGET="$a"; else echo "ERROR: unexpected argument '$a'"; usage; exit 2; fi ;;
   esac
 done
-TARGET="${TARGET:---dexory_minio}"
+TARGET="${TARGET:---local}"
 
 # Is a builder from a PREVIOUS invocation already working on this SAME target
 # (server not up yet — e.g. mid cold-scan on a real bucket)? If so, the
@@ -361,13 +361,13 @@ fi
 # ---------------- target -> MODE / CONFIG / CRED_HINT ----------------
 MODE=local; CONFIG=""; CRED_HINT=""
 case "$TARGET" in
-  --dexory_minio) MODE=local ;;
-  --dexory_aws)
-    MODE=cloud; CONFIG="$DEPLOY/config.dexory-staging.yaml"
-    export AWS_PROFILE="${AWS_PROFILE:-dexory-staging}"
+  --local) MODE=local ;;
+  --aws)
+    MODE=cloud; CONFIG="$DEPLOY/config.aws-staging.yaml"
+    export AWS_PROFILE="${AWS_PROFILE:-aws-staging}"
     CRED_HINT="AWS_PROFILE=$AWS_PROFILE (or AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY)" ;;
-  --asensus_google)
-    MODE=cloud; CONFIG="$DEPLOY/config.asensus-staging.yaml"
+  --gcs)
+    MODE=cloud; CONFIG="$DEPLOY/config.gcs-staging.yaml"
     CRED_HINT="Application Default Credentials (gcloud auth application-default login)" ;;
   --*) echo "ERROR: unknown target '$TARGET'"; echo; usage; exit 2 ;;
   *)   MODE=cloud; CONFIG="$TARGET"; CRED_HINT="your cloud-provider environment credentials" ;;
@@ -417,9 +417,9 @@ if [ "$MODE" = cloud ]; then
   exit 0
 fi
 
-# ---------------- LOCAL (--dexory_minio) ----------------
+# ---------------- LOCAL (--local) ----------------
 if our_server_up :8080; then
-  echo "==> --dexory_minio: backend already up on :8080 — reusing it."
+  echo "==> --local: backend already up on :8080 — reusing it."
   if [ -f "$BUILDER_PIDFILE" ] && kill -0 "$(cat "$BUILDER_PIDFILE")" 2>/dev/null; then
     : # catalog builder still alive — nothing to do
   else
@@ -429,7 +429,7 @@ if our_server_up :8080; then
     start_local_builder || { echo "ERROR: catalog builder did not complete its initial build within 60s — see $BUILDER_LOGFILE"; exit 1; }
   fi
 else
-  command -v docker >/dev/null || { echo "ERROR: docker not found — install Docker, or use a cloud target (./run.sh --dexory_aws)"; exit 1; }
+  command -v docker >/dev/null || { echo "ERROR: docker not found — install Docker, or use a cloud target (./run.sh --aws)"; exit 1; }
   need seed; need gen-ci-fixtures; need gen-3d-fixture
   [ "$SAME_TARGET_BUILDING" = "1" ] || stop_other_server
   echo "==> [1/4] Starting Minio (S3) on :9000  (console :9001, admin/password123)"

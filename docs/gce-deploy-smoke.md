@@ -28,14 +28,14 @@ operational expression of the unified plan's M2c-GCS acceptance gate.
 ## Preconditions (on the GCE VM)
 
 - Server container running and serving TLS (e.g. via `server/deploy/` —
-  `Dockerfile` + `pj-cloud-server.service` + `config.asensus-staging.yaml`).
+  `Dockerfile` + `pj-cloud-server.service` + `config.gcs-staging.yaml`).
 - The VM's **attached service account** has bucket-read scope
   (`roles/storage.objectViewer`); **no** `GOOGLE_APPLICATION_CREDENTIALS`, **no**
   key file on disk (ADC resolves via the metadata server).
 - A **persistent disk** mounted at `/var/lib/pj-cloud` holding `catalog.db`
   (`mkfs.ext4` once, `/etc/fstab` mount so it survives reboots).
-- `dexory-cloud-cli` available on the VM (built by `./build.sh
-  toolbox_dexory_cloud`).
+- `mcap-cloud-cli` available on the VM (built by `./build.sh
+  toolbox_mcap_cloud`).
 
 ## The five checks
 
@@ -59,9 +59,9 @@ operational expression of the unified plan's M2c-GCS acceptance gate.
 set -euo pipefail
 
 SERVER=${SERVER:-https://localhost:8443}          # TLS health/metrics endpoint
-WSS=${WSS:-wss://localhost:8443}                  # ws endpoint (DEXORY_CLOUD_URL)
+WSS=${WSS:-wss://localhost:8443}                  # ws endpoint (MCAP_CLOUD_URL)
 TOKEN=${PJ_CLOUD_TOKEN:-}                          # bearer token if auth enabled
-CLI=${PJCLOUD_CLI:-dexory-cloud-cli}
+CLI=${PJCLOUD_CLI:-mcap-cloud-cli}
 DB=${CATALOG_DB:-/var/lib/pj-cloud/catalog.db}
 CONTAINER=${CONTAINER:-pj-cloud-server}
 

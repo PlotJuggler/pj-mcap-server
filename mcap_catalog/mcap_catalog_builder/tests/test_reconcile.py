@@ -14,7 +14,7 @@ CH = [("/a", "S", "ros2msg", 2), ("/b", "S", "ros2msg", 1), ("/zero", "S", "ros2
 def _hive(root, filename="x.mcap", channels=None, s3_key=None):
     dest = os.path.join(
         root,
-        "customer=dexory",
+        "customer=globex",
         "customer_site=london",
         "robot=rob01",
         "source=ros-bags",

@@ -143,17 +143,17 @@ def test_schema_version_mismatch_fails_fast(tmp_path):
 
 def test_resolve_customer_idempotent(conn):
     caches = load_caches(conn)
-    a = resolve_customer(conn, caches, "dexory")
-    b = resolve_customer(conn, caches, "dexory")
+    a = resolve_customer(conn, caches, "globex")
+    b = resolve_customer(conn, caches, "globex")
     assert a == b
     conn.commit()
-    n = conn.execute("SELECT COUNT(*) FROM customers WHERE name='dexory'").fetchone()[0]
+    n = conn.execute("SELECT COUNT(*) FROM customers WHERE name='globex'").fetchone()[0]
     assert n == 1
 
 
 def test_resolve_hierarchy_scopes_by_parent(conn):
     caches = load_caches(conn)
-    cid = resolve_customer(conn, caches, "dexory")
+    cid = resolve_customer(conn, caches, "globex")
     sid = resolve_site(conn, caches, cid, "nashville")
     rid = resolve_robot(conn, caches, sid, "arri-182")
     conn.commit()
@@ -196,9 +196,9 @@ def test_resolve_topic_set_rejects_unsorted_members(conn):
 
 def test_caches_reload_from_db(conn):
     caches = load_caches(conn)
-    cid = resolve_customer(conn, caches, "dexory")
+    cid = resolve_customer(conn, caches, "globex")
     conn.commit()
-    assert load_caches(conn).customer["dexory"] == cid
+    assert load_caches(conn).customer["globex"] == cid
 
 
 def test_record_failure_upserts(conn):

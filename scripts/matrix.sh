@@ -72,14 +72,14 @@ exit 2
 #       on :8082 pointed at GCS (fresh temp DB, STORAGE_EMULATOR_HOST). Asserts
 #       THROUGH BOTH CLIENT STACKS like the s3 legs: devprobe list == 8, full zeg_1
 #       download == 33670 + mcapdiff logically-equal vs the original, AND the C++
-#       dexory-cloud-cli list/download round-trip. Then asserts CHANGE-DETECT
+#       mcap-cloud-cli list/download round-trip. Then asserts CHANGE-DETECT
 #       PARITY: restart on the SAME GCS DB -> indexer logs 0 new / 0 reindexed
 #       (warm-start works because ETag == GCS Generation). Reaps the GCS server +
 #       its DB; tears fake-gcs down IFF this leg started it.
 # ─────────────────────────────────────────────────────────────────────────────
 # PINNED GROUND TRUTH — self-contained to THIS script and THIS legacy real
 # corpus (${GROUND_TRUTH_DIR}, the 8 "nissan_zala_*" MCAPs). These do NOT
-# track scripts/smoke.sh or the C++ live gtests (plugin/toolbox_dexory_cloud/
+# track scripts/smoke.sh or the C++ live gtests (plugin/toolbox_mcap_cloud/
 # tests/*_live_test.cpp) — since the catalog-migration cutover (2026-07-06)
 # those run against an entirely different, synthetic Hive-keyed corpus
 # (server/internal/genmcap's deterministic generator) that has no relationship
@@ -151,9 +151,9 @@ readonly M8_EXPECT_FILES=8
 # ── paths (all absolute; cwd is reset between agent steps elsewhere) ──────────
 readonly REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 readonly SERVER_DIR="${REPO_ROOT}/server"
-readonly PLUGIN_DIR="${REPO_ROOT}/plugin/toolbox_dexory_cloud"
+readonly PLUGIN_DIR="${REPO_ROOT}/plugin/toolbox_mcap_cloud"
 readonly CTEST_DIR="${PLUGIN_DIR}/build"
-readonly SDK_CLI="${CTEST_DIR}/bin/dexory-cloud-cli"
+readonly SDK_CLI="${CTEST_DIR}/bin/mcap-cloud-cli"
 
 # ── harness server config (NEVER :8080 / :8081 / their PID files) ─────────────
 readonly MATRIX_PORT=8082
@@ -281,7 +281,7 @@ setup() {
   DEVPROBE="${SERVER_DIR}/bin/devprobe"
 
   [[ -x "${SDK_CLI}" ]] \
-    || fail "setup: dexory-cloud-cli missing at ${SDK_CLI} (build it: ./build.sh (from the repo root))"
+    || fail "setup: mcap-cloud-cli missing at ${SDK_CLI} (build it: ./build.sh (from the repo root))"
   [[ -d "${GROUND_TRUTH_DIR}" ]] || fail "setup: ground-truth originals dir ${GROUND_TRUTH_DIR} not present"
 
   rm -f "${MATRIX_DB}" "${MATRIX_DB}-wal" "${MATRIX_DB}-shm" 2>/dev/null || true
@@ -481,7 +481,7 @@ leg_m7() {
 # Brings up fake-gcs, seeds the SAME 8 ground-truth MCAPs, reaps the S3 matrix
 # server, and re-boots a SECOND server on :8082 pointed at GCS (fresh temp DB,
 # STORAGE_EMULATOR_HOST). Asserts through BOTH client stacks (devprobe + the C++
-# dexory-cloud-cli) that the GCS arm round-trips IDENTICALLY to the S3 arm, then
+# mcap-cloud-cli) that the GCS arm round-trips IDENTICALLY to the S3 arm, then
 # asserts change-detect parity (warm-start = 0 re-extracts, ETag == Generation).
 # ─────────────────────────────────────────────────────────────────────────────
 leg_m8() {
@@ -566,7 +566,7 @@ YAML
     || fail "m8: devprobe GCS reconstruction NOT logically equal to the original"
   log "m8: devprobe GCS round-trip clean (${mc} msgs, mcapdiff equal)"
 
-  # (b) C++ dexory-cloud-cli round-trip: list == 8 + download == 33670.
+  # (b) C++ mcap-cloud-cli round-trip: list == 8 + download == 33670.
   local clist; clist="$("${SDK_CLI}" --url "${MATRIX_URL}" list --json 2>/dev/null)" \
     || fail "m8: C++ CLI list failed against GCS server"
   local cn

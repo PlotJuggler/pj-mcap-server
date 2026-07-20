@@ -82,7 +82,7 @@
 # a numeric count. See compute_local_ground_truth() / derive_server_ground_
 # truth() below for where the real numbers come from.
 #
-# The C++ live gtests (plugin/toolbox_dexory_cloud/tests/*_live_test.cpp)
+# The C++ live gtests (plugin/toolbox_mcap_cloud/tests/*_live_test.cpp)
 # CANNOT self-derive at build time (they are compiled long before this script
 # runs) — their ground-truth constants are hand-pinned from ONE empirical run
 # against this exact deterministic generator (see each file's comment for the
@@ -140,7 +140,7 @@ readonly REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 readonly SERVER_DIR="${REPO_ROOT}/server"
 readonly MCAP_CATALOG_DIR="${REPO_ROOT}/mcap_catalog"
 readonly COMPOSE_FILE="${REPO_ROOT}/infra/minio/docker-compose.yml"
-readonly PLUGIN_DIR="${REPO_ROOT}/plugin/toolbox_dexory_cloud"
+readonly PLUGIN_DIR="${REPO_ROOT}/plugin/toolbox_mcap_cloud"
 readonly CTEST_DIR="${PLUGIN_DIR}/build"
 readonly MCAP_CLI="${HOME}/Apps/mcap-linux-amd64"
 readonly VENV_PY="${HOME}/.venvs/pj-catalog/bin/python3"
@@ -696,9 +696,9 @@ PY
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Step d: C++ SDK tests — hermetic (no env) then live (DEXORY_CLOUD_LIVE_URL).
+# Step d: C++ SDK tests — hermetic (no env) then live (MCAP_CLOUD_LIVE_URL).
 # Mechanically unchanged from the legacy harness; the gtest ground-truth
-# constants themselves were re-pinned (plugin/toolbox_dexory_cloud/tests/) to
+# constants themselves were re-pinned (plugin/toolbox_mcap_cloud/tests/) to
 # this corpus in the same change that produced this script.
 # ─────────────────────────────────────────────────────────────────────────────
 step_cpp_tests() {
@@ -709,45 +709,45 @@ step_cpp_tests() {
     || fail "cpp: incremental cmake --build failed in ${CTEST_DIR}"
 
   log "step d: ctest HERMETIC (live test expected to SKIP at gtest level)"
-  ( cd "${CTEST_DIR}" && env -u DEXORY_CLOUD_LIVE_URL ctest --output-on-failure ) \
+  ( cd "${CTEST_DIR}" && env -u MCAP_CLOUD_LIVE_URL ctest --output-on-failure ) \
     || fail "cpp: hermetic ctest failed"
 
-  local live_bin="${CTEST_DIR}/bin/toolbox_dexory_cloud_backend_live_test"
+  local live_bin="${CTEST_DIR}/bin/toolbox_mcap_cloud_backend_live_test"
   [[ -x "${live_bin}" ]] || fail "cpp: live test binary missing at ${live_bin}"
   local hermetic_out
-  hermetic_out="$(env -u DEXORY_CLOUD_LIVE_URL "${live_bin}" 2>&1)" || true
+  hermetic_out="$(env -u MCAP_CLOUD_LIVE_URL "${live_bin}" 2>&1)" || true
   printf '%s\n' "${hermetic_out}" | grep -q '\[  SKIPPED \]' \
-    || { printf '%s\n' "${hermetic_out}"; fail "cpp: live test did NOT skip when DEXORY_CLOUD_LIVE_URL is unset"; }
+    || { printf '%s\n' "${hermetic_out}"; fail "cpp: live test did NOT skip when MCAP_CLOUD_LIVE_URL is unset"; }
   log "step d: hermetic OK (suite green; live test correctly SKIPPED at gtest level)"
 
   log "step d: ctest LIVE against ws://localhost:${SMOKE_PORT} (live tests must RUN, not skip)"
-  ( cd "${CTEST_DIR}" && DEXORY_CLOUD_LIVE_URL="ws://localhost:${SMOKE_PORT}" \
-      ctest --output-on-failure -R DexoryCloudBackendLive ) \
-    || fail "cpp: live ctest (DexoryCloudBackendLive) failed"
+  ( cd "${CTEST_DIR}" && MCAP_CLOUD_LIVE_URL="ws://localhost:${SMOKE_PORT}" \
+      ctest --output-on-failure -R McapCloudBackendLive ) \
+    || fail "cpp: live ctest (McapCloudBackendLive) failed"
 
-  log "step d: ctest LIVE reconnect-resume + cache (DexoryCloudSessionResumeLive)"
-  ( cd "${CTEST_DIR}" && DEXORY_CLOUD_LIVE_URL="ws://localhost:${SMOKE_PORT}" \
-      ctest --output-on-failure -R DexoryCloudSessionResumeLive ) \
-    || fail "cpp: live ctest (DexoryCloudSessionResumeLive) failed"
+  log "step d: ctest LIVE reconnect-resume + cache (McapCloudSessionResumeLive)"
+  ( cd "${CTEST_DIR}" && MCAP_CLOUD_LIVE_URL="ws://localhost:${SMOKE_PORT}" \
+      ctest --output-on-failure -R McapCloudSessionResumeLive ) \
+    || fail "cpp: live ctest (McapCloudSessionResumeLive) failed"
 
-  log "step d: ctest LIVE session download (DexoryCloudSessionDownloadLive)"
-  ( cd "${CTEST_DIR}" && DEXORY_CLOUD_LIVE_URL="ws://localhost:${SMOKE_PORT}" \
-      ctest --output-on-failure -R DexoryCloudSessionDownloadLive ) \
-    || fail "cpp: live ctest (DexoryCloudSessionDownloadLive) failed"
+  log "step d: ctest LIVE session download (McapCloudSessionDownloadLive)"
+  ( cd "${CTEST_DIR}" && MCAP_CLOUD_LIVE_URL="ws://localhost:${SMOKE_PORT}" \
+      ctest --output-on-failure -R McapCloudSessionDownloadLive ) \
+    || fail "cpp: live ctest (McapCloudSessionDownloadLive) failed"
 
-  log "step d: ctest LIVE worker parser-ingest ground-truth (DexoryCloudParserIngestLive)"
-  ( cd "${CTEST_DIR}" && DEXORY_CLOUD_LIVE_URL="ws://localhost:${SMOKE_PORT}" \
-      ctest --output-on-failure -R DexoryCloudParserIngestLive ) \
-    || fail "cpp: live ctest (DexoryCloudParserIngestLive) failed"
+  log "step d: ctest LIVE worker parser-ingest ground-truth (McapCloudParserIngestLive)"
+  ( cd "${CTEST_DIR}" && MCAP_CLOUD_LIVE_URL="ws://localhost:${SMOKE_PORT}" \
+      ctest --output-on-failure -R McapCloudParserIngestLive ) \
+    || fail "cpp: live ctest (McapCloudParserIngestLive) failed"
 
   local live_out
-  if ! live_out="$(DEXORY_CLOUD_LIVE_URL="ws://localhost:${SMOKE_PORT}" "${live_bin}" 2>&1)"; then
+  if ! live_out="$(MCAP_CLOUD_LIVE_URL="ws://localhost:${SMOKE_PORT}" "${live_bin}" 2>&1)"; then
     printf '%s\n' "${live_out}"
     fail "cpp: live test binary failed in live mode"
   fi
   if printf '%s\n' "${live_out}" | grep -q '\[  SKIPPED \]'; then
     printf '%s\n' "${live_out}"
-    fail "cpp: live test SKIPPED in live mode (DEXORY_CLOUD_LIVE_URL was not honored)"
+    fail "cpp: live test SKIPPED in live mode (MCAP_CLOUD_LIVE_URL was not honored)"
   fi
   if ! printf '%s\n' "${live_out}" | grep -qE '\[  PASSED  \] [1-9][0-9]* test'; then
     printf '%s\n' "${live_out}"
@@ -762,29 +762,29 @@ step_cpp_tests() {
 # ─────────────────────────────────────────────────────────────────────────────
 step_cli_spotcheck() {
   log "step e1: C++ SDK CLI spot check (hello + list + topics for ${TARGET_KEY})"
-  local sdk_cli="${CTEST_DIR}/bin/dexory-cloud-cli"
-  [[ -x "${sdk_cli}" ]] || fail "cli: dexory-cloud-cli missing at ${sdk_cli} (built by step d's cmake --build)"
+  local sdk_cli="${CTEST_DIR}/bin/mcap-cloud-cli"
+  [[ -x "${sdk_cli}" ]] || fail "cli: mcap-cloud-cli missing at ${sdk_cli} (built by step d's cmake --build)"
 
   local hello_out
   hello_out="$("${sdk_cli}" --url "ws://localhost:${SMOKE_PORT}" hello)" \
-    || fail "cli: dexory-cloud-cli hello failed"
+    || fail "cli: mcap-cloud-cli hello failed"
   printf '%s' "${hello_out}" | grep -q "server_version" \
-    || fail "cli: dexory-cloud-cli hello output missing server_version"
+    || fail "cli: mcap-cloud-cli hello output missing server_version"
 
   local list_out
   list_out="$("${sdk_cli}" --url "ws://localhost:${SMOKE_PORT}" list)" \
-    || fail "cli: dexory-cloud-cli list failed"
+    || fail "cli: mcap-cloud-cli list failed"
   printf '%s' "${list_out}" | grep -qF "${TARGET_KEY}" \
-    || fail "cli: dexory-cloud-cli list missing ${TARGET_KEY}"
+    || fail "cli: mcap-cloud-cli list missing ${TARGET_KEY}"
 
   local cpp_topics_out
   cpp_topics_out="$("${sdk_cli}" --url "ws://localhost:${SMOKE_PORT}" topics "${TARGET_KEY}")" \
-    || fail "cli: dexory-cloud-cli topics failed"
+    || fail "cli: mcap-cloud-cli topics failed"
   local ct
   IFS=',' read -r -a target_topics <<<"${LOCAL_TARGET_TOPIC_NAMES}"
   for ct in "${target_topics[@]}"; do
     printf '%s' "${cpp_topics_out}" | grep -qF "${ct}" \
-      || fail "cli: dexory-cloud-cli topics missing ${ct}"
+      || fail "cli: mcap-cloud-cli topics missing ${ct}"
   done
   log "step e1: OK (C++ SDK CLI: hello + list + all ${#target_topics[@]} topics present)"
 
@@ -835,11 +835,11 @@ step_roundtrip() {
   local mcapdiff="${SERVER_DIR}/bin/mcapdiff"
   local mcaptopics="${SERVER_DIR}/bin/mcaptopics"
   local probe="${SERVER_DIR}/bin/devprobe"
-  local sdk_cli="${CTEST_DIR}/bin/dexory-cloud-cli"
+  local sdk_cli="${CTEST_DIR}/bin/mcap-cloud-cli"
   [[ -x "${mcapdiff}" ]]   || fail "roundtrip: mcapdiff binary missing at ${mcapdiff}"
   [[ -x "${mcaptopics}" ]] || fail "roundtrip: mcaptopics binary missing at ${mcaptopics}"
   [[ -x "${probe}" ]]      || fail "roundtrip: devprobe binary missing at ${probe}"
-  [[ -x "${sdk_cli}" ]]    || fail "roundtrip: dexory-cloud-cli missing at ${sdk_cli}"
+  [[ -x "${sdk_cli}" ]]    || fail "roundtrip: mcap-cloud-cli missing at ${sdk_cli}"
   [[ -x "${MCAP_CLI}" ]]   || fail "roundtrip: official mcap CLI missing at ${MCAP_CLI}"
   [[ -f "${GROUND_TRUTH_TARGET}" ]] \
     || fail "roundtrip: ground-truth original not found at ${GROUND_TRUTH_TARGET}"
@@ -1065,7 +1065,7 @@ PY
 step_tag_flow() {
   log "step h: tag flow (set -> visible -> survives rebuild -> unset -> gone)"
   local probe="${SERVER_DIR}/bin/devprobe"
-  local sdk_cli="${CTEST_DIR}/bin/dexory-cloud-cli"
+  local sdk_cli="${CTEST_DIR}/bin/mcap-cloud-cli"
   [[ -x "${probe}" ]] || fail "tag: devprobe binary missing at ${probe}"
 
   local target_id
@@ -1080,7 +1080,7 @@ step_tag_flow() {
     if "${sdk_cli}" --url "ws://localhost:${SMOKE_PORT}" tag "${TARGET_KEY}" \
          --set verified=yes --set smoke_marker=h >/dev/null 2>&1; then
       used_cpp=1
-      log "step h1: set via C++ dexory-cloud-cli tag"
+      log "step h1: set via C++ mcap-cloud-cli tag"
     fi
   fi
   if [[ "${used_cpp}" != "1" ]]; then
@@ -1185,7 +1185,7 @@ PY
   # ── h4: unset both keys (against the possibly-renumbered id) -> gone ──
   if [[ "${used_cpp}" == "1" ]] && "${sdk_cli}" --url "ws://localhost:${SMOKE_PORT}" tag "${TARGET_KEY}" \
        --unset verified --unset smoke_marker >/dev/null 2>&1; then
-    log "step h4: unset via C++ dexory-cloud-cli tag"
+    log "step h4: unset via C++ mcap-cloud-cli tag"
   else
     "${probe}" -url "${SMOKE_WS}" -file-id "${new_target_id}" \
         -unset-tag verified -unset-tag smoke_marker >/dev/null \
@@ -1220,7 +1220,7 @@ step_key_addressed_open() {
   log "step i: key-addressed open survives a rowid-shifting rebuild (wire v2)"
   local probe="${SERVER_DIR}/bin/devprobe"
   local mcapdiff="${SERVER_DIR}/bin/mcapdiff"
-  local sdk_cli="${CTEST_DIR}/bin/dexory-cloud-cli"
+  local sdk_cli="${CTEST_DIR}/bin/mcap-cloud-cli"
   local extra_key="customer=aaa/customer_site=lab/robot=r1/source=synthetic/date=2026-06-22/aaa_shift.mcap"
 
   local id_before

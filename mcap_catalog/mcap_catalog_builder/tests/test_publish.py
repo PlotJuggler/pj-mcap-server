@@ -23,7 +23,7 @@ CH = [("/a", "S", "ros2msg", 2), ("/b", "S", "ros2msg", 1)]
 def _hive(root, filename="x.mcap", channels=None):
     dest = os.path.join(
         root,
-        "customer=dexory",
+        "customer=globex",
         "customer_site=london",
         "robot=rob01",
         "source=ros-bags",
@@ -275,7 +275,7 @@ def test_build_fn_that_never_stamps_aborts_publish(tmp_path):
 
 
 _DIMS_A = {
-    "customer": "dexory", "site": "london", "robot": "rob01",
+    "customer": "globex", "site": "london", "robot": "rob01",
     "source": "ros-bags", "date": "2026-06-01", "filename": "a.mcap",
 }
 _DIMS_B = {**_DIMS_A, "filename": "b.mcap"}
@@ -407,7 +407,7 @@ def test_rebuild_carry_forward_disambiguates_same_filename_different_customer(tm
     the other file sharing its filename/date."""
     served = str(tmp_path / "catalog.db")
     root = str(tmp_path / "watch")
-    _hive(root, "a.mcap")  # customer=dexory (see _hive's fixed dims)
+    _hive(root, "a.mcap")  # customer=globex (see _hive's fixed dims)
     acme_dest = os.path.join(
         root, "customer=acme", "customer_site=london", "robot=rob01",
         "source=ros-bags", "date=2026-06-01", "a.mcap",
@@ -417,24 +417,24 @@ def test_rebuild_carry_forward_disambiguates_same_filename_different_customer(tm
     build_and_publish(served, _build_fn_for(root))
 
     conn = open_db(served)
-    dexory_id = lookup_file_id(conn, _DIMS_A)
+    globex_id = lookup_file_id(conn, _DIMS_A)
     acme_id = lookup_file_id(conn, _DIMS_ACME_A)
-    assert dexory_id is not None
+    assert globex_id is not None
     assert acme_id is not None
-    assert dexory_id != acme_id
-    update_tags(conn, dexory_id, set_kv={"only_dexory": "yes"})
+    assert globex_id != acme_id
+    update_tags(conn, globex_id, set_kv={"only_globex": "yes"})
     conn.close()
 
     build_and_publish(served, _build_fn_for(root))  # --rebuild, same corpus
 
     conn = open_db(served)
     try:
-        new_dexory_id = lookup_file_id(conn, _DIMS_A)
+        new_globex_id = lookup_file_id(conn, _DIMS_A)
         new_acme_id = lookup_file_id(conn, _DIMS_ACME_A)
-        dexory_tags = {
+        globex_tags = {
             r["key"]: r["value"]
             for r in conn.execute(
-                "SELECT key, value FROM tags_override WHERE file_id=?", (new_dexory_id,)
+                "SELECT key, value FROM tags_override WHERE file_id=?", (new_globex_id,)
             )
         }
         acme_tags = {
@@ -443,7 +443,7 @@ def test_rebuild_carry_forward_disambiguates_same_filename_different_customer(tm
                 "SELECT key, value FROM tags_override WHERE file_id=?", (new_acme_id,)
             )
         }
-        assert dexory_tags == {"only_dexory": "yes"}
+        assert globex_tags == {"only_globex": "yes"}
         assert acme_tags == {}
     finally:
         conn.close()

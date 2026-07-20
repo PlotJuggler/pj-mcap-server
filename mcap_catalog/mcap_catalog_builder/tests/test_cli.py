@@ -168,7 +168,7 @@ def test_parser_tag_socket_option():
 def _hive_one_file(root):
     dest = os.path.join(
         root,
-        "customer=dexory", "customer_site=london", "robot=rob01",
+        "customer=globex", "customer_site=london", "robot=rob01",
         "source=ros-bags", "date=2026-06-01", "a.mcap",
     )
     write_minimal_mcap(dest)

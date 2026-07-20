@@ -1,7 +1,7 @@
 """Test fixtures: real-data access, synthetic MCAP writers, and Hive trees.
 
 These helpers let the suite exercise the happy path even though the real
-``../DATA/dexory`` samples are flat and carry no ``s3_key`` (so they must be
+``../DATA/samples`` samples are flat and carry no ``s3_key`` (so they must be
 copied into a Hive tree, or a synthetic MCAP with an injected ``s3_key`` used).
 """
 
@@ -12,7 +12,7 @@ import shutil
 import pytest
 from mcap.writer import Writer
 
-DEXORY_DIR = "/home/davide/ws_plotjuggler/DATA/dexory"
+SAMPLE_DIR = "/home/davide/ws_plotjuggler/DATA/samples"
 
 
 class _S3ClientError(Exception):
@@ -62,11 +62,11 @@ class InMemoryS3Client:
         return _Paginator()
 
 
-def dexory_file(name: str) -> str:
-    """Absolute path to a real Dexory sample; ``pytest.skip`` if the data is absent."""
-    path = os.path.join(DEXORY_DIR, name)
+def sample_file(name: str) -> str:
+    """Absolute path to a real sample file; ``pytest.skip`` if the data is absent."""
+    path = os.path.join(SAMPLE_DIR, name)
     if not os.path.exists(path):
-        pytest.skip(f"Dexory data absent: {path}")
+        pytest.skip(f"sample data absent: {path}")
     return path
 
 
@@ -134,7 +134,7 @@ def write_minimal_mcap(
 
 
 def write_flat_no_metadata(dest: str) -> None:
-    """A minimal MCAP with no ``s3_key`` metadata (mimics the flat Dexory samples)."""
+    """A minimal MCAP with no ``s3_key`` metadata (mimics the flat sample files)."""
     write_minimal_mcap(dest, s3_key=None, channels=[("/a", "S", "ros2msg", 1)])
 
 

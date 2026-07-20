@@ -62,8 +62,8 @@ func TestDecodeCountsBlob(t *testing.T) {
 }
 
 func TestRebuildHiveKey(t *testing.T) {
-	got := rebuildHiveKey("dexory", "london", "r1", "ros-bags", "2026-06-01", "x.mcap")
-	want := "customer=dexory/customer_site=london/robot=r1/source=ros-bags/date=2026-06-01/x.mcap"
+	got := rebuildHiveKey("globex", "london", "r1", "ros-bags", "2026-06-01", "x.mcap")
+	want := "customer=globex/customer_site=london/robot=r1/source=ros-bags/date=2026-06-01/x.mcap"
 	if got != want {
 		t.Fatalf("rebuildHiveKey = %q, want %q", got, want)
 	}
@@ -125,7 +125,7 @@ func buildMinimalAurynDB(t *testing.T, path string) {
 	defer db.Close()
 	ddl := []string{
 		// dimensions
-		`INSERT INTO customers(id,name) VALUES (1,'dexory')`,
+		`INSERT INTO customers(id,name) VALUES (1,'globex')`,
 		`INSERT INTO sites(id,customer_id,name) VALUES (1,1,'london')`,
 		`INSERT INTO robots(id,site_id,name) VALUES (1,1,'r1')`,
 		`INSERT INTO sources(id,name) VALUES (1,'ros-bags')`,
@@ -190,7 +190,7 @@ func TestGetFilesByKeys(t *testing.T) {
 	defer st.Close()
 	ctx := context.Background()
 
-	key := "customer=dexory/customer_site=london/robot=r1/source=ros-bags/date=2026-06-01/x.mcap"
+	key := "customer=globex/customer_site=london/robot=r1/source=ros-bags/date=2026-06-01/x.mcap"
 	recs, err := GetFilesByKeys(ctx, st, []string{key})
 	if err != nil {
 		t.Fatalf("GetFilesByKeys: %v", err)
@@ -224,7 +224,7 @@ func TestAurynReader_Hermetic(t *testing.T) {
 		t.Fatalf("FilterFiles = %d files (more=%v), want exactly 1", len(files), more)
 	}
 	f := files[0]
-	wantKey := "customer=dexory/customer_site=london/robot=r1/source=ros-bags/date=2026-06-01/x.mcap"
+	wantKey := "customer=globex/customer_site=london/robot=r1/source=ros-bags/date=2026-06-01/x.mcap"
 	if f.S3Key != wantKey {
 		t.Fatalf("s3_key = %q, want %q", f.S3Key, wantKey)
 	}

@@ -5,12 +5,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## What this directory is
 
 This is the **design / planning workspace AND implementation repo for the "PJ Cloud
-Connector"** — a commercial engagement (clients: Dexory/S3, Asensus/GCS) to build a
-self-hosted server + client that serves MCAP recordings from a cloud bucket to
-PlotJuggler-class clients on demand.
+Connector"** — a self-hosted server + client that serves MCAP recordings from a
+cloud bucket to PlotJuggler-class clients on demand.
 
 This repo (`pj-mcap-server`, a git repo on branch `main`) holds the design spec, the
-implementation plans, the commercial proposal, the **Go server + connector plugin**
+implementation plans, the **Go server + connector plugin**
 implementation, and (2026-06-22) the **vendored auryn Python catalog builder** (in
 `mcap_catalog/` — VENDORED directly as of 2026-07-17; formerly a submodule of
 `AurynRobotics/mcap_server`, de-submoduled so this repo is fully self-contained).
@@ -66,7 +65,7 @@ Settled, present-tense facts about the system, distilled from the implementation
 history (`docs/history.md`) and the migration record. Verify against code if in
 doubt, but don't relitigate the decision itself.
 
-- **"Dexory Cloud" is a TOOLBOX, forever** — a user product decision; Slice 16's
+- **"MCAP Cloud" is a TOOLBOX, forever** — a user product decision; Slice 16's
   host parser-delegation tail slots made a DataSource shape unnecessary (a Toolbox
   can now reach the full parser pipeline).
 - **The connector plugin ships ZERO message decoders.** Decoding happens via host
@@ -159,7 +158,7 @@ local codebases first. Do not guess SDK/plugin APIs — read the real headers.
 > `pj-official-plugins` are **NOT submodules of this repo** (removed in `82a8c2f`) —
 > they are managed as sibling checkouts under `~/ws_plotjuggler/` (e.g. `PJ4-cloud/`,
 > `plotjuggler_sdk-cloud/`). The connector plugin builds **standalone** at
-> `plugin/toolbox_dexory_cloud/` against the SDK Conan package (**0.11.0** — built on
+> `plugin/toolbox_mcap_cloud/` against the SDK Conan package (**0.11.0** — built on
 > this machine 2026-07-06 from `~/ws_plotjuggler/plotjuggler_sdk-cloud`). The ONLY
 > directory `mcap_catalog/` is VENDORED (formerly the only submodule). Prose below that mentions `PJ4/` as a
 > submodule or SDK 0.8.1 is a stale reference-reading aid — the fork/vendoring history
@@ -226,7 +225,7 @@ How real PJ4 plugins are shaped, built, and shipped. **Note: on this machine it 
   - Transport note **[AMENDED 2026-06-05, audit-verified]**: the design spec §9 /
     Plan B envisioned a Qt-WebSockets `client-core`; the **as-built transport is
     ixwebsocket** (the in-repo plugin convention — `src/backend_connection.*`), and
-    `dexory-cloud-cli` links **zero Qt** (`ldd`-verified). There is no standalone
+    `mcap-cloud-cli` links **zero Qt** (`ldd`-verified). There is no standalone
     `client-core` library; the transport units compile into the plugin and the CLI.
     Plan B's Qt shape is superseded — do not "restore" QtWebSockets without a new
     decision.
@@ -253,21 +252,21 @@ Arrow ingest (`src/arrow_ingest.*`) → raw-record forwarding to host MessagePar
 - `docs/catalog-vocabulary-rpc.md` — the `GetVocabulary` filter-RPC design: a strict
   cascading customer→site→robot tree + flat `source` + tag facets, filtered server-side;
   resolves the migration's D3.
-- `docs/gce-deploy-smoke.md` — the Asensus GCE/ADC deploy-smoke runbook (the pending
+- `docs/gce-deploy-smoke.md` — the GCS (GCE/ADC) deploy-smoke runbook (the pending
   real-bucket M1 gate).
-- `docs/ec2-deploy.md` — the **Dexory** EC2 deploy runbook (Docker Compose, IAM
+- `docs/ec2-deploy.md` — the S3 EC2 deploy runbook (Docker Compose, IAM
   instance role, IMDS hop-limit); paired artifacts
-  `server/deploy/{docker-compose.dexory.yml,config.dexory-ec2.yaml}`.
+  `server/deploy/{docker-compose.aws.yml,config.aws-ec2.yaml}`.
 
 **Canonical references (kept in `arch/`):**
 1. `arch/2026-05-28-pj-cloud-connector-design.md` — **the canonical design spec (single
    source of truth).** 14 sections: architecture, repo layout, catalog/SQLite model, wire
    protocol, Go server design, Qt client design, failure/resume, testing, phased build order.
-2. `arch/2026-06-03-unified-cloud-connector-plan.md` — **the unified plan** (Dexory S3 +
-   Asensus GCS, one codebase): the six abstraction seams (`BlobStore`, `FormatCodec`,
-   `ClientAuthenticator`, …), milestones M0–M2c, testing matrix, risks, open commercial items.
-3. `arch/2026-06-01-dexory-proposal.md` — the commercial proposal / SOW (source `*.md`;
-   the rendered html/pdf are generated artifacts — do not hand-edit).
+
+(The unified multi-backend plan and the original commercial proposal have been removed from
+the repo; the six abstraction seams — `BlobStore`, `FormatCodec`, `ClientAuthenticator`, … —
+that let one codebase serve both the S3 and GCS use cases now live in the code and in the
+Decisions section above.)
 
 NOTE: the per-component implementation plans (Plan A Go server, Plan B Qt client, Plan C
 integration, Plan D PJ4 plugin) and the 2026-06-04 two-endpoints approach doc were ARCHIVED
@@ -309,15 +308,15 @@ slice done.** The harness proves the whole pipeline without the GUI:
   real-corpus pins need the `/home/gn/ws/jkk_dataset02` machine; the legacy leg
   definitions (m1–m8) are retained in the script as the migration starting point.
   Do not "fix" it piecemeal — migrate it to the Python-builder pipeline like smoke.
-- `dexory-cloud-cli` (built by `./build.sh toolbox_dexory_cloud`, lands under
-  `build/toolbox_dexory_cloud/Release/toolbox_dexory_cloud/`): `hello` / `list [--json]`
+- `mcap-cloud-cli` (built by `./build.sh toolbox_mcap_cloud`, lands under
+  `build/toolbox_mcap_cloud/Release/toolbox_mcap_cloud/`): `hello` / `list [--json]`
   / `topics <sequence> [--json]` / `download <seq…> [--topics …] [--time-range …]
   --output …` (variadic = stitched; duplicate → exit 2) / `tag`, `--url` or
-  `DEXORY_CLOUD_URL` (default `ws://localhost:8080`), `--insecure` for
+  `MCAP_CLOUD_URL` (default `ws://localhost:8080`), `--insecure` for
   self-signed `wss://`. Exit 0/1/2 = ok/connection-failure/usage.
 - Ground truth is pinned in TWO places that must move in lockstep when the bucket is
   reseeded: `scripts/smoke.sh` constants and
-  `toolbox_dexory_cloud/tests/backend_connection_live_test.cpp` (8 sequences; 6 topics
+  `toolbox_mcap_cloud/tests/backend_connection_live_test.cpp` (8 sequences; 6 topics
   + imu==14904 for `nissan_zala_50_zeg_1_0.mcap`).
 - `make server-start` / `make server-stop` manage the interactive `:8080` instance
   (`/tmp/pj-cloud-server.{pid,log}`).
@@ -334,12 +333,12 @@ easy to forget). Use these unless you have a reason not to:
 ./build.sh   # builds server + dev tools (server/bin/, direct `go build` — NO protoc
              # needed, the wire bindings are checked in) + the plugin (+ the GUI app
              # if Qt is installed; otherwise it prints the one-time Qt install command).
-./run.sh [--dexory_minio]  # LOCAL (the default): Minio up -> seed synthetic Hive-keyed MCAPs IFF the
+./run.sh [--local]  # LOCAL (the default): Minio up -> seed synthetic Hive-keyed MCAPs IFF the
              # bucket is empty -> PYTHON BUILDER daemon first (sole writer + tag-edit IPC on
              # /tmp/pj-cloud-tag.sock; waits for build_metadata, 'ok' OR 'partial' both count)
              # -> Go server on :8080 (read-only, -tag-ipc-socket).
-./run.sh --dexory_aws      # Dexory staging bucket (AWS S3): config.dexory-staging.yaml, :8084.
-./run.sh --asensus_google  # Asensus GCS: config.asensus-staging.yaml (REPLACE_ME template guard), :8085, ADC.
+./run.sh --aws      # S3 staging bucket (AWS S3): config.aws-staging.yaml, :8084.
+./run.sh --gcs      # GCS staging bucket (Google Cloud Storage): config.gcs-staging.yaml (REPLACE_ME template guard), :8085, ADC.
 ./run.sh <config.yaml>     # power-user escape hatch: any S3/GCS server config (this is how to use a
              # non-default port when :8080 is taken).
              # TWO processes, ONE backend at a time (/tmp/pj-cloud-{server,builder}.{pid,log});
@@ -370,10 +369,10 @@ cd infra/minio && docker compose up -d
 # Easiest: ./build.sh from the repo root builds server + SDK pkg + official
 # plugins (from the fork) + the connector + the app, and stages the .so. Or just
 # the connector:
-cd plugin/toolbox_dexory_cloud \
+cd plugin/toolbox_mcap_cloud \
   && conan install . --output-folder=build --build=missing -s compiler.cppstd=20 \
   && cmake -B build -DCMAKE_TOOLCHAIN_FILE=build/conan_toolchain.cmake -DCMAKE_BUILD_TYPE=Release \
-  && cmake --build build -j"$(nproc)"   # -> plugin/toolbox_dexory_cloud/build/bin/
+  && cmake --build build -j"$(nproc)"   # -> plugin/toolbox_mcap_cloud/build/bin/
 
 # Run PJ4 — ALWAYS the CLOUD-FORK app (the sibling checkout ~/ws_plotjuggler/PJ4-cloud;
 # its run.sh auto-loads plugins from its sibling pj-official-plugins build dir). NEVER
@@ -383,19 +382,9 @@ cd plugin/toolbox_dexory_cloud \
 # like "nothing changed".
 cd ~/ws_plotjuggler/PJ4-cloud && ./run.sh
 # After a host edit: rebuild the fork app (./build.sh in PJ4-cloud) and commit to its
-# `cloud` branch. After a connector edit: rebuild plugin/toolbox_dexory_cloud (this
+# `cloud` branch. After a connector edit: rebuild plugin/toolbox_mcap_cloud (this
 # repo's root ./build.sh does it and re-stages the .so).
 ```
-
-Render the proposal `*.md` → self-contained `*.html`:
-
-```bash
-python3 _render_proposal.py          # needs the `markdown` pip package
-```
-
-PDF is then produced from that HTML with headless Chrome
-(`google-chrome --headless --print-to-pdf=docs/2026-06-01-dexory-proposal.pdf docs/2026-06-01-dexory-proposal.html`).
-Editing the proposal = edit the `.md`, re-run the script, regenerate the PDF.
 
 ### Once implementation lands in this repo (per the plans)
 
@@ -469,9 +458,9 @@ estimates (`estimated_chunk_bytes`, `approximate_messages`).
 - **Before implementing anything that touches PJ4 or the plugin SDK, consult the
   "Reference codebases" section above and read the real headers** — Plan D §0 exists
   precisely because the spec named APIs that don't exist in the SDK.
-- Engagement shape (from the proposal + unified plan): **Milestone 1** = PoC (Go server +
+- Engagement shape (from the design spec): **Milestone 1** = PoC (Go server +
   Qt CLI, round-trip validated), gated on written client approval before **Milestone 2** =
   hardening + PlotJuggler plugin integration (with a browser/WASM bonus). Keep v1 work
   inside the M1 non-goals (no multi-tenancy, no realtime pacing, no PJ4 plugin, single
-  shared bearer token; Dexory M1 gate = whole-file topic filtering — tag editing and
-  intra-file time windows are M2 scope for Dexory).
+  shared bearer token; the S3 M1 gate = whole-file topic filtering — tag editing and
+  intra-file time windows are M2 scope).

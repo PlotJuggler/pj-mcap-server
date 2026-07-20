@@ -9,7 +9,7 @@ runbook assumed a Qt CLI + `docker-compose` stack + `pjcloud-cli` over
 `wss://:8443`; NONE of that is as-built. The real harness is:
 
 - an **in-process Go server** (no separate process for the unit/CI legs),
-- a **C++ `dexory-cloud-cli`** over **`ws://`** (ixwebsocket, zero Qt) for the
+- a **C++ `mcap-cloud-cli`** over **`ws://`** (ixwebsocket, zero Qt) for the
   end-to-end shell gates,
 - the wire bindings are **checked in** (`server/internal/wire/pj_cloud`) — the
   gates never run `protoc` / `make proto`.
@@ -77,8 +77,8 @@ never touch it.
   install boto3 google-cloud-storage mcap watchdog`). smoke fails fast with this
   exact bootstrap command if the venv is missing.
 - **The C++ CLI** built (`./build.sh` from the repo root, or a standalone
-  `conan install` + `cmake` in `plugin/toolbox_dexory_cloud`) for smoke/matrix —
-  they shell out to `dexory-cloud-cli`. (smoke/matrix incrementally rebuild it.)
+  `conan install` + `cmake` in `plugin/toolbox_mcap_cloud`) for smoke/matrix —
+  they shell out to `mcap-cloud-cli`. (smoke/matrix incrementally rebuild it.)
 
 `make ci-integration` and the in-process bench microbenches need **only** Docker
 + Go (no corpus, no CLI) — they are the parts that run in GitHub CI.
@@ -98,7 +98,7 @@ hardcodes are STRUCTURAL identifiers inherent to the deterministic generator
 — e.g. `TARGET_KEY` (the target fixture's full Hive object key) and
 `SUBSET_TOPIC="/imu"`.
 
-The **C++ live gtests** (`plugin/toolbox_dexory_cloud/tests/*_live_test.cpp`)
+The **C++ live gtests** (`plugin/toolbox_mcap_cloud/tests/*_live_test.cpp`)
 CANNOT self-derive — they're compiled long before smoke.sh runs — so their
 ground-truth constants ARE hand-pinned, from one empirical run against the same
 deterministic generator smoke.sh uses (`gen-ci-fixtures -hive` +
@@ -262,15 +262,15 @@ would move the extern/plotjuggler_core submodule to a nonexistent upstream tag.)
 
 ## Real AWS staging bucket (S3-use-case M1 real-bucket run)
 
-Config: `server/deploy/config.dexory-staging.yaml` (bucket
-`dexory-data-offload-staging-bucket`, real AWS — no endpoint override, no
-inline secrets; the connector only READS the bucket).
+Config: `server/deploy/config.aws-staging.yaml` (set `storage.s3.bucket` +
+`region` — the file ships with a `REPLACE_ME` placeholder; real AWS — no endpoint
+override, no inline secrets; the connector only READS the bucket).
 
 One-time credential drop (NOT in the repo, never commit):
 
     mkdir -p ~/.aws && chmod 700 ~/.aws
     cat > ~/.aws/credentials << 'CREDS'
-    [dexory-staging]
+    [aws-staging]
     aws_access_key_id     = <PASTE>
     aws_secret_access_key = <PASTE>
     CREDS
@@ -279,12 +279,12 @@ One-time credential drop (NOT in the repo, never commit):
 Run + verify (read-only):
 
     cd server && go build -o ./bin/pj-cloud-server ./cmd/pj-cloud-server
-    AWS_PROFILE=dexory-staging ./bin/pj-cloud-server \
-      -config deploy/config.dexory-staging.yaml -listen :8084 \
-      -db /tmp/pj-cloud-dexory-staging.db > /tmp/pj-cloud-staging.log 2>&1 &
+    AWS_PROFILE=aws-staging ./bin/pj-cloud-server \
+      -config deploy/config.aws-staging.yaml -listen :8084 \
+      -db /tmp/pj-cloud-aws-staging.db > /tmp/pj-cloud-staging.log 2>&1 &
     # watch the indexer scan, then list through the real client stack:
     tail -f /tmp/pj-cloud-staging.log          # expect "indexer: ... run complete scanned=N"
-    <plugin build dir>/dexory-cloud-cli --url ws://localhost:8084 list
+    <plugin build dir>/mcap-cloud-cli --url ws://localhost:8084 list
 
 If the first List fails with 301/PermanentRedirect, the error names the
 bucket's actual region — fix `region:` in the staging config and restart.

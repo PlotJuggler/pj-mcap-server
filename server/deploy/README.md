@@ -26,9 +26,9 @@ deployment" below before adapting any of this to your own infra.
 | `Dockerfile` | Multi-stage build of the Go server → `gcr.io/distroless/static-debian12:nonroot`. |
 | `Dockerfile.builder` | Build of the Python catalog builder daemon (`python:3.12-slim`). |
 | `docker-compose.yml` | Minio + `builder`, each with its own container healthcheck; `server` is gated on `builder`'s health and probed externally via `/health` (no container healthcheck of its own — distroless); config/volumes mounted. |
-| `docker-compose.dexory.yml` | **S3 use case** deploy (real AWS bucket, no Minio, IAM-role creds) — `builder` + `server` only. See `docs/ec2-deploy.md`. |
+| `docker-compose.aws.yml` | **S3 use case** deploy (real AWS bucket, no Minio, IAM-role creds) — `builder` + `server` only. See `docs/ec2-deploy.md`. |
 | `deploy.config.yaml` | Compose-tuned server config (plaintext :8080, `minio:9000` endpoint, `tag_ipc_socket` pointed at the shared volume). |
-| `config.dexory-ec2.yaml` | Server config for the S3-use-case Compose deploy (real S3, empty creds = IAM role, shared-volume DB/socket paths). |
+| `config.aws-ec2.yaml` | Server config for the S3-use-case Compose deploy (real S3, empty creds = IAM role, shared-volume DB/socket paths). |
 | `config.example.yaml` | The FULL server config surface, commented, field-verified against `config.go`. |
 | `pj-cloud-server.service` | systemd unit for the Go server, bare-metal deploy. |
 | `pj-cloud-builder.service` | systemd unit for the Python builder daemon, bare-metal deploy. |

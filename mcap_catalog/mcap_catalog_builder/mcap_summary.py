@@ -92,5 +92,5 @@ def extract_s3_key(path: str) -> str | None:
 
 
 def derive_tags(summary: FileSummary) -> list[tuple[str, str]]:
-    """Derive ``(key, value)`` tags from a file. Empty for Dexory (no embedded tags)."""
+    """Derive ``(key, value)`` tags from a file. Empty by default (no embedded tags)."""
     return []

@@ -1,0 +1,61 @@
+# pj-cloud-server config for the S3-use-case EC2 / Docker-Compose deploy (real AWS S3).
+# Mounted read-only into the `server` container by docker-compose.aws.yml.
+# TEMPLATE — set bucket / region / prefix below before deploying.
+#
+# SPECIFIC TO THE S3 USE CASE: bucket, region and prefix below are the S3 staging values.
+# (The GCS use case is a SEPARATE GCS/GCE deploy — see docs/gce-deploy-smoke.md.)
+#
+# CREDENTIALS ARE NOT IN THIS FILE. endpoint/access_key/secret_key are
+# present-and-EMPTY on purpose: empty endpoint = real AWS S3 (virtual-hosted),
+# empty keys = the AWS default credential chain, which on EC2 resolves to the
+# instance's IAM role (no secrets on the box). See docs/ec2-deploy.md.
+#
+# The connector only READS the bucket (List / Head / GetRange). It never writes.
+
+server:
+  listen: ":8080"            # container-internal; published on the host by the compose file
+  # tls:                     # uncomment BOTH for wss:// + https dashboard (see the runbook §TLS)
+  #   cert: /etc/pj-cloud/server.crt
+  #   key:  /etc/pj-cloud/server.key
+
+auth:
+  bearer_token: ${PJ_CLOUD_TOKEN}   # fail-closed: empty => server refuses to start unless PJ_CLOUD_ALLOW_ANONYMOUS=1 (never anonymous on a public port)
+
+format: mcap
+
+storage:
+  s3:
+    bucket: REPLACE_ME_with_your_s3_bucket
+    region: us-east-1          # MUST match the bucket's region (a 301 on first List names the real one)
+    # If the bucket is a Hive-partitioned lake, an UNSCOPED scan can blow the scan
+    # budget. Scope to one MCAP partition; widen deliberately, e.g.:
+    #   prefix: "customer=<x>/customer_site=<y>/robot=<z>/source=ros-bags/date=<d>/"
+    prefix: ""                 # "" = whole bucket; scope it if the bucket is large
+    endpoint: ""               # present-and-EMPTY: real AWS S3 (NOT Minio)
+    access_key: ""             # present-and-EMPTY: AWS default cred chain -> EC2 instance role
+    secret_key: ""
+
+catalog:
+  db_path: /var/lib/pj-cloud/catalog.db       # written by the `builder` service, shared via the catalog-data volume
+  tag_ipc_socket: /var/lib/pj-cloud/tag.sock  # the `builder` service's tag-edit IPC socket, same shared volume
+
+session:
+  max_concurrent: 16
+  retain_after_disconnect: 60s
+  retain_max_seqs: 256
+  retain_max_bytes: 67108864     # 64 MB
+  max_batch_bytes: 524288        # 512 KB
+  max_batch_age: 50ms
+  max_message_bytes: 16777216    # 16 MB
+  compress_threshold_bytes: 4096
+  body_zstd_level: 3
+
+dashboard:
+  enabled: true
+  basic_auth:
+    username: admin
+    password: ${PJ_CLOUD_DASHBOARD_PASSWORD}   # empty env => dashboard stays DISABLED
+
+metrics:
+  enabled: true
+  require_auth: false            # /metrics unauthenticated by default

@@ -132,8 +132,8 @@ merely unlikely:
   `mcap_server` in the doc titles (`README.md`, `REQUIREMENTS.md`) — the repo dir
   carries an "auryn" prefix the project name does not. The name is intentional;
   only filesystem paths point at `auryn-mcap-server/`.
-- **Real Dexory samples are flat** (`/home/davide/ws_plotjuggler/DATA/dexory`,
-  referenced as `../DATA/dexory`) and carry **no `s3_key`**, so they route
+- **Real sample files are flat** (`/home/davide/ws_plotjuggler/DATA/samples`,
+  referenced as `../DATA/samples`) and carry **no `s3_key`**, so they route
   straight to `catalog_failures`. Tests therefore either copy a sample into a Hive
   tree (`make_hive_fixture`) or synthesize an MCAP with an injected `s3_key`
   (`write_minimal_mcap`). The real-data e2e test **auto-skips** when the data is
