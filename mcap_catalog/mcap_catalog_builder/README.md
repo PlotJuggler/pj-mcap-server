@@ -24,7 +24,7 @@ python3 -m mcap_catalog_builder --source s3 --s3-bucket B --sqs-url U  # S3
 | `--tag-socket` | off | path for the tag-edit IPC unix socket (daemon mode only; see [Tag-edit IPC](#tag-edit-ipc)) |
 | `--rescan-interval` | `300.0` | seconds between safety re-scans |
 | `--no-watch` | off | daemon mode: start **no** live event producer (no local watchdog/inotify observer, no S3 SQS long-poll thread) — discovery is then rescan-only, driven purely by `--rescan-interval`. With `--source s3`, also drops the `--sqs-url` requirement. No-op for `--source gcs` (already rescan-only) and for `--once` |
-| `--extract-workers` | `64` | threads that fetch MCAP summaries during a full reconcile (the network-bound, out-of-transaction read). DB writes stay single-threaded; `1` = sequential. Extraction is latency-bound (each file is 1–2 sequential range GETs), so throughput scales ~linearly with this until S3's per-prefix limits — the boto3 client's HTTP connection pool is sized to match (`max_pool_connections = max(workers, 10)`). Lower it for a tiny or local bucket |
+| `--extract-workers` | `2×CPU, max 32` | concurrency for the full-reconcile read phase (fetch+parse summaries). For a remote bucket (`--source s3`) these are worker **processes** — each with its own client and its own GIL, so the GIL-bound pure-Python MCAP parse scales across cores; for a local watch root, threads. The DB apply stays serial either way. Rarely needs tuning |
 | `--debounce` | `2.0` | [local] seconds to debounce file events |
 | `--stability-checks` | `3` | [local] size-stability polls before cataloging |
 | `--stability-interval` | `0.5` | [local] seconds between stability polls |

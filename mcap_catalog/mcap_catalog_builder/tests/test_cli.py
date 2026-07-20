@@ -34,7 +34,7 @@ def test_parser_defaults():
     assert args.stability_interval == 0.5
     assert args.log_level == "INFO"
     assert args.source == "local"  # default backend
-    assert args.extract_workers == 64  # wide default: extraction is latency-bound
+    assert args.extract_workers == min(2 * (os.cpu_count() or 1), 32)  # auto: 2x CPU, max 32
 
 
 def test_parser_s3_options():
@@ -95,9 +95,9 @@ def test_no_watch_local_daemon_starts_no_observer(tmp_path, monkeypatch):
 
     reconciled = []
 
-    def spy_reconcile(conn, caches, source, workers=1):
+    def spy_reconcile(conn, caches, source, workers=1, source_spec=None):
         reconciled.append(source)
-        return real_full_reconcile(conn, caches, source, workers=workers)
+        return real_full_reconcile(conn, caches, source, workers=workers, source_spec=source_spec)
 
     monkeypatch.setattr(m, "full_reconcile", spy_reconcile)
     monkeypatch.setattr(m, "worker_loop", lambda *a, **k: None)

@@ -8,7 +8,8 @@ the single writer thread like everything else.
 """
 
 import logging
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from pathlib import Path
 
 import sqlite3
@@ -18,6 +19,58 @@ from .builder import apply_extract, extract_summary, resolve_key_dims
 from .storage import LocalSource
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class SourceSpec:
+    """A **picklable** recipe for rebuilding a read-only ``Source`` inside a worker
+    PROCESS. The live ``Source`` holds an unpicklable boto3 client, so it cannot
+    cross a process boundary — each worker builds its own from this spec instead.
+    Used only by the process-pool extraction path (below)."""
+
+    kind: str  # "s3" | "local"
+    # s3
+    bucket: str = ""
+    prefix: str = ""
+    region: str = ""
+    endpoint: str = ""
+    max_pool: int = 4  # per-PROCESS boto3 pool: each process extracts one file at a time
+    # local
+    root: str = ""
+
+
+# Per-process singleton, built once by the ProcessPoolExecutor initializer so the
+# boto3 client / open fds are created ONCE per worker, not per task.
+_worker_source = None
+
+
+def _init_worker(spec: SourceSpec) -> None:
+    """ProcessPoolExecutor initializer: construct one ``Source`` for this worker."""
+    global _worker_source
+    if spec.kind == "s3":
+        import boto3
+        from botocore.config import Config
+
+        from .s3_storage import S3Source
+
+        cfg: dict = {"max_pool_connections": spec.max_pool}
+        if spec.region:
+            cfg["region_name"] = spec.region
+        client_kwargs: dict = {"config": Config(**cfg)}
+        if spec.endpoint:
+            client_kwargs["endpoint_url"] = spec.endpoint
+        _worker_source = S3Source(boto3.client("s3", **client_kwargs), spec.bucket, spec.prefix)
+    elif spec.kind == "local":
+        _worker_source = LocalSource(spec.root)
+    else:  # pragma: no cover - guarded by callers
+        raise ValueError(f"unsupported SourceSpec.kind: {spec.kind!r}")
+
+
+def _extract_task(item):
+    """Worker-process task: fetch+parse one object's summary via the per-process
+    ``Source``. Returns a picklable ``Extract`` (``extract_summary`` never raises)."""
+    key, stat, dims, eff_key = item
+    return extract_summary(_worker_source, key, stat, dims, eff_key)
 
 
 def _is_catalogable_name(name: str) -> bool:
@@ -59,13 +112,17 @@ def _composite_ids(caches: Caches, dims) -> tuple | None:
 
 
 def full_reconcile(
-    conn: sqlite3.Connection, caches: Caches, source, workers: int = 1
+    conn: sqlite3.Connection, caches: Caches, source, workers: int = 1,
+    source_spec: "SourceSpec | None" = None,
 ) -> dict[str, int]:
     """Catalog all objects in ``source``, then delete catalog rows with no object.
 
     ``source`` is a storage ``Source``; a ``str`` is accepted as shorthand for a
     local watch root. ``workers`` > 1 fetches summaries on a thread pool (the slow,
     network-bound, out-of-transaction read); DB writes stay on this single thread.
+    When ``source_spec`` is given (a picklable recipe for the ``Source``), that read
+    phase runs in a PROCESS pool instead, so the GIL-bound pure-Python MCAP parse
+    scales across cores; the DB apply stays serial on this thread either way.
     Returns a tally ``{"cataloged", "skipped", "failed", "deleted"}``.
     """
     if isinstance(source, str):
@@ -110,7 +167,19 @@ def full_reconcile(
     # Read phase (parallel, network-bound, NO DB) -> apply phase (serial, DB writes
     # on this thread only). as_completed lets each summary apply as soon as it lands
     # while other fetches are still in flight.
-    if workers > 1 and len(to_extract) > 1:
+    if source_spec is not None and workers > 1 and len(to_extract) > 1:
+        # PROCESS pool: fetch+parse run in worker PROCESSES, each with its own boto3
+        # client and its own GIL, so the pure-Python MCAP-summary parse scales across
+        # cores (thread-parallelism can't — the parse is GIL-bound). The DB apply
+        # stays serial on THIS process/thread, unchanged. Per-file quarantine and the
+        # count-check are untouched (apply_extract still runs here, per Extract).
+        with ProcessPoolExecutor(
+            max_workers=workers, initializer=_init_worker, initargs=(source_spec,)
+        ) as pool:
+            futures = [pool.submit(_extract_task, item) for item in to_extract]
+            for fut in as_completed(futures):
+                tally[apply_extract(conn, caches, fut.result()).status] += 1
+    elif workers > 1 and len(to_extract) > 1:
         with ThreadPoolExecutor(max_workers=workers) as pool:
             futures = [
                 pool.submit(extract_summary, source, key, stat, dims, eff_key)
