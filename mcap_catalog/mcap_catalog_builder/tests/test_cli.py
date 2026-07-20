@@ -34,6 +34,7 @@ def test_parser_defaults():
     assert args.stability_interval == 0.5
     assert args.log_level == "INFO"
     assert args.source == "local"  # default backend
+    assert args.extract_workers == 64  # wide default: extraction is latency-bound
 
 
 def test_parser_s3_options():
@@ -129,7 +130,9 @@ def test_main_s3_daemon_no_watch_skips_sqs_requirement(tmp_path, monkeypatch):
     import mcap_catalog_builder.s3_producer as s3_producer_mod
 
     fake_boto3 = types.ModuleType("boto3")
-    fake_boto3.client = lambda name: _EmptyS3Client() if name == "s3" else object()
+    # Real boto3.client accepts a `config=` kwarg (we pass a botocore Config to size
+    # the connection pool); the fake must tolerate it.
+    fake_boto3.client = lambda name, **kw: _EmptyS3Client() if name == "s3" else object()
     monkeypatch.setitem(sys.modules, "boto3", fake_boto3)
 
     producer_calls = []

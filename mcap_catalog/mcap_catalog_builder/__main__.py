@@ -79,12 +79,15 @@ def build_parser() -> argparse.ArgumentParser:
                    help="[local] size-stability poll count before cataloging (default: 3)")
     p.add_argument("--stability-interval", type=float, default=0.5,
                    help="[local] seconds between size-stability polls (default: 0.5)")
-    p.add_argument("--extract-workers", type=int, default=8,
+    p.add_argument("--extract-workers", type=int, default=64,
                    help="number of threads that fetch MCAP summaries during a full "
                         "reconcile (the network-bound, out-of-transaction read). DB "
                         "writes stay single-threaded; this only parallelizes reads. "
-                        "1 = sequential. Higher values hide per-file round-trip "
-                        "latency on a remote bucket (default: 8).")
+                        "1 = sequential. Extraction is latency-bound (each file is "
+                        "1-2 sequential range GETs), so throughput scales ~linearly "
+                        "with this until S3's per-prefix limits — the S3 client's HTTP "
+                        "connection pool is sized to match. Lower it for a tiny or "
+                        "local bucket (default: 64).")
     p.add_argument("--log-level", default="INFO",
                    choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     return p
@@ -165,7 +168,24 @@ def main(argv: list[str] | None = None) -> int:
         from .s3_storage import S3Source
         from .s3_producer import s3_event_producer
 
-        source = S3Source(boto3.client("s3"), args.s3_bucket, args.s3_prefix)
+        # Size the HTTP connection pool to the extract concurrency: extraction fans
+        # out --extract-workers threads of range GETs, and boto3's default pool of 10
+        # would throttle anything above ~10 (pool-full warnings + retries → SLOWER,
+        # not faster). Never drop below the default 10 for a low worker count.
+        # botocore is imported defensively so the s3 path stays exercisable with a
+        # bare fake boto3 (no botocore) in tests / no-AWS environments.
+        client_kwargs: dict = {}
+        try:
+            from botocore.config import Config
+
+            client_kwargs["config"] = Config(
+                max_pool_connections=max(args.extract_workers, 10)
+            )
+        except ImportError:
+            pass  # no botocore -> fall back to boto3's default connection pool
+        source = S3Source(
+            boto3.client("s3", **client_kwargs), args.s3_bucket, args.s3_prefix
+        )
 
         def start_producer() -> None:
             threading.Thread(
