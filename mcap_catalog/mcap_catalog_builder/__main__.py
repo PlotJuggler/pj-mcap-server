@@ -167,24 +167,11 @@ def main(argv: list[str] | None = None) -> int:
         from .s3_storage import S3Source
         from .s3_producer import s3_event_producer
 
-        # Size the HTTP connection pool to the extract concurrency: extraction fans
-        # out --extract-workers threads of range GETs, and boto3's default pool of 10
-        # would throttle anything above ~10 (pool-full warnings + retries → SLOWER,
-        # not faster). Never drop below the default 10 for a low worker count.
-        # botocore is imported defensively so the s3 path stays exercisable with a
-        # bare fake boto3 (no botocore) in tests / no-AWS environments.
-        client_kwargs: dict = {}
-        try:
-            from botocore.config import Config
-
-            client_kwargs["config"] = Config(
-                max_pool_connections=max(args.extract_workers, 10)
-            )
-        except ImportError:
-            pass  # no botocore -> fall back to boto3's default connection pool
-        source = S3Source(
-            boto3.client("s3", **client_kwargs), args.s3_bucket, args.s3_prefix
-        )
+        # This client does only the serial LIST (reconcile classify) + serial
+        # per-event single-file catalogs. The parallel range-GET extraction now runs
+        # in worker PROCESSES with their own clients (see reconcile.SourceSpec), so
+        # boto3's default connection pool is ample here — no explicit sizing needed.
+        source = S3Source(boto3.client("s3"), args.s3_bucket, args.s3_prefix)
 
         def start_producer() -> None:
             threading.Thread(

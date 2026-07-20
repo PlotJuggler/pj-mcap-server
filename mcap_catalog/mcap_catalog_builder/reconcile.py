@@ -29,14 +29,10 @@ class SourceSpec:
     Used only by the process-pool extraction path (below)."""
 
     kind: str  # "s3" | "local"
-    # s3
-    bucket: str = ""
-    prefix: str = ""
-    region: str = ""
-    endpoint: str = ""
-    max_pool: int = 4  # per-PROCESS boto3 pool: each process extracts one file at a time
-    # local
-    root: str = ""
+    bucket: str = ""   # s3
+    prefix: str = ""   # s3
+    max_pool: int = 4  # s3: per-PROCESS boto3 pool (each process extracts one file at a time)
+    root: str = ""     # local
 
 
 # Per-process singleton, built once by the ProcessPoolExecutor initializer so the
@@ -53,13 +49,11 @@ def _init_worker(spec: SourceSpec) -> None:
 
         from .s3_storage import S3Source
 
-        cfg: dict = {"max_pool_connections": spec.max_pool}
-        if spec.region:
-            cfg["region_name"] = spec.region
-        client_kwargs: dict = {"config": Config(**cfg)}
-        if spec.endpoint:
-            client_kwargs["endpoint_url"] = spec.endpoint
-        _worker_source = S3Source(boto3.client("s3", **client_kwargs), spec.bucket, spec.prefix)
+        _worker_source = S3Source(
+            boto3.client("s3", config=Config(max_pool_connections=spec.max_pool)),
+            spec.bucket,
+            spec.prefix,
+        )
     elif spec.kind == "local":
         _worker_source = LocalSource(spec.root)
     else:  # pragma: no cover - guarded by callers
@@ -167,30 +161,29 @@ def full_reconcile(
     # Read phase (parallel, network-bound, NO DB) -> apply phase (serial, DB writes
     # on this thread only). as_completed lets each summary apply as soon as it lands
     # while other fetches are still in flight.
-    if source_spec is not None and workers > 1 and len(to_extract) > 1:
-        # PROCESS pool: fetch+parse run in worker PROCESSES, each with its own boto3
-        # client and its own GIL, so the pure-Python MCAP-summary parse scales across
-        # cores (thread-parallelism can't — the parse is GIL-bound). The DB apply
-        # stays serial on THIS process/thread, unchanged. Per-file quarantine and the
-        # count-check are untouched (apply_extract still runs here, per Extract).
-        with ProcessPoolExecutor(
-            max_workers=workers, initializer=_init_worker, initargs=(source_spec,)
-        ) as pool:
-            futures = [pool.submit(_extract_task, item) for item in to_extract]
-            for fut in as_completed(futures):
-                tally[apply_extract(conn, caches, fut.result()).status] += 1
-    elif workers > 1 and len(to_extract) > 1:
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = [
-                pool.submit(extract_summary, source, key, stat, dims, eff_key)
-                for key, stat, dims, eff_key in to_extract
-            ]
+    if workers > 1 and len(to_extract) > 1:
+        # Parallelize fetch+parse. For a remote bucket (source_spec given) use a
+        # PROCESS pool so the pure-Python MCAP parse isn't GIL-serialized — each worker
+        # has its own client + GIL; otherwise a thread pool. Size to the actual work so
+        # a small rescan doesn't spawn a full-width pool. The DB apply stays serial on
+        # THIS thread either way (per-file quarantine + count-check unchanged).
+        n = min(workers, len(to_extract))
+        if source_spec is not None:
+            pool = ProcessPoolExecutor(
+                max_workers=n, initializer=_init_worker, initargs=(source_spec,)
+            )
+        else:
+            pool = ThreadPoolExecutor(max_workers=n)
+        with pool:
+            if source_spec is not None:
+                futures = [pool.submit(_extract_task, item) for item in to_extract]
+            else:
+                futures = [pool.submit(extract_summary, source, *item) for item in to_extract]
             for fut in as_completed(futures):
                 tally[apply_extract(conn, caches, fut.result()).status] += 1
     else:
-        for key, stat, dims, eff_key in to_extract:
-            ex = extract_summary(source, key, stat, dims, eff_key)
-            tally[apply_extract(conn, caches, ex).status] += 1
+        for item in to_extract:
+            tally[apply_extract(conn, caches, extract_summary(source, *item)).status] += 1
 
     # Deletion sweep: composite keys present in the source (parseable + cached ids).
     # Reuses the dims parsed above; caches are now fully populated post-apply.
