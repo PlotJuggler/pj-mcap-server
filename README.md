@@ -25,11 +25,33 @@ scans the bucket and owns the SQLite catalog + tag-edit IPC; the Go server
 writer path of its own and will not start until the builder has published a
 catalog. `run.sh` (below) starts both, in order, for local development.
 
+```mermaid
+flowchart LR
+    Client["PlotJuggler plugin<br/>or mcap-cloud-cli"]
+    Server["Go server"]
+    Builder["Python catalog builder"]
+    Catalog[("SQLite catalog")]
+    Storage[("S3 / GCS / Minio")]
+
+    Client <-->|"WebSocket + Protobuf<br/>browse, stream, resume"| Server
+    Server -->|"read-only queries"| Catalog
+    Server -->|"range reads for selected data"| Storage
+    Server -->|"tag edits over Unix socket"| Builder
+    Builder -->|"scan MCAP summaries"| Storage
+    Builder -->|"atomic catalog publish"| Catalog
+```
+
+Object-store recordings must use the Hive key layout
+`customer=<c>/customer_site=<site>/robot=<r>/source=<s>/date=<d>/<file>.mcap`,
+or they are reported in `catalog_failures` and omitted from the catalog. The
+builder's local-filesystem mode additionally accepts an intended Hive key from
+an MCAP `s3_key` metadata record.
+
 ## Quick start — local, no cloud account needed
 
-**Prerequisites:** Docker, Go toolchain at `$HOME/.local/go`, Conan 2, CMake ≥ 3.21,
-and a Python 3 venv for the catalog builder at `~/.venvs/pj-catalog` (bootstrap once,
-pins match CI/`scripts/smoke.sh`):
+**Prerequisites:** Docker, Go 1.23+ at `$HOME/.local/go`, a C++20 compiler,
+Conan 2, CMake ≥ 3.22, and a Python 3 venv for the catalog builder at
+`~/.venvs/pj-catalog` (bootstrap once; pins match CI/`scripts/smoke.sh`):
 `python3 -m venv ~/.venvs/pj-catalog && ~/.venvs/pj-catalog/bin/pip install boto3==1.43.40 google-cloud-storage==3.12.0 mcap==1.4.0 watchdog==6.0.0`.
 The `plotjuggler_sdk` Conan package must be in your cache before building the plugin
 (see `plugin/SDK_VERSION` for the required version).
@@ -57,16 +79,18 @@ Stop everything: `make server-stop && (cd infra/minio && docker compose down)`
 | Command | What |
 |---|---|
 | `./run.sh` or `./run.sh --local` | Local Minio + synthetic data. No credentials. **`:8080`** |
-| `./run.sh --aws` | S3 staging bucket on AWS S3. Creds: `AWS_PROFILE` (defaults to `aws-staging`). **`:8084`** |
+| `./run.sh --aws` | S3 staging bucket on AWS S3. Fill in `server/deploy/config.aws-staging.yaml`; creds: `AWS_PROFILE` (defaults to `aws-staging`). **`:8084`** |
 | `./run.sh --gcs` | GCS staging bucket. Creds: Application Default Credentials. *(fill in `server/deploy/config.gcs-staging.yaml` first)* **`:8085`** |
 | `./run.sh <path/to.yaml>` | Any S3/GCS server config file. |
 
 One backend (builder + server) runs at a time — `make server-stop` to switch targets.
 
-> **Auth:** `run.sh` runs the server with **no authentication** (`-allow-anonymous`)
-> for local use. A real deployment must set `PJ_CLOUD_TOKEN` (a single shared bearer
-> token) — the server is **fail-closed** and refuses to start without it (pass
-> `-allow-anonymous` / `PJ_CLOUD_ALLOW_ANONYMOUS=1` only to intentionally run open).
+> **Auth:** `run.sh` opts into anonymous startup for development: when
+> `PJ_CLOUD_TOKEN` is unset, the server runs open; when it is set, the server
+> enforces that shared bearer token. Outside the development launcher, the server
+> is **fail-closed** and refuses to start without a configured token unless
+> `-allow-anonymous` / `PJ_CLOUD_ALLOW_ANONYMOUS=1` explicitly permits open access.
 > See `server/deploy/README.md` and `docs/ec2-deploy.md`.
 
-Run the full regression gate (needs the pinned corpus): `make smoke`.
+Run the full regression gate: `make smoke`. It generates and seeds its own
+synthetic corpus; see `scripts/RUNBOOK.md` for its additional tooling prerequisites.
