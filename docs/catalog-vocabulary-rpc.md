@@ -11,8 +11,7 @@ Reviewed by Claude + Codex at the M3 boundary.
 **Scope:** the wire design for **filtering the catalog** by a strict
 customer→site→robot hierarchy plus flat tags, and the RPC that ships the
 filter vocabulary to the client. Depends on the auryn dimension schema (see
-[`auryn-catalog-migration-plan.md`](auryn-catalog-migration-plan.md);
-this resolves that plan's open decision **D3**).
+[`CATALOG_CONTRACT.md`](CATALOG_CONTRACT.md)).
 **Canonical wire schema:** `proto/pj_cloud.proto` — every message below is drop-in.
 
 ---

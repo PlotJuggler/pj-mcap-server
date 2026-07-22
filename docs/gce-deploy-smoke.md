@@ -27,15 +27,23 @@ operational expression of the unified plan's M2c-GCS acceptance gate.
 
 ## Preconditions (on the GCE VM)
 
-- Server container running and serving TLS (e.g. via `server/deploy/` —
-  `Dockerfile` + `pj-cloud-server.service` + `config.gcs-staging.yaml`).
+The backend is **two processes** (since the M6 cutover): the Python
+`mcap_catalog_builder` is the sole catalog writer; the Go server is a read-only
+reader that will not come up until a catalog has been published. Bring the
+builder up first.
+
+- The **Python `mcap_catalog_builder`** running against the GCS bucket
+  (`--source gcs`) and having **published its first `catalog.db`**.
+- The **Go server** container running (read-only), serving TLS (e.g. via
+  `server/deploy/` — `Dockerfile` + `pj-cloud-server.service` +
+  `config.gcs-staging.yaml`), gated on the builder's first publish.
 - The VM's **attached service account** has bucket-read scope
   (`roles/storage.objectViewer`); **no** `GOOGLE_APPLICATION_CREDENTIALS`, **no**
   key file on disk (ADC resolves via the metadata server).
-- A **persistent disk** mounted at `/var/lib/pj-cloud` holding `catalog.db`
-  (`mkfs.ext4` once, `/etc/fstab` mount so it survives reboots).
-- `mcap-cloud-cli` available on the VM (built by `./build.sh
-  toolbox_mcap_cloud`).
+- A **persistent disk** mounted at `/var/lib/pj-cloud` holding `catalog.db` and the
+  builder's tag socket (`mkfs.ext4` once, `/etc/fstab` mount so it survives reboots;
+  local disk only — never NFS/EFS, since SQLite WAL needs real file locking).
+- `mcap-cloud-cli` available on the VM (built by the repo-root `./build.sh`).
 
 ## The five checks
 
@@ -47,7 +55,7 @@ operational expression of the unified plan's M2c-GCS acceptance gate.
 5. **`catalog.db` survives a restart without a full re-scan** — after restarting
    the container, the file count is immediately the same (a full re-scan would
    briefly show 0 and rewrite every row); assert via the
-   `pj_cloud_indexer_full_scans_total` (current) metric.
+   `pj_cloud_catalog_files_scanned` metric.
 
 ## `scripts/gce_smoke.sh` (run ON the GCE VM)
 
@@ -97,7 +105,7 @@ echo "== 5. Persistent-disk catalog survives a restart WITHOUT a full re-scan ==
 [[ -f "$DB" ]] || fail "catalog.db not found on the persistent disk at $DB"
 sudo docker restart "$CONTAINER" >/dev/null
 for _ in $(seq 1 30); do curl -fsS -k "$SERVER/health" >/dev/null 2>&1 && break; sleep 2; done
-METRIC=$(curl -fsS -k "$SERVER/metrics" | grep -E '^pj_cloud_indexer_full_scans_total' || true)
+METRIC=$(curl -fsS -k "$SERVER/metrics" | grep -E '^pj_cloud_catalog_files_scanned' || true)
 N_AFTER=$("$CLI" --url "$WSS" --insecure list --json \
            | python3 -c 'import sys,json; print(len(json.load(sys.stdin)))')
 [[ "$N_AFTER" -eq "$N" ]] || fail "file count changed after restart ($N -> $N_AFTER) — catalog did not survive"
@@ -119,13 +127,12 @@ echo "ALL GCE SMOKE CHECKS PASSED"
 ## Adapting under the auryn migration (two-process deploy)
 
 Once the catalog writer is the separate **Python `mcap_catalog_builder`** (see
-[`auryn-catalog-migration-plan.md`](auryn-catalog-migration-plan.md)) and the Go
-server is **read-only**:
+[`CATALOG_CONTRACT.md`](CATALOG_CONTRACT.md)) and the Go server is **read-only**:
 
 - Check 5's "no full re-scan after restart" becomes "the **Python builder**
   warm-starts with zero re-extracts AND the Go reader serves immediately from the
-  existing `catalog.db`." Prefer the new `pj_cloud_catalog_*` freshness series
-  (migration-plan 6.5) over `pj_cloud_indexer_full_scans_total`.
+  existing `catalog.db`." Use the `pj_cloud_catalog_*` freshness series (e.g.
+  `pj_cloud_catalog_files_scanned`, `pj_cloud_catalog_last_build_timestamp_seconds`).
 - The restart check should also confirm the **atomic-publish** invariant
   (migration-plan 6.2a): the reader never serves a torn catalog while the builder
   rebuilds.

@@ -21,7 +21,7 @@ runbook assumed a Qt CLI + `docker-compose` stack + `pjcloud-cli` over
 | Gate                  | Command               | What it proves                                                                 | Port(s) it owns | Needs Docker? | Needs the real corpus? |
 |-----------------------|-----------------------|--------------------------------------------------------------------------------|-----------------|---------------|------------------------|
 | Unit + race           | `make test` / `make race` | Every package's logic, including `-race`. Hermetic.                          | none            | no            | no                     |
-| Smoke                 | `make smoke`          | The whole NEW pipeline end-to-end: Python `mcap_catalog` builder (sole catalog writer + tag-edit IPC) + Go server in `-external-builder` read-only mode + C++ CLI, against a FRESH SYNTHETIC Hive-keyed corpus it generates itself. | **:8081**       | yes (Minio)   | no (synthetic, self-seeded) |
+| Smoke                 | `make smoke`          | The whole NEW pipeline end-to-end: Python `mcap_catalog` builder (sole catalog writer + tag-edit IPC) + Go server (read-only reader) + C++ CLI, against a FRESH SYNTHETIC Hive-keyed corpus it generates itself. | **:8081**       | yes (Minio)   | no (synthetic, self-seeded) |
 | Matrix                | `make matrix`         | The deeper spec §11 L3/L4 round-trip MATRIX (half-topics, none-matching, out-of-range, spans-boundary, 8-file stitch, 4-parallel, overlap-rejection), each `mcapdiff`-verified, on both s3 + gcs legs. | **:8082** | yes (Minio + fake-gcs) | **yes** |
 | CI integration        | `make ci-integration` | The `{s3,gcs}` CI legs (Plan A 46/46a) over **synthetic** fixtures — the same in-process Go harness GitHub runs in service containers, proven locally. | none for the server (in-process); emulators on **:19010 / :14450** | yes (Minio + fake-gcs) | no (synthetic) |
 | Bench (throughput)    | `make bench`          | Streaming throughput (MB/s) + the in-process CPU/backpressure microbenches.    | **:8082** for its throwaway server | yes (Minio) for throughput; the microbenches are in-process | yes for throughput; no for the microbenches |
@@ -247,18 +247,16 @@ The change-detect triple is keyed wrong — the gcsreader must map GCS
 `Generation` into the `etag` slot and `Updated` into `last_modified`
 (unified-plan §3.2). This is a code bug, not an operator issue.
 
-## SDK package (Slice 16+)
+## SDK package
 
-Plugins build against the Conan package `plotjuggler_sdk/<SDK_VERSION>` (pin file
-`PJ4/pj-official-plugins/SDK_VERSION`, currently 0.6.1 — a local-fork bump
-carrying the toolbox parser-ingest tail slots). On a fresh machine, publish it
-once from the EDITED in-tree SDK before any plugin build:
+The plugin builds against the Conan package `plotjuggler_sdk/<SDK_VERSION>` (pin
+file `plugin/SDK_VERSION`, currently 0.11.0 — carries the toolbox parser-ingest
+tail slots). On a fresh machine, publish it once from the sibling SDK checkout
+before any plugin build (the repo-root `./build.sh` checks the cache and prints
+this exact command if it's missing):
 
-    cd PJ4/plotjuggler_sdk
+    cd ~/ws_plotjuggler/plotjuggler_sdk-cloud
     conan create . -s build_type=Release -s compiler.cppstd=20 --build=missing
-
-(`scripts/bump_core_version.py` is deliberately NOT used for this version — it
-would move the extern/plotjuggler_core submodule to a nonexistent upstream tag.)
 
 ## Real AWS staging bucket (S3-use-case M1 real-bucket run)
 
@@ -276,15 +274,16 @@ One-time credential drop (NOT in the repo, never commit):
     CREDS
     chmod 600 ~/.aws/credentials
 
-Run + verify (read-only):
+Run + verify (read-only). The backend is TWO processes — the Python builder (the
+sole catalog writer) then the read-only Go server. `run.sh --aws` orchestrates
+both (builder first, waits for its first published catalog, then the server on
+:8084), and defaults `AWS_PROFILE=aws-staging` to match the profile above:
 
-    cd server && go build -o ./bin/pj-cloud-server ./cmd/pj-cloud-server
-    AWS_PROFILE=aws-staging ./bin/pj-cloud-server \
-      -config deploy/config.aws-staging.yaml -listen :8084 \
-      -db /tmp/pj-cloud-aws-staging.db > /tmp/pj-cloud-staging.log 2>&1 &
-    # watch the indexer scan, then list through the real client stack:
-    tail -f /tmp/pj-cloud-staging.log          # expect "indexer: ... run complete scanned=N"
-    <plugin build dir>/mcap-cloud-cli --url ws://localhost:8084 list
+    ./run.sh --aws                             # needs the builder venv (see `make smoke`)
+    # watch the builder scan the real bucket:
+    tail -f /tmp/pj-cloud-builder.log          # expect "catalog built: N file(s) scanned"
+    # then list through the real client stack:
+    plugin/toolbox_mcap_cloud/build/bin/mcap-cloud-cli --url ws://localhost:8084 list
 
 If the first List fails with 301/PermanentRedirect, the error names the
 bucket's actual region — fix `region:` in the staging config and restart.

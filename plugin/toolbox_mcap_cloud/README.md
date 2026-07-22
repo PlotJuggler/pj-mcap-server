@@ -8,9 +8,8 @@ the connector pipeline (server → WebSocket/Protobuf → this plugin).
 > **Shape note.** The cloud connector **IS a cloud TOOLBOX** (a Mosaico-style
 > non-modal panel: browse catalog, Lua-filter, select sequences + topics +
 > time-range, Fetch). It is *not* a Streaming/File DataSource. This is a
-> deliberate, verified product decision — see
-> `2026-06-04-two-endpoints-approach.md` and the GROUNDED FACTS in the repo-root
-> `CLAUDE.md`. Plan D's DataSource shape is superseded for now.
+> deliberate, verified product decision — see the "Decisions & pins" section in the
+> repo-root `CLAUDE.md`. Plan D's DataSource shape is superseded for now.
 
 ## What it does
 
@@ -29,25 +28,38 @@ the connector pipeline (server → WebSocket/Protobuf → this plugin).
 
 ## Build
 
-From the plugin collection root (Conan 2 + CMake, C++20, `-Werror`):
+The plugin builds **standalone** in this repo (Conan 2 + CMake, C++20, `-Werror`).
+It requires the `plotjuggler_sdk/0.11.0` Conan package in your local cache — if it
+is missing, the repo-root `./build.sh` prints the exact `conan create` command to
+build it from the `plotjuggler_sdk-cloud` checkout.
+
+Easiest — from the **repo root**, build the server + this plugin and stage the `.so`:
 
 ```bash
-cd PJ4/pj-official-plugins
-./build.sh toolbox_mcap_cloud
+./build.sh
 ```
 
-Artifacts land under `build/toolbox_mcap_cloud/Release/`:
-
-- `bin/libtoolbox_mcap_cloud_plugin.so` — the plugin (toolbox + borrowed dialog).
-- `toolbox_mcap_cloud/mcap-cloud-cli` — the headless CLI (below).
-
-Run PlotJuggler with the plugin — **the vendored app**, never the pristine
-`/home/gn/ws/PJ4` one (the vendored host carries required changes — SDK
-parser-ingest tail slots, RangeSlider markers, widget bindings — that the
-pristine app lacks; the `.so` loads there but host features silently vanish):
+Or build just the plugin:
 
 ```bash
-cd /home/gn/ws/PJ4_Server_Template/pj-mcap-server/PJ4 && ./run.sh
+cd plugin/toolbox_mcap_cloud
+conan install . --output-folder=build --build=missing -s compiler.cppstd=20
+cmake -B build -DCMAKE_TOOLCHAIN_FILE=build/conan_toolchain.cmake -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j"$(nproc)"
+```
+
+Artifacts land under `plugin/toolbox_mcap_cloud/build/bin/`:
+
+- `libtoolbox_mcap_cloud_plugin.so` — the plugin (toolbox + borrowed dialog).
+- `mcap-cloud-cli` — the headless CLI (below).
+
+Run PlotJuggler pointed at that build directory. Use a PlotJuggler build that carries
+the cloud host-side changes (SDK parser-ingest tail slots, RangeSlider markers, widget
+bindings) — on this machine that is `~/ws_plotjuggler/PJ4`; a pristine upstream app
+loads the `.so` but those host features silently vanish:
+
+```bash
+PJ_PLUGIN_DIR="$PWD/plugin/toolbox_mcap_cloud/build/bin" ~/ws_plotjuggler/PJ4/run.sh
 ```
 
 ## CLI — `mcap-cloud-cli`
@@ -84,9 +96,9 @@ the pure resolver in `tools/cli_url_resolve.hpp` and pinned by the
 ## Tests (ctest)
 
 ```bash
-ctest --test-dir build/toolbox_mcap_cloud/Release            # hermetic: live tests SKIP
+ctest --test-dir plugin/toolbox_mcap_cloud/build            # hermetic: live tests SKIP
 MCAP_CLOUD_LIVE_URL=ws://localhost:8081 \
-  ctest --test-dir build/toolbox_mcap_cloud/Release          # live: all run
+  ctest --test-dir plugin/toolbox_mcap_cloud/build          # live: all run
 ```
 
 Two modes, gated by `MCAP_CLOUD_LIVE_URL`:
@@ -107,7 +119,7 @@ Two modes, gated by `MCAP_CLOUD_LIVE_URL`:
 Parsing is delegated to the **host's MessageParser plugins** via the toolbox
 parser-ingest tail slots (`create_parser_ingest` / `release_parser_ingest` +
 the data-source runtime `ensure_parser_binding` / `push_message`) — the SDK
-0.6.1 toolbox parser-ingest path implemented in `src/parser_ingest_driver.*`.
+0.11.0 toolbox parser-ingest path implemented in `src/parser_ingest_driver.*`.
 tf/pointclouds/images arrive as ObjectStore object topics with render-time
 parsers registered by the host (3D-draggable AND renderable). The plugin
 contains **zero message decoders**; decode correctness is owned by
@@ -115,7 +127,7 @@ contains **zero message decoders**; decode correctness is owned by
 
 ## Deferred / not as-built
 
-The plan (`2026-06-03-pj-cloud-pj4-plugin.md`, Plan D) mentions a DataSource
+The original Plan D (archived — recover from git history) mentioned a DataSource
 shape, `qtkeychain`-backed secret storage, a `pjcloud://` URI scheme, and
 file-hierarchy browsing. None are as-built: the plugin is a Toolbox, secrets are
 per-URI tokens supplied via env/flag, and the catalog is flat (the server reports
@@ -123,9 +135,6 @@ per-URI tokens supplied via env/flag, and the catalog is flat (the server report
 
 ## Pointers
 
-- Repo-root `CLAUDE.md` — project handbook, slice history, GROUNDED FACTS.
-- `2026-05-28-pj-cloud-connector-design.md` — canonical design spec (wire
+- Repo-root `CLAUDE.md` — project handbook, decisions & pins, slice history.
+- `arch/2026-05-28-pj-cloud-connector-design.md` — canonical design spec (wire
   protocol, sessions, resume, testing).
-- `2026-06-03-unified-cloud-connector-plan.md` — the unified S3+GCS plan and seams.
-- `2026-06-04-two-endpoints-approach.md` — the active build order + the
-  Toolbox-vs-DataSource reconciliation note.

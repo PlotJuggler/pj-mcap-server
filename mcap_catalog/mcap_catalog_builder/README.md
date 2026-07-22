@@ -8,6 +8,9 @@ storage `Source` seam (see [S3 backend](#s3-backend-experimental)).
 
 ## Usage
 
+Run from `mcap_catalog/` (the directory that contains the `mcap_catalog_builder/`
+package):
+
 ```bash
 python3 -m mcap_catalog_builder <watch_root> [options]                 # local (default)
 python3 -m mcap_catalog_builder --source s3 --s3-bucket B --sqs-url U  # S3
@@ -16,15 +19,19 @@ python3 -m mcap_catalog_builder --source s3 --s3-bucket B --sqs-url U  # S3
 | Option | Default | Meaning |
 |---|---|---|
 | `watch_root` (positional) | `.` | [local] folder of `.mcap` files to watch (recursive) |
-| `--source` | `local` | backend: `local` or `s3` |
+| `--source` | `local` | backend: `local`, `s3`, or `gcs` |
 | `--s3-bucket` | — | [s3] bucket name (required for `--source s3`) |
 | `--s3-prefix` | `""` | [s3] key prefix to scope the listing |
-| `--sqs-url` | — | [s3] SQS queue URL for S3 event notifications (required for `--source s3`) |
+| `--gcs-bucket` | — | [gcs] bucket name (required for `--source gcs`) |
+| `--gcs-prefix` | `""` | [gcs] key prefix to scope the listing |
+| `--sqs-url` | — | [s3] SQS queue URL for S3 event notifications (required for `--source s3` **unless** `--no-watch` or `--once`) |
+| `--once` | off | run one full reconcile, publish the catalog, and exit (no daemon/watch). The one-shot build mode CI and the read-only server bring-up use |
+| `--rebuild` | off | build into a temp DB and publish it atomically (implied when `--db` doesn't exist yet); valid with `--once` or in daemon mode |
 | `--db` | `/tmp/pj-cloud-catalog.db` | catalog SQLite file |
 | `--tag-socket` | off | path for the tag-edit IPC unix socket (daemon mode only; see [Tag-edit IPC](#tag-edit-ipc)) |
 | `--rescan-interval` | `300.0` | seconds between safety re-scans |
 | `--no-watch` | off | daemon mode: start **no** live event producer (no local watchdog/inotify observer, no S3 SQS long-poll thread) — discovery is then rescan-only, driven purely by `--rescan-interval`. With `--source s3`, also drops the `--sqs-url` requirement. No-op for `--source gcs` (already rescan-only) and for `--once` |
-| `--extract-workers` | `2×CPU, max 32` | concurrency for the full-reconcile read phase (fetch+parse summaries). For a remote bucket (`--source s3`) these are worker **processes** — each with its own client and its own GIL, so the GIL-bound pure-Python MCAP parse scales across cores; for a local watch root, threads. The DB apply stays serial either way. Rarely needs tuning |
+| `--extract-workers` | `2×CPU, max 32` | concurrency for the full-reconcile read phase (fetch+parse summaries). For a remote bucket (`--source s3`) these are worker **processes** — each with its own client and its own GIL, so the GIL-bound pure-Python MCAP parse scales across cores; for a local watch root (or `--source gcs`) they are threads. The DB apply stays serial either way. Rarely needs tuning |
 | `--debounce` | `2.0` | [local] seconds to debounce file events |
 | `--stability-checks` | `3` | [local] size-stability polls before cataloging |
 | `--stability-interval` | `0.5` | [local] seconds between stability polls |
@@ -124,7 +131,7 @@ bytes and records every range requested, so the cheap-read property is asserted
 directly:
 
 ```bash
-cd /home/davide/ws_plotjuggler/auryn-mcap-server
+cd /home/davide/ws_plotjuggler/mcap_server/mcap_catalog
 python3 -m pytest mcap_catalog_builder/tests/test_s3_storage.py \
                   mcap_catalog_builder/tests/test_s3_producer.py \
                   mcap_catalog_builder/tests/test_storage.py -v
@@ -138,10 +145,10 @@ pip install boto3   # only needed to actually hit S3
 
 # Read one recording's signals/counts/time span — prints bytes fetched vs object
 # size, showing the body was skipped (e.g. "fetched 7,914 of 512,338,001 bytes"):
-python3 examples/s3_read_summary.py s3://my-bucket/customer=acme/.../x.mcap
+python3 mcap_catalog_builder/examples/s3_read_summary.py s3://my-bucket/customer=acme/.../x.mcap
 
 # List the .mcap objects under a prefix (key + ETag, from the listing, no body read):
-python3 examples/s3_read_summary.py --list s3://my-bucket/customer=acme/
+python3 mcap_catalog_builder/examples/s3_read_summary.py --list s3://my-bucket/customer=acme/
 ```
 
 **3. Run the daemon against S3.** First wire the bucket: add a bucket notification
@@ -165,7 +172,7 @@ with a fake SQS client.
 ## Tests
 
 ```bash
-cd /home/davide/ws_plotjuggler/auryn-mcap-server
+cd /home/davide/ws_plotjuggler/mcap_server/mcap_catalog
 python3 -m compileall mcap_catalog_builder
 python3 -m pytest mcap_catalog_builder/tests/ -v
 ```

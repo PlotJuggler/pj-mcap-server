@@ -148,6 +148,8 @@ cd server/deploy
 # Upload your recordings to s3://recordings first (nothing in this stack writes objects):
 #   mc alias set local http://localhost:9000 admin password123
 #   mc cp *.mcap local/recordings/
+# PJ_CLOUD_TOKEN is REQUIRED — the server is fail-closed and refuses to start without
+# it (or set PJ_CLOUD_ALLOW_ANONYMOUS=1 to run with no auth on purpose):
 PJ_CLOUD_TOKEN=changeme docker compose up -d --build
 docker compose logs -f builder     # watch the initial catalog build
 curl -fsS http://localhost:8080/health        # -> ok (once the builder's first scan lands)
@@ -156,11 +158,12 @@ curl -fsS http://localhost:8080/health        # -> ok (once the builder's first 
 - Ports: `8080` (ws:// + http dashboard/health/metrics), `9000`/`9001` (Minio API/console).
 - The SQLite catalog + tag-edit socket persist in the `catalog-data` volume
   (shared by `builder` and `server` only); bucket data in `minio-data`.
-- For a REAL S3/GCS deploy: drop the `minio`/`minio-init` services, edit
-  `deploy.config.yaml`'s `storage.{s3,gcs}` block (endpoint/region/creds), and
-  edit the `builder` service's `command:` to match (`--source`,
-  `--s3-bucket`/`--gcs-bucket`, prefix) plus its `environment:` for
-  credentials.
+- For a REAL S3/GCS deploy, don't hand-edit this local stack — use the dedicated
+  templates and runbooks:
+  - **S3:** `config.aws-ec2.yaml` + `docker-compose.aws.yml` (fill in the `REPLACE_ME`
+    bucket + region + prefix); full walkthrough in `docs/ec2-deploy.md`.
+  - **GCS:** `config.gcs-staging.yaml` (fill in `REPLACE_ME_with_your_gcs_bucket` +
+    prefix; ADC for credentials); see `docs/gce-deploy-smoke.md`.
 
 ## systemd (bare metal)
 

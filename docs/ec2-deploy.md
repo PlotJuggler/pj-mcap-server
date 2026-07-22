@@ -48,9 +48,9 @@ first catalog is published.
 | Setting | Recommendation | Why |
 |---|---|---|
 | AMI | Amazon Linux 2023 or Ubuntu 22.04 LTS | Docker-ready; systemd for the daemon. |
-| Instance type | `t3.medium` (2 vCPU / 4 GB) to start | Builder extraction is I/O-bound (S3 range-GETs); server is light. Scale up for large catalogs / many clients. |
+| Instance type | `t3.medium` (2 vCPU / 4 GB) to start | The server is light. The builder's first scan parallelizes across CPU cores, so more vCPUs speed up a large cold catalog. |
 | Storage | **EBS gp3**, ≥ 20 GB | The Docker named volume lives on the local EBS root — correct for `catalog-data`. |
-| Region | **`eu-west-2`** (same as the bucket) | Cross-region range-GETs are the extraction bottleneck. |
+| Region | **Same region as your S3 bucket** | Deploy in-region: cross-region range-GETs are the extraction bottleneck. |
 | Security group | Inbound `22` (SSH, your IP) + `8080` (WS/health/dashboard, or restrict to your client CIDR). Outbound `443` to S3. | Don't expose the dashboard publicly without a password. |
 
 **IAM instance role (no secrets on the box).** Attach a role with a read-only S3
@@ -122,18 +122,30 @@ step just works — its build context is the repo root.
 
 ---
 
-## 4. Set the S3 scope (the one knob you tune)
+## 4. Fill in your S3 settings
 
-The deployment constants (bucket, region) are already in the two committed
-artifacts. The one thing to decide is **how much data to serve** — the S3
-`prefix`. The default is the first-contact scope (one robot, one day, 34 files).
-Widen it deliberately (an unscoped scan of the whole Hive lake blows the scan
-budget). Edit **both** files, keeping them in sync:
+The two committed artifacts ship as **templates** with placeholders. Set the same
+three values in **both** files (they must match):
 
-- `server/deploy/config.aws-ec2.yaml` → `storage.s3.prefix`
-- `server/deploy/docker-compose.aws.yml` → the builder's `--s3-prefix=` arg
+| Setting | In `config.aws-ec2.yaml` | In `docker-compose.aws.yml` |
+|---|---|---|
+| **bucket** | `storage.s3.bucket` | the builder's `--s3-bucket=` arg |
+| **region** | `storage.s3.region` | `AWS_REGION` / `AWS_DEFAULT_REGION` (both services) |
+| **prefix** | `storage.s3.prefix` | the builder's `--s3-prefix=` arg |
 
-Example — all ROS bags for one site:
+`bucket` ships as `REPLACE_ME_...` — the server will not serve real data until you
+set it. `region` must match the bucket's region. `prefix` decides **how much data
+to serve**.
+
+**Choosing a prefix.** `""` scans the whole bucket. If the bucket is a large
+Hive-partitioned lake, an unscoped scan can exceed the scan budget — scope to one
+partition first and widen later. List the bucket to see its layout:
+
+```bash
+aws s3 ls s3://YOUR_BUCKET/ --region YOUR_REGION
+```
+
+Example prefix — all ROS bags for one robot at one site:
 `customer=<x>/customer_site=<y>/robot=<z>/source=ros-bags/`
 
 ---
@@ -170,7 +182,7 @@ publish (its healthcheck), then starts `server`.
 ```bash
 cd server/deploy
 
-# 1. Builder scanning / publishing (cold WAN scan is minutes — ~7-12s/file):
+# 1. Builder scanning / publishing (a large first scan takes a few minutes):
 docker compose -f docker-compose.aws.yml logs -f builder
 
 # 2. Server (only starts once the builder is healthy):

@@ -245,10 +245,11 @@ Arrow ingest (`src/arrow_ingest.*`) → raw-record forwarding to host MessagePar
 ## Documents (read in this order)
 
 **Current plans (in `docs/` — the up-to-date forward work):**
-- `docs/auryn-catalog-migration-plan.md` — the catalog migration plan (**EXECUTED —
-  all blocks complete 2026-07-06**; kept as the design record). `docs/CATALOG_CONTRACT.md`
-  is the LIVE cross-language contract (schema v3, publish/reopen §9, tag IPC §10;
-  byte-identical copy in `mcap_catalog/` — always update both).
+- `docs/CATALOG_CONTRACT.md` — the LIVE cross-language contract (schema v3,
+  publish/reopen §9, tag IPC §10, single-writer lock §11; byte-identical copy in
+  `mcap_catalog/` — always update both). (The executed auryn catalog-migration plan
+  was removed once it landed — recover from git history if the design record is ever
+  needed; current system state lives under "Current state" above.)
 - `docs/catalog-vocabulary-rpc.md` — the `GetVocabulary` filter-RPC design: a strict
   cascading customer→site→robot tree + flat `source` + tag facets, filtered server-side;
   resolves the migration's D3.

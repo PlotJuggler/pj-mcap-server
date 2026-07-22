@@ -85,12 +85,16 @@ Stop everything: `make server-stop && (cd infra/minio && docker compose down)`
 
 One backend (builder + server) runs at a time — `make server-stop` to switch targets.
 
-> **Auth:** `run.sh` opts into anonymous startup for development: when
-> `PJ_CLOUD_TOKEN` is unset, the server runs open; when it is set, the server
-> enforces that shared bearer token. Outside the development launcher, the server
-> is **fail-closed** and refuses to start without a configured token unless
-> `-allow-anonymous` / `PJ_CLOUD_ALLOW_ANONYMOUS=1` explicitly permits open access.
-> See `server/deploy/README.md` and `docs/ec2-deploy.md`.
+> **Port already in use?** `run.sh` hard-errors (rather than silently misbehaving)
+> if the target port is held by another process — `:8080` is commonly taken on dev
+> boxes. Use `./run.sh <path/to.yaml>` with a config whose `listen:` is a free port.
+
+> **Auth:** `run.sh` always passes `-allow-anonymous`, so local development needs no
+> token. If you also set `PJ_CLOUD_TOKEN`, the server still enforces it (the flag only
+> disables auth when no token is configured). Outside the launcher the server is
+> **fail-closed**: it refuses to start without a token unless `-allow-anonymous` /
+> `PJ_CLOUD_ALLOW_ANONYMOUS=1` explicitly permits open access. See
+> `server/deploy/README.md` and `docs/ec2-deploy.md`.
 
 Run the full regression gate: `make smoke`. It generates and seeds its own
 synthetic corpus; see `scripts/RUNBOOK.md` for its additional tooling prerequisites.
