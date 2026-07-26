@@ -476,6 +476,9 @@ McapCloudDialog::McapCloudDialog() : worker_(std::make_unique<FetchWorker>()) {
   worker_->sequenceListStarted = [this](std::vector<SequenceInfo> sequences) {
     postEvent([this, sequences = std::move(sequences)]() mutable { onSequenceListStarted(std::move(sequences)); });
   };
+  worker_->sequencePageReady = [this](std::vector<SequenceInfo> page, bool reset) {
+    postEvent([this, page = std::move(page), reset]() mutable { onSequencePageReady(std::move(page), reset); });
+  };
   worker_->sequenceInfoReady = [this](SequenceInfo sequence) {
     postEvent([this, sequence = std::move(sequence)]() mutable { onSequenceInfoReady(std::move(sequence)); });
   };
@@ -2897,6 +2900,23 @@ void McapCloudDialog::onSequenceListStarted(std::vector<SequenceInfo> seqs) {
   sortSequencesLocked();
 }
 
+void McapCloudDialog::onSequencePageReady(std::vector<SequenceInfo> page, bool reset) {
+  // reset semantics matter: it is NOT merely "page one". A builder rebuild
+  // landing mid-pagination aborts the attempt server-side (ERROR_STALE_CATALOG)
+  // and the client restarts from page one on the new generation — appending
+  // across that boundary would render the aborted attempt's rows twice.
+  if (reset) {
+    progressive_seqs_.clear();
+  }
+  progressive_seqs_.insert(progressive_seqs_.end(), std::make_move_iterator(page.begin()),
+                           std::make_move_iterator(page.end()));
+  std::lock_guard<std::mutex> lock(state_.mu);
+  // Same shape as onSequenceListStarted: populate + sort, but leave the date
+  // picker untouched — only the authoritative final list seeds it.
+  populateSequencesLocked(progressive_seqs_, /*seed_dates=*/false);
+  sortSequencesLocked();
+}
+
 void McapCloudDialog::onSequenceInfoReady(SequenceInfo seq) {
   std::lock_guard<std::mutex> lock(state_.mu);
   // Fill in this one sequence's detail in place (min/max ts → Date, size →
@@ -2923,6 +2943,10 @@ void McapCloudDialog::onSequenceInfoReady(SequenceInfo seq) {
 }
 
 void McapCloudDialog::onSequencesReady(std::vector<SequenceInfo> seqs) {
+  // The sweep is over; the progressive accumulator has served its purpose (this
+  // handler repopulates from the complete vector below). Free the duplicate.
+  progressive_seqs_.clear();
+  progressive_seqs_.shrink_to_fit();
   std::size_t count = 0;
   std::string reselect_sequence;
   {

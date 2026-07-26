@@ -45,6 +45,17 @@ class Hello;
 
 namespace mcap_cloud {
 
+// Page size requested for every ListFiles page.
+//
+// Leaving ListFilesRequest.limit unset takes the server's 200 default, which on
+// a 25,550-file catalog is 128 strictly-serial round trips. Measured against a
+// remote server (RTT ~37 ms) the sweep behaves as `pages * RTT + rows * 0.18 ms`:
+// 200 -> 10.6 s, 500 -> 7.8 s, 1000 -> 8.1 s. 500 is the measured optimum —
+// 1000 removes 26 more round trips but its per-page latency tail degrades
+// (mean 323 ms vs p50 233 ms) and gives the time back. The server clamps
+// anything above 1000.
+inline constexpr std::uint32_t kListFilesPageLimit = 500;
+
 // Defined in session_decode.hpp; only a reference to it appears in this header
 // (the MessageHandler typedef), so a forward declaration suffices.
 struct DecodedMessage;
@@ -97,7 +108,19 @@ class BackendConnection {
   // with the partial snapshot (the last COMPLETE index is retained), so a
   // dropped page can't silently shrink the browse index; the caller decides
   // whether to surface the partial vector or discard it.
-  [[nodiscard]] std::vector<SequenceInfo> listSequences(bool* complete = nullptr);
+  // Called once per ListFiles page, on the calling thread, BEFORE the sweep
+  // finishes — so a browse UI can draw page one (~110 ms) instead of waiting for
+  // the whole listing (~8 s over 25k files).
+  //
+  // `reset` is true for the first page of an attempt. It is NOT merely "page
+  // one": an ERROR_STALE_CATALOG (a builder rebuild racing the pagination) makes
+  // the client discard every page it already delivered and restart on the new
+  // generation, and the consumer is told by a SECOND reset. Treat it as "drop
+  // everything shown so far", or a rebuild mid-browse duplicates rows.
+  using PageCallback = std::function<void(const std::vector<SequenceInfo>& page, bool reset)>;
+
+  [[nodiscard]] std::vector<SequenceInfo> listSequences(bool* complete = nullptr,
+                                                        const PageCallback& on_page = {});
 
   // GetFile RPC for the file backing `sequence_name`, addressed by s3_key
   // (sequence_name is sent verbatim as s3_key — see the key-addressing note

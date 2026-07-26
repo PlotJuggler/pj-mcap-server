@@ -135,7 +135,16 @@ void FetchWorker::listSequencesAsync() {
   }
 
   bool complete = false;
-  std::vector<SequenceInfo> sequences = backend_->listSequences(&complete);
+  // Forward each page as it lands (worker thread — the dialog's wrapper posts it
+  // to the GUI queue, same as every other callback here). Vector-per-page, never
+  // per-row; the reset bit propagates the stale-catalog restart.
+  BackendConnection::PageCallback on_page;
+  if (sequencePageReady) {
+    on_page = [this](const std::vector<SequenceInfo>& page, bool reset) {
+      sequencePageReady(page, reset);
+    };
+  }
+  std::vector<SequenceInfo> sequences = backend_->listSequences(&complete, on_page);
   if (backend_->isClosed()) {
     // A dead browse socket reads as an empty/short list; tell the dialog the
     // connection is gone instead of letting it render a silently empty table.

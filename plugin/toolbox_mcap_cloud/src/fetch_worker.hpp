@@ -156,6 +156,13 @@ class FetchWorker {
   /// for code paths that only want names.
   std::function<void(std::vector<SequenceInfo> sequences)> sequencesReady;
   std::function<void(std::vector<std::string> names)> sequenceNamesReady;
+  /// One event per ListFiles page, DURING the (blocking) catalog sweep — so the
+  /// table can draw page one (~150 ms) instead of staying blank for the whole
+  /// listing (~8 s over 25k files). `reset` true = drop everything previously
+  /// delivered (first page, or an ERROR_STALE_CATALOG restart after a builder
+  /// rebuild raced the pagination — see BackendConnection::PageCallback).
+  /// The final authoritative sequencesReady still follows.
+  std::function<void(std::vector<SequenceInfo> page, bool reset)> sequencePageReady;
   // Progressive discovery (PJ3 parity): the initial list, so the table can
   // populate before per-sequence detail finishes streaming in...
   std::function<void(std::vector<SequenceInfo> sequences)> sequenceListStarted;

@@ -696,6 +696,25 @@ if(BUILD_TESTING)
   # an UpdateTags frame; tag_edit_supported=true -> updateTags() proceeds past
   # the gate and actually sends (and completes, since the fake server answers
   # ListFiles/UpdateTags too); resume_supported round-trips independently.
+  # Pagination sweep: the explicit page limit + progressive per-page delivery
+  # (incl. the ERROR_STALE_CATALOG restart reset). Same in-process fake-WS-server
+  # shape as server_caps_test below.
+  add_executable(toolbox_mcap_cloud_list_pagination_test
+    tests/list_pagination_test.cpp
+    src/backend_connection.cpp
+    src/wire_mapping.cpp
+    src/session_decode.cpp
+    ${MCAP_CLOUD_PROTO_SRCS}
+  )
+  target_include_directories(toolbox_mcap_cloud_list_pagination_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${MCAP_CLOUD_PROTO_OUT_DIR}
+  )
+  target_link_libraries(toolbox_mcap_cloud_list_pagination_test PRIVATE
+    protobuf::libprotobuf ixwebsocket::ixwebsocket zstd::libzstd_static LZ4::lz4_static GTest::gtest_main
+  )
+  add_test(NAME McapCloudListPaginationTest COMMAND toolbox_mcap_cloud_list_pagination_test)
+
   add_executable(toolbox_mcap_cloud_server_caps_test
     tests/server_caps_test.cpp
     src/backend_connection.cpp

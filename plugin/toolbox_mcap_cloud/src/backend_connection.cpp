@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <iterator>
 #include <string>
 #include <thread>
 #include <utility>
@@ -426,7 +427,8 @@ std::optional<ServerCaps> BackendConnection::serverCapabilities() const {
   return server_caps_;
 }
 
-std::vector<SequenceInfo> BackendConnection::listSequences(bool* complete) {
+std::vector<SequenceInfo> BackendConnection::listSequences(bool* complete,
+                                                           const PageCallback& on_page) {
   if (complete != nullptr) {
     *complete = false;
   }
@@ -450,10 +452,14 @@ std::vector<SequenceInfo> BackendConnection::listSequences(bool* complete) {
     std::string page_token;
     std::string generation;  // the generation attempt-page-1 was served from
     bool stale = false;
+    // First page of THIS attempt: tells a progressive consumer to drop whatever
+    // a previous (stale-aborted) attempt already handed it.
+    bool reset_consumer = true;
     for (;;) {
       pj_cloud::v1::ClientMessage request;
       auto* list = request.mutable_list_files();
       list->set_page_token(page_token);
+      list->set_limit(kListFilesPageLimit);
 
       pj_cloud::v1::ServerMessage response;
       if (!sendAndWait(request, &response)) {
@@ -472,10 +478,18 @@ std::vector<SequenceInfo> BackendConnection::listSequences(bool* complete) {
       if (page_token.empty()) {
         generation = list_response.catalog_generation();
       }
+      std::vector<SequenceInfo> page;
       for (auto& mapped : mapListFilesResponse(list_response)) {
         file_ids[mapped.info.name] = mapped.file_id;
-        sequences.push_back(std::move(mapped.info));
+        page.push_back(std::move(mapped.info));
       }
+      if (on_page) {
+        // Hand the page over BEFORE the sweep completes so the UI can draw it.
+        on_page(page, reset_consumer);
+        reset_consumer = false;
+      }
+      sequences.insert(sequences.end(), std::make_move_iterator(page.begin()),
+                       std::make_move_iterator(page.end()));
 
       page_token = list_response.next_page_token();
       if (page_token.empty()) {

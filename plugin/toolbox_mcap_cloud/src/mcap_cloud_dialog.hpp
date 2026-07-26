@@ -414,6 +414,11 @@ class McapCloudDialog : public PJ::DialogPluginTyped {
   // streams per-sequence detail (onSequenceInfoReady), before the final list.
   void onSequenceListStarted(std::vector<SequenceInfo> sequences);
   void onSequenceInfoReady(SequenceInfo sequence);
+  // One ListFiles page, mid-sweep: append into progressive_seqs_ (or clear it
+  // first when reset — first page, or a stale-catalog restart) and repopulate
+  // the table so the browse renders in ~150 ms instead of after the full ~8 s
+  // sweep. The final onSequencesReady stays authoritative (dates, reselect).
+  void onSequencePageReady(std::vector<SequenceInfo> page, bool reset);
   void onTopicsReady(std::string sequence_name, std::vector<std::string> topic_names);
   void onTopicInfosReady(std::string sequence_name, std::vector<TopicInfo> topics);
   // Failure twin of onTopicInfosReady: records the error WITHOUT caching (so
@@ -518,6 +523,13 @@ class McapCloudDialog : public PJ::DialogPluginTyped {
   void persistState();
 
   DialogState state_;
+
+  // Pages accumulated across one in-flight catalog sweep (onSequencePageReady).
+  // GUI-thread only: written exclusively inside postEvent lambdas drained by
+  // onTick, so no lock; cleared on reset and again when the authoritative
+  // onSequencesReady lands (which re-populates from its own complete vector).
+  std::vector<SequenceInfo> progressive_seqs_;
+
   std::thread worker_thread_;
   std::unique_ptr<FetchWorker> worker_;
   std::mutex cmd_mu_;
