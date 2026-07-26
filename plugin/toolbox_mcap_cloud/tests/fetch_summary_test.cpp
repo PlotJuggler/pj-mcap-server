@@ -37,6 +37,15 @@ TEST(FetchSummary, PartialSuccessStillImportsAndCloses) {
   EXPECT_EQ(s.error_summary, "timeout");
 }
 
+TEST(FetchSummary, McapSaveFailureImportsButKeepsPanelOpen) {
+  auto s = buildFetchSummary(
+      /*total=*/2, /*done=*/2, /*failed=*/0, /*imported_any=*/true,
+      /*cancelling=*/false, Errors{}, /*mcap_save_failed=*/true);
+  EXPECT_TRUE(s.should_import);
+  EXPECT_FALSE(s.should_close);
+  EXPECT_EQ(s.status_text, "Imported 2/2 topics");
+}
+
 TEST(FetchSummary, AllFailedStaysOpenNoImport) {
   Errors errs{{"no data", 2}};
   auto s = buildFetchSummary(2, 2, 2, /*imported_any=*/false, false, errs);

@@ -31,6 +31,7 @@
 namespace mcap_cloud {
 
 class LuaQueryEngine;
+struct McapSaveResult;
 
 struct SequenceRecord {
   std::string name;
@@ -313,6 +314,14 @@ struct DialogState {
   // whole batch lands, and only when not cancelling.
   bool fetch_active = false;
   bool cancelling = false;
+  // Optional raw-session reconstruction. Checked by default; the path is a
+  // directory because the plugin stays Qt-free and generates collision-safe
+  // filenames itself.
+  bool save_mcap = true;
+  std::string save_directory;
+  // Latched before allFetchesComplete so a local save failure suppresses the
+  // otherwise automatic close after a successful host import.
+  bool mcap_save_failed = false;
   int fetch_total = 0;   // topics requested this batch
   int fetch_done = 0;    // topics that reported pullFinished (ok or fail)
   int fetch_failed = 0;  // subset of fetch_done that failed
@@ -493,6 +502,7 @@ class McapCloudDialog : public PJ::DialogPluginTyped {
   // Caller holds state_.mu.
   [[nodiscard]] std::string fetchStatusLineLocked() const;
   void onPullFinished(std::string sequence_name, std::string topic_name, bool ok, std::string error);
+  void onMcapSaveFinished(McapSaveResult result);
   void onAllFetchesComplete(std::string sequence_name);
 
   // Reconnect-resume UX (Slice 8). Fires per reconnect attempt during a mid-pull

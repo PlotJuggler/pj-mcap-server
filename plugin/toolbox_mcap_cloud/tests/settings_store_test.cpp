@@ -56,6 +56,18 @@ TEST(SettingsStore, BoolRoundTrip) {
   EXPECT_TRUE(store.getBool("key", false));
 }
 
+TEST(SettingsStore, McapSavePreferencesRoundTrip) {
+  Fixture fx;
+  auto store = fx.store();
+  store.setBool("mcap_cloud/save_mcap", true);
+  store.setString("mcap_cloud/save_directory", "/tmp/plotjuggler-mcaps");
+
+  EXPECT_TRUE(fx.store().getBool("mcap_cloud/save_mcap", false));
+  EXPECT_EQ(
+      fx.store().getString("mcap_cloud/save_directory"),
+      "/tmp/plotjuggler-mcaps");
+}
+
 TEST(SettingsStore, MissingKeysReturnDefaults) {
   Fixture fx;
   auto store = fx.store();

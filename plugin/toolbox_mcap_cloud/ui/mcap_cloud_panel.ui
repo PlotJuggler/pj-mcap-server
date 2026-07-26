@@ -474,6 +474,31 @@
     </widget>
    </item>
 
+   <!-- Optional raw-session reconstruction. The plugin remains Qt-free: users
+        choose a directory and the worker generates a collision-safe filename. -->
+   <item>
+    <layout class="QHBoxLayout" name="saveMcapRow">
+     <item>
+      <widget class="QCheckBox" name="checkSaveMcap">
+       <property name="text"><string>Save MCAP</string></property>
+       <property name="toolTip"><string>Save every downloaded message as one local MCAP file</string></property>
+       <property name="checked"><bool>true</bool></property>
+      </widget>
+     </item>
+     <item>
+      <widget class="QLabel" name="labelSaveDirectory">
+       <property name="text"><string>Directory:</string></property>
+      </widget>
+     </item>
+     <item>
+      <widget class="QLineEdit" name="saveDirectory">
+       <property name="placeholderText"><string>MCAP output directory</string></property>
+       <property name="clearButtonEnabled"><bool>true</bool></property>
+      </widget>
+     </item>
+    </layout>
+   </item>
+
    <!-- Two-handle time range slider + Download button (PJ3 RangeSlider) -->
    <item>
     <layout class="QHBoxLayout" name="rangeRow">

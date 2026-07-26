@@ -15,6 +15,7 @@
 
 #include <chrono>
 #include <cstdio>
+#include <filesystem>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -22,9 +23,11 @@
 #include <vector>
 
 #include "parser_ingest_driver.hpp"
+#include "mcap_save_path.hpp"
 #include "session_cache.hpp"
 #include "session_decode.hpp"
 #include "session_key.hpp"
+#include "session_mcap_writer.hpp"
 #include "vocab_select.hpp"
 
 namespace mcap_cloud {
@@ -396,7 +399,8 @@ void FetchWorker::updateTagsAsync(std::string sequence_name,
 }
 
 void FetchWorker::pullTopicsAsync(std::vector<std::string> sequence_names, std::string group_name,
-                                  std::vector<std::string> topic_names, std::int64_t start_ns, std::int64_t end_ns) {
+                                  std::vector<std::string> topic_names, std::int64_t start_ns, std::int64_t end_ns,
+                                  std::string save_directory) {
   // The group/display name groups all topics of a (possibly stitched) selection
   // into one catalog dataset + addresses the per-topic ledger callbacks. For
   // N==1 it equals the single sequence name (byte-identical to the pre-Slice-7
@@ -425,6 +429,26 @@ void FetchWorker::pullTopicsAsync(std::vector<std::string> sequence_names, std::
     finish_all();
     return;
   }
+
+  // Allocate both names before touching the network. A non-empty save
+  // directory deliberately bypasses the count-only SessionCache below: the
+  // cache holds no raw payloads from which a new MCAP could be reconstructed.
+  std::optional<McapOutputPaths> save_paths;
+  if (!save_directory.empty()) {
+    McapOutputPaths paths;
+    std::string path_error;
+    if (!prepareMcapOutputPaths(
+            std::filesystem::path(save_directory), sequence_names, utcTimestampForFilename(), &paths, &path_error)) {
+      if (mcapSaveFinished) {
+        mcapSaveFinished(McapSaveResult{McapSaveStatus::Failed, {}, path_error});
+      }
+      finish_all_topics(false, "MCAP save failed: " + path_error);
+      finish_all();
+      return;
+    }
+    save_paths = std::move(paths);
+  }
+
   if (!host_provider_) {
     finish_all_topics(false, "toolbox host not bound");
     finish_all();
@@ -448,7 +472,7 @@ void FetchWorker::pullTopicsAsync(std::vector<std::string> sequence_names, std::
   // session_key.hpp's header comment). `sequence_names` is always available
   // here (no resolve, no MISS fallthrough needed). A HIT requires the cached
   // dataset to STILL exist in the host.
-  {
+  if (!save_paths.has_value()) {
     const PJ::cloud::SessionKey key =
         PJ::cloud::computeSessionKey(conn_uri_, sequence_names, topic_names, {start_ns, end_ns});
     const auto& exists = dataset_exists_
@@ -657,6 +681,22 @@ void FetchWorker::pullTopicsAsync(std::vector<std::string> sequence_names, std::
     return;
   }
 
+  std::unique_ptr<SessionMcapWriter> mcap_writer;
+  std::string mcap_write_error;
+  if (save_paths.has_value()) {
+    mcap_writer = std::make_unique<SessionMcapWriter>();
+    if (!mcap_writer->open(save_paths->partial_path.string(), session_info, &mcap_write_error)) {
+      write_lock.unlock();
+      if (mcapSaveFinished) {
+        mcapSaveFinished(
+            McapSaveResult{McapSaveStatus::Failed, save_paths->partial_path.string(), mcap_write_error});
+      }
+      finish_all_topics(false, "MCAP save failed: " + mcap_write_error);
+      finish_all();
+      return;
+    }
+  }
+
   // Progress throttle: emit pullProgress at most ~10 Hz per topic.
   std::unordered_map<std::uint32_t, std::int64_t> bytes_by_id;
   std::unordered_map<std::uint32_t, std::chrono::steady_clock::time_point> last_emit;
@@ -691,6 +731,11 @@ void FetchWorker::pullTopicsAsync(std::vector<std::string> sequence_names, std::
         if (cancel_flag_.load(std::memory_order_relaxed)) {
           return false;  // downloadSession sends the wire Cancel + returns
         }
+        // Save the transport record before host parsing. Parser rejection is an
+        // import concern and must not make the reconstructed MCAP lossy.
+        if (mcap_writer && !mcap_writer->write(m, &mcap_write_error)) {
+          return false;
+        }
         (void)driver.decode(m);  // best-effort; drops + counts on failure
 
         // Throttled per-topic progress.
@@ -718,6 +763,45 @@ void FetchWorker::pullTopicsAsync(std::vector<std::string> sequence_names, std::
   {
     std::lock_guard<std::mutex> lock(cancel_mu_);
     backend_session_for_cancel_ = nullptr;
+  }
+
+  if (mcap_writer) {
+    std::string close_error;
+    if (!mcap_writer->close(&close_error) && mcap_write_error.empty()) {
+      mcap_write_error = std::move(close_error);
+    }
+
+    if (!mcap_write_error.empty()) {
+      stats.eos = SessionEos::Error;
+      stats.error = "MCAP save failed: " + mcap_write_error;
+      if (mcapSaveFinished) {
+        mcapSaveFinished(
+            McapSaveResult{McapSaveStatus::Failed, save_paths->partial_path.string(), stats.error});
+      }
+    } else if (stats.eos == SessionEos::Complete &&
+               !cancel_flag_.load(std::memory_order_relaxed)) {
+      std::error_code rename_error;
+      std::filesystem::rename(save_paths->partial_path, save_paths->final_path, rename_error);
+      if (rename_error) {
+        mcap_write_error =
+            "could not finalize MCAP '" + save_paths->final_path.string() + "': " + rename_error.message();
+        if (mcapSaveFinished) {
+          mcapSaveFinished(
+              McapSaveResult{McapSaveStatus::Failed, save_paths->partial_path.string(), mcap_write_error});
+        }
+      } else if (mcapSaveFinished) {
+        mcapSaveFinished(McapSaveResult{McapSaveStatus::Complete, save_paths->final_path.string(), {}});
+      }
+    } else if (mcapSaveFinished) {
+      std::string partial_reason = stats.error;
+      if (partial_reason.empty()) {
+        partial_reason =
+            stats.eos == SessionEos::Cancelled ? std::string("download cancelled")
+                                                : std::string("download ended before completion");
+      }
+      mcapSaveFinished(
+          McapSaveResult{McapSaveStatus::Partial, save_paths->partial_path.string(), std::move(partial_reason)});
+    }
   }
 
   // Seal the host-side parser writes (releaseParserIngest -> flushAll) while

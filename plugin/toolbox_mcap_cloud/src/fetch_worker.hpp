@@ -20,6 +20,18 @@
 
 namespace mcap_cloud {
 
+enum class McapSaveStatus {
+  Complete,
+  Partial,
+  Failed,
+};
+
+struct McapSaveResult {
+  McapSaveStatus status = McapSaveStatus::Failed;
+  std::string path;
+  std::string error;
+};
+
 /// Thin background adapter for the cloud backend, running on the dialog's worker
 /// thread. It owns the concrete ixwebsocket+Protobuf BackendConnection(s) (the
 /// catalog-browse socket plus one fresh session connection per pull); callers
@@ -121,7 +133,8 @@ class FetchWorker {
   /// by host_write_mu_. driver.finalize() seals host parser writes (flushAll)
   /// while still inside the critical section, before notifyDataChanged.
   void pullTopicsAsync(std::vector<std::string> sequence_names, std::string group_name,
-                       std::vector<std::string> topic_names, std::int64_t start_ns, std::int64_t end_ns);
+                       std::vector<std::string> topic_names, std::int64_t start_ns, std::int64_t end_ns,
+                       std::string save_directory = {});
 
   // `uri` echoes the EXACT uri this connectAsync() call was invoked with (not
   // re-read from any mutable dialog state), so a caller that may have edited
@@ -194,6 +207,11 @@ class FetchWorker {
   /// in-memory SessionCache (zero transport). Routed to a "served from cache"
   /// notify on the dialog.
   std::function<void(std::string group)> pullServedFromCache;
+  /// Local MCAP result when saving was requested. Complete names the final
+  /// `.mcap`; Partial names the readable `.partial.mcap` retained after a
+  /// cancellation/session failure; Failed carries an open/write/rename error.
+  /// Fires before allFetchesComplete so the dialog's close policy sees it.
+  std::function<void(McapSaveResult result)> mcapSaveFinished;
   /// Tag-edit commit result. ok=false carries the verbatim server/transport
   /// error. On ok=true a sequencesReady follows so the dialog refreshes the
   /// catalog metadata (the Lua filter re-evaluates against the new tags).

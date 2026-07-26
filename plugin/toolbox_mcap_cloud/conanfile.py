@@ -38,7 +38,7 @@ class ToolboxMcapCloudConan(ConanFile):
         # the same zstd::libzstd_static + LZ4::lz4_static targets.
         "zstd/1.5.5",
         "lz4/1.9.4",
-        # MCAP writer for the CLI's session-download tool (header-only).
+        # Shared MCAP writer for CLI reconstruction + optional GUI download saving.
         "mcap/2.1.1",
     )
     # Build-context protobuf so the conan protoc (6.33.5) lands on the build

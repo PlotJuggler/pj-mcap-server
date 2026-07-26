@@ -24,6 +24,8 @@ the connector pipeline (server → WebSocket/Protobuf → this plugin).
   session (union of topics, one continuous time range).
 - Fetches the selection and ingests decoded scalar series into the datastore.
   ROS2/CDR messages are decoded **in the plugin** (see "Decoder rationale").
+- Optionally reconstructs every fetched session as one local, chunked +
+  Zstd-compressed MCAP while it is ingested.
 - Edits a file's override **tags** (the server keeps an effective-tags view).
 - Survives a mid-download WebSocket drop via reconnect-and-resume; repeat fetches
   of the same selection are served from an in-memory session cache.
@@ -123,6 +125,24 @@ correctness can be exercised without launching the GUI. It links **zero Qt**
 | `debug <seq1> [<seq2> …] [--topics a,b] [--time-range s,e] [--limit N] [--json]` | open a session and print the first N decoded messages (topic, log_time, payload size) **without writing a file** |
 
 Exit codes: `0` success · `1` connection/RPC failure · `2` usage error.
+
+## Saving Toolbox downloads
+
+The **Save MCAP** checkbox is enabled by default. The adjacent **Directory**
+field defaults to PlotJuggler's per-user data directory under
+`mcap_cloud/downloads` and is persisted between runs.
+
+Each Download click creates one collision-safe file. A single recording uses
+`<source>_download_<UTC>.mcap`; stitched selections use
+`<first-source>_plus_<N>_download_<UTC>.mcap`. The worker writes to a sibling
+`.partial.mcap` while data is arriving and renames it only after a clean session
+completion. Cancellation or transport failure retains the readable partial
+file and reports its path. Disable the checkbox to retain the previous
+import-only behavior and count-only session-cache hits.
+
+The reconstructed file contains the session protocol's messages, schemas,
+channels, and log/publish timestamps. Attachments and source MCAP metadata are
+not transmitted by the server and therefore cannot be reconstructed.
 
 ### Environment variables and flags
 

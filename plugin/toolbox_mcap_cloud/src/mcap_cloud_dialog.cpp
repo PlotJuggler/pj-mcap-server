@@ -37,6 +37,7 @@
 #include "canonical_fields.h"
 #include "seq_display.h"
 #include "fetch_summary.h"
+#include "mcap_save_path.hpp"
 #include "fetch_worker.hpp"
 #include "format_utils.h"
 #include "mcap_cloud_panel_manifest.hpp"
@@ -522,6 +523,9 @@ McapCloudDialog::McapCloudDialog() : worker_(std::make_unique<FetchWorker>()) {
   worker_->pullServedFromCache = [this](std::string group) {
     postEvent([this, group = std::move(group)]() mutable { onPullServedFromCache(std::move(group)); });
   };
+  worker_->mcapSaveFinished = [this](McapSaveResult result) {
+    postEvent([this, result = std::move(result)]() mutable { onMcapSaveFinished(std::move(result)); });
+  };
   worker_->errorOccurred = [this](std::string message) {
     postEvent([this, message = std::move(message)]() mutable { notify(PJ::ToolboxMessageLevel::kError, message); });
   };
@@ -589,6 +593,12 @@ void McapCloudDialog::initFromSettings() {
   state_.aggregate = settings.getBool("mcap_cloud/aggregate", false);
   state_.topics_all = settings.getBool("mcap_cloud/topics_all", false);
   state_.filter_tab = std::clamp(settings.getInt("mcap_cloud/filter_tab", 0), 0, 1);
+  state_.save_mcap = settings.getBool("mcap_cloud/save_mcap", true);
+  state_.save_directory =
+      settings.getString("mcap_cloud/save_directory", defaultMcapSaveDirectory());
+  if (state_.save_directory.empty()) {
+    state_.save_directory = defaultMcapSaveDirectory();
+  }
   // customer/site are NOT restored here — they live in the mandatory browse
   // gate now (per-server keys, resolved against the vocabulary in
   // onVocabularyReady, with a one-shot migration off the legacy global keys
@@ -733,6 +743,11 @@ std::string McapCloudDialog::widget_data() {
   // app's top notification bell via notify(); live download progress shows in
   // the Info panel during a fetch.
   wd.setText("comboUri", state_.uri);
+  wd.setChecked("checkSaveMcap", state_.save_mcap);
+  wd.setText("saveDirectory", state_.save_directory);
+  wd.setEnabled("saveDirectory", state_.save_mcap && !state_.fetch_active);
+  wd.setEnabled("labelSaveDirectory", state_.save_mcap && !state_.fetch_active);
+  wd.setEnabled("checkSaveMcap", !state_.fetch_active);
 
   // PJ3 parity: combo always lists the MRU history + the default server pin.
   {
@@ -904,7 +919,8 @@ std::string McapCloudDialog::widget_data() {
   // multi-file selection downloads via ONE OpenFresh.
   wd.setEnabled(
       "buttonFetch", state_.connected && !state_.selected_sequences.empty() &&
-                         (state_.topics_all || !state_.topic_selected_rows.empty()) && !state_.fetch_active);
+                         (state_.topics_all || !state_.topic_selected_rows.empty()) && !state_.fetch_active &&
+                         (!state_.save_mcap || !state_.save_directory.empty()));
   // Tooltip = the FIRST unmet requirement (priority-ordered), so a disabled
   // Download always says why. Pushed via setFieldValid with ok=true: the host's
   // generic field-validity branch then applies only the tooltip (no invalid
@@ -920,6 +936,8 @@ std::string McapCloudDialog::widget_data() {
       fetch_tip = "Disabled: select at least one sequence";
     } else if (!state_.topics_all && state_.topic_selected_rows.empty()) {
       fetch_tip = "Disabled: select at least one topic (or switch topics to All)";
+    } else if (state_.save_mcap && state_.save_directory.empty()) {
+      fetch_tip = "Disabled: enter an MCAP output directory";
     }
     wd.setFieldValid("buttonFetch", true, fetch_tip);
   }
@@ -1539,6 +1557,10 @@ bool McapCloudDialog::onTextChanged(std::string_view widget_name, std::string_vi
     state_.query_text = std::string(text);
     return true;
   }
+  if (widget_name == "saveDirectory") {
+    state_.save_directory = std::string(text);
+    return true;
+  }
   // Cert sub-dialog input widgets: panel_engine fires onTextChanged for
   // each text/checkable child after the user clicks OK,
   // followed by an onClicked("subDialogAccepted") to commit. We just
@@ -1847,6 +1869,7 @@ bool McapCloudDialog::onClicked(std::string_view widget_name) {
     std::vector<std::string> topics;
     std::int64_t start = 0;
     std::int64_t end = 0;
+    std::string save_directory;
     std::string overlap_error;
     {
       std::lock_guard<std::mutex> lock(state_.mu);
@@ -1941,6 +1964,10 @@ bool McapCloudDialog::onClicked(std::string_view widget_name) {
         // allFetchesComplete, not per-topic).
         state_.fetch_active = true;
         state_.cancelling = false;
+        state_.mcap_save_failed = false;
+        if (state_.save_mcap) {
+          save_directory = state_.save_directory;
+        }
         // Immediate feedback: the worker's first pullPhase can be seconds away
         // (the per-download connection itself must connect over the WAN).
         state_.fetch_status = "Starting download - connecting session";
@@ -1967,7 +1994,10 @@ bool McapCloudDialog::onClicked(std::string_view widget_name) {
            fmt::format("Fetching {} topic(s) from {}…", topics.size(), display_name));
     postCommand(
         [w = worker_.get(), names = std::move(ordered_names), display_name, topics = std::move(topics), start,
-         end]() mutable { w->pullTopicsAsync(std::move(names), display_name, std::move(topics), start, end); });
+         end, save_directory = std::move(save_directory)]() mutable {
+          w->pullTopicsAsync(
+              std::move(names), display_name, std::move(topics), start, end, std::move(save_directory));
+        });
     persistState();  // crash-resilient: remember query + range at fetch time
     return true;
   }
@@ -2007,6 +2037,11 @@ bool McapCloudDialog::onToggled(std::string_view widget_name, bool checked) {
   if (widget_name == "checkShowInfo") {
     std::lock_guard<std::mutex> lock(state_.mu);
     state_.show_info = checked;  // widget_data() applies the visibility next tick
+    return true;
+  }
+  if (widget_name == "checkSaveMcap") {
+    std::lock_guard<std::mutex> lock(state_.mu);
+    state_.save_mcap = checked;
     return true;
   }
   if (widget_name == "checkAggregate") {
@@ -2919,6 +2954,31 @@ void McapCloudDialog::onPullFinished(
   }
 }
 
+void McapCloudDialog::onMcapSaveFinished(McapSaveResult result) {
+  {
+    std::lock_guard<std::mutex> lock(state_.mu);
+    state_.mcap_save_failed = result.status != McapSaveStatus::Complete;
+  }
+  if (result.status == McapSaveStatus::Complete) {
+    notify(PJ::ToolboxMessageLevel::kInfo, fmt::format("Saved MCAP: {}", result.path));
+    return;
+  }
+  if (result.status == McapSaveStatus::Partial) {
+    notify(
+        PJ::ToolboxMessageLevel::kWarning,
+        fmt::format("Partial MCAP retained: {} ({})", result.path, result.error));
+    return;
+  }
+  std::string message = "MCAP save failed";
+  if (!result.error.empty()) {
+    message += ": " + result.error;
+  }
+  if (!result.path.empty()) {
+    message += "\nPartial output: " + result.path;
+  }
+  notify(PJ::ToolboxMessageLevel::kError, message);
+}
+
 void McapCloudDialog::onAllFetchesComplete(std::string sequence_name) {
   FetchSummary summary;
   int total = 0;
@@ -2934,7 +2994,7 @@ void McapCloudDialog::onAllFetchesComplete(std::string sequence_name) {
     imported_any = state_.imported_any;
     summary = buildFetchSummary(
         state_.fetch_total, state_.fetch_done, state_.fetch_failed, state_.imported_any, state_.cancelling,
-        state_.error_counts);
+        state_.error_counts, state_.mcap_save_failed);
     state_.cancelling = false;
     if (summary.should_close) {
       state_.close_pending = true;  // PJ3 parity: panel closes after a successful batch.
@@ -2997,6 +3057,8 @@ void McapCloudDialog::persistState() {
   std::vector<std::string> selected_topics;
   bool aggregate = true;
   bool topics_all = false;
+  bool save_mcap = true;
+  std::string save_directory;
   int filter_tab = 0;
   std::map<std::string, std::string, std::less<>> basic_filter;
   {
@@ -3006,6 +3068,8 @@ void McapCloudDialog::persistState() {
     upper = state_.range_upper;
     aggregate = state_.aggregate;
     topics_all = state_.topics_all;
+    save_mcap = state_.save_mcap;
+    save_directory = state_.save_directory;
     filter_tab = state_.filter_tab;
     basic_filter = state_.basic_filter;
     // Selection is deliberately not persisted (2026-07-12): the toolbox opens
@@ -3020,6 +3084,8 @@ void McapCloudDialog::persistState() {
   settings.setStringList("mcap_cloud/selected_topics", selected_topics);
   settings.setBool("mcap_cloud/aggregate", aggregate);
   settings.setBool("mcap_cloud/topics_all", topics_all);
+  settings.setBool("mcap_cloud/save_mcap", save_mcap);
+  settings.setString("mcap_cloud/save_directory", save_directory);
   settings.setInt("mcap_cloud/filter_tab", filter_tab);
   // One key per LOCAL Basic-tab field (robot/source — customer/site are the
   // gate now, persisted per-server in onIndexChanged/onVocabularyReady, not
