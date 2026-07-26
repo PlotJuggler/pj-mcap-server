@@ -15,6 +15,15 @@
 
 namespace mcap_cloud {
 
+// Resolve a persisted/typed (customer, site) NAME pair against `vocab` into a
+// ListFilter carrying their current ids + the vocabulary's generation. Names
+// are matched exactly (case-sensitive, no trimming) — the caller normalizes if
+// it wants that. Returns nullopt when either name is absent from `vocab`: a
+// rebuild can rename/remove a site (or the caller is replaying a stale
+// persisted selection typed before this vocabulary was fetched), and a
+// half-resolved filter (customer id but no site) is not a valid ListFilter.
+// The returned ids are session handles: they are only meaningful together with
+// the embedded generation, and go stale the moment a new vocabulary arrives.
 [[nodiscard]] inline std::optional<ListFilter> resolveGateFilter(const VocabularyInfo& vocab,
                                                                  const std::string& customer,
                                                                  const std::string& site) {
@@ -31,15 +40,27 @@ namespace mcap_cloud {
         return f;
       }
     }
-    return std::nullopt;  // customer matched, site didn't
+    // Customer matched but no site under it matched: stop here rather than
+    // keep scanning. Customer names are unique within one VocabularyInfo (the
+    // catalog builds this list via a GROUP BY on customer), so no later
+    // customer entry could match `customer` either.
+    return std::nullopt;
   }
   return std::nullopt;
 }
 
+// Returns the sole customer name when `vocab` has EXACTLY one customer, else
+// "". The empty result is deliberately ambiguous between "zero customers"
+// (empty catalog) and "more than one" (needs an explicit pick) — those are
+// different GatePhases, so a caller that must tell them apart checks
+// vocab.customers.size() itself rather than relying on this return value.
 [[nodiscard]] inline std::string autoSelectCustomer(const VocabularyInfo& vocab) {
   return vocab.customers.size() == 1 ? vocab.customers[0].name : std::string{};
 }
 
+// Lists the site names under `customer`, in vocabulary (catalog) order — no
+// sorting is applied here, so the caller sees whatever order the server built
+// the vocabulary in. Returns {} when `customer` is not found in `vocab`.
 [[nodiscard]] inline std::vector<std::string> siteNamesFor(const VocabularyInfo& vocab,
                                                            const std::string& customer) {
   for (const auto& c : vocab.customers) {
