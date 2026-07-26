@@ -250,10 +250,13 @@ class FetchWorker {
     std::vector<SequenceInfo> sequences;
   };
 
-  /// Vocabulary result. recovery=true when this refresh was triggered from
-  /// INSIDE a filtered-list stale recovery — the dialog must then only refresh
-  /// combos, never auto-start another sweep (the recovery owns the retry).
-  std::function<void(VocabularyInfo vocab, bool recovery)> vocabularyReady;
+  /// Vocabulary result. request_id is echoed (uniformly with vocabularyFailed/
+  /// gatePageReady/gateListFinished) so the dialog can drop a stale answer by
+  /// simple id comparison, with no special case for this callback.
+  /// recovery=true when this refresh was triggered from INSIDE a
+  /// filtered-list stale recovery — the dialog must then only refresh combos,
+  /// never auto-start another sweep (the recovery owns the retry).
+  std::function<void(std::uint64_t request_id, VocabularyInfo vocab, bool recovery)> vocabularyReady;
   /// GetVocabulary failed on a live connection (the kVocabularyError phase).
   std::function<void(std::uint64_t request_id)> vocabularyFailed;
   /// One page of a gated sweep; reset semantics as in BackendConnection.

@@ -184,6 +184,14 @@ void FetchWorker::listSequencesAsync() {
 }
 
 void FetchWorker::fetchVocabularyAsync(std::uint64_t request_id) {
+  if (latest_gate_request_.load() != request_id) {
+    // Superseded before starting: unlike listSequencesFilteredAsync's gated
+    // list, a vocabulary fetch has no terminal-signal contract to honor (no
+    // callback here is documented as "exactly one per call") — a plain no-op
+    // is correct and the dialog's own id check would have dropped a stale
+    // answer anyway.
+    return;
+  }
   if (!backend_) {
     if (vocabularyFailed) {
       vocabularyFailed(request_id);
@@ -207,7 +215,7 @@ void FetchWorker::fetchVocabularyAsync(std::uint64_t request_id) {
   }
   vocab_ = std::move(*vocab);
   if (vocabularyReady) {
-    vocabularyReady(*vocab_, /*recovery=*/false);
+    vocabularyReady(request_id, *vocab_, /*recovery=*/false);
   }
 }
 
@@ -248,14 +256,26 @@ void FetchWorker::listSequencesFilteredAsync(std::uint64_t request_id, std::stri
   for (int attempt = 0; attempt < 2; ++attempt) {
     if (!vocab_) {
       auto fresh = backend_->getVocabulary();
+      if (backend_->isClosed()) {
+        // A dead browse socket during the recovery refresh: mirror
+        // fetchVocabularyAsync's and the sweep-below's handling exactly —
+        // without this check a dead socket read as an empty optional and
+        // fell through to the generic kRebuildStorm below, so the dialog
+        // never learned the connection was gone (connectionLost never
+        // fired) and the misdiagnosis read as "catalog rebuilding" instead
+        // of "reconnect".
+        notifyConnectionLostOnce();
+        finish(false, GateListResult::Error::kConnectionLost, {});
+        return;
+      }
       if (!fresh) {
-        break;  // connection-level failure — the final kRebuildStorm below explains it
+        break;  // vocabulary RPC failed on a live socket -> kRebuildStorm below
       }
       vocab_ = std::move(*fresh);
       // recovery=true: combos refresh, but the dialog must NOT start a second
       // sweep — THIS loop owns the retry (F3, the duplicate-sweep finding).
       if (vocabularyReady) {
-        vocabularyReady(*vocab_, /*recovery=*/true);
+        vocabularyReady(request_id, *vocab_, /*recovery=*/true);
       }
     }
     const auto filter = resolveGateFilter(*vocab_, customer, site);
