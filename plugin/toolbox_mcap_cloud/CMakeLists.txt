@@ -23,6 +23,24 @@ else()
     -Wcast-qual -Wconversion -Woverloaded-virtual -Wpedantic)
 endif()
 
+# Every GNU-style warning list below is a hard cl.exe error on MSVC (D8021:
+# "-Wextra" parses as an invalid /W numeric argument), so each one is gated
+# behind this genex. MSVC builds at cl's default warning level — the strict
+# -Werror bar stays owned by the gcc/clang (Linux CI) leg.
+set(PJ_NOT_MSVC "$<NOT:$<CXX_COMPILER_ID:MSVC>>")
+
+if(MSVC)
+  # Conformant preprocessor: the SDK's PJ_TOOLBOX_PLUGIN / PJ_DIALOG_PLUGIN
+  # 1-arg/2-arg __VA_ARGS__ dispatch mis-expands under MSVC's traditional
+  # preprocessor (the manifest argument bleeds into the vtable template-id ->
+  # C2912 on dialogVtableFor). Newer SDK packaging injects this flag from the
+  # Conan recipe; the pinned 0.11.0 package predates that, so set it here.
+  add_compile_options(/Zc:preprocessor)
+  # Keep windows.h from defining min/max macros (they break std::min/std::max)
+  # and from dragging the full Win32 surface into every TU.
+  add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN)
+endif()
+
 find_package(GTest REQUIRED)
 find_package(plotjuggler_sdk CONFIG REQUIRED COMPONENTS base plugin_sdk plugin_host)
 
@@ -113,8 +131,7 @@ target_compile_features(toolbox_mcap_cloud_plugin PRIVATE cxx_std_20)
 # core dialog/state-machine code is reviewed manually; this matches the
 # upstream toolbox build flags for the query/ subdir.
 target_compile_options(toolbox_mcap_cloud_plugin PRIVATE
-  -Wall -Wextra -Werror
-  -Wno-conversion -Wno-unused-parameter -Wno-unused-function
+  "$<${PJ_NOT_MSVC}:-Wall;-Wextra;-Werror;-Wno-conversion;-Wno-unused-parameter;-Wno-unused-function>"
 )
 
 target_include_directories(toolbox_mcap_cloud_plugin PRIVATE
@@ -183,7 +200,7 @@ add_executable(mcap-cloud-cli
 )
 target_compile_features(mcap-cloud-cli PRIVATE cxx_std_20)
 target_compile_options(mcap-cloud-cli PRIVATE
-  -Wall -Wextra -Werror -Wshadow -Wold-style-cast -Wcast-qual -Wconversion
+  "$<${PJ_NOT_MSVC}:-Wall;-Wextra;-Werror;-Wshadow;-Wold-style-cast;-Wcast-qual;-Wconversion>"
 )
 target_include_directories(mcap-cloud-cli PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/src
@@ -197,7 +214,7 @@ set_source_files_properties(
   src/wire_mapping.cpp
   src/session_decode.cpp
   tools/session_download.cpp
-  PROPERTIES COMPILE_OPTIONS "-Wno-conversion;-Wno-old-style-cast;-Wno-cast-qual;-Wno-shadow"
+  PROPERTIES COMPILE_OPTIONS "$<${PJ_NOT_MSVC}:-Wno-conversion;-Wno-old-style-cast;-Wno-cast-qual;-Wno-shadow>"
 )
 target_link_libraries(mcap-cloud-cli PRIVATE
   protobuf::libprotobuf
@@ -222,6 +239,9 @@ target_link_libraries(mcap-cloud-cli PRIVATE
 # ----------------------------------------------------------------------------
 if(BUILD_TESTING)
   find_package(GTest REQUIRED)
+  # The UI well-formedness ctest below shells out to a Python interpreter; on
+  # Windows runners `python3` is not reliably on PATH, so resolve it here.
+  find_package(Python3 REQUIRED COMPONENTS Interpreter)
 
   # Fetch-completion policy (close/import/error-dedup). Header-only, std only.
   add_executable(toolbox_mcap_cloud_fetch_summary_test
@@ -333,8 +353,7 @@ if(BUILD_TESTING)
   # Match the plugin's relaxed flags: the vendored PJ3 query/* headers and sol2
   # trip -Wconversion / -Wunused-parameter under -Werror.
   target_compile_options(toolbox_mcap_cloud_query_engine_test PRIVATE
-    -Wall -Wextra -Werror
-    -Wno-conversion -Wno-unused-parameter -Wno-unused-function
+    "$<${PJ_NOT_MSVC}:-Wall;-Wextra;-Werror;-Wno-conversion;-Wno-unused-parameter;-Wno-unused-function>"
   )
   target_include_directories(toolbox_mcap_cloud_query_engine_test PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
@@ -352,8 +371,7 @@ if(BUILD_TESTING)
   )
   target_compile_features(toolbox_mcap_cloud_query_filter_test PRIVATE cxx_std_20)
   target_compile_options(toolbox_mcap_cloud_query_filter_test PRIVATE
-    -Wall -Wextra -Werror
-    -Wno-conversion -Wno-unused-parameter -Wno-unused-function
+    "$<${PJ_NOT_MSVC}:-Wall;-Wextra;-Werror;-Wno-conversion;-Wno-unused-parameter;-Wno-unused-function>"
   )
   target_include_directories(toolbox_mcap_cloud_query_filter_test PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
@@ -506,7 +524,7 @@ if(BUILD_TESTING)
   # test TU keeps strict flags (gtest's defaults), the unit/codegen TUs relax it.
   set_source_files_properties(
     src/session_decode.cpp
-    PROPERTIES COMPILE_OPTIONS "-Wno-conversion"
+    PROPERTIES COMPILE_OPTIONS "$<${PJ_NOT_MSVC}:-Wno-conversion>"
   )
   target_link_libraries(toolbox_mcap_cloud_session_decode_test PRIVATE
     protobuf::libprotobuf zstd::libzstd_static LZ4::lz4_static GTest::gtest_main
@@ -526,7 +544,7 @@ if(BUILD_TESTING)
   )
   target_compile_features(toolbox_mcap_cloud_parser_ingest_test PRIVATE cxx_std_20)
   target_compile_options(toolbox_mcap_cloud_parser_ingest_test PRIVATE
-    -Wall -Wextra -Werror
+    "$<${PJ_NOT_MSVC}:-Wall;-Wextra;-Werror>"
   )
   target_include_directories(toolbox_mcap_cloud_parser_ingest_test PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
@@ -564,7 +582,7 @@ if(BUILD_TESTING)
     src/backend_connection.cpp
     src/wire_mapping.cpp
     src/session_decode.cpp
-    PROPERTIES COMPILE_OPTIONS "-Wno-conversion"
+    PROPERTIES COMPILE_OPTIONS "$<${PJ_NOT_MSVC}:-Wno-conversion>"
   )
   target_link_libraries(toolbox_mcap_cloud_session_resume_live_test PRIVATE
     plotjuggler_sdk::plugin_sdk
@@ -624,7 +642,7 @@ if(BUILD_TESTING)
     src/backend_connection.cpp
     src/wire_mapping.cpp
     src/session_decode.cpp
-    PROPERTIES COMPILE_OPTIONS "-Wno-conversion"
+    PROPERTIES COMPILE_OPTIONS "$<${PJ_NOT_MSVC}:-Wno-conversion>"
   )
   target_link_libraries(toolbox_mcap_cloud_session_download_live_test PRIVATE
     protobuf::libprotobuf ixwebsocket::ixwebsocket zstd::libzstd_static LZ4::lz4_static GTest::gtest_main
@@ -693,7 +711,7 @@ if(BUILD_TESTING)
     src/backend_connection.cpp
     src/wire_mapping.cpp
     src/session_decode.cpp
-    PROPERTIES COMPILE_OPTIONS "-Wno-conversion"
+    PROPERTIES COMPILE_OPTIONS "$<${PJ_NOT_MSVC}:-Wno-conversion>"
   )
   target_link_libraries(toolbox_mcap_cloud_server_caps_test PRIVATE
     protobuf::libprotobuf ixwebsocket::ixwebsocket zstd::libzstd_static LZ4::lz4_static GTest::gtest_main
@@ -718,18 +736,21 @@ if(BUILD_TESTING)
   # symbols only (RTLD_NOW|RTLD_LOCAL) — never constructs the Qt dialog without a
   # QApplication. The .so path is passed via a compile definition from the target
   # file (mirrors how the ROS parity test passes PJ_ROS_PARSER_PLUGIN_PATH).
-  add_executable(toolbox_mcap_cloud_plugin_load_smoke_test
-    tests/plugin_load_smoke_test.cpp
-  )
-  target_link_libraries(toolbox_mcap_cloud_plugin_load_smoke_test PRIVATE
-    GTest::gtest_main ${CMAKE_DL_LIBS}
-  )
-  target_compile_definitions(toolbox_mcap_cloud_plugin_load_smoke_test PRIVATE
-    MCAP_PLUGIN_SO_PATH="$<TARGET_FILE:toolbox_mcap_cloud_plugin>"
-  )
-  # Build the .so before this test runs (it dlopens the artifact).
-  add_dependencies(toolbox_mcap_cloud_plugin_load_smoke_test toolbox_mcap_cloud_plugin)
-  add_test(NAME McapCloudPluginLoadSmokeTest COMMAND toolbox_mcap_cloud_plugin_load_smoke_test)
+  # POSIX-only (dlfcn.h): not built on Windows.
+  if(NOT WIN32)
+    add_executable(toolbox_mcap_cloud_plugin_load_smoke_test
+      tests/plugin_load_smoke_test.cpp
+    )
+    target_link_libraries(toolbox_mcap_cloud_plugin_load_smoke_test PRIVATE
+      GTest::gtest_main ${CMAKE_DL_LIBS}
+    )
+    target_compile_definitions(toolbox_mcap_cloud_plugin_load_smoke_test PRIVATE
+      MCAP_PLUGIN_SO_PATH="$<TARGET_FILE:toolbox_mcap_cloud_plugin>"
+    )
+    # Build the .so before this test runs (it dlopens the artifact).
+    add_dependencies(toolbox_mcap_cloud_plugin_load_smoke_test toolbox_mcap_cloud_plugin)
+    add_test(NAME McapCloudPluginLoadSmokeTest COMMAND toolbox_mcap_cloud_plugin_load_smoke_test)
+  endif()
 
   # B14 no-Qt guard (HERMETIC, build-only): the as-built mcap-cloud-cli links
   # ZERO Qt (ixwebsocket transport, not QtWebSockets). Enforce it: ldd the built
@@ -737,12 +758,14 @@ if(BUILD_TESTING)
   # This is the as-built adaptation of Plan B Task 14's CI guard — the plugin CI
   # that the plan envisioned does not exist, so the invariant is pinned as a
   # ctest instead. Only the CLI is asserted Qt-free; the plugin .so IS a Qt dialog
-  # and is intentionally NOT guarded here.
-  add_test(NAME McapCloudCliNoQtGuard
-    COMMAND ${CMAKE_COMMAND}
-      -DCLI_BIN=$<TARGET_FILE:mcap-cloud-cli>
-      -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/check_no_qt.cmake
-  )
+  # and is intentionally NOT guarded here. ldd-based: not registered on Windows.
+  if(NOT WIN32)
+    add_test(NAME McapCloudCliNoQtGuard
+      COMMAND ${CMAKE_COMMAND}
+        -DCLI_BIN=$<TARGET_FILE:mcap-cloud-cli>
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/check_no_qt.cmake
+    )
+  endif()
 
   # The embedded .ui files are hex-dumped verbatim by pj_embed_ui (never parsed
   # at build time), so a malformed XML compiles fine and only explodes at
@@ -752,7 +775,7 @@ if(BUILD_TESTING)
   # Caught live: an em-dash "fixed" to `--` INSIDE an XML comment is illegal
   # XML and silently killed the tag sub-dialog.
   add_test(NAME McapCloudUiFilesWellFormed
-    COMMAND python3 -c
+    COMMAND ${Python3_EXECUTABLE} -c
 "import sys, xml.etree.ElementTree as ET
 for f in sys.argv[1:]:
     ET.parse(f)  # raises on malformed XML (incl. '--' inside comments)

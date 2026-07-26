@@ -16,6 +16,16 @@
 #include "session_decode.hpp"
 #include "wire_mapping.hpp"
 
+// Deliberately NOT #include <ixwebsocket/IXNetSystem.h>: on Windows it pulls
+// in windows.h, whose winerror.h defines ERROR_NOT_FOUND (and other ERROR_*
+// names) as numeric macros that textually clobber the pj_cloud::v1::ERROR_*
+// enumerators in errorCodeName() below (C2589). Forward-declare the one free
+// function the constructor needs — the signature is pinned by ixwebsocket, so
+// a drift would be a loud link error, never a silent mismatch.
+namespace ix {
+bool initNetSystem();
+}  // namespace ix
+
 namespace mcap_cloud {
 
 namespace {
@@ -81,7 +91,15 @@ BackendConnection::BackendConnection(std::string uri, std::string cert_path, std
     : uri_(std::move(uri)),
       cert_path_(std::move(cert_path)),
       api_key_(std::move(api_key)),
-      allow_insecure_(allow_insecure) {}
+      allow_insecure_(allow_insecure) {
+  // Windows requires WSAStartup before any socket call and ixwebsocket does
+  // not self-initialize; a function-local static runs it exactly once per
+  // process (no-op on POSIX). Never paired with uninitNetSystem — winsock
+  // stays initialized for the process lifetime, which is what every consumer
+  // of this class (plugin dialog, CLI, tests) wants.
+  static const bool net_system_ready = ix::initNetSystem();
+  (void)net_system_ready;
+}
 
 BackendConnection::~BackendConnection() {
   if (socket_) {
