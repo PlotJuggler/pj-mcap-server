@@ -466,3 +466,129 @@ TEST(FilteredList, AbortPredicateStopsTheSweepBetweenPages) {
   EXPECT_EQ(pages_seen, 1);
   EXPECT_LT(rows.size(), 1200u);
 }
+
+// --- gate supersession ---------------------------------------------------
+//
+// Why this suite exists. The dialog's fetch worker binds a `listSequences`
+// abort predicate to "the gate selection the user is currently looking at"
+// (customer/site/generation): the moment the user picks a different site
+// mid-sweep, the OLD sweep must become inert — no more of ITS pages may reach
+// the UI, or the table would show a flash of the previous site's rows before
+// the new sweep's first page lands. The worker maps a superseded sweep to a
+// dedicated `kSuperseded` terminal state, distinct from `ERROR_STALE_CATALOG`
+// (a server-reported rebuild race, surfaced as `stale_vocabulary`) — mixing
+// the two would make the worker retry a supersession (wrong: the selection is
+// gone, there's nothing to retry) or silently drop a real staleness signal.
+// These tests pin the BackendConnection-level half of that contract: once
+// `abort` starts returning true, no further page reaches the callback AND no
+// further request reaches the wire, while an abort predicate that never
+// fires is provably a no-op. (The FetchWorker itself needs `connectAsync` +
+// a host harness that doesn't exist yet, so worker-level supersession
+// plumbing is out of scope here — see FilteredList.AbortPredicateStops...
+// above for the sibling filtered-sweep case this suite complements.)
+
+TEST(GateSupersession, AbortedSweepDeliversNoFurtherPagesAfterSupersession) {
+  FakePagingServer server(/*total_rows=*/1200, /*stale_at_page=*/-1);
+  server.setPageDelayMs(30);  // slow pages so supersession lands mid-sweep
+  ASSERT_TRUE(server.ok());
+  mcap_cloud::BackendConnection conn(server.uri(), "", "", false);
+  std::string err;
+  ASSERT_TRUE(conn.connect(&err)) << err;
+
+  std::atomic<std::uint64_t> latest{1};
+  int pages_after_supersede = 0;
+  int pages_seen = 0;
+  bool complete = true;
+  (void)conn.listSequences(
+      &complete,
+      [&](const std::vector<mcap_cloud::SequenceInfo>&, bool) {
+        ++pages_seen;
+        if (latest.load() != 1) { ++pages_after_supersede; }
+        if (pages_seen == 1) { latest.store(2); }  // the user picked another site
+      },
+      nullptr, nullptr, [&] { return latest.load() != 1; });
+  EXPECT_FALSE(complete);
+  EXPECT_LE(pages_after_supersede, 0) << "no page may arrive after supersession";
+  EXPECT_EQ(pages_seen, 1);
+}
+
+TEST(GateSupersession, SupersededSweepStopsIssuingRequestsNotJustPages) {
+  // The previous test proves no further PAGE reaches the callback; this one
+  // proves the sweep stops issuing REQUESTS, the stronger claim. listSequences
+  // polls abort() at the TOP of the page loop (backend_connection.cpp, before
+  // the ListFiles request is even built — see the header doc on `abort`:
+  // "polled at the top of every page iteration"). Sequence of events here:
+  //   iteration 1: abort() false -> request page_token="" sent (limit=500,
+  //     rows 0..499) -> on_page callback fires and flips `latest`, so the
+  //     predicate is now true -> page_token becomes "1", loop continues.
+  //   iteration 2: abort() true -> return immediately, BEFORE building/sending
+  //     the page-index-1 request.
+  // So exactly ONE request reaches the server, not the three
+  // (500+500+200 rows) an unsuperseded 1200-row sweep at the 500-row page
+  // limit would issue.
+  FakePagingServer server(/*total_rows=*/1200, /*stale_at_page=*/-1);
+  ASSERT_TRUE(server.ok());
+  mcap_cloud::BackendConnection conn(server.uri(), "", "", false);
+  std::string err;
+  ASSERT_TRUE(conn.connect(&err)) << err;
+
+  std::atomic<std::uint64_t> latest{1};
+  bool complete = true;
+  (void)conn.listSequences(
+      &complete,
+      [&](const std::vector<mcap_cloud::SequenceInfo>&, bool) { latest.store(2); },
+      nullptr, nullptr, [&] { return latest.load() != 1; });
+  EXPECT_FALSE(complete);
+  EXPECT_EQ(server.limitsSeen().size(), 1u)
+      << "abort must be checked before the next request is built/sent, not merely "
+         "before its (already in-flight) response is delivered to the callback";
+}
+
+TEST(GateSupersession, AbsentOrAlwaysFalseAbortPredicateIsANoOp) {
+  // Proves the predicate adds zero behavioural change when it never fires:
+  // an abort that always returns false must let the sweep run to completion
+  // exactly like the no-abort overload used everywhere else in this file.
+  FakePagingServer server(/*total_rows=*/1200, /*stale_at_page=*/-1);
+  ASSERT_TRUE(server.ok());
+  mcap_cloud::BackendConnection conn(server.uri(), "", "", false);
+  std::string err;
+  ASSERT_TRUE(conn.connect(&err)) << err;
+
+  bool complete = false;
+  const auto rows =
+      conn.listSequences(&complete, {}, nullptr, nullptr, /*abort=*/[] { return false; });
+  EXPECT_TRUE(complete);
+  EXPECT_EQ(rows.size(), 1200u);
+}
+
+TEST(GateSupersession, FilteredSweepSupersessionIsNotReportedAsStaleVocabulary) {
+  // Supersession (client decided to stop) and staleness (server reported a
+  // rebuilt catalog) must stay distinguishable on a FILTERED sweep too: the
+  // worker maps them to different terminal states (kSuperseded vs. a
+  // vocabulary refresh). A gate switch mid-sweep must leave stale_vocabulary
+  // FALSE even though the result is partial/incomplete, exactly like an
+  // unfiltered supersession.
+  FakePagingServer server(/*total_rows=*/1200, /*stale_at_page=*/-1);
+  ASSERT_TRUE(server.ok());
+  mcap_cloud::BackendConnection conn(server.uri(), "", "", false);
+  std::string err;
+  ASSERT_TRUE(conn.connect(&err)) << err;
+
+  mcap_cloud::ListFilter filter;
+  filter.customer_id = 11;
+  filter.site_id = 21;
+  filter.generation = "gen-1";
+
+  int pages_seen = 0;
+  bool complete = true;
+  bool stale = false;
+  const auto rows = conn.listSequences(
+      &complete,
+      [&](const std::vector<mcap_cloud::SequenceInfo>&, bool) { ++pages_seen; }, &filter,
+      &stale, [&] { return pages_seen >= 1; });  // supersede right after page one (700 rows / 2 pages)
+
+  EXPECT_FALSE(complete);
+  EXPECT_FALSE(stale) << "supersession is a client decision, not a server-reported staleness";
+  EXPECT_FALSE(rows.empty());
+  EXPECT_LT(rows.size(), 700u) << "the fake's site_rows_ — a full filtered sweep would return all 700";
+}
