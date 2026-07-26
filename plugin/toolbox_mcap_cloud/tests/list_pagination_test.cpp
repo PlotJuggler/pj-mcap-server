@@ -508,7 +508,7 @@ TEST(GateSupersession, AbortedSweepDeliversNoFurtherPagesAfterSupersession) {
       },
       nullptr, nullptr, [&] { return latest.load() != 1; });
   EXPECT_FALSE(complete);
-  EXPECT_LE(pages_after_supersede, 0) << "no page may arrive after supersession";
+  EXPECT_EQ(pages_after_supersede, 0) << "no page may arrive after supersession";
   EXPECT_EQ(pages_seen, 1);
 }
 
