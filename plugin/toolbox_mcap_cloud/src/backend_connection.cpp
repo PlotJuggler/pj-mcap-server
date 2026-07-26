@@ -428,9 +428,15 @@ std::optional<ServerCaps> BackendConnection::serverCapabilities() const {
 }
 
 std::vector<SequenceInfo> BackendConnection::listSequences(bool* complete,
-                                                           const PageCallback& on_page) {
+                                                           const PageCallback& on_page,
+                                                           const ListFilter* filter,
+                                                           bool* stale_vocabulary,
+                                                           const std::function<bool()>& abort) {
   if (complete != nullptr) {
     *complete = false;
+  }
+  if (stale_vocabulary != nullptr) {
+    *stale_vocabulary = false;
   }
   std::vector<SequenceInfo> sequences;
   std::unordered_map<std::string, std::uint64_t> file_ids;
@@ -456,10 +462,23 @@ std::vector<SequenceInfo> BackendConnection::listSequences(bool* complete,
     // a previous (stale-aborted) attempt already handed it.
     bool reset_consumer = true;
     for (;;) {
+      if (abort && abort()) {
+        return sequences;  // superseded — PARTIAL (exhausted stays false)
+      }
       pj_cloud::v1::ClientMessage request;
       auto* list = request.mutable_list_files();
       list->set_page_token(page_token);
       list->set_limit(kListFilesPageLimit);
+      if (filter != nullptr && !filter->empty()) {
+        auto* wire_filter = list->mutable_filter();
+        if (filter->customer_id) { wire_filter->set_customer_id(*filter->customer_id); }
+        if (filter->site_id)     { wire_filter->set_site_id(*filter->site_id); }
+        // Page-one-only echo: later pages carry the generation inside
+        // page_token (server contract, handlers_catalog.go:157).
+        if (page_token.empty()) {
+          list->set_expected_catalog_generation(filter->generation);
+        }
+      }
 
       pj_cloud::v1::ServerMessage response;
       if (!sendAndWait(request, &response)) {
@@ -467,7 +486,14 @@ std::vector<SequenceInfo> BackendConnection::listSequences(bool* complete,
       }
       if (response.has_error() &&
           response.error().code() == pj_cloud::v1::ERROR_STALE_CATALOG) {
-        stale = true;  // rebuild raced the pagination — restart from page one
+        if (filter != nullptr && !filter->empty()) {
+          // Filtered ids belong to a dead generation: retrying is at best
+          // futile, at worst selects a renumbered WRONG dimension. Abort;
+          // the caller re-resolves names -> ids from a fresh vocabulary.
+          if (stale_vocabulary != nullptr) { *stale_vocabulary = true; }
+          return {};
+        }
+        stale = true;  // unfiltered: bounded restart (existing behaviour)
         break;
       }
       if (!response.has_list_files()) {

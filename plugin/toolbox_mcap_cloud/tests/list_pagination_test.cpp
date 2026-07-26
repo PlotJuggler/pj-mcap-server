@@ -32,9 +32,12 @@
 #include <unistd.h>
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <mutex>
+#include <optional>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <ixwebsocket/IXWebSocketServer.h>
@@ -97,33 +100,56 @@ class FakePagingServer {
         vocab->set_catalog_generation("gen-1");
       } else if (request.has_list_files()) {
         const auto& req = request.list_files();
+        const bool filtered = req.filter().has_site_id() || req.filter().has_customer_id();
         const int page_index = req.page_token().empty() ? 0 : std::stoi(req.page_token());
         {
           std::lock_guard<std::mutex> lock(mu_);
           limits_seen_.push_back(req.limit());
+          generations_seen_.push_back(req.expected_catalog_generation());
+          filter_sites_seen_.push_back(req.filter().has_site_id()
+                                            ? std::optional<std::uint64_t>(req.filter().site_id())
+                                            : std::nullopt);
         }
-        // Inject the rebuild race exactly once, on the requested page.
-        if (page_index == stale_at_page_ && !stale_fired_.exchange(true)) {
+        if (page_delay_ms_.load() > 0) {
+          std::this_thread::sleep_for(std::chrono::milliseconds(page_delay_ms_.load()));
+        }
+        if (filtered && page_index == 0 && req.expected_catalog_generation().empty()) {
+          auto* err = response.mutable_error();
+          err->set_code(pj_cloud::v1::ERROR_INVALID_REQUEST);
+          err->set_message("dimension filter without expected_catalog_generation");
+        } else if (!req.expected_catalog_generation().empty() &&
+                   req.expected_catalog_generation() != "gen-1") {
+          auto* err = response.mutable_error();
+          err->set_code(pj_cloud::v1::ERROR_STALE_CATALOG);
+          err->set_message("stale generation");
+        } else if (page_index == stale_at_page_ && !stale_fired_.exchange(true)) {
+          // Inject the rebuild race exactly once, on the requested page.
           auto* err = response.mutable_error();
           err->set_code(pj_cloud::v1::ERROR_STALE_CATALOG);
           err->set_message("catalog rebuilt mid-pagination");
-          std::string payload;
-          response.SerializeToString(&payload);
-          ws.sendBinary(payload);
-          return;
-        }
-        const int limit = req.limit() == 0 ? 200 : std::min<int>(req.limit(), 1000);
-        auto* list = response.mutable_list_files();
-        list->set_catalog_generation("gen-1");
-        const int start = page_index * limit;
-        const int end = std::min(start + limit, total_rows_);
-        for (int i = start; i < end; ++i) {
-          auto* file = list->add_files();
-          file->set_id(static_cast<std::uint64_t>(i + 1));
-          file->set_s3_key("file_" + std::to_string(i) + ".mcap");
-        }
-        if (end < total_rows_) {
-          list->set_next_page_token(std::to_string(page_index + 1));
+        } else {
+          const int rows_for_request = filtered ? site_rows_ : total_rows_;
+          const int requested_limit = req.limit() == 0 ? 200 : std::min<int>(req.limit(), 1000);
+          // site_rows_ (300) is smaller than a real client page
+          // (kListFilesPageLimit==500), so an unmodified filtered sweep would
+          // always finish in a single page and the stale-on-page-two test
+          // could never exercise a genuine second request. Cap the SERVED
+          // chunk for filtered results only (limits_seen_ still records the
+          // client's real requested limit, untouched) so 300 filtered rows
+          // still spans multiple pages.
+          const int limit = filtered ? std::min(requested_limit, kFilteredPageChunk) : requested_limit;
+          auto* list = response.mutable_list_files();
+          list->set_catalog_generation("gen-1");
+          const int start = page_index * limit;
+          const int end = std::min(start + limit, rows_for_request);
+          for (int i = start; i < end; ++i) {
+            auto* file = list->add_files();
+            file->set_id(static_cast<std::uint64_t>(i + 1));
+            file->set_s3_key("file_" + std::to_string(i) + ".mcap");
+          }
+          if (end < rows_for_request) {
+            list->set_next_page_token(std::to_string(page_index + 1));
+          }
         }
       } else {
         return;
@@ -149,15 +175,40 @@ class FakePagingServer {
     return limits_seen_;
   }
 
+  [[nodiscard]] std::vector<std::string> generationsSeen() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return generations_seen_;
+  }
+
+  [[nodiscard]] std::vector<std::optional<std::uint64_t>> filterSitesSeen() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return filter_sites_seen_;
+  }
+
+  // TEST-ONLY: sleep this many ms at the top of each list_files reply (used by
+  // a later task's supersession test to widen the window for an abort to land
+  // between pages). 0 = disabled (default).
+  void setPageDelayMs(int ms) { page_delay_ms_.store(ms); }
+
  private:
   int port_;
   ix::WebSocketServer server_;
   int total_rows_;
   int stale_at_page_;
+  // Total rows served for a FILTERED (site_id/customer_id) request, independent
+  // of total_rows_ (the unfiltered count) — mirrors the real server's dimension
+  // scoping without needing a second fake.
+  int site_rows_ = 300;
+  // Per-page chunk size for filtered results only — see the comment at its use
+  // site (below, in the list_files branch).
+  static constexpr int kFilteredPageChunk = 200;
   std::atomic<bool> stale_fired_{false};
+  std::atomic<int> page_delay_ms_{0};
   bool ok_ = false;
   mutable std::mutex mu_;
   std::vector<std::uint32_t> limits_seen_;
+  std::vector<std::string> generations_seen_;
+  std::vector<std::optional<std::uint64_t>> filter_sites_seen_;
 };
 
 // One recorded invocation of the progressive page callback.
@@ -324,4 +375,102 @@ TEST(Vocabulary, MapsTheCustomerSiteTree) {
 TEST(Vocabulary, FailsCleanlyWhenNotConnected) {
   mcap_cloud::BackendConnection conn("ws://127.0.0.1:1", "", "", false);
   EXPECT_FALSE(conn.getVocabulary().has_value());
+}
+
+// --- filtered listing --------------------------------------------------
+
+TEST(FilteredList, SendsSiteIdWithGenerationOnPageOneOnly) {
+  FakePagingServer server(/*total_rows=*/1200, /*stale_at_page=*/-1);
+  ASSERT_TRUE(server.ok());
+  mcap_cloud::BackendConnection conn(server.uri(), "", "", false);
+  std::string err;
+  ASSERT_TRUE(conn.connect(&err)) << err;
+
+  mcap_cloud::ListFilter filter;
+  filter.customer_id = 11;
+  filter.site_id = 21;
+  filter.generation = "gen-1";
+  bool complete = false;
+  bool stale = false;
+  const auto rows = conn.listSequences(&complete, {}, &filter, &stale);
+  EXPECT_TRUE(complete);
+  EXPECT_FALSE(stale);
+  EXPECT_EQ(rows.size(), 300u);  // the fake's site_rows_
+  const auto gens = server.generationsSeen();
+  ASSERT_GE(gens.size(), 1u);
+  EXPECT_EQ(gens[0], "gen-1");            // page one: explicit echo
+  for (std::size_t i = 1; i < gens.size(); ++i) {
+    EXPECT_TRUE(gens[i].empty()) << "later pages ride page_token, no echo";
+  }
+  for (const auto& s : server.filterSitesSeen()) {
+    EXPECT_EQ(s, std::optional<std::uint64_t>(21)) << "filter on EVERY page";
+  }
+}
+
+TEST(FilteredList, StaleOnPageTwoAbortsWithoutRetryAndReportsStaleVocabulary) {
+  FakePagingServer server(/*total_rows=*/1200, /*stale_at_page=*/1);
+  ASSERT_TRUE(server.ok());
+  mcap_cloud::BackendConnection conn(server.uri(), "", "", false);
+  std::string err;
+  ASSERT_TRUE(conn.connect(&err)) << err;
+  mcap_cloud::ListFilter filter;
+  filter.site_id = 21;
+  filter.generation = "gen-1";
+  bool complete = false;
+  bool stale = false;
+  const auto rows = conn.listSequences(&complete, {}, &filter, &stale);
+  EXPECT_FALSE(complete);
+  EXPECT_TRUE(stale) << "caller must re-resolve names->ids, never blind-retry";
+  EXPECT_TRUE(rows.empty());
+  EXPECT_EQ(server.limitsSeen().size(), 2u) << "page 0 ok, page 1 stale, NO retry";
+}
+
+TEST(FilteredList, DeadGenerationOnPageOneAbortsStale) {
+  FakePagingServer server(/*total_rows=*/1200, /*stale_at_page=*/-1);
+  ASSERT_TRUE(server.ok());
+  mcap_cloud::BackendConnection conn(server.uri(), "", "", false);
+  std::string err;
+  ASSERT_TRUE(conn.connect(&err)) << err;
+  mcap_cloud::ListFilter filter;
+  filter.site_id = 21;
+  filter.generation = "gen-0-DEAD";
+  bool complete = false;
+  bool stale = false;
+  const auto rows = conn.listSequences(&complete, {}, &filter, &stale);
+  EXPECT_FALSE(complete);
+  EXPECT_TRUE(stale);
+  EXPECT_TRUE(rows.empty());
+  EXPECT_EQ(server.limitsSeen().size(), 1u);
+}
+
+TEST(FilteredList, UnfilteredStaleRetryBehaviourIsUnchanged) {
+  FakePagingServer server(/*total_rows=*/1200, /*stale_at_page=*/1);
+  ASSERT_TRUE(server.ok());
+  mcap_cloud::BackendConnection conn(server.uri(), "", "", false);
+  std::string err;
+  ASSERT_TRUE(conn.connect(&err)) << err;
+  bool complete = false;
+  bool stale = false;
+  const auto rows = conn.listSequences(&complete, {}, nullptr, &stale);
+  EXPECT_TRUE(complete);
+  EXPECT_FALSE(stale);
+  EXPECT_EQ(rows.size(), 1200u);
+}
+
+TEST(FilteredList, AbortPredicateStopsTheSweepBetweenPages) {
+  FakePagingServer server(/*total_rows=*/1200, /*stale_at_page=*/-1);
+  ASSERT_TRUE(server.ok());
+  mcap_cloud::BackendConnection conn(server.uri(), "", "", false);
+  std::string err;
+  ASSERT_TRUE(conn.connect(&err)) << err;
+  int pages_seen = 0;
+  bool complete = true;
+  const auto rows = conn.listSequences(
+      &complete,
+      [&](const std::vector<mcap_cloud::SequenceInfo>&, bool) { ++pages_seen; },
+      nullptr, nullptr,
+      /*abort=*/[&] { return pages_seen >= 1; });  // supersession after page one
+  EXPECT_FALSE(complete);
+  EXPECT_EQ(pages_seen, 1);
+  EXPECT_LT(rows.size(), 1200u);
 }

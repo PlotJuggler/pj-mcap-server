@@ -169,6 +169,15 @@ struct VocabularyInfo {
   }
 };
 
+// Server-side ListFiles dimension filter. ids come from a VocabularyInfo and
+// are ONLY meaningful with that vocabulary's generation (echoed on page one).
+struct ListFilter {
+  std::optional<std::uint64_t> customer_id;
+  std::optional<std::uint64_t> site_id;
+  std::string generation;  // REQUIRED when any id is set (server: INVALID_REQUEST otherwise)
+  [[nodiscard]] bool empty() const { return !customer_id && !site_id; }
+};
+
 // ---------------------------------------------------------------------------
 // Session / streaming (Slice 2). These mirror the wire OpenSessionResponse
 // bindings (names + schemas cross the wire ONCE; everything afterwards is

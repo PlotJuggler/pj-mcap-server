@@ -119,8 +119,26 @@ class BackendConnection {
   // everything shown so far", or a rebuild mid-browse duplicates rows.
   using PageCallback = std::function<void(const std::vector<SequenceInfo>& page, bool reset)>;
 
+  // `filter` (optional): a server-side dimension filter (customer_id/site_id)
+  // bound to a VocabularyInfo generation. A FILTERED request that hits
+  // ERROR_STALE_CATALOG ABORTS immediately (*stale_vocabulary = true, empty
+  // result) rather than retrying — its dimension ids belong to a dead
+  // generation, and a blind retry could silently select a renumbered WRONG
+  // site. The caller must re-fetch the vocabulary and re-resolve names to ids.
+  // An UNFILTERED request keeps the existing bounded-restart behaviour.
+  //
+  // `stale_vocabulary` (optional out): set true only on the filtered-abort
+  // path above; always cleared to false on entry.
+  //
+  // `abort` (optional): polled at the top of every page iteration (including
+  // the first). When it returns true the sweep stops immediately and returns
+  // whatever has been accumulated so far, with *complete left false (a
+  // superseded sweep — e.g. the user changed the filter mid-listing).
   [[nodiscard]] std::vector<SequenceInfo> listSequences(bool* complete = nullptr,
-                                                        const PageCallback& on_page = {});
+                                                        const PageCallback& on_page = {},
+                                                        const ListFilter* filter = nullptr,
+                                                        bool* stale_vocabulary = nullptr,
+                                                        const std::function<bool()>& abort = {});
 
   // GetVocabulary RPC: the customer->site filter tree + the generation its ids
   // are bound to. nullopt on timeout / dead socket / server Error. ids are ONLY
