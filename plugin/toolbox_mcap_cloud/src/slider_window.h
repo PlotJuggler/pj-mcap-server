@@ -41,9 +41,14 @@ inline SliderWindow sliderToWindow(std::int64_t union_min_ns, std::int64_t union
     return out;  // (0,0): whole-range sentinel
   }
   const std::int64_t span = union_max_ns - union_min_ns;
-  // 128-bit intermediate: span (<=~int64) * lower (<=1e6) cannot overflow.
+  // Exact muldiv without a 128-bit intermediate (MSVC has no __int128): with
+  // span = q*steps + r, span*pos/steps == q*pos + r*pos/steps in truncating
+  // integer arithmetic, and neither term can overflow — q*pos <= span for
+  // pos <= steps, and r*pos < steps^2 (< 2^62 even for steps = INT_MAX).
   const auto offset = [&](int pos) -> std::int64_t {
-    return static_cast<std::int64_t>(static_cast<__int128>(span) * pos / slider_steps);
+    const std::int64_t q = span / slider_steps;
+    const std::int64_t r = span % slider_steps;
+    return q * pos + r * pos / slider_steps;
   };
   out.start_ns = union_min_ns + offset(lower);
   out.end_ns = (upper >= slider_steps) ? union_max_ns + 1 : union_min_ns + offset(upper);

@@ -38,13 +38,13 @@ TEST(SliderWindow, MultiHourAggregateDoesNotOverflow) {
   EXPECT_GE(w.start_ns, kAggMin) << "start wrapped below union_min (the overflow bug)";
   EXPECT_LE(w.end_ns, kAggMax + 1);
   EXPECT_LT(w.start_ns, w.end_ns);
-  // Exact proportional positions (computed in 128-bit, then verified here in
-  // 128-bit so the expectation itself can't overflow).
-  const auto expect_offset = [](int pos) -> std::int64_t {
-    return static_cast<std::int64_t>(static_cast<__int128>(kAggMax - kAggMin) * pos / kSteps);
-  };
-  EXPECT_EQ(w.start_ns, kAggMin + expect_offset(502278));
-  EXPECT_EQ(w.end_ns, kAggMin + expect_offset(624146));
+  // Exact proportional positions, pinned as literals computed independently
+  // in arbitrary-precision arithmetic (python3: span * pos // kSteps) — a
+  // ground-truth oracle that cannot itself overflow and, unlike the previous
+  // __int128 recomputation, is portable to MSVC and independent of however
+  // sliderToWindow performs the widening.
+  EXPECT_EQ(w.start_ns, kAggMin + 13296830719201LL);
+  EXPECT_EQ(w.end_ns, kAggMin + 16523048403607LL);
 }
 
 // Single ~13-min file: the old code worked here (no overflow); the new code
