@@ -2225,6 +2225,9 @@ bool McapCloudDialog::onIndexChanged(std::string_view widget_name, int index) {
     std::string server_key;
     {
       std::lock_guard<std::mutex> lock(state_.mu);
+      if (!state_.connected) {
+        return true;  // disconnected -- same gate as buttonRefresh; no wasted round-trip
+      }
       if (!state_.vocabulary || index >= static_cast<int>(state_.vocabulary->customers.size())) {
         return true;  // out of range -- vocabulary changed under us; ignore
       }
@@ -2251,6 +2254,9 @@ bool McapCloudDialog::onIndexChanged(std::string_view widget_name, int index) {
     std::uint64_t id = 0;
     {
       std::lock_guard<std::mutex> lock(state_.mu);
+      if (!state_.connected) {
+        return true;  // disconnected -- same gate as buttonRefresh; no wasted round-trip
+      }
       if (!state_.vocabulary) {
         return true;
       }
@@ -2573,8 +2579,29 @@ void McapCloudDialog::onConnectFinished(bool ok, std::string uri, std::string st
 
     if (ok) {
       // The browse gate is keyed to the server we ACTUALLY connected to.
-      state_.active_server_key = normalizeServerKey(uri);
+      const std::string new_server_key = normalizeServerKey(uri);
+      // buttonConnect has no !connected guard, so this can be a switch AWAY
+      // from a different, previously-used server while a gate_customer/
+      // gate_site selection from THAT server is still sitting in state_.
+      // onVocabularyReady's "an already-set in-session choice wins" rule would
+      // otherwise apply the OLD server's pick to the NEW server, defeating
+      // per-server persistence (the new server would silently inherit a name
+      // that happens to also exist in its own vocabulary, or dead-end at
+      // kNeedsSelection some sites will never resolve). Only carry the
+      // selection over when reconnecting to the SAME server.
+      if (new_server_key != state_.active_server_key) {
+        state_.gate_customer.clear();
+        state_.gate_site.clear();
+      }
+      state_.active_server_key = new_server_key;
       gate_request_id = beginGateRequestLocked(GatePhase::kVocabularyLoading);
+    } else {
+      // A failed (re)connect leaves state_.connected=false; without this the
+      // gate phase could still read a stale kRows/kListLoading/etc. from
+      // before the attempt, showing e.g. old rows or a stale pill hint while
+      // genuinely disconnected. (A plaintext retry about to fire is still
+      // "disconnected" until IT reports connectFinished.)
+      state_.gate_phase = GatePhase::kDisconnected;
     }
   }
 
@@ -2670,8 +2697,18 @@ void McapCloudDialog::onVocabularyReady(std::uint64_t request_id, VocabularyInfo
       }
     }
 
-    if (!customer.empty() && !site.empty() && !resolveGateFilter(vocab, customer, site)) {
-      // The pair doesn't resolve against THIS vocabulary (a rebuild
+    const bool customer_known = std::any_of(vocab.customers.begin(), vocab.customers.end(),
+                                            [&customer](const VocabCustomer& c) { return c.name == customer; });
+    if (!customer.empty() && !customer_known) {
+      // The CUSTOMER itself is gone from this vocabulary (not just the
+      // site) — resolveGateFilter would fail regardless of what `site` is,
+      // and keeping a bogus customer name around would show an unselected
+      // customer combo next to an empty (customer-scoped) Site combo. Clear
+      // both and let kNeedsSelection below start the picker over clean.
+      customer.clear();
+      site.clear();
+    } else if (!customer.empty() && !site.empty() && !resolveGateFilter(vocab, customer, site)) {
+      // The customer IS known but the pair still doesn't resolve (a rebuild
       // renamed/removed the site, or this was a stale persisted/migrated
       // pick): keep the customer, drop only the site.
       site.clear();
@@ -2750,10 +2787,11 @@ void McapCloudDialog::onGateListFinished(FetchWorker::GateListResult result) {
         warning = "Recording list is incomplete (server paging error) — use Refresh to retry";
         break;
       case Err::kConnectionLost:
-        state_.gate_phase = GatePhase::kListError;
-        notify_warning = true;
-        warning = "Connection to the server was lost while listing recordings";
-        break;
+        // onConnectionLost already set kDisconnected + notified for this same
+        // drop (every kConnectionLost path calls notifyConnectionLostOnce()
+        // before finish()); don't overwrite it with a phase whose hint ("use
+        // Refresh") is wrong once Refresh is disabled by !state_.connected.
+        break;  // no phase change, no notify
       case Err::kRebuildStorm:
         state_.gate_phase = GatePhase::kListError;
         notify_warning = true;
