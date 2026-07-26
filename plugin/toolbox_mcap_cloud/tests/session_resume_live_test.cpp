@@ -190,7 +190,7 @@ TEST(McapCloudSessionResumeLive, RepeatFetchIsCacheHitZeroTransport) {
 
   bool connected = false;
   std::string connect_err;
-  worker.connectFinished = [&](bool ok, std::string, std::string err) {
+  worker.connectFinished = [&](bool ok, std::string, std::string, std::string err) {
     connected = ok;
     if (!ok) {
       connect_err = std::move(err);

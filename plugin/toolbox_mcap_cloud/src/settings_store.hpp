@@ -19,6 +19,11 @@ class SettingsStore {
 
   std::string getString(const std::string& key, const std::string& def = "") const;
   void setString(const std::string& key, const std::string& value);
+  // Remove a key outright (vs. setString(key, "") which still leaves the key
+  // present with an empty value). Used for one-shot migrations that must not
+  // let a downgrade resurrect the legacy value. No-op (silently) on an unbound
+  // store or a backend fault, matching every other setter's contract here.
+  void remove(const std::string& key);
 
   std::vector<std::string> getStringList(const std::string& key) const;
   void setStringList(const std::string& key, const std::vector<std::string>& values);

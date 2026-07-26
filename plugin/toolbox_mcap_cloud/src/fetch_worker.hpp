@@ -133,7 +133,11 @@ class FetchWorker {
   void pullTopicsAsync(std::vector<std::string> sequence_names, std::string group_name,
                        std::vector<std::string> topic_names, std::int64_t start_ns, std::int64_t end_ns);
 
-  std::function<void(bool ok, std::string status, std::string error)> connectFinished;
+  // `uri` echoes the EXACT uri this connectAsync() call was invoked with (not
+  // re-read from any mutable dialog state), so a caller that may have edited
+  // its own editable URI field since issuing the connect can still learn which
+  // server this result is actually about.
+  std::function<void(bool ok, std::string uri, std::string status, std::string error)> connectFinished;
   /// D8: the BackendCapabilities (HelloResponse.backend) the server advertised,
   /// emitted once on a successful connect BEFORE connectFinished so the dialog
   /// can drive additive UI (the '/'-prefix hierarchy combo + the query-assist

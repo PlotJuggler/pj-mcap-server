@@ -10,6 +10,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <unordered_map>
 
 #include <pj_base/sdk/plugin_data_api.hpp>
@@ -24,10 +25,11 @@
 #include "backend_types.hpp"  // mcap_cloud::SequenceInfo / TopicInfo / TimeRange
 #include "core/types.h"
 #include "credential_store.hpp"  // mcap_cloud::CredentialStore (D6 token store)
+#include "fetch_worker.hpp"      // mcap_cloud::FetchWorker::GateListResult (onGateListFinished's param type)
+#include "vocab_select.hpp"      // mcap_cloud::GatePhase / resolveGateFilter / autoSelectCustomer / siteNamesFor
 
 namespace mcap_cloud {
 
-class FetchWorker;
 class LuaQueryEngine;
 
 struct SequenceRecord {
@@ -77,6 +79,16 @@ struct DialogState {
   // tag-edit IPC forwarder configured). The BackendConnection::updateTags()
   // gate is the authoritative enforcement point; this is UI-only.
   bool tag_edit_supported = false;
+
+  // Browse gate: the catalog is NEVER fetched unfiltered. One monotonic id per
+  // gate transition; every worker callback echoes it and stale echoes are
+  // dropped. Phase drives the pill.
+  std::optional<VocabularyInfo> vocabulary;
+  std::string gate_customer;  // selected NAMES (durable identity, persisted)
+  std::string gate_site;
+  std::uint64_t gate_request_seq = 0;   // last issued id
+  GatePhase gate_phase = GatePhase::kDisconnected;
+  std::string active_server_key;        // canonical key of the CONNECTED server
 
   // Discovery
   std::vector<SequenceRecord> sequences;
@@ -400,7 +412,10 @@ class McapCloudDialog : public PJ::DialogPluginTyped {
   // settings view is bound, before the tick loop.
   void initFromSettings();
 
-  void onConnectFinished(bool ok, std::string status, std::string error);
+  // `uri` is the URI ACTUALLY CONNECTED (captured at the connect() call site,
+  // not re-read from state_.uri — the editable field may have changed since
+  // the connect was issued; see beginGateRequestLocked's caller).
+  void onConnectFinished(bool ok, std::string uri, std::string status, std::string error);
   // D8: latch the server's BackendCapabilities (hierarchy flag + query-assist
   // vocabulary) into state_. Runs on the GUI thread (event-drained).
   void onCapabilitiesReady(BackendCaps caps);
@@ -409,6 +424,29 @@ class McapCloudDialog : public PJ::DialogPluginTyped {
   // the GUI thread (event-drained), same as onCapabilitiesReady above.
   void onServerCapabilitiesReady(ServerCaps caps);
   void onSequencesReady(std::vector<SequenceInfo> sequences);
+
+  // ---- Browse gate (customer/site) — GatePhase state machine -------------
+  // EVERY gate transition funnels through this: it drops all site-scoped
+  // state (rows, selection, topics, date filter) so nothing from the
+  // previous site can leak into (or mask) the next one, then issues a fresh
+  // monotonic request id and supersedes any in-flight worker sweep. Caller
+  // MUST hold state_.mu.
+  [[nodiscard]] std::uint64_t beginGateRequestLocked(GatePhase next_phase);
+  // Vocabulary arrived (the gate's data source). Drops a stale id. When
+  // `recovery` is true this came from INSIDE a filtered-list stale-recovery
+  // retry (the worker owns that retry) — only combos refresh, never a new
+  // sweep. Otherwise resolves/auto-selects customer+site and either starts a
+  // gated sweep or lands on kNeedsSelection/kEmptyCatalog.
+  void onVocabularyReady(std::uint64_t request_id, VocabularyInfo vocab, bool recovery);
+  // GetVocabulary failed on a live connection: phase -> kVocabularyError.
+  void onVocabularyFailed(std::uint64_t request_id);
+  // One page of a gated sweep — same shape as onSequencePageReady, gated on
+  // the request id instead of always accepted.
+  void onGatePageReady(std::uint64_t request_id, std::vector<SequenceInfo> page, bool reset);
+  // Terminal result of one gated list sweep. May arrive WITHOUT a preceding
+  // dialog-initiated transition (the tag-edit re-list reuses the stored gate
+  // id) — gating is by request_id alone, never by an assumed prior phase.
+  void onGateListFinished(FetchWorker::GateListResult result);
   // Progressive discovery (PJ3 parity): populate the table from the initial
   // list as soon as it arrives, then fill each row's Date/Size as the server
   // streams per-sequence detail (onSequenceInfoReady), before the final list.

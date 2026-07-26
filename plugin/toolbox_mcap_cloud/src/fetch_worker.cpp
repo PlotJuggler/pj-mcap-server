@@ -85,7 +85,7 @@ void FetchWorker::connectAsync(std::string uri, std::string cert_path, std::stri
     if (!backend_->connect(&error)) {
       backend_.reset();
       if (connectFinished) {
-        connectFinished(false, {}, error.empty() ? std::string("connection failed") : error);
+        connectFinished(false, uri, {}, error.empty() ? std::string("connection failed") : error);
       }
       return;
     }
@@ -115,17 +115,17 @@ void FetchWorker::connectAsync(std::string uri, std::string cert_path, std::stri
       serverCapabilitiesReady(backend_->serverCapabilities().value_or(ServerCaps{}));
     }
     if (connectFinished) {
-      connectFinished(true, "Connected — server " + version_text, {});
+      connectFinished(true, uri, "Connected — server " + version_text, {});
     }
   } catch (const std::exception& e) {
     backend_.reset();
     if (connectFinished) {
-      connectFinished(false, {}, e.what());
+      connectFinished(false, uri, {}, e.what());
     }
   } catch (...) {
     backend_.reset();
     if (connectFinished) {
-      connectFinished(false, {}, "Unknown error");
+      connectFinished(false, uri, {}, "Unknown error");
     }
   }
 }

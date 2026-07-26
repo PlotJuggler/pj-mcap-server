@@ -258,10 +258,25 @@ std::string sessionLabel(const mcap_cloud::AggSession& s) {
   return fmt::format("{} - {} ({} files)", base, dateTimeUtc(s.min_ts_ns), s.keys.size());
 }
 
-// The S3-key field keys offered as Basic-tab dropdowns, in display order.
+// The S3-key field keys offered as Basic-tab dropdowns, in display order. This
+// stays the full 4-field set: it is ALSO the canonical Lua/Advanced-tab
+// vocabulary (canonicalFilterFields/canonicalVocabularyKeys below), which still
+// reasons about customer/site even though those two are no longer LOCAL
+// dropdowns (see kLocalBasicFilterKeys).
 const std::array<std::pair<const char*, const char*>, 4> kBasicFilterKeys = {{
     {"customer", "Customer"},
     {"customer_site", "Site"},
+    {"robot", "Robot"},
+    {"source", "Source"},
+}};
+
+// The LOCAL Basic-tab dropdowns (combo feed + matchesBasicFilter + Basic-tab
+// persistence). customer/site moved OUT to the mandatory browse gate
+// (server-filtered, fed from GetVocabulary — gateRow's filter_customer /
+// filter_customer_site, resolved in onIndexChanged and populated in
+// getWidgetData()); only robot/source remain as client-side equality filters
+// applied on top of the already gate-scoped result set.
+const std::array<std::pair<const char*, const char*>, 2> kLocalBasicFilterKeys = {{
     {"robot", "Robot"},
     {"source", "Source"},
 }};
@@ -454,10 +469,31 @@ std::string buildTopicInfoText(const TopicInfo& info) {
 }  // namespace
 
 McapCloudDialog::McapCloudDialog() : worker_(std::make_unique<FetchWorker>()) {
-  worker_->connectFinished = [this](bool ok, std::string status, std::string err) {
-    postEvent([this, ok, status = std::move(status), err = std::move(err)]() mutable {
-      onConnectFinished(ok, std::move(status), std::move(err));
+  worker_->connectFinished = [this](bool ok, std::string uri, std::string status, std::string err) {
+    postEvent([this, ok, uri = std::move(uri), status = std::move(status), err = std::move(err)]() mutable {
+      onConnectFinished(ok, std::move(uri), std::move(status), std::move(err));
     });
+  };
+  // Browse gate (customer/site): vocabulary is the gate's data source;
+  // gatePageReady/gateListFinished are the gated twin of
+  // sequencePageReady/sequencesReady, request-id-scoped instead of always
+  // accepted. All four echo the request_id issued by beginGateRequestLocked so
+  // the dialog can drop a stale answer by simple id comparison.
+  worker_->vocabularyReady = [this](std::uint64_t request_id, VocabularyInfo vocab, bool recovery) {
+    postEvent([this, request_id, vocab = std::move(vocab), recovery]() mutable {
+      onVocabularyReady(request_id, std::move(vocab), recovery);
+    });
+  };
+  worker_->vocabularyFailed = [this](std::uint64_t request_id) {
+    postEvent([this, request_id] { onVocabularyFailed(request_id); });
+  };
+  worker_->gatePageReady = [this](std::uint64_t request_id, std::vector<SequenceInfo> page, bool reset) {
+    postEvent([this, request_id, page = std::move(page), reset]() mutable {
+      onGatePageReady(request_id, std::move(page), reset);
+    });
+  };
+  worker_->gateListFinished = [this](FetchWorker::GateListResult result) {
+    postEvent([this, result = std::move(result)]() mutable { onGateListFinished(std::move(result)); });
   };
   // D8: caps arrive on a successful connect (before connectFinished). Latch the
   // hierarchy flag + vocabulary into state_ on the GUI thread so the next tick's
@@ -614,7 +650,11 @@ void McapCloudDialog::initFromSettings() {
   state_.aggregate = settings.getBool("mcap_cloud/aggregate", false);
   state_.topics_all = settings.getBool("mcap_cloud/topics_all", false);
   state_.filter_tab = std::clamp(settings.getInt("mcap_cloud/filter_tab", 0), 0, 1);
-  for (const auto& [key, label] : kBasicFilterKeys) {
+  // customer/site are NOT restored here — they live in the mandatory browse
+  // gate now (per-server keys, resolved against the vocabulary in
+  // onVocabularyReady, with a one-shot migration off the legacy global keys
+  // this loop used to read).
+  for (const auto& [key, label] : kLocalBasicFilterKeys) {
     (void)label;
     const std::string value = settings.getString(std::string("mcap_cloud/basic_filter/") + key);
     if (!value.empty()) {
@@ -1146,7 +1186,7 @@ std::string McapCloudDialog::widget_data() {
     wd.setChecked("radioFilterAdvanced", state_.filter_tab == 1);
     wd.setVisible("basicPane", state_.filter_tab == 0);
     wd.setVisible("advancedPane", state_.filter_tab == 1);
-    for (const auto& [key, label] : kBasicFilterKeys) {
+    for (const auto& [key, label] : kLocalBasicFilterKeys) {
       const std::vector<std::string> values = distinctFieldValues(state_.sequences, key);
       std::vector<std::string> items;
       items.reserve(values.size() + 1);
@@ -1163,6 +1203,29 @@ std::string McapCloudDialog::widget_data() {
         }
       }
       wd.setCurrentIndex(combo, idx);
+    }
+
+    // Browse-gate combos (customer/site): fed straight from the vocabulary,
+    // in vocabulary order, with NO "(any)" entry — the gate is mandatory, so
+    // there is no unconstrained option to offer. -1 = unselected (either no
+    // vocabulary yet, or the persisted/typed name isn't in this vocabulary).
+    {
+      std::vector<std::string> customers, sites;
+      int customer_idx = -1, site_idx = -1;
+      if (state_.vocabulary) {
+        for (const auto& c : state_.vocabulary->customers) {
+          if (c.name == state_.gate_customer) { customer_idx = static_cast<int>(customers.size()); }
+          customers.push_back(c.name);
+        }
+        sites = siteNamesFor(*state_.vocabulary, state_.gate_customer);
+        for (std::size_t i = 0; i < sites.size(); ++i) {
+          if (sites[i] == state_.gate_site) { site_idx = static_cast<int>(i); }
+        }
+      }
+      wd.setItems("filter_customer", customers);
+      wd.setCurrentIndex("filter_customer", customer_idx);
+      wd.setItems("filter_customer_site", sites);
+      wd.setCurrentIndex("filter_customer_site", site_idx);
     }
 
     // (The D8 "Folder:" prefix combo was removed 2026-07-12: with Hive keys the
@@ -1214,6 +1277,22 @@ std::string McapCloudDialog::widget_data() {
       wd.setLabel("seqHeader", "Sequences - not connected");
     } else {
       wd.setLabel("seqHeader", fmt::format("Sequences ({}/{})", seq_visible.size(), cache.rows.size()));
+    }
+  }
+
+  // Browse-gate pill: an overlay on top of seqTable (same grid cell,
+  // seqTableStack) explaining why the table is empty — disconnected, loading,
+  // needs a customer/site pick, or an error — since a bare empty table gives no
+  // hint that a gate is even in play. show_pill additionally requires empty
+  // rows so cached rows left on screen after e.g. a disconnect aren't covered.
+  {
+    const std::string hint = gateHintText(
+        state_.gate_phase, state_.vocabulary ? state_.vocabulary->totalFiles() : 0,
+        state_.vocabulary ? state_.vocabulary->totalSites() : 0);
+    const bool show_pill = !hint.empty() && state_.sequences.empty();
+    wd.setVisible("gateHintLabel", show_pill);
+    if (show_pill) {
+      wd.setLabel("gateHintLabel", hint);
     }
   }
 
@@ -1584,16 +1663,35 @@ bool McapCloudDialog::onClicked(std::string_view widget_name) {
     return true;
   }
   if (widget_name == "buttonRefresh") {
-    // Re-list sequences without a disconnect/reconnect (PJ3 onRefreshClicked,
-    // main_window.cpp:933-945). No-op unless connected and idle.
+    // Re-list without a disconnect/reconnect (PJ3 onRefreshClicked,
+    // main_window.cpp:933-945). No-op unless connected and idle. The catalog is
+    // NEVER fetched unfiltered: with both gate names already chosen, re-sweep
+    // the same site; otherwise re-fetch the vocabulary (mirrors a fresh
+    // connect's gate entry point).
+    std::string customer, site;
+    std::uint64_t id = 0;
+    bool has_selection = false;
     {
       std::lock_guard<std::mutex> lock(state_.mu);
       if (!state_.connected || state_.connecting || state_.fetch_active) {
         return true;
       }
+      has_selection = !state_.gate_customer.empty() && !state_.gate_site.empty();
+      if (has_selection) {
+        customer = state_.gate_customer;
+        site = state_.gate_site;
+        id = beginGateRequestLocked(GatePhase::kListLoading);
+      } else {
+        id = beginGateRequestLocked(GatePhase::kVocabularyLoading);
+      }
     }
-    notify(PJ::ToolboxMessageLevel::kInfo, "Refreshing sequences…");
-    postCommand([w = worker_.get()] { w->listSequencesAsync(); });
+    if (has_selection) {
+      notify(PJ::ToolboxMessageLevel::kInfo, fmt::format("Refreshing {}/{}…", customer, site));
+      postCommand([w = worker_.get(), id, customer, site] { w->listSequencesFilteredAsync(id, customer, site); });
+    } else {
+      notify(PJ::ToolboxMessageLevel::kInfo, "Refreshing catalog…");
+      postCommand([w = worker_.get(), id] { w->fetchVocabularyAsync(id); });
+    }
     return true;
   }
   if (widget_name == "buttonCert") {
@@ -2117,10 +2215,69 @@ bool McapCloudDialog::onIndexChanged(std::string_view widget_name, int index) {
   if (index < 0) {
     return false;
   }
-  // Basic-tab metadata dropdowns (filter_<field>). Item 0 is "(any)" (no
-  // constraint); items 1..N are the distinct values, resolved against the same
-  // distinctFieldValues() the widget_data populated.
-  for (const auto& [key, label] : kBasicFilterKeys) {
+  // Browse-gate combos (customer/site): unlike the Basic-tab dropdowns below,
+  // these carry NO "(any)" entry — index resolves DIRECTLY against the
+  // vocabulary lists getWidgetData() populated (customers in vocabulary order;
+  // sites via siteNamesFor(gate_customer)). Both guard against an
+  // out-of-range index (the vocabulary can change under a stale combo echo).
+  if (widget_name == "filter_customer") {
+    std::string new_customer;
+    std::string server_key;
+    {
+      std::lock_guard<std::mutex> lock(state_.mu);
+      if (!state_.vocabulary || index >= static_cast<int>(state_.vocabulary->customers.size())) {
+        return true;  // out of range -- vocabulary changed under us; ignore
+      }
+      new_customer = state_.vocabulary->customers[static_cast<std::size_t>(index)].name;
+      if (new_customer == state_.gate_customer) {
+        return true;  // no-op re-pick
+      }
+      // A new customer invalidates any site pick made under the OLD one.
+      state_.gate_customer = new_customer;
+      state_.gate_site.clear();
+      server_key = state_.active_server_key;
+      (void)beginGateRequestLocked(GatePhase::kNeedsSelection);  // clears the old site's rows immediately
+    }
+    SettingsStore settings(settings_);
+    const std::string prefix = "mcap_cloud/gate/" + server_key + "/";
+    settings.setString(prefix + "customer", new_customer);
+    settings.remove(prefix + "site");
+    return true;
+  }
+  if (widget_name == "filter_customer_site") {
+    std::string new_site;
+    std::string customer;
+    std::string server_key;
+    std::uint64_t id = 0;
+    {
+      std::lock_guard<std::mutex> lock(state_.mu);
+      if (!state_.vocabulary) {
+        return true;
+      }
+      const std::vector<std::string> sites = siteNamesFor(*state_.vocabulary, state_.gate_customer);
+      if (index >= static_cast<int>(sites.size())) {
+        return true;  // out of range -- vocabulary changed under us; ignore
+      }
+      new_site = sites[static_cast<std::size_t>(index)];
+      if (new_site == state_.gate_site) {
+        return true;  // no-op re-pick
+      }
+      state_.gate_site = new_site;
+      customer = state_.gate_customer;
+      server_key = state_.active_server_key;
+      id = beginGateRequestLocked(GatePhase::kListLoading);
+    }
+    SettingsStore settings(settings_);
+    settings.setString("mcap_cloud/gate/" + server_key + "/site", new_site);
+    notify(PJ::ToolboxMessageLevel::kInfo, fmt::format("Loading {}/{}…", customer, new_site));
+    postCommand([w = worker_.get(), id, customer, new_site] { w->listSequencesFilteredAsync(id, customer, new_site); });
+    return true;
+  }
+  // Basic-tab metadata dropdowns (filter_<field>, robot/source only — see
+  // kLocalBasicFilterKeys). Item 0 is "(any)" (no constraint); items 1..N are
+  // the distinct values, resolved against the same distinctFieldValues() the
+  // widget_data populated.
+  for (const auto& [key, label] : kLocalBasicFilterKeys) {
     if (widget_name == std::string("filter_") + key) {
       std::lock_guard<std::mutex> lock(state_.mu);
       if (index == 0) {
@@ -2204,6 +2361,29 @@ void McapCloudDialog::clearSelectionStateLocked() {
   state_.topics_loading = false;
   state_.topics_failed.clear();
   state_.topics_failure_notified = false;
+}
+
+std::uint64_t McapCloudDialog::beginGateRequestLocked(GatePhase next_phase) {
+  // EVERY gate change funnels through here: it clears all site-scoped state so
+  // rows/selection/topics/dates from the previous site can never leak into (or
+  // hide — the old date span would mask the new site's progressive pages) the
+  // next one, then issues the new request id and supersedes in-flight sweeps.
+  state_.sequences.clear();
+  state_.sequence_names.clear();
+  progressive_seqs_.clear();
+  ++state_.seq_epoch;
+  clearSelectionStateLocked();
+  // Reset the sequence-level date filter to "All" (unbounded): dateFilterMatches
+  // (date_filter.h) treats 0/0 as unbounded, so a stale span picked for the
+  // previous site can never mask every row of the new site's progressive pages.
+  state_.date_from_ns = 0;
+  state_.date_to_ns = 0;
+  state_.date_from_iso.clear();
+  state_.date_to_iso.clear();
+  state_.gate_phase = next_phase;
+  const std::uint64_t id = ++state_.gate_request_seq;
+  worker_->supersedeGateRequests(id);  // atomic — safe from the GUI thread
+  return id;
 }
 
 bool McapCloudDialog::onSelectionChanged(std::string_view widget_name, const std::vector<std::string>& selected) {
@@ -2353,15 +2533,20 @@ void McapCloudDialog::onServerCapabilitiesReady(ServerCaps caps) {
   state_.tag_edit_supported = caps.tag_edit_supported;
 }
 
-void McapCloudDialog::onConnectFinished(bool ok, std::string status, std::string error) {
-  std::string uri;
+void McapCloudDialog::onConnectFinished(bool ok, std::string uri, std::string status, std::string error) {
+  // `uri` is the URI THIS connectAsync() call actually targeted (threaded
+  // through connectFinished's payload — see fetch_worker.hpp), NOT
+  // state_.uri: the user may have already typed a different server into the
+  // (still editable) combo box while this connect was in flight, and every
+  // decision below (MRU history, credential lookup, plaintext retry, the gate's
+  // active_server_key) must stay about the server that actually answered.
   bool plaintext_retry_needed = false;
   std::string plaintext_uri;
   bool suppress_error = false;
+  std::uint64_t gate_request_id = 0;
   {
     std::lock_guard<std::mutex> lock(state_.mu);
     state_.connected = ok;
-    uri = state_.uri;
 
     // PJ3 plaintext-fallback: TLS connect failed, user allowed insecure
     // fallback, no custom cert in use, and we haven't tried plaintext
@@ -2385,6 +2570,12 @@ void McapCloudDialog::onConnectFinished(bool ok, std::string status, std::string
     // Stay "connecting" only while a plaintext retry is about to fire.
     state_.connecting = plaintext_retry_needed;
     suppress_error = state_.suppress_connect_error;
+
+    if (ok) {
+      // The browse gate is keyed to the server we ACTUALLY connected to.
+      state_.active_server_key = normalizeServerKey(uri);
+      gate_request_id = beginGateRequestLocked(GatePhase::kVocabularyLoading);
+    }
   }
 
   if (ok) {
@@ -2396,27 +2587,12 @@ void McapCloudDialog::onConnectFinished(bool ok, std::string status, std::string
     settings.setStringList("mcap_cloud/server_history", history);
 
     notify(PJ::ToolboxMessageLevel::kInfo, status);
-    postCommand([w = worker_.get()] { w->listSequencesAsync(); });
-    // A fresh socket invalidates the failure ledger; re-request topics for any
-    // still-selected sequence that never got a successful answer, so a
-    // reconnect deterministically heals the Topics panel (no reselect needed).
-    std::vector<std::string> need_topics;
-    {
-      std::lock_guard<std::mutex> lock(state_.mu);
-      state_.topics_failed.clear();
-      state_.topics_failure_notified = false;
-      for (const std::string& name : state_.selected_sequences) {
-        if (state_.topic_infos_by_seq.find(name) == state_.topic_infos_by_seq.end()) {
-          need_topics.push_back(name);
-        }
-      }
-      if (!need_topics.empty()) {
-        state_.topics_loading = true;
-      }
-    }
-    for (const std::string& name : need_topics) {
-      postCommand([w = worker_.get(), name] { w->listTopicsAsync(name); });
-    }
+    // The catalog is NEVER fetched unfiltered: fetch the vocabulary (the
+    // gate's data source) instead of the old unconditional listSequencesAsync.
+    // onVocabularyReady resolves/auto-selects a customer+site (persisted
+    // per-server, with a one-shot migration off the legacy global Basic-tab
+    // keys) and starts the gated sweep itself.
+    postCommand([w = worker_.get(), gate_request_id] { w->fetchVocabularyAsync(gate_request_id); });
     return;
   }
 
@@ -2425,6 +2601,185 @@ void McapCloudDialog::onConnectFinished(bool ok, std::string status, std::string
   } else if (!suppress_error) {
     // PJ3 AutoConnect context shows no popup; explicit connects do.
     notify(PJ::ToolboxMessageLevel::kError, fmt::format("MCAP Cloud connection failed: {}", error));
+  }
+}
+
+void McapCloudDialog::onVocabularyReady(std::uint64_t request_id, VocabularyInfo vocab, bool recovery) {
+  std::string customer, site;
+  std::uint64_t id = 0;
+  {
+    std::lock_guard<std::mutex> lock(state_.mu);
+    if (request_id != state_.gate_request_seq) {
+      return;  // stale answer; a newer gate transition already superseded it
+    }
+    state_.vocabulary = vocab;
+    if (recovery) {
+      // The combos pick up state_.vocabulary next tick automatically. This
+      // refresh came from INSIDE listSequencesFilteredAsync's own stale-
+      // vocabulary retry loop, which owns retrying the sweep itself — starting
+      // a second one here would double-sweep the same request id.
+      return;
+    }
+    if (vocab.customers.empty()) {
+      state_.gate_phase = GatePhase::kEmptyCatalog;
+      return;
+    }
+
+    // Resolve the (customer, site) selection: an already-set in-session choice
+    // wins outright (e.g. a reconnect to the same server), else the per-server
+    // persisted values, else auto-select (exactly one customer).
+    customer = state_.gate_customer;
+    site = state_.gate_site;
+    if (customer.empty() || site.empty()) {
+      SettingsStore settings(settings_);
+      const std::string prefix = "mcap_cloud/gate/" + state_.active_server_key + "/";
+      if (customer.empty()) {
+        customer = settings.getString(prefix + "customer");
+      }
+      if (site.empty()) {
+        site = settings.getString(prefix + "site");
+      }
+    }
+    if (customer.empty()) {
+      customer = autoSelectCustomer(vocab);
+    }
+    // ONE-SHOT MIGRATION: nothing above resolved a full selection — seed from
+    // the legacy GLOBAL (pre-gate) Basic-tab keys this build no longer writes,
+    // then clear them so a downgrade can't resurrect a value from an older
+    // install that predates the per-server gate keys.
+    if (customer.empty() || site.empty()) {
+      SettingsStore settings(settings_);
+      bool migrated = false;
+      if (customer.empty()) {
+        const std::string legacy = settings.getString("mcap_cloud/basic_filter/customer");
+        if (!legacy.empty()) {
+          customer = legacy;
+          migrated = true;
+        }
+      }
+      if (site.empty()) {
+        const std::string legacy = settings.getString("mcap_cloud/basic_filter/customer_site");
+        if (!legacy.empty()) {
+          site = legacy;
+          migrated = true;
+        }
+      }
+      if (migrated) {
+        settings.remove("mcap_cloud/basic_filter/customer");
+        settings.remove("mcap_cloud/basic_filter/customer_site");
+      }
+    }
+
+    if (!customer.empty() && !site.empty() && !resolveGateFilter(vocab, customer, site)) {
+      // The pair doesn't resolve against THIS vocabulary (a rebuild
+      // renamed/removed the site, or this was a stale persisted/migrated
+      // pick): keep the customer, drop only the site.
+      site.clear();
+    }
+    state_.gate_customer = customer;
+    state_.gate_site = site;
+    if (customer.empty() || site.empty()) {
+      state_.gate_phase = GatePhase::kNeedsSelection;
+      return;
+    }
+    id = beginGateRequestLocked(GatePhase::kListLoading);
+  }
+  postCommand([w = worker_.get(), id, customer, site] { w->listSequencesFilteredAsync(id, customer, site); });
+}
+
+void McapCloudDialog::onVocabularyFailed(std::uint64_t request_id) {
+  std::lock_guard<std::mutex> lock(state_.mu);
+  if (request_id != state_.gate_request_seq) {
+    return;  // stale answer
+  }
+  state_.gate_phase = GatePhase::kVocabularyError;
+}
+
+void McapCloudDialog::onGatePageReady(std::uint64_t request_id, std::vector<SequenceInfo> page, bool reset) {
+  std::lock_guard<std::mutex> lock(state_.mu);
+  if (request_id != state_.gate_request_seq) {
+    return;  // a newer gate transition owns progressive_seqs_/the table now
+  }
+  // Same shape as onSequencePageReady: reset semantics matter (a builder
+  // rebuild racing the pagination aborts server-side and restarts from page
+  // one on the new generation — appending across that boundary would render
+  // the aborted attempt's rows twice).
+  if (reset) {
+    progressive_seqs_.clear();
+  }
+  progressive_seqs_.insert(progressive_seqs_.end(), std::make_move_iterator(page.begin()),
+                           std::make_move_iterator(page.end()));
+  populateSequencesLocked(progressive_seqs_, /*seed_dates=*/false);
+  sortSequencesLocked();
+}
+
+void McapCloudDialog::onGateListFinished(FetchWorker::GateListResult result) {
+  // May arrive WITHOUT a preceding dialog-initiated transition (the tag-edit
+  // re-list path reuses the stored gate id) — gate on request_id ALONE, never
+  // on an assumed prior phase.
+  using Err = FetchWorker::GateListResult::Error;
+  bool complete = false;
+  bool notify_warning = false;
+  std::string warning;
+  {
+    std::lock_guard<std::mutex> lock(state_.mu);
+    if (result.request_id != state_.gate_request_seq) {
+      return;  // stale answer
+    }
+    switch (result.error) {
+      case Err::kSuperseded:
+        return;  // a newer request already owns the UI; nothing to show
+      case Err::kNone:
+        complete = true;
+        break;
+      case Err::kSelectionGone: {
+        // The (customer, site) pair no longer resolves against the current
+        // vocabulary (a rebuild renamed/removed the site out from under an
+        // in-flight sweep). Keep the customer, drop the site, and send the
+        // user back to kNeedsSelection instead of showing a stale/empty list.
+        const std::string missing = state_.gate_site.empty() ? state_.gate_customer : state_.gate_site;
+        state_.gate_site.clear();
+        state_.gate_phase = GatePhase::kNeedsSelection;
+        notify_warning = true;
+        warning = fmt::format("'{}' is no longer available in the catalog — pick another site", missing);
+        break;
+      }
+      case Err::kPartial:
+        state_.gate_phase = GatePhase::kListError;
+        notify_warning = true;
+        warning = "Recording list is incomplete (server paging error) — use Refresh to retry";
+        break;
+      case Err::kConnectionLost:
+        state_.gate_phase = GatePhase::kListError;
+        notify_warning = true;
+        warning = "Connection to the server was lost while listing recordings";
+        break;
+      case Err::kRebuildStorm:
+        state_.gate_phase = GatePhase::kListError;
+        notify_warning = true;
+        warning = "Catalog is rebuilding faster than it can be listed — use Refresh to retry";
+        break;
+    }
+  }
+
+  if (complete) {
+    // NEVER render "no recordings" for anything but a genuinely complete,
+    // empty result — this IS that case. Reuse the existing authoritative
+    // onSequencesReady path (date seeding, stale-value pruning, reselect,
+    // the "N sequences" notify) exactly as the legacy unfiltered path did.
+    const bool empty = result.sequences.empty();
+    onSequencesReady(std::move(result.sequences));
+    std::lock_guard<std::mutex> lock(state_.mu);
+    // A newer gate request could have superseded us WHILE onSequencesReady ran
+    // (it re-locks internally); only the request that is STILL current gets to
+    // set the terminal phase.
+    if (result.request_id == state_.gate_request_seq) {
+      state_.gate_phase = empty ? GatePhase::kListEmpty : GatePhase::kRows;
+    }
+    return;
+  }
+  if (notify_warning) {
+    notify(PJ::ToolboxMessageLevel::kWarning, warning);
   }
 }
 
@@ -2632,9 +2987,11 @@ void McapCloudDialog::persistState() {
   settings.setBool("mcap_cloud/aggregate", aggregate);
   settings.setBool("mcap_cloud/topics_all", topics_all);
   settings.setInt("mcap_cloud/filter_tab", filter_tab);
-  // One key per Basic-tab field; an unset filter writes "" so a previously
-  // persisted constraint is cleared, not resurrected.
-  for (const auto& [key, label] : kBasicFilterKeys) {
+  // One key per LOCAL Basic-tab field (robot/source — customer/site are the
+  // gate now, persisted per-server in onIndexChanged/onVocabularyReady, not
+  // here); an unset filter writes "" so a previously persisted constraint is
+  // cleared, not resurrected.
+  for (const auto& [key, label] : kLocalBasicFilterKeys) {
     (void)label;
     const auto it = basic_filter.find(key);
     settings.setString(
@@ -3141,6 +3498,9 @@ void McapCloudDialog::onConnectionLost() {
       return;  // already known (explicit disconnect or an earlier notice)
     }
     state_.connected = false;
+    // Leave rows on screen (cached from before the drop); the pill only shows
+    // when state_.sequences is empty, so a populated table stays visible.
+    state_.gate_phase = GatePhase::kDisconnected;
   }
   notify(PJ::ToolboxMessageLevel::kWarning, "MCAP Cloud: connection to the server was lost — press Connect to reconnect");
 }
