@@ -80,6 +80,7 @@ void FetchWorker::connectAsync(std::string uri, std::string cert_path, std::stri
     vocab_.reset();
     last_gate_customer_.clear();
     last_gate_site_.clear();
+    last_gate_request_id_ = 0;
     std::string error;
     if (!backend_->connect(&error)) {
       backend_.reset();
@@ -235,9 +236,12 @@ void FetchWorker::listSequencesFilteredAsync(std::uint64_t request_id, std::stri
   }
   // Remembered even if this attempt ultimately fails/is superseded: it is
   // "the last gate selection the user asked for", which the tag-edit re-list
-  // path below reuses to stay scoped to the same site after a commit.
+  // path below reuses to stay scoped to the same site after a commit. The id
+  // is stored ALONGSIDE the names (not re-read from latest_gate_request_ at
+  // use time) so the pair can never drift apart — see the tag-edit call site.
   last_gate_customer_ = customer;
   last_gate_site_ = site;
+  last_gate_request_id_ = request_id;
 
   // Two resolution attempts: the cached vocabulary, then ONE refresh when the
   // generation died mid-request (builder rebuild raced the sweep).
@@ -399,8 +403,19 @@ void FetchWorker::updateTagsAsync(std::string sequence_name,
   // record (e.g. the browse gate machinery hasn't landed on the dialog side
   // yet, or the ungated fallback path is in use) falls back to the legacy
   // unfiltered re-list below — just a guard, no assert.
+  //
+  // WHY last_gate_request_id_ (not latest_gate_request_.load()) here: this
+  // command can sit queued behind a NEWER gate transition. If the GUI has
+  // already bumped latest_gate_request_ to a new id and enqueued the real
+  // sweep for the NEW site, reading latest_gate_request_ here would pass the
+  // pre-start supersession check (id matches "latest") and sweep the OLD
+  // site UNDER the new id — self-healing once the queued sweep runs, but
+  // transiently wrong and indistinguishable from a real answer by the
+  // dialog's id-equality check. Passing last_gate_request_id_ (the id these
+  // NAMES were actually requested under) makes a stale pairing correctly
+  // no-op as kSuperseded instead.
   if (!last_gate_customer_.empty() && !last_gate_site_.empty()) {
-    listSequencesFilteredAsync(latest_gate_request_.load(), last_gate_customer_, last_gate_site_);
+    listSequencesFilteredAsync(last_gate_request_id_, last_gate_customer_, last_gate_site_);
     return;
   }
 

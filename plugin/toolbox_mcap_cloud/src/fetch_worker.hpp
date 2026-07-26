@@ -278,6 +278,7 @@ class FetchWorker {
   std::atomic<std::uint64_t> latest_gate_request_{0};
   std::string last_gate_customer_;
   std::string last_gate_site_;
+  std::uint64_t last_gate_request_id_ = 0;  // worker-thread only: the id last_gate_customer_/site_ were requested under
 
   std::unique_ptr<BackendConnection> backend_;  // catalog-browse socket
   // Credentials remembered from the last successful connectAsync, so a pull can
