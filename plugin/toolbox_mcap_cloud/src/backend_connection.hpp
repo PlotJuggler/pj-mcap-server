@@ -122,6 +122,11 @@ class BackendConnection {
   [[nodiscard]] std::vector<SequenceInfo> listSequences(bool* complete = nullptr,
                                                         const PageCallback& on_page = {});
 
+  // GetVocabulary RPC: the customer->site filter tree + the generation its ids
+  // are bound to. nullopt on timeout / dead socket / server Error. ids are ONLY
+  // valid together with result.generation — echo both, never cache ids alone.
+  [[nodiscard]] std::optional<VocabularyInfo> getVocabulary();
+
   // GetFile RPC for the file backing `sequence_name`, addressed by s3_key
   // (sequence_name is sent verbatim as s3_key — see the key-addressing note
   // above the implementation: catalog file ids renumber across

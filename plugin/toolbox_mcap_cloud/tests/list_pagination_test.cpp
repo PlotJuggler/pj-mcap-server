@@ -77,6 +77,21 @@ class FakePagingServer {
 
       if (request.has_hello()) {
         response.mutable_hello_response()->set_server_version("fake-paging-1.0");
+      } else if (request.has_get_vocabulary()) {
+        auto* vocab = response.mutable_get_vocabulary();
+        auto* customer = vocab->add_customers();
+        customer->set_id(11);
+        customer->set_name("dexory");
+        customer->set_file_count(static_cast<std::uint64_t>(total_rows_));
+        auto* site_a = customer->add_sites();
+        site_a->set_id(21);
+        site_a->set_name("nashville");
+        site_a->set_file_count(static_cast<std::uint64_t>(total_rows_ / 2));
+        auto* site_b = customer->add_sites();
+        site_b->set_id(22);
+        site_b->set_name("wallingford");
+        site_b->set_file_count(static_cast<std::uint64_t>(total_rows_ - total_rows_ / 2));
+        vocab->set_catalog_generation("gen-1");
       } else if (request.has_list_files()) {
         const auto& req = request.list_files();
         const int page_index = req.page_token().empty() ? 0 : std::stoi(req.page_token());
@@ -275,4 +290,32 @@ TEST(ListPagination, WorksWithoutACallback) {
   const auto sequences = conn.listSequences(&complete);
   EXPECT_TRUE(complete);
   EXPECT_EQ(sequences.size(), 700u);
+}
+
+// --- vocabulary --------------------------------------------------------
+
+TEST(Vocabulary, MapsTheCustomerSiteTree) {
+  FakePagingServer server(/*total_rows=*/1000, /*stale_at_page=*/-1);
+  ASSERT_TRUE(server.ok());
+  mcap_cloud::BackendConnection conn(server.uri(), "", "", false);
+  std::string err;
+  ASSERT_TRUE(conn.connect(&err)) << err;
+
+  const auto vocab = conn.getVocabulary();
+  ASSERT_TRUE(vocab.has_value());
+  EXPECT_EQ(vocab->generation, "gen-1");
+  ASSERT_EQ(vocab->customers.size(), 1u);
+  EXPECT_EQ(vocab->customers[0].name, "dexory");
+  EXPECT_EQ(vocab->customers[0].id, 11u);
+  ASSERT_EQ(vocab->customers[0].sites.size(), 2u);
+  EXPECT_EQ(vocab->customers[0].sites[0].name, "nashville");
+  EXPECT_EQ(vocab->customers[0].sites[0].id, 21u);
+  EXPECT_EQ(vocab->customers[0].sites[0].file_count, 500u);
+  EXPECT_EQ(vocab->totalFiles(), 1000u);
+  EXPECT_EQ(vocab->totalSites(), 2u);
+}
+
+TEST(Vocabulary, FailsCleanlyWhenNotConnected) {
+  mcap_cloud::BackendConnection conn("ws://127.0.0.1:1", "", "", false);
+  EXPECT_FALSE(conn.getVocabulary().has_value());
 }

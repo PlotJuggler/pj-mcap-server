@@ -140,6 +140,35 @@ struct ServerCaps {
   bool tag_edit_supported = false;
 };
 
+// GetVocabularyResponse mapped for the client (catalog-vocabulary-rpc.md).
+// ids are SESSION HANDLES bound to `generation` — they renumber across builder
+// rebuilds and MUST only be echoed together with the generation they came from.
+struct VocabSite {
+  std::uint64_t id = 0;
+  std::string name;
+  std::uint64_t file_count = 0;
+};
+struct VocabCustomer {
+  std::uint64_t id = 0;
+  std::string name;
+  std::uint64_t file_count = 0;
+  std::vector<VocabSite> sites;
+};
+struct VocabularyInfo {
+  std::vector<VocabCustomer> customers;
+  std::string generation;  // opaque bytes; echo with any dimension-id filter
+  [[nodiscard]] std::uint64_t totalFiles() const {
+    std::uint64_t n = 0;
+    for (const auto& c : customers) { n += c.file_count; }
+    return n;
+  }
+  [[nodiscard]] std::size_t totalSites() const {
+    std::size_t n = 0;
+    for (const auto& c : customers) { n += c.sites.size(); }
+    return n;
+  }
+};
+
 // ---------------------------------------------------------------------------
 // Session / streaming (Slice 2). These mirror the wire OpenSessionResponse
 // bindings (names + schemas cross the wire ONCE; everything afterwards is
