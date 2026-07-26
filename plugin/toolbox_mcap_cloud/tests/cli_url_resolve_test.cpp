@@ -65,3 +65,31 @@ TEST(CliUrlResolve, TokenFlagOverridesEnv) {
 }
 
 }  // namespace
+
+// --- CA certificate ----------------------------------------------------------
+//
+// --cert / MCAP_CLOUD_CACERT selects the CA bundle used to verify a wss:// peer.
+// An EMPTY result is meaningful: it tells BackendConnection to auto-detect the
+// system bundle (ixwebsocket's own "SYSTEM" keyword is unimplemented on Linux),
+// so "unset" must resolve to "" rather than to any built-in path.
+
+// No flag, no env -> empty (auto-detect downstream).
+TEST(CliCertResolve, EmptyWhenNothingSet) {
+  EXPECT_EQ(mcap_cloud::resolveCliCert(std::nullopt, std::nullopt), "");
+}
+
+// An explicit --cert wins over the environment.
+TEST(CliCertResolve, FlagWinsOverEnv) {
+  EXPECT_EQ(mcap_cloud::resolveCliCert(std::string("/flag/ca.pem"), std::string("/env/ca.pem")),
+            "/flag/ca.pem");
+}
+
+// No flag -> the environment value is used.
+TEST(CliCertResolve, EnvUsedWhenNoFlag) {
+  EXPECT_EQ(mcap_cloud::resolveCliCert(std::nullopt, std::string("/env/ca.pem")), "/env/ca.pem");
+}
+
+// An empty env value is treated as unset (auto-detect), matching resolveCliUrl.
+TEST(CliCertResolve, EmptyEnvFallsThroughToAutoDetect) {
+  EXPECT_EQ(mcap_cloud::resolveCliCert(std::nullopt, std::string("")), "");
+}

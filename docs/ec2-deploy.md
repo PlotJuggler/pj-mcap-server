@@ -215,7 +215,10 @@ The server runs **plaintext** by default. Two options:
 - **At the server:** mount a cert/key pair into the container, set
   `PJ_CLOUD_TLS_CERT`/`PJ_CLOUD_TLS_KEY` (or `server.tls.{cert,key}` in the
   config), publish the TLS port. All-or-nothing — set both or neither. Clients
-  then use `wss://` (the plugin/CLI `--insecure` flag accepts a self-signed cert).
+  then use `wss://`. A **publicly-trusted** cert needs no client-side flags — the
+  plugin/CLI auto-detects the system CA bundle. For a **self-signed** cert either
+  pass the CA with `--cert FILE` / `MCAP_CLOUD_CACERT` (verification stays on) or
+  skip verification with `--insecure`.
 
 The tag-edit IPC is a local UNIX socket with no TLS concept.
 

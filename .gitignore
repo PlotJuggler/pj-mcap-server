@@ -18,3 +18,11 @@ server/bin/
 
 # editor LSP index caches
 **/.cache/
+
+# Local bearer-token / credential files (never commit)
+.dexorykey
+*.key
+!server/deploy/*.key.example
+
+# Git worktrees live under <repo>/.worktrees/<branch> by convention
+.worktrees/
