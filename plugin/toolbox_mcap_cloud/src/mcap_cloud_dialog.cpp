@@ -111,13 +111,6 @@ ServerCredentials resolveCredentials(PJ::sdk::SettingsView view, CredentialStore
 // unit-tested without the Arrow/Flight link.
 // ---------------------------------------------------------------------------
 
-std::string isoFromNs(std::int64_t ts_ns) {
-  if (ts_ns <= 0) {
-    return {};
-  }
-  return formatIso8601Utc(ts_ns);
-}
-
 std::string dateOnly(std::int64_t ts_ns) {
   if (ts_ns <= 0) {
     return "--/--/----";
@@ -147,13 +140,15 @@ std::vector<std::string> schemaKeys(const Schema& schema) {
   return keys;
 }
 
-// D8: the Key dropdown's item list = the union of the keys present in the
-// loaded sequences' metadata (schema) AND the server-advertised
-// metadata_key_vocabulary (HelloResponse.backend.metadata_key_vocabulary),
-// sorted + de-duplicated. This surfaces server-known searchable keys even
-// before any sequence metadata streams in (Plan D Task 8: vocabulary feeds the
-// query-assist dropdowns). Both widget_data() and onIndexChanged() resolve the
-// picked index against THIS list so they stay in lockstep.
+// The Key dropdown's item list = the union of the keys present in the loaded
+// sequences' metadata (schema) AND `vocabulary`, sorted + de-duplicated. Both
+// call sites below pass canonicalVocabularyKeys() (the 4 canonical S3-key
+// fields) as `vocabulary`, NOT the server's HelloResponse.backend.
+// metadata_key_vocabulary (that one is MCAP-content-derived and deliberately
+// never offered as a filter dimension — see onCapabilitiesReady). This
+// surfaces the canonical keys even before any sequence metadata streams in.
+// Both widget_data() and onIndexChanged() resolve the picked index against
+// THIS list so they stay in lockstep.
 std::vector<std::string> queryAssistKeys(const Schema& schema, const std::vector<std::string>& vocabulary) {
   std::set<std::string> merged;
   for (const auto& kv : schema) {
@@ -200,9 +195,9 @@ std::string formatMetadata(const MapType& metadata, std::string_view indent = {}
 
 // Render the flat (name,type) schema fields as a "Fields (N):" block. The
 // Arrow-typed formatFieldType/formatSchemaFields helpers of toolbox_mosaico are
-// gone with the Arrow dependency; TopicInfo now carries plain string pairs. The
-// inert backend never populates schema_fields, so this block is simply omitted
-// for the cloud connector plugin until the real client-core lands.
+// gone with the Arrow dependency; TopicInfo now carries plain string pairs,
+// populated from the wire by mapTopicInfo (wire_mapping.cpp: schema name/
+// encoding/message-count ride in as pseudo-rows).
 std::string formatSchemaFields(const std::vector<std::pair<std::string, std::string>>& fields) {
   std::string text;
   if (fields.empty()) {
@@ -475,10 +470,10 @@ McapCloudDialog::McapCloudDialog() : worker_(std::make_unique<FetchWorker>()) {
     });
   };
   // Browse gate (customer/site): vocabulary is the gate's data source;
-  // gatePageReady/gateListFinished are the gated twin of
-  // sequencePageReady/sequencesReady, request-id-scoped instead of always
-  // accepted. All four echo the request_id issued by beginGateRequestLocked so
-  // the dialog can drop a stale answer by simple id comparison.
+  // gatePageReady streams pages progressively during a sweep, gateListFinished
+  // carries the terminal result. Both echo the request_id issued by
+  // beginGateRequestLocked so the dialog can drop a stale answer by simple id
+  // comparison.
   worker_->vocabularyReady = [this](std::uint64_t request_id, VocabularyInfo vocab, bool recovery) {
     postEvent([this, request_id, vocab = std::move(vocab), recovery]() mutable {
       onVocabularyReady(request_id, std::move(vocab), recovery);
@@ -495,9 +490,9 @@ McapCloudDialog::McapCloudDialog() : worker_(std::make_unique<FetchWorker>()) {
   worker_->gateListFinished = [this](FetchWorker::GateListResult result) {
     postEvent([this, result = std::move(result)]() mutable { onGateListFinished(std::move(result)); });
   };
-  // D8: caps arrive on a successful connect (before connectFinished). Latch the
-  // hierarchy flag + vocabulary into state_ on the GUI thread so the next tick's
-  // widget_data() can show/populate the prefix combo + query-assist vocabulary.
+  // D8: caps arrive on a successful connect (before connectFinished). Runs on
+  // the GUI thread so a future capability consumer has a safe place to latch
+  // state before the next tick's widget_data().
   worker_->capabilitiesReady = [this](BackendCaps caps) {
     postEvent([this, caps = std::move(caps)]() mutable { onCapabilitiesReady(std::move(caps)); });
   };
@@ -508,15 +503,6 @@ McapCloudDialog::McapCloudDialog() : worker_(std::make_unique<FetchWorker>()) {
   };
   worker_->sequencesReady = [this](std::vector<SequenceInfo> sequences) {
     postEvent([this, sequences = std::move(sequences)]() mutable { onSequencesReady(std::move(sequences)); });
-  };
-  worker_->sequenceListStarted = [this](std::vector<SequenceInfo> sequences) {
-    postEvent([this, sequences = std::move(sequences)]() mutable { onSequenceListStarted(std::move(sequences)); });
-  };
-  worker_->sequencePageReady = [this](std::vector<SequenceInfo> page, bool reset) {
-    postEvent([this, page = std::move(page), reset]() mutable { onSequencePageReady(std::move(page), reset); });
-  };
-  worker_->sequenceInfoReady = [this](SequenceInfo sequence) {
-    postEvent([this, sequence = std::move(sequence)]() mutable { onSequenceInfoReady(std::move(sequence)); });
   };
   worker_->topicsReady = [this](std::string sequence_name, std::vector<std::string> topic_names) {
     postEvent([this, sequence_name = std::move(sequence_name), topic_names = std::move(topic_names)]() mutable {
@@ -668,7 +654,7 @@ void McapCloudDialog::initFromSettings() {
     // Same printable-ASCII gate as the explicit Connect handler (PJ3
     // connectToServer validates both paths). On auto-connect PJ3 shows no
     // popup, so a malformed persisted value silently aborts the auto-connect
-    // rather than handing control bytes to gRPC.
+    // rather than handing control bytes to the transport.
     if (isPrintableAscii(uri) && isPrintableAscii(creds.cert_path) && isPrintableAscii(creds.api_key)) {
       state_.connecting = true;
       state_.suppress_connect_error = true;  // PJ3 AutoConnect: no error notification on failure.
@@ -852,7 +838,7 @@ std::string McapCloudDialog::widget_data() {
     const int cursor = clampQueryCursor(state_.query_cursor, state_.query_text);
     const CursorContext ctx = analyze(state_.query_text, cursor, state_.query_schema);
 
-    wd.setItems("keyCombo", queryAssistKeys(state_.query_schema, state_.metadata_key_vocabulary));
+    wd.setItems("keyCombo", queryAssistKeys(state_.query_schema, canonicalVocabularyKeys()));
     wd.setEnabled("keyCombo", ctx.can_pick_key());
     wd.setCurrentIndex("keyCombo", -1);
 
@@ -1500,12 +1486,11 @@ std::string McapCloudDialog::widget_data() {
     wd.setText("certPath", saved.cert_path);
     wd.setText("apiKey", saved.api_key);
     wd.setChecked("allowInsecure", saved.allow_insecure);
-    // Open the embedded cert_dialog.ui as a read-only modal popup. The
-    // existing requestSubDialog mechanism in dialog_protocol only surfaces
-    // the UI — there's no roundtrip of user edits back to the plugin yet.
-    // PJ3-parity persistence reads cert path + api key from the settings store
-    // (loadCredentialsForUri) on next Connect; the Cert dialog surface here
-    // gives the user a way to inspect/initiate that flow.
+    // Open the embedded cert_dialog.ui as a modal popup. User edits DO round-
+    // trip: onTextChanged/onToggled stage certPath/apiKey/allowInsecure into
+    // pending_cert_path/pending_api_key/pending_allow_insecure as the user
+    // types, and the synthetic `subDialogAccepted` click (below) commits the
+    // staged values into persisted settings under the current URI.
     state_.active_sub_dialog = DialogState::ActiveSubDialog::kCert;
     wd.requestSubDialog(kCertDialogUi);
   }
@@ -1535,7 +1520,6 @@ std::string McapCloudDialog::widget_data() {
       // a glance. "" clears any prior tint (embedded rows).
       wd.setRowColor("tagTable", static_cast<int>(i), rows[i].is_override ? "#fff3cd" : "");
     }
-    state_.tag_dialog_open = true;
     state_.active_sub_dialog = DialogState::ActiveSubDialog::kTag;
     wd.requestSubDialog(kTagDialogUi);
   }
@@ -1622,17 +1606,20 @@ bool McapCloudDialog::onClicked(std::string_view widget_name) {
       uri = state_.uri;
     }
     // Pull saved credentials keyed by the normalized server URI (PJ3 parity:
-    // dedupes "grpc+tls://X:6726", "GRPC+TLS://X:6726", and "x:6726" to the
-    // same cache entry), with MCAP_CLOUD_API_KEY env fallback.
+    // normalizeServerKey case-folds the host and strips a trailing slash, so
+    // "ws://Demo.Host:8080/" and "WS://demo.host:8080" share the same cache
+    // entry; ws:// and wss:// keys stay deliberately distinct), with
+    // MCAP_CLOUD_API_KEY env fallback.
     auto creds = resolveCredentials(settings_, credentialStore(), uri);
     cert_path = creds.cert_path;
     api_key = creds.api_key;
     allow_insecure = creds.allow_insecure;
 
     // Printable-ASCII gate (PJ3 main_window.cpp:947-1013). The host/cert/api-key
-    // are headers/URIs handed straight into gRPC, which asserts-and-aborts on
-    // control bytes (CR/LF/NUL). Reject here — before the worker is dispatched —
-    // and abort the connect so the worst outcome is a visible notification.
+    // values flow into the WS handshake (URL, TLS cert path, Hello.auth_token) —
+    // control bytes (CR/LF/NUL) there are never valid input. Reject here —
+    // before the worker is dispatched — so the failure is a clear notification
+    // instead of a confusing deep transport error.
     if (!isPrintableAscii(uri)) {
       notify(PJ::ToolboxMessageLevel::kError, "Server URI contains invalid characters (control or non-ASCII bytes).");
       return true;
@@ -1777,7 +1764,6 @@ bool McapCloudDialog::onClicked(std::string_view widget_name) {
       std::lock_guard<std::mutex> lock(state_.mu);
       which = state_.active_sub_dialog;
       state_.active_sub_dialog = DialogState::ActiveSubDialog::kNone;
-      state_.tag_dialog_open = false;
     }
 
     if (which == DialogState::ActiveSubDialog::kTag) {
@@ -2319,7 +2305,7 @@ bool McapCloudDialog::onIndexChanged(std::string_view widget_name, int index) {
   std::string item;
   Action action = Action::Disabled;
   if (which == Which::kKey) {
-    const auto keys = queryAssistKeys(state_.query_schema, state_.metadata_key_vocabulary);
+    const auto keys = queryAssistKeys(state_.query_schema, canonicalVocabularyKeys());
     if (index >= static_cast<int>(keys.size())) {
       return true;
     }
@@ -2356,8 +2342,6 @@ bool McapCloudDialog::onIndexChanged(std::string_view widget_name, int index) {
 }
 
 void McapCloudDialog::clearSelectionStateLocked() {
-  state_.restore_selected_sequence.clear();
-  state_.restore_selected_topics.clear();
   state_.seq_selected_rows.clear();
   state_.selected_sequences.clear();
   state_.primary_sequence.clear();
@@ -2384,8 +2368,6 @@ std::uint64_t McapCloudDialog::beginGateRequestLocked(GatePhase next_phase) {
   // previous site can never mask every row of the new site's progressive pages.
   state_.date_from_ns = 0;
   state_.date_to_ns = 0;
-  state_.date_from_iso.clear();
-  state_.date_to_iso.clear();
   state_.gate_phase = next_phase;
   const std::uint64_t id = ++state_.gate_request_seq;
   worker_->supersedeGateRequests(id);  // atomic — safe from the GUI thread
@@ -2412,10 +2394,6 @@ bool McapCloudDialog::onSelectionChanged(std::string_view widget_name, const std
     std::vector<std::string> need_topics;
     {
       std::lock_guard<std::mutex> lock(state_.mu);
-      // A manual pick supersedes any pending restore.
-      state_.restore_selected_sequence.clear();
-      state_.restore_selected_topics.clear();
-
       state_.selected_sequences.clear();
       state_.seq_selected_rows.clear();  // recomputed in widget_data() from selected_sequences
       // The PanelEngine harvests column-0 (display) text. Map each selected row
@@ -2522,14 +2500,14 @@ bool McapCloudDialog::onSelectionChanged(std::string_view widget_name, const std
 }
 
 void McapCloudDialog::onCapabilitiesReady(BackendCaps caps) {
-  std::lock_guard<std::mutex> lock(state_.mu);
-  state_.supports_file_hierarchy = caps.supports_file_hierarchy;
-  // The Advanced query-assist vocabulary is the 4 canonical S3-key fields, NOT
-  // the server's metadata_key_vocabulary (which is MCAP-content-derived). We
-  // deliberately ignore caps.metadata_key_vocabulary so MCAP stats never appear
-  // as a filterable key.
-  (void)caps.metadata_key_vocabulary;
-  state_.metadata_key_vocabulary = canonicalVocabularyKeys();
+  // BackendCaps carries supports_file_hierarchy (the '/'-prefix hierarchy
+  // combo — unused: the browse gate replaced it) and metadata_key_vocabulary
+  // (MCAP-content-derived — deliberately never offered as a filter dimension;
+  // the Advanced query-assist vocabulary is always the 4 canonical S3-key
+  // fields, see canonicalVocabularyKeys()). Neither is latched into state_
+  // today; this hook stays wired as the connect-time place a future
+  // capability would slot into.
+  (void)caps;
 }
 
 void McapCloudDialog::onServerCapabilitiesReady(ServerCaps caps) {
@@ -2544,37 +2522,14 @@ void McapCloudDialog::onConnectFinished(bool ok, std::string uri, std::string st
   // through connectFinished's payload — see fetch_worker.hpp), NOT
   // state_.uri: the user may have already typed a different server into the
   // (still editable) combo box while this connect was in flight, and every
-  // decision below (MRU history, credential lookup, plaintext retry, the gate's
+  // decision below (MRU history, credential lookup, the gate's
   // active_server_key) must stay about the server that actually answered.
-  bool plaintext_retry_needed = false;
-  std::string plaintext_uri;
   bool suppress_error = false;
   std::uint64_t gate_request_id = 0;
   {
     std::lock_guard<std::mutex> lock(state_.mu);
     state_.connected = ok;
-
-    // PJ3 plaintext-fallback: TLS connect failed, user allowed insecure
-    // fallback, no custom cert in use, and we haven't tried plaintext
-    // yet for this URI. Switch grpc+tls:// → grpc:// and retry once.
-    if (!ok) {
-      auto creds = loadCredentialsForUri(settings_, credentialStore(), uri);
-      const bool no_custom_cert = creds.cert_path.empty();
-      if (creds.allow_insecure && no_custom_cert && !state_.attempted_plaintext_fallback) {
-        plaintext_uri = uri;
-        if (const auto pos = plaintext_uri.find("grpc+tls://"); pos != std::string::npos) {
-          plaintext_uri.replace(pos, std::string("grpc+tls://").size(), "grpc://");
-        }
-        if (plaintext_uri != uri) {
-          plaintext_retry_needed = true;
-          state_.attempted_plaintext_fallback = true;
-        }
-      }
-    } else {
-      state_.attempted_plaintext_fallback = false;
-    }
-    // Stay "connecting" only while a plaintext retry is about to fire.
-    state_.connecting = plaintext_retry_needed;
+    state_.connecting = false;
     suppress_error = state_.suppress_connect_error;
 
     if (ok) {
@@ -2599,8 +2554,7 @@ void McapCloudDialog::onConnectFinished(bool ok, std::string uri, std::string st
       // A failed (re)connect leaves state_.connected=false; without this the
       // gate phase could still read a stale kRows/kListLoading/etc. from
       // before the attempt, showing e.g. old rows or a stale pill hint while
-      // genuinely disconnected. (A plaintext retry about to fire is still
-      // "disconnected" until IT reports connectFinished.)
+      // genuinely disconnected.
       state_.gate_phase = GatePhase::kDisconnected;
     }
   }
@@ -2623,9 +2577,7 @@ void McapCloudDialog::onConnectFinished(bool ok, std::string uri, std::string st
     return;
   }
 
-  if (plaintext_retry_needed) {
-    postCommand([w = worker_.get(), plaintext_uri] { w->connectAsync(plaintext_uri, {}, {}, true); });
-  } else if (!suppress_error) {
+  if (!suppress_error) {
     // PJ3 AutoConnect context shows no popup; explicit connects do.
     notify(PJ::ToolboxMessageLevel::kError, fmt::format("MCAP Cloud connection failed: {}", error));
   }
@@ -2737,10 +2689,10 @@ void McapCloudDialog::onGatePageReady(std::uint64_t request_id, std::vector<Sequ
   if (request_id != state_.gate_request_seq) {
     return;  // a newer gate transition owns progressive_seqs_/the table now
   }
-  // Same shape as onSequencePageReady: reset semantics matter (a builder
-  // rebuild racing the pagination aborts server-side and restarts from page
-  // one on the new generation — appending across that boundary would render
-  // the aborted attempt's rows twice).
+  // reset semantics matter: it is NOT merely "page one". A builder rebuild
+  // racing the pagination aborts server-side and restarts from page one on
+  // the new generation — appending across that boundary would render the
+  // aborted attempt's rows twice.
   if (reset) {
     progressive_seqs_.clear();
   }
@@ -3066,12 +3018,9 @@ void McapCloudDialog::rebuildSeqDisplayLocked() {
   // PanelEngine harvests column-0 text on selection).
   state_.seq_display_names.clear();
   state_.seq_display_names.reserve(state_.sequence_names.size());
-  state_.display_to_key.clear();
-  state_.display_to_key.reserve(state_.sequence_names.size());
   for (std::size_t i = 0; i < state_.sequence_names.size(); ++i) {
     const std::string& key = state_.sequence_names[i];
     std::string display = counts[candidates[i]] == 1 ? candidates[i] : key;
-    state_.display_to_key.emplace(display, key);
     state_.seq_display_names.push_back(std::move(display));
   }
 }
@@ -3118,8 +3067,6 @@ void McapCloudDialog::populateSequencesLocked(std::vector<SequenceInfo>& seqs, b
   if (seed_dates && gmin > 0 && gmax > 0) {
     state_.date_from_ns = gmin;
     state_.date_to_ns = gmax;
-    state_.date_from_iso = isoFromNs(gmin);
-    state_.date_to_iso = isoFromNs(gmax);
   }
   ++state_.seq_epoch;  // invalidate the seqTable view cache
 }
@@ -3235,33 +3182,6 @@ void McapCloudDialog::sortTopicsLocked() {
   }
 }
 
-std::vector<std::string> McapCloudDialog::restoreSelectedTopicsLocked() {
-  std::vector<std::string> need_metadata;
-  if (state_.restore_selected_topics.empty()) {
-    return need_metadata;
-  }
-  // One-shot: take the staged names and clear the slot so a later re-fetch or
-  // manual selection isn't overridden.
-  const std::vector<std::string> wanted = std::move(state_.restore_selected_topics);
-  state_.restore_selected_topics.clear();
-
-  state_.topic_selected_rows.clear();
-  for (std::size_t i = 0; i < state_.topic_names.size(); ++i) {
-    for (const std::string& name : wanted) {
-      if (state_.topic_names[i] == name) {
-        state_.topic_selected_rows.push_back(static_cast<int>(i));
-        // Fetch full metadata (Arrow schema + tag) for the Info panel, same as
-        // the manual topic-selection path, when not already cached.
-        if (state_.topic_meta.find(name) == state_.topic_meta.end()) {
-          need_metadata.push_back(name);
-        }
-        break;
-      }
-    }
-  }
-  return need_metadata;
-}
-
 bool McapCloudDialog::onHeaderClicked(std::string_view widget_name, int section) {
   std::lock_guard<std::mutex> lock(state_.mu);
   if (widget_name == "seqTable") {
@@ -3287,63 +3207,12 @@ bool McapCloudDialog::onHeaderClicked(std::string_view widget_name, int section)
   return false;
 }
 
-void McapCloudDialog::onSequenceListStarted(std::vector<SequenceInfo> seqs) {
-  std::lock_guard<std::mutex> lock(state_.mu);
-  // Early populate so the table shows up immediately; leave the date picker
-  // untouched (the final sequencesReady seeds it from the complete span).
-  populateSequencesLocked(seqs, /*seed_dates=*/false);
-  sortSequencesLocked();
-}
-
-void McapCloudDialog::onSequencePageReady(std::vector<SequenceInfo> page, bool reset) {
-  // reset semantics matter: it is NOT merely "page one". A builder rebuild
-  // landing mid-pagination aborts the attempt server-side (ERROR_STALE_CATALOG)
-  // and the client restarts from page one on the new generation — appending
-  // across that boundary would render the aborted attempt's rows twice.
-  if (reset) {
-    progressive_seqs_.clear();
-  }
-  progressive_seqs_.insert(progressive_seqs_.end(), std::make_move_iterator(page.begin()),
-                           std::make_move_iterator(page.end()));
-  std::lock_guard<std::mutex> lock(state_.mu);
-  // Same shape as onSequenceListStarted: populate + sort, but leave the date
-  // picker untouched — only the authoritative final list seeds it.
-  populateSequencesLocked(progressive_seqs_, /*seed_dates=*/false);
-  sortSequencesLocked();
-}
-
-void McapCloudDialog::onSequenceInfoReady(SequenceInfo seq) {
-  std::lock_guard<std::mutex> lock(state_.mu);
-  // Fill in this one sequence's detail in place (min/max ts → Date, size →
-  // Size, metadata → query schema) so the columns populate incrementally as
-  // the server streams detail, instead of snapping in all at once at the final
-  // sequencesReady (PJ3 parity). Keyed by name; positions are left as-is
-  // (re-sorting per row would make the list jump during load — the final
-  // sequencesReady re-sorts once).
-  for (auto& rec : state_.sequences) {
-    if (rec.name != seq.name) {
-      continue;
-    }
-    rec.min_ts_ns = seq.min_ts_ns;
-    rec.max_ts_ns = seq.max_ts_ns;
-    rec.total_size_bytes = seq.total_size_bytes;
-    rec.metadata.clear();
-    for (const auto& kv : seq.user_metadata) {
-      rec.metadata.emplace(kv.first, kv.second);
-    }
-    rec.tags = seq.tags;
-    ++state_.seq_epoch;  // this row's Date/Size changed → invalidate the view cache so it streams in live
-    break;
-  }
-}
-
 void McapCloudDialog::onSequencesReady(std::vector<SequenceInfo> seqs) {
   // The sweep is over; the progressive accumulator has served its purpose (this
   // handler repopulates from the complete vector below). Free the duplicate.
   progressive_seqs_.clear();
   progressive_seqs_.shrink_to_fit();
   std::size_t count = 0;
-  std::string reselect_sequence;
   {
     std::lock_guard<std::mutex> lock(state_.mu);
     populateSequencesLocked(seqs, /*seed_dates=*/true);
@@ -3363,39 +3232,9 @@ void McapCloudDialog::onSequencesReady(std::vector<SequenceInfo> seqs) {
         ++it;
       }
     }
-
-    // PJ3 parity: re-select the persisted sequence if it's present in the
-    // freshly-listed sequences and the user hasn't already picked one this
-    // session. One-shot — clear the restore slot once consumed so a later
-    // manual selection / refresh doesn't snap back.
-    if (!state_.restore_selected_sequence.empty() && state_.selected_sequences.empty()) {
-      for (std::size_t i = 0; i < state_.sequence_names.size(); ++i) {
-        if (state_.sequence_names[i] == state_.restore_selected_sequence) {
-          // Slice 7: persisted restore is single — seed the plural state with
-          // exactly the one restored sequence.
-          state_.selected_sequences = {state_.restore_selected_sequence};
-          state_.primary_sequence = state_.restore_selected_sequence;
-          state_.seq_selected_rows = {static_cast<int>(i)};
-          state_.topics_loading = true;  // header shows "loading…" until topicsReady
-          reselect_sequence = state_.restore_selected_sequence;
-          break;
-        }
-      }
-      state_.restore_selected_sequence.clear();
-      if (reselect_sequence.empty()) {
-        // The saved sequence is gone from the server — drop any staged topic
-        // restore too, since topics are scoped to a sequence.
-        state_.restore_selected_topics.clear();
-      }
-    }
   }
   // Surface the "data arrived" outcome in the app's notification bell.
   notify(PJ::ToolboxMessageLevel::kInfo, fmt::format("{} sequences", count));
-  // Kick off the topic list for the re-selected sequence (mirrors the manual
-  // onSelectionChanged path); restored topic names are re-applied in onTopicsReady.
-  if (!reselect_sequence.empty()) {
-    postCommand([w = worker_.get(), reselect_sequence] { w->listTopicsAsync(reselect_sequence); });
-  }
 }
 
 std::vector<McapCloudDialog::TagEditorRow> McapCloudDialog::buildTagEditorRowsLocked() const {
@@ -3466,45 +3305,26 @@ void McapCloudDialog::onTagsUpdated(std::string sequence_name, bool ok, std::str
 
 void McapCloudDialog::onTopicsReady(std::string sequence_name, std::vector<std::string> /*topic_names*/) {
   // Slice 7: topicInfosReady (below) carries the full per-topic records and is
-  // what feeds the per-sequence cache + union. topicsReady is the name-only
-  // companion signal; the union path drives entirely off topic_infos_by_seq, so
-  // this only refreshes the persisted-topic restore once the union has settled.
-  std::vector<std::string> need_metadata;
-  {
-    std::lock_guard<std::mutex> lock(state_.mu);
-    // Membership test: ignore a stale result for a sequence no longer selected.
-    if (std::find(state_.selected_sequences.begin(), state_.selected_sequences.end(), sequence_name) ==
-        state_.selected_sequences.end()) {
-      return;  // user moved on
-    }
-    if (!state_.topics_loading) {
-      need_metadata = restoreSelectedTopicsLocked();
-    }
-  }
-  for (const std::string& topic : need_metadata) {
-    postCommand([w = worker_.get(), sequence_name, topic] { w->fetchTopicMetadataAsync(sequence_name, topic); });
+  // what feeds the per-sequence cache + union — topicsReady is the name-only
+  // companion signal and only needs the stale-result guard.
+  std::lock_guard<std::mutex> lock(state_.mu);
+  // Membership test: ignore a stale result for a sequence no longer selected.
+  if (std::find(state_.selected_sequences.begin(), state_.selected_sequences.end(), sequence_name) ==
+      state_.selected_sequences.end()) {
+    return;  // user moved on
   }
 }
 
 void McapCloudDialog::onTopicInfosReady(std::string sequence_name, std::vector<TopicInfo> topics) {
-  std::vector<std::string> need_metadata;
-  {
-    std::lock_guard<std::mutex> lock(state_.mu);
-    // Membership test (Slice 7): store into the per-sequence cache when the
-    // sequence is still part of the selection, then recompute the topic UNION.
-    if (std::find(state_.selected_sequences.begin(), state_.selected_sequences.end(), sequence_name) ==
-        state_.selected_sequences.end()) {
-      return;  // user moved on
-    }
-    state_.topic_infos_by_seq[sequence_name] = std::move(topics);
-    recomputeTopicUnionLocked();
-    if (!state_.topics_loading) {
-      need_metadata = restoreSelectedTopicsLocked();
-    }
+  std::lock_guard<std::mutex> lock(state_.mu);
+  // Membership test (Slice 7): store into the per-sequence cache when the
+  // sequence is still part of the selection, then recompute the topic UNION.
+  if (std::find(state_.selected_sequences.begin(), state_.selected_sequences.end(), sequence_name) ==
+      state_.selected_sequences.end()) {
+    return;  // user moved on
   }
-  for (const std::string& topic : need_metadata) {
-    postCommand([w = worker_.get(), sequence_name, topic] { w->fetchTopicMetadataAsync(sequence_name, topic); });
-  }
+  state_.topic_infos_by_seq[sequence_name] = std::move(topics);
+  recomputeTopicUnionLocked();
 }
 
 void McapCloudDialog::onTopicsFailed(std::string sequence_name, std::string error) {

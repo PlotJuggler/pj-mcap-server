@@ -130,59 +130,6 @@ void FetchWorker::connectAsync(std::string uri, std::string cert_path, std::stri
   }
 }
 
-void FetchWorker::listSequencesAsync() {
-  // Not connected → empty result (no error spam): the sequence table stays
-  // empty, matching the dialog's connected-state gating.
-  if (!backend_) {
-    if (sequencesReady) {
-      sequencesReady({});
-    }
-    if (sequenceNamesReady) {
-      sequenceNamesReady({});
-    }
-    return;
-  }
-
-  bool complete = false;
-  // Forward each page as it lands (worker thread — the dialog's wrapper posts it
-  // to the GUI queue, same as every other callback here). Vector-per-page, never
-  // per-row; the reset bit propagates the stale-catalog restart.
-  BackendConnection::PageCallback on_page;
-  if (sequencePageReady) {
-    on_page = [this](const std::vector<SequenceInfo>& page, bool reset) {
-      sequencePageReady(page, reset);
-    };
-  }
-  std::vector<SequenceInfo> sequences = backend_->listSequences(&complete, on_page);
-  if (backend_->isClosed()) {
-    // A dead browse socket reads as an empty/short list; tell the dialog the
-    // connection is gone instead of letting it render a silently empty table.
-    notifyConnectionLostOnce();
-  } else if (!complete) {
-    // Pagination broke mid-way but the socket is still up: the list is PARTIAL.
-    // Surface it as an error rather than presenting a silently-truncated catalog
-    // as authoritative (the browse name->file_id index kept its last COMPLETE
-    // snapshot inside listSequences()).
-    if (errorOccurred) {
-      errorOccurred("Recording list is incomplete (server paging error); showing a partial catalog — retry to refresh.");
-    }
-  }
-
-  // Name-only convenience callback (used by code paths that only want names),
-  // emitted before the full record callback so both views land in one tick.
-  std::vector<std::string> names;
-  names.reserve(sequences.size());
-  for (const auto& s : sequences) {
-    names.push_back(s.name);
-  }
-  if (sequenceNamesReady) {
-    sequenceNamesReady(names);
-  }
-  if (sequencesReady) {
-    sequencesReady(std::move(sequences));
-  }
-}
-
 void FetchWorker::fetchVocabularyAsync(std::uint64_t request_id) {
   if (latest_gate_request_.load() != request_id) {
     // Superseded before starting: unlike listSequencesFilteredAsync's gated
@@ -224,10 +171,9 @@ void FetchWorker::listSequencesFilteredAsync(std::uint64_t request_id, std::stri
   // The ONLY terminal signal for a gated list: exactly one finish() call on
   // every path out of this function (including the pre-start supersession
   // no-op below) — see F5/F4 in the task's design rationale.
-  auto finish = [this, request_id](bool complete, GateListResult::Error error,
-                                   std::vector<SequenceInfo> sequences) {
+  auto finish = [this, request_id](GateListResult::Error error, std::vector<SequenceInfo> sequences) {
     if (gateListFinished) {
-      gateListFinished(GateListResult{request_id, complete, error, std::move(sequences)});
+      gateListFinished(GateListResult{request_id, error, std::move(sequences)});
     }
   };
   if (latest_gate_request_.load() != request_id) {
@@ -235,11 +181,11 @@ void FetchWorker::listSequencesFilteredAsync(std::uint64_t request_id, std::stri
     // this queued command started running: NO-OP rather than sweep the
     // now-irrelevant selection (F4 — commands are FIFO on one worker thread,
     // so a stale request can sit behind a full sweep without this check).
-    finish(false, GateListResult::Error::kSuperseded, {});
+    finish(GateListResult::Error::kSuperseded, {});
     return;
   }
   if (!backend_) {
-    finish(false, GateListResult::Error::kConnectionLost, {});
+    finish(GateListResult::Error::kConnectionLost, {});
     return;
   }
   // Remembered even if this attempt ultimately fails/is superseded: it is
@@ -265,7 +211,7 @@ void FetchWorker::listSequencesFilteredAsync(std::uint64_t request_id, std::stri
         // fired) and the misdiagnosis read as "catalog rebuilding" instead
         // of "reconnect".
         notifyConnectionLostOnce();
-        finish(false, GateListResult::Error::kConnectionLost, {});
+        finish(GateListResult::Error::kConnectionLost, {});
         return;
       }
       if (!fresh) {
@@ -283,7 +229,7 @@ void FetchWorker::listSequencesFilteredAsync(std::uint64_t request_id, std::stri
       // Names no longer resolve against the (possibly just-refreshed)
       // vocabulary: a rebuild renamed/removed the site, or this is a stale
       // persisted selection typed before any vocabulary existed.
-      finish(false, GateListResult::Error::kSelectionGone, {});
+      finish(GateListResult::Error::kSelectionGone, {});
       return;
     }
     bool complete = false;
@@ -298,7 +244,7 @@ void FetchWorker::listSequencesFilteredAsync(std::uint64_t request_id, std::stri
     auto sequences = backend_->listSequences(&complete, on_page, &*filter, &stale, abort);
     if (backend_->isClosed()) {
       notifyConnectionLostOnce();
-      finish(false, GateListResult::Error::kConnectionLost, std::move(sequences));
+      finish(GateListResult::Error::kConnectionLost, std::move(sequences));
       return;
     }
     if (latest_gate_request_.load() != request_id) {
@@ -306,7 +252,7 @@ void FetchWorker::listSequencesFilteredAsync(std::uint64_t request_id, std::stri
       // early): the partial `sequences` it returned belong to a request the
       // dialog no longer cares about, so they are dropped rather than passed
       // to finish().
-      finish(false, GateListResult::Error::kSuperseded, {});
+      finish(GateListResult::Error::kSuperseded, {});
       return;
     }
     if (stale) {
@@ -316,14 +262,13 @@ void FetchWorker::listSequencesFilteredAsync(std::uint64_t request_id, std::stri
       vocab_.reset();
       continue;
     }
-    finish(complete, complete ? GateListResult::Error::kNone : GateListResult::Error::kPartial,
-           std::move(sequences));
+    finish(complete ? GateListResult::Error::kNone : GateListResult::Error::kPartial, std::move(sequences));
     return;
   }
   // Both attempts were exhausted without a usable result (a vocabulary
   // refresh failed, or the generation kept dying out from under us): the
   // catalog is rebuilding faster than this loop can keep up.
-  finish(false, GateListResult::Error::kRebuildStorm, {});
+  finish(GateListResult::Error::kRebuildStorm, {});
 }
 
 void FetchWorker::notifyConnectionLostOnce() {
@@ -357,17 +302,11 @@ void FetchWorker::listTopicsAsync(std::string sequence_name) {
   }
   std::vector<TopicInfo> infos = std::move(result.topics);
 
-  // Cache the full per-topic records by name (the dialog uses this for later
-  // metadata lookups without another round trip).
-  std::unordered_map<std::string, TopicInfo> by_name;
-  by_name.reserve(infos.size());
   std::vector<std::string> names;
   names.reserve(infos.size());
   for (const auto& info : infos) {
     names.push_back(info.topic_name);
-    by_name.emplace(info.topic_name, info);
   }
-  setTopicInfoCache(std::move(by_name));
 
   // topicInfosReady carries the full TopicInfo list (size/schema/message-count);
   // topicsReady carries the name-only view. The dialog keeps the two aligned.
@@ -439,9 +378,9 @@ void FetchWorker::updateTagsAsync(std::string sequence_name,
     return;
   }
 
-  // Guard on the `complete` flag exactly like the browse path
-  // (listSequencesAsync): a PARTIAL re-list (a page dropped, or a rebuild
-  // racing the pagination) must NOT replace the dialog's authoritative
+  // Guard on the `complete` flag exactly like every other browse path
+  // (listSequencesFilteredAsync above): a PARTIAL re-list (a page dropped, or a
+  // rebuild racing the pagination) must NOT replace the dialog's authoritative
   // catalog with a truncated snapshot — surface it as an error and keep the
   // existing view instead.
   bool complete = false;
@@ -452,14 +391,6 @@ void FetchWorker::updateTagsAsync(std::string sequence_name,
                     "(server paging error) — the list may be stale; retry to refresh.");
     }
     return;
-  }
-  std::vector<std::string> names;
-  names.reserve(sequences.size());
-  for (const auto& s : sequences) {
-    names.push_back(s.name);
-  }
-  if (sequenceNamesReady) {
-    sequenceNamesReady(std::move(names));
   }
   if (sequencesReady) {
     sequencesReady(std::move(sequences));

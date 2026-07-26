@@ -2,16 +2,16 @@
 // SPDX-License-Identifier: MIT
 //
 // Local replacements for the mosaico_sdk flight/types.hpp structs. The cloud
-// connector plugin is a visual copy of toolbox_mosaico with the Apache Arrow /
-// Arrow Flight / gRPC / mosaico_sdk transport removed and replaced by an inert
-// stub (backend_connection.hpp). These structs carry only the fields the
-// dialog + worker actually read; the arrow::Schema field of the SDK's TopicInfo
-// is flattened into a plain (name,type) string vector so the Info panel can
-// still render a "Fields (N):" block without Arrow.
+// connector plugin started as a visual copy of toolbox_mosaico with the Apache
+// Arrow / Arrow Flight / gRPC / mosaico_sdk transport removed; the real
+// ixwebsocket+Protobuf transport (backend_connection.hpp/.cpp) now populates
+// these structs from the wire (see wire_mapping.cpp). These structs carry only
+// the fields the dialog + worker actually read; the arrow::Schema field of the
+// SDK's TopicInfo is flattened into a plain (name,type) string vector so the
+// Info panel can still render a "Fields (N):" block without Arrow.
 //
 // This header is deliberately self-contained — it must NOT transitively include
-// any flight/* / arrow/* header. When the real WS+Protobuf client-core lands,
-// these types stay (or are repopulated) behind the same names.
+// any flight/* / arrow/* header.
 #pragma once
 
 #include <cstdint>

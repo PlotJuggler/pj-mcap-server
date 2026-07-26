@@ -11,7 +11,6 @@
 #include <pj_base/sdk/plugin_data_api.hpp>
 #include <pj_base/sdk/toolbox_plugin_base.hpp>
 #include <string>
-#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -22,8 +21,9 @@
 namespace mcap_cloud {
 
 /// Thin background adapter for the cloud backend, running on the dialog's worker
-/// thread. The worker itself is transport-agnostic: callers serialize commands
-/// and route callbacks to the GUI thread.
+/// thread. It owns the concrete ixwebsocket+Protobuf BackendConnection(s) (the
+/// catalog-browse socket plus one fresh session connection per pull); callers
+/// serialize commands onto this thread and route callbacks back to the GUI thread.
 ///
 /// TOOLBOX shape (Slice 5/16): the worker owns BOTH the catalog browse path
 /// (connect / listSequences / listTopics / getTopicMetadata) AND the in-dialog
@@ -75,18 +75,8 @@ class FetchWorker {
     return cancel_flag_.load(std::memory_order_relaxed);
   }
 
-  /// Cache topic infos from the most recent listTopicsAsync so per-topic
-  /// metadata can be looked up later without another round trip. Keyed by
-  /// topic_name.
-  void setTopicInfoCache(std::unordered_map<std::string, TopicInfo> by_name) {
-    topic_info_by_name_ = std::move(by_name);
-  }
-
   /// Connect (or reconnect) to the given URI. Calls connectFinished on completion.
   void connectAsync(std::string uri, std::string cert_path, std::string api_key, bool allow_insecure);
-
-  /// List all sequences from the connected server.
-  void listSequencesAsync();
 
   /// List topics for a given sequence (partial metadata).
   void listTopicsAsync(std::string sequence_name);
@@ -156,24 +146,8 @@ class FetchWorker {
   /// conservative default for an ancient/odd server too).
   std::function<void(ServerCaps caps)> serverCapabilitiesReady;
   /// Full SequenceInfo entries, including user_metadata (used by the Lua
-  /// metadata filter). The name-only callback is kept
-  /// for code paths that only want names.
+  /// metadata filter).
   std::function<void(std::vector<SequenceInfo> sequences)> sequencesReady;
-  std::function<void(std::vector<std::string> names)> sequenceNamesReady;
-  /// One event per ListFiles page, DURING the (blocking) catalog sweep — so the
-  /// table can draw page one (~150 ms) instead of staying blank for the whole
-  /// listing (~8 s over 25k files). `reset` true = drop everything previously
-  /// delivered (first page, or an ERROR_STALE_CATALOG restart after a builder
-  /// rebuild raced the pagination — see BackendConnection::PageCallback).
-  /// The final authoritative sequencesReady still follows.
-  std::function<void(std::vector<SequenceInfo> page, bool reset)> sequencePageReady;
-  // Progressive discovery (PJ3 parity): the initial list, so the table can
-  // populate before per-sequence detail finishes streaming in...
-  std::function<void(std::vector<SequenceInfo> sequences)> sequenceListStarted;
-  // ...and one callback per sequence as the server fills in its detail
-  // (min/max timestamp, size, metadata), so Date/Size columns populate
-  // incrementally rather than snapping in all at once.
-  std::function<void(SequenceInfo sequence)> sequenceInfoReady;
   std::function<void(std::string sequence_name, std::vector<std::string> topic_names)> topicsReady;
   /// Full TopicInfo list from listTopics (name + size + timestamp range +
   /// created/locked/chunks). Schema/ontology/user_metadata are NOT populated
@@ -244,11 +218,11 @@ class FetchWorker {
  public:
   /// Terminal result of ONE gated (filtered) list request. Exactly one is
   /// emitted per listSequencesFilteredAsync call that is not superseded before
-  /// starting. `complete=false` + error explains why (the dialog must NOT
-  /// render "no recordings" for anything but a complete empty result).
+  /// starting. `error != kNone` explains why the result isn't authoritative
+  /// (the dialog must NOT render "no recordings" for anything but a genuinely
+  /// complete, error==kNone, result).
   struct GateListResult {
     std::uint64_t request_id = 0;
-    bool complete = false;
     enum class Error { kNone, kPartial, kConnectionLost, kSelectionGone, kRebuildStorm, kSuperseded };
     Error error = Error::kNone;
     std::vector<SequenceInfo> sequences;
@@ -298,7 +272,6 @@ class FetchWorker {
   std::function<PJ::sdk::ToolboxHostView()> host_provider_;
   std::function<PJ::ToolboxRuntimeHostView()> runtime_host_provider_;
   std::atomic<bool> cancel_flag_{false};
-  std::unordered_map<std::string, TopicInfo> topic_info_by_name_;
 
   std::optional<PJ::sdk::DataSourceHandle> fetch_dataset_;
   std::mutex fetch_dataset_mu_;
