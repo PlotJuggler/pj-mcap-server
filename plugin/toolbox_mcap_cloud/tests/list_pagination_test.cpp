@@ -20,6 +20,9 @@
 //
 // Same in-process ix::WebSocketServer shape as server_caps_test.cpp: no env
 // gate, no external process, loopback ephemeral port.
+//
+// This file also hosts the Vocabulary suite (BackendConnection::getVocabulary()),
+// since FakePagingServer already answers GetVocabulary unconditionally below.
 
 #include <gtest/gtest.h>
 
@@ -311,6 +314,9 @@ TEST(Vocabulary, MapsTheCustomerSiteTree) {
   EXPECT_EQ(vocab->customers[0].sites[0].name, "nashville");
   EXPECT_EQ(vocab->customers[0].sites[0].id, 21u);
   EXPECT_EQ(vocab->customers[0].sites[0].file_count, 500u);
+  EXPECT_EQ(vocab->customers[0].sites[1].name, "wallingford");
+  EXPECT_EQ(vocab->customers[0].sites[1].id, 22u);
+  EXPECT_EQ(vocab->customers[0].sites[1].file_count, 500u);
   EXPECT_EQ(vocab->totalFiles(), 1000u);
   EXPECT_EQ(vocab->totalSites(), 2u);
 }

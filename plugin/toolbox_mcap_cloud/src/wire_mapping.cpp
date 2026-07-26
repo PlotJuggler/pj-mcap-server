@@ -96,4 +96,22 @@ std::vector<TopicInfo> mapGetFileResponseTopics(const pj_cloud::v1::GetFileRespo
   return out;
 }
 
+VocabularyInfo mapGetVocabularyResponse(const pj_cloud::v1::GetVocabularyResponse& response) {
+  VocabularyInfo out;
+  out.generation = response.catalog_generation();
+  out.customers.reserve(static_cast<std::size_t>(response.customers_size()));
+  for (const auto& c : response.customers()) {
+    VocabCustomer customer;
+    customer.id = c.id();
+    customer.name = c.name();
+    customer.file_count = c.file_count();
+    customer.sites.reserve(static_cast<std::size_t>(c.sites_size()));
+    for (const auto& s : c.sites()) {
+      customer.sites.push_back(VocabSite{s.id(), s.name(), s.file_count()});
+    }
+    out.customers.push_back(std::move(customer));
+  }
+  return out;
+}
+
 }  // namespace mcap_cloud

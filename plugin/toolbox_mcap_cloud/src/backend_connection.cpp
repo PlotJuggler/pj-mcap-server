@@ -574,22 +574,7 @@ std::optional<VocabularyInfo> BackendConnection::getVocabulary() {
   if (!sendAndWait(request, &response) || !response.has_get_vocabulary()) {
     return std::nullopt;
   }
-  const auto& wire = response.get_vocabulary();
-  VocabularyInfo out;
-  out.generation = wire.catalog_generation();
-  out.customers.reserve(static_cast<std::size_t>(wire.customers_size()));
-  for (const auto& c : wire.customers()) {
-    VocabCustomer customer;
-    customer.id = c.id();
-    customer.name = c.name();
-    customer.file_count = c.file_count();
-    customer.sites.reserve(static_cast<std::size_t>(c.sites_size()));
-    for (const auto& s : c.sites()) {
-      customer.sites.push_back(VocabSite{s.id(), s.name(), s.file_count()});
-    }
-    out.customers.push_back(std::move(customer));
-  }
-  return out;
+  return mapGetVocabularyResponse(response.get_vocabulary());
 }
 
 bool BackendConnection::isClosed() {

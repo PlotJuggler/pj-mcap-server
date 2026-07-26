@@ -17,6 +17,7 @@
 namespace {
 
 using mcap_cloud::mapGetFileResponseTopics;
+using mcap_cloud::mapGetVocabularyResponse;
 using mcap_cloud::mapListFilesResponse;
 using mcap_cloud::mapTags;
 
@@ -191,6 +192,61 @@ TEST(WireMapping, UpdateTagsResponseEffectiveTagsMapToTagRows) {
   EXPECT_EQ(rows[1].key, "recorder");
   EXPECT_EQ(rows[1].value, "zala-7");
   EXPECT_FALSE(rows[1].is_override);
+}
+
+// ---- Vocabulary (customer/site browse gate) --------------------------------
+
+TEST(WireMapping, GetVocabularyResponseMapsCustomerSiteTree) {
+  pj_cloud::v1::GetVocabularyResponse response;
+  response.set_catalog_generation("gen-42");
+
+  auto* customer_a = response.add_customers();
+  customer_a->set_id(11);
+  customer_a->set_name("dexory");
+  customer_a->set_file_count(1000);
+  auto* site_a1 = customer_a->add_sites();
+  site_a1->set_id(21);
+  site_a1->set_name("nashville");
+  site_a1->set_file_count(500);
+  auto* site_a2 = customer_a->add_sites();
+  site_a2->set_id(22);
+  site_a2->set_name("wallingford");
+  site_a2->set_file_count(0);
+
+  auto* customer_b = response.add_customers();
+  customer_b->set_id(12);
+  customer_b->set_name("acme");
+  customer_b->set_file_count(7);
+
+  const auto vocab = mapGetVocabularyResponse(roundTrip(response));
+
+  EXPECT_EQ(vocab.generation, "gen-42");
+  ASSERT_EQ(vocab.customers.size(), 2u);
+
+  EXPECT_EQ(vocab.customers[0].id, 11u);
+  EXPECT_EQ(vocab.customers[0].name, "dexory");
+  EXPECT_EQ(vocab.customers[0].file_count, 1000u);
+  ASSERT_EQ(vocab.customers[0].sites.size(), 2u);
+  EXPECT_EQ(vocab.customers[0].sites[0].id, 21u);
+  EXPECT_EQ(vocab.customers[0].sites[0].name, "nashville");
+  EXPECT_EQ(vocab.customers[0].sites[0].file_count, 500u);
+  EXPECT_EQ(vocab.customers[0].sites[1].id, 22u);
+  EXPECT_EQ(vocab.customers[0].sites[1].name, "wallingford");
+  EXPECT_EQ(vocab.customers[0].sites[1].file_count, 0u);
+
+  EXPECT_EQ(vocab.customers[1].id, 12u);
+  EXPECT_EQ(vocab.customers[1].name, "acme");
+  EXPECT_EQ(vocab.customers[1].file_count, 7u);
+  EXPECT_TRUE(vocab.customers[1].sites.empty());
+}
+
+TEST(WireMapping, EmptyGetVocabularyResponseMapsToEmptyVocabularyInfo) {
+  pj_cloud::v1::GetVocabularyResponse response;
+
+  const auto vocab = mapGetVocabularyResponse(roundTrip(response));
+
+  EXPECT_TRUE(vocab.generation.empty());
+  EXPECT_TRUE(vocab.customers.empty());
 }
 
 }  // namespace

@@ -60,4 +60,9 @@ struct MappedSequence {
 // Map the topics of a GetFileResponse into a TopicInfo vector (preserving order).
 [[nodiscard]] std::vector<TopicInfo> mapGetFileResponseTopics(const pj_cloud::v1::GetFileResponse& response);
 
+// Map a GetVocabularyResponse (the customer->site filter tree) onto
+// VocabularyInfo, preserving order. catalog_generation carries the opaque
+// generation the customer/site ids are bound to (see backend_types.hpp).
+[[nodiscard]] VocabularyInfo mapGetVocabularyResponse(const pj_cloud::v1::GetVocabularyResponse& response);
+
 }  // namespace mcap_cloud
