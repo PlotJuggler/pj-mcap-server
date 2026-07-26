@@ -49,4 +49,21 @@ inline std::string resolveCliToken(const std::optional<std::string>& cli_token,
   return std::string{};  // dev anonymous
 }
 
+// Resolve the CA bundle used to verify a wss:// peer, same precedence as the URL:
+//   1. an explicit --cert, 2. else a non-empty MCAP_CLOUD_CACERT, 3. else empty.
+// An EMPTY result is meaningful rather than an error: it asks BackendConnection
+// to auto-detect the host's system bundle (see detectSystemCaBundle() — the
+// ixwebsocket "SYSTEM" keyword is a no-op on Linux), so there is deliberately no
+// built-in default path here.
+inline std::string resolveCliCert(const std::optional<std::string>& cli_cert,
+                                  const std::optional<std::string>& env_cert) {
+  if (cli_cert.has_value() && !cli_cert->empty()) {
+    return *cli_cert;
+  }
+  if (env_cert.has_value() && !env_cert->empty()) {
+    return *env_cert;
+  }
+  return std::string{};  // auto-detect
+}
+
 }  // namespace mcap_cloud

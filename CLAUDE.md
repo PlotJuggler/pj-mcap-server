@@ -79,6 +79,20 @@ doubt, but don't relitigate the decision itself.
 - **Transport is ixwebsocket; the CLI and plugin link zero Qt.** QtWebSockets /
   a standalone `client-core` (the original plan) is a SUPERSEDED design — do not
   "restore" it without a new decision.
+- **`wss://` MUST be handed an explicit CA bundle path — never ixwebsocket's
+  `caFile = "SYSTEM"`.** Its mbedTLS backend implements `loadSystemCertificates()`
+  for Windows ONLY; every other platform hits `#else return false;` *without
+  assigning `errorMsg`*, so the whole handshake fails as `error: no error`. The
+  client resolves a real bundle itself (`detectSystemCaBundle()` in
+  `src/tls_utils.h`: `SSL_CERT_FILE` → distro path list), falling back to
+  `"SYSTEM"` only as a last resort (correct on macOS/Windows). `SSL_CERT_DIR` is
+  NOT honoured — ixwebsocket only calls `mbedtls_x509_crt_parse_file()`, never
+  `..._parse_path()`, so a directory cannot work. **Corollary: `--insecure`/`allow_insecure`
+  sets `caFile = "NONE"` and NOTHING else** — ixwebsocket gates
+  `mbedtls_ssl_set_hostname()` (SNI) on `!disable_hostname_validation`, so setting
+  that flag silently stops sending SNI and any SNI-dependent TLS front-end
+  (Tailscale Serve, Cloudflare, shared-IP terminators) kills the handshake with a
+  fatal alert. Both rules are pinned by `tests/tls_utils_test.cpp`.
 - **LZ4 chunks are FRAMES, decoded with `lz4.NewReader`** — not raw blocks. Chunk
   `UncompressedCRC` is read but NEVER verified; the only integrity surface is a
   zstd/lz4 decode failure.
@@ -314,7 +328,9 @@ slice done.** The harness proves the whole pipeline without the GUI:
   / `topics <sequence> [--json]` / `download <seq…> [--topics …] [--time-range …]
   --output …` (variadic = stitched; duplicate → exit 2) / `tag`, `--url` or
   `MCAP_CLOUD_URL` (default `ws://localhost:8080`), `--insecure` for
-  self-signed `wss://`. Exit 0/1/2 = ok/connection-failure/usage.
+  self-signed `wss://`, `--cert`/`MCAP_CLOUD_CACERT` for a private CA (a
+  publicly-trusted `wss://` needs NEITHER — the system CA bundle is auto-detected).
+  Exit 0/1/2 = ok/connection-failure/usage.
 - Ground truth is pinned in TWO places that must move in lockstep when the bucket is
   reseeded: `scripts/smoke.sh` constants and
   `toolbox_mcap_cloud/tests/backend_connection_live_test.cpp` (8 sequences; 6 topics

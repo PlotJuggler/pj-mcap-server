@@ -14,6 +14,7 @@
 
 #include "pj_cloud.pb.h"
 #include "session_decode.hpp"
+#include "tls_utils.h"
 #include "wire_mapping.hpp"
 
 namespace mcap_cloud {
@@ -237,16 +238,17 @@ bool BackendConnection::buildAndOpenSocket(std::string* error_out) {
   socket_->setHandshakeTimeout(static_cast<int>(kRequestTimeout.count()));
 
   if (isWssScheme(uri_)) {
+    // The CA choice is resolved by a pure helper (see tls_utils.h) because BOTH
+    // of ixwebsocket's mbedTLS defaults are wrong for us:
+    //   * caFile "SYSTEM" is unimplemented outside Windows, so leaving it makes
+    //     every wss:// handshake fail with the empty message "error: no error";
+    //   * disable_hostname_validation also suppresses SNI, which SNI-dependent
+    //     TLS front-ends (Tailscale, Cloudflare) reject with a fatal alert.
     ix::SocketTLSOptions tls;
     tls.tls = true;
-    if (!cert_path_.empty()) {
-      tls.caFile = cert_path_;
-    }
-    if (allow_insecure_) {
-      // Skip peer verification AND hostname validation (dev / self-signed).
-      tls.caFile = "NONE";
-      tls.disable_hostname_validation = true;
-    }
+    const TlsCaChoice ca = chooseTlsCaFile(cert_path_, allow_insecure_, detectSystemCaBundle());
+    tls.caFile = ca.ca_file;
+    tls.disable_hostname_validation = ca.disable_hostname_validation;
     socket_->setTLSOptions(tls);
   }
 

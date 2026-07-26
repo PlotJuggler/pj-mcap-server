@@ -28,6 +28,7 @@
 // Flags / env:
 //   --url   / MCAP_CLOUD_URL      WS base URI (default ws://localhost:8080)
 //   --token / MCAP_CLOUD_API_KEY  bearer token (may be empty = dev anonymous)
+//   --cert  / MCAP_CLOUD_CACERT   wss:// CA bundle (default: auto-detect system)
 //   --output FILE                   (download) destination MCAP path (required)
 //   --topics a,b,c                  (download / debug) topic subset (default: all)
 //   --time-range startNs,endNs      (download / debug) optional time window (nanoseconds)
@@ -87,6 +88,8 @@ void printUsage(std::ostream& os) {
         "  --url URL                WS base URI (env MCAP_CLOUD_URL; default ws://localhost:8080)\n"
         "  --token TOKEN            bearer token (env MCAP_CLOUD_API_KEY; may be empty)\n"
         "  --insecure               wss://: skip TLS certificate verification (self-signed dev certs)\n"
+        "  --cert FILE              wss://: CA bundle to verify the server (env MCAP_CLOUD_CACERT;\n"
+        "                           default: auto-detect the system bundle)\n"
         "  --output FILE            (download) destination MCAP path (required)\n"
         "  --topics a,b,c           (download/debug) comma-separated topic subset (default: all)\n"
         "  --time-range startNs,endNs (download/debug) optional time window in nanoseconds\n"
@@ -682,6 +685,9 @@ int main(int argc, char** argv) {
   // verification (wires the BackendConnection's existing allow_insecure / the
   // ixwebsocket TLS option the GUI plugin exposes). Ignored for ws://.
   bool insecure = false;
+  // --cert: CA bundle used to verify a wss:// peer. Unset = auto-detect the
+  // system bundle (BackendConnection does this); only needed for a private CA.
+  std::optional<std::string> cert_flag;
 
   auto needValue = [&](const std::string& flag, int& i) -> const char* {
     if (i + 1 >= argc) {
@@ -703,6 +709,12 @@ int main(int argc, char** argv) {
       include_latched = true;
     } else if (arg == "--insecure") {
       insecure = true;
+    } else if (arg == "--cert") {
+      const char* v = needValue(arg, i);
+      if (v == nullptr) {
+        return kExitUsage;
+      }
+      cert_flag = std::string(v);
     } else if (arg == "--url") {
       const char* v = needValue(arg, i);
       if (v == nullptr) {
@@ -852,11 +864,14 @@ int main(int argc, char** argv) {
   // absent --token falls back to MCAP_CLOUD_API_KEY (then empty = dev anonymous).
   const std::string url = mcap_cloud::resolveCliUrl(url_flag, envOpt("MCAP_CLOUD_URL"));
   const std::string token = mcap_cloud::resolveCliToken(token_flag, envOpt("MCAP_CLOUD_API_KEY"));
+  // Empty = auto-detect the system CA bundle inside BackendConnection; only a
+  // private/corporate CA needs --cert or MCAP_CLOUD_CACERT.
+  const std::string cert = mcap_cloud::resolveCliCert(cert_flag, envOpt("MCAP_CLOUD_CACERT"));
 
   // All commands need a live connection. Use the exact class the GUI uses. The
   // harness normally targets ws://; --insecure wires the same allow_insecure TLS
   // skip-verify the GUI plugin exposes so a wss:// dev-cert leg works end-to-end.
-  mcap_cloud::BackendConnection conn(url, /*cert_path=*/"", /*api_key=*/token,
+  mcap_cloud::BackendConnection conn(url, /*cert_path=*/cert, /*api_key=*/token,
                                        /*allow_insecure=*/insecure);
   std::string error;
   if (!conn.connect(&error)) {

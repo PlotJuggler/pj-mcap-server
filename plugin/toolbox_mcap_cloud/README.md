@@ -87,6 +87,46 @@ Exit codes: `0` success · `1` connection/RPC failure · `2` usage error.
 | `MCAP_CLOUD_URL` | `--url URL` | `ws://localhost:8080` | WS base URI (`ws://` or `wss://`) |
 | `MCAP_CLOUD_API_KEY` | `--token TOKEN` | *(empty)* | bearer token; empty = dev anonymous |
 | — | `--insecure` | off | `wss://`: skip TLS cert verification (self-signed dev certs) |
+| `MCAP_CLOUD_CACERT` | `--cert FILE` | *(auto-detect)* | `wss://`: CA bundle verifying the server; only needed for a private CA |
+| `SSL_CERT_FILE` | — | *(unset)* | `wss://`: standard override consulted before the built-in path list |
+
+### `wss://` and certificate discovery
+
+**A publicly-trusted `wss://` server needs no flags at all** — just `--url` and
+`--token`. The CA bundle is located automatically by `detectSystemCaBundle()`
+(`src/tls_utils.h`), which consults, in order:
+
+1. `SSL_CERT_FILE`, when it points at a readable file;
+2. the well-known per-distro bundles — `/etc/ssl/certs/ca-certificates.crt`
+   (Debian/Ubuntu/Alpine), `/etc/pki/tls/certs/ca-bundle.crt` (Fedora/RHEL),
+   `/etc/ssl/ca-bundle.pem` (openSUSE),
+   `/etc/ca-certificates/extracted/tls-ca-bundle.pem` (Arch), `/etc/ssl/cert.pem`;
+3. ixwebsocket's `"SYSTEM"` keyword as a last resort.
+
+Doing this ourselves is **not** optional. ixwebsocket's `caFile = "SYSTEM"` default
+implements system-certificate loading on Windows only; every other platform takes
+a `return false` branch that never assigns an error string, so the whole handshake
+fails as the misleading `error: no error`. Step 3 exists purely because that
+default *is* correct on macOS/Windows.
+
+`SSL_CERT_DIR` is deliberately ignored: it names a hashed-symlink *directory*, and
+ixwebsocket only ever calls `mbedtls_x509_crt_parse_file()` on `caFile`, never
+`mbedtls_x509_crt_parse_path()`.
+
+`--insecure` disables verification via `caFile = "NONE"` **and nothing else**.
+ixwebsocket gates SNI on `disable_hostname_validation`, so setting that flag would
+stop sending SNI entirely and any SNI-dependent TLS front-end (Tailscale Serve,
+Cloudflare, shared-IP terminators) would abort the handshake with a fatal alert.
+
+**AppImage note:** an AppImage is a self-mounting SquashFS, not a sandbox, so the
+host's `/etc` is visible and the path list above resolves normally. (PlotJuggler's
+own `AppRun` probes the same paths to set `GRPC_DEFAULT_SSL_ROOTS_FILE_PATH`.) On
+a distro with none of these layouts — NixOS, minimal containers — export
+`SSL_CERT_FILE`, or pass `--cert` / set the GUI's certificate field.
+
+In the GUI plugin the same three inputs live behind the connect row's
+**"Cert / API Key…"** button (`ui/cert_dialog.ui`): certificate path (leave EMPTY
+for auto-detect), API key, and an "allow insecure" checkbox.
 
 Precedence is **explicit flag > environment > built-in default**, implemented by
 the pure resolver in `tools/cli_url_resolve.hpp` and pinned by the

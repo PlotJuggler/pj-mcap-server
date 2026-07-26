@@ -96,5 +96,28 @@ One backend (builder + server) runs at a time — `make server-stop` to switch t
 > `PJ_CLOUD_ALLOW_ANONYMOUS=1` explicitly permits open access. See
 > `server/deploy/README.md` and `docs/ec2-deploy.md`.
 
+### Connecting to a remote server (`wss://`)
+
+Against a server behind a TLS front-end (nginx/ALB, Tailscale Serve, Cloudflare)
+with a publicly-trusted certificate, a client needs only the URL and the token —
+**no certificate configuration**:
+
+```bash
+export MCAP_CLOUD_API_KEY=<token>
+plugin/toolbox_mcap_cloud/build/bin/mcap-cloud-cli \
+  --url wss://recordings.example.com list
+```
+
+- Give the **host only** — no port and no path. The client appends the WebSocket
+  path (`/api/ws`) itself, and a TLS front-end normally serves on 443.
+- The system CA bundle is auto-detected. Override with `SSL_CERT_FILE`, or pass
+  `--cert FILE` / `MCAP_CLOUD_CACERT` for a private CA.
+- For a **self-signed** cert, prefer `--cert` with the CA over `--insecure`.
+- In the GUI plugin the same settings live behind the connect row's
+  **"Cert / API Key…"** button; leave the certificate field EMPTY for auto-detect.
+
+See `plugin/toolbox_mcap_cloud/README.md` for the full flag/environment table and
+the certificate-discovery order.
+
 Run the full regression gate: `make smoke`. It generates and seeds its own
 synthetic corpus; see `scripts/RUNBOOK.md` for its additional tooling prerequisites.
