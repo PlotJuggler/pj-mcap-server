@@ -116,8 +116,13 @@ plugin/toolbox_mcap_cloud/build/bin/mcap-cloud-cli \
 - In the GUI plugin the same settings live behind the connect row's
   **"Cert / API Key…"** button; leave the certificate field EMPTY for auto-detect.
 
-See `plugin/toolbox_mcap_cloud/README.md` for the full flag/environment table and
-the certificate-discovery order.
+After connecting, the PlotJuggler plugin asks for a customer and site before
+loading any recordings -- the catalog can hold tens of thousands of files. The
+selection is remembered per server, so reconnecting lands back on the last
+site. `mcap-cloud-cli list` stays unfiltered.
+
+See `plugin/toolbox_mcap_cloud/README.md` for the full flag/environment table,
+the certificate-discovery order, and the gated browse-flow details.
 
 Run the full regression gate: `make smoke`. It generates and seeds its own
 synthetic corpus; see `scripts/RUNBOOK.md` for its additional tooling prerequisites.

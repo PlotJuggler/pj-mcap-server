@@ -48,10 +48,12 @@ byte-identical copies in `docs/` and `mcap_catalog/`) is the cross-language cont
 schema/IPC changes MUST update it.
 
 - **Remaining follow-ups:** `matrix.sh` migration (fail-fasts with exit 2 today; needs the
-  `jkk_dataset02` corpus machine); the C++ facet UI (client-side `GetVocabulary`, now that
-  the generation token makes cached dimension ids safe to echo —
-  `docs/catalog-vocabulary-rpc.md`); real-bucket GCE smoke (`docs/gce-deploy-smoke.md`);
+  `jkk_dataset02` corpus machine); real-bucket GCE smoke (`docs/gce-deploy-smoke.md`);
   builder gaps by design: `derive_tags()` stub, GCS Pub/Sub discovery, `file_metrics`.
+- **The C++ facet UI has LANDED** (2026-07-26): browse is now gated on a required
+  customer+site selection fed by `GetVocabulary`, server-filtered (`ListFiles`) and
+  progressively rendered, persisted per server -- see
+  `docs/2026-07-26-facet-gated-browse-plan.md` for the design.
 - **Team rule:** technical decisions are cross-checked with a standing Codex instance
   before they're locked; milestone boundaries get adversarial review (Codex + Claude —
   this caught ~35 real defects across the M6 tail).

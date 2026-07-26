@@ -16,8 +16,10 @@ the connector pipeline (server → WebSocket/Protobuf → this plugin).
 - Connects to a PJ Cloud server over a single WebSocket multiplexing catalog RPCs
   and bounded-horizon session streaming (incremental download, not wall-clock
   playback).
-- Lists sequences (cloud MCAP files), their topics, time ranges, sizes, and
-  metadata/tags; supports a Lua metadata query filter.
+- Browses the catalog through a required customer/site gate (see "Browse
+  flow" below), then lists that site's sequences (cloud MCAP files), their
+  topics, time ranges, sizes, and metadata/tags; supports a Lua metadata
+  query filter over the loaded rows.
 - Selects N consecutive sequences and presents them as one **stitched** logical
   session (union of topics, one continuous time range).
 - Fetches the selection and ingests decoded scalar series into the datastore.
@@ -25,6 +27,46 @@ the connector pipeline (server → WebSocket/Protobuf → this plugin).
 - Edits a file's override **tags** (the server keeps an effective-tags view).
 - Survives a mid-download WebSocket drop via reconnect-and-resume; repeat fetches
   of the same selection are served from an in-memory session cache.
+
+## Browse flow: the customer/site gate
+
+Connecting to a production server does **not** fetch the file list -- a real
+catalog can hold tens of thousands of files, and pulling all of them up front
+made the browse table sit blank for a long time. Instead:
+
+- On connect the plugin fetches only the **filter vocabulary**
+  (`GetVocabulary`): a customer -> site tree with a per-node file count and a
+  catalog generation. Nothing else loads yet.
+- A permanent **gate row** (customer combo + site combo) sits above the
+  filter panes and stays visible in both **Basic** and **Advanced** modes. The
+  customer combo auto-selects when the vocabulary has exactly one customer;
+  otherwise the user must pick one. No recordings load until a customer AND a
+  site are both chosen.
+- Picking a site issues a **server-filtered** `ListFiles` request
+  (`FileFilter.customer_id`/`site_id`, with the vocabulary's generation echoed
+  on the first page) and renders it **progressively** -- the table fills in
+  as pages arrive rather than only after the whole sweep completes.
+- The (customer, site) selection persists **per server**, keyed by the
+  canonical `ws://`/`wss://` server URI: a returning user reconnects straight
+  into their last site. A one-shot migration seeds this from the old global
+  filter settings the first time, then clears them.
+- The robot/source combos, the date filter (default **All**), the free-text
+  name filter, and the Lua/Advanced query are UNCHANGED: they keep narrowing
+  the rows already loaded for the selected site, client-side.
+- The old "(any)/(any)" merged-all-sites view is removed by design --
+  browsing is always scoped to one customer + site.
+- `mcap-cloud-cli` is unaffected: `list` still returns the full, unfiltered
+  catalog (there is no gate on the CLI).
+
+Measured on a real 25,550-file catalog: the vocabulary fetch takes 167 ms; a
+473-file site loads completely in 147 ms; a 14,480-file site shows its first
+rows in 127 ms and completes in 3.7 s. The previous unfiltered browse of the
+whole catalog took about 11.9 s with a blank table the entire time.
+
+Empty-state pill (one message shown at a time, in the table's grid cell, so
+the state is always explicit): disconnected; vocabulary loading (silent);
+vocabulary error; empty catalog; needs selection (with the corpus size); list
+loading (silent); list error; no matches for the current selection.
 
 ## Build
 
