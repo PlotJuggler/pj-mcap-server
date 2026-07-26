@@ -3,6 +3,7 @@
 
 #include "backend_connection.hpp"
 
+#include <ixwebsocket/IXNetSystem.h>
 #include <ixwebsocket/IXWebSocket.h>
 
 #include <algorithm>
@@ -81,7 +82,15 @@ BackendConnection::BackendConnection(std::string uri, std::string cert_path, std
     : uri_(std::move(uri)),
       cert_path_(std::move(cert_path)),
       api_key_(std::move(api_key)),
-      allow_insecure_(allow_insecure) {}
+      allow_insecure_(allow_insecure) {
+  // Windows requires WSAStartup before any socket call and ixwebsocket does
+  // not self-initialize; a function-local static runs it exactly once per
+  // process (no-op on POSIX). Never paired with uninitNetSystem — winsock
+  // stays initialized for the process lifetime, which is what every consumer
+  // of this class (plugin dialog, CLI, tests) wants.
+  static const bool net_system_ready = ix::initNetSystem();
+  (void)net_system_ready;
+}
 
 BackendConnection::~BackendConnection() {
   if (socket_) {

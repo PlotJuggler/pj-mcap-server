@@ -24,10 +24,15 @@
 
 #include <gtest/gtest.h>
 
+#include <ixwebsocket/IXNetSystem.h>
+#ifdef _WIN32
+#include <winsock2.h>  // sockaddr_in, htonl/ntohs, getsockname, closesocket
+#else
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#endif
 
 #include <atomic>
 #include <chrono>
@@ -53,16 +58,32 @@ namespace {
 // hermetic unit test; unlike backend_connection_error_test.cpp's reserved
 // closed port (127.0.0.1:9), a real listener needs an actually-free port.
 int findFreePort() {
-  const int probe = ::socket(AF_INET, SOCK_STREAM, 0);
+  // WSAStartup before the raw ::socket below AND the ix server/client the
+  // tests stand up (ixwebsocket does not self-initialize on Windows); no-op
+  // on POSIX. Windows/POSIX also disagree on the socket handle type, the
+  // getsockname length type, and the close call — alias all three.
+  ix::initNetSystem();
+#ifdef _WIN32
+  using probe_socket_t = SOCKET;
+  using probe_socklen_t = int;
+#else
+  using probe_socket_t = int;
+  using probe_socklen_t = socklen_t;
+#endif
+  const probe_socket_t probe = ::socket(AF_INET, SOCK_STREAM, 0);
   sockaddr_in addr{};
   addr.sin_family = AF_INET;
   addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
   addr.sin_port = 0;
   ::bind(probe, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
-  socklen_t len = sizeof(addr);
+  probe_socklen_t len = sizeof(addr);
   ::getsockname(probe, reinterpret_cast<sockaddr*>(&addr), &len);
   const int port = ntohs(addr.sin_port);
+#ifdef _WIN32
+  ::closesocket(probe);
+#else
   ::close(probe);
+#endif
   return port;
 }
 
