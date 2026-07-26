@@ -50,6 +50,30 @@ TEST(ServerHistoryNormalize, MalformedSchemeOnlyYieldsEmpty) {
   EXPECT_EQ(normalizeServerKey("grpc://"), std::string(""));
 }
 
+TEST(ServerHistoryNormalize, CanonicalizesWsAndWss) {
+  EXPECT_EQ(normalizeServerKey("wss://Plotjuggler.Example.TS.net/"),
+            normalizeServerKey("wss://plotjuggler.example.ts.net"));
+  EXPECT_EQ(normalizeServerKey("  ws://host:8080/  "), normalizeServerKey("ws://host:8080"));
+  EXPECT_NE(normalizeServerKey("ws://host:8080"), normalizeServerKey("ws://host:8081"));
+  EXPECT_NE(normalizeServerKey("ws://host"), normalizeServerKey("wss://host"));
+}
+
+TEST(ServerHistoryNormalize, WsSchemeIsPreservedUnlikeGrpc) {
+  EXPECT_EQ(normalizeServerKey("ws://demo.mosaico.dev:6726"), std::string("ws://demo.mosaico.dev:6726"));
+}
+
+TEST(ServerHistoryNormalize, WssSchemeIsPreservedDistinctFromWs) {
+  EXPECT_EQ(normalizeServerKey("wss://demo.mosaico.dev:6726"), std::string("wss://demo.mosaico.dev:6726"));
+}
+
+TEST(ServerHistoryNormalize, WsTrailingSlashOnlyDifferenceStillMatches) {
+  EXPECT_EQ(normalizeServerKey("ws://host:8080"), normalizeServerKey("ws://host:8080/"));
+}
+
+TEST(ServerHistoryNormalize, MixedCaseWssSchemeIsLowercased) {
+  EXPECT_EQ(normalizeServerKey("WSS://Host:8080"), normalizeServerKey("wss://host:8080"));
+}
+
 // ---------- promoteToHead ----------
 
 TEST(ServerHistoryPromote, PrependsNewKey) {

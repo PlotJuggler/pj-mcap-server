@@ -9,10 +9,15 @@
 #include <string>
 #include <vector>
 
-// Normalize a user-supplied URI to a canonical `host:port` key used for
-// dedup and per-server credential storage. Rules:
+// Normalize a user-supplied URI to a canonical key used for dedup and
+// per-server credential storage. Rules:
 //   - trim surrounding whitespace
-//   - strip leading `grpc://` or `grpc+tls://`
+//   - strip leading `grpc://` or `grpc+tls://` entirely (both collapse to
+//     the SAME key: historically one credential bucket per host regardless
+//     of plaintext/TLS grpc)
+//   - `ws://` / `wss://` (case-insensitive) are instead LOWERCASED AND KEPT
+//     as part of the key, so the two stay DISTINCT (different servers can
+//     listen on each)
 //   - drop a single trailing `/`
 //   - lowercase everything up to the first `:` (the host); leave the port as-is
 // Returns an empty string for inputs that produce no usable key (empty

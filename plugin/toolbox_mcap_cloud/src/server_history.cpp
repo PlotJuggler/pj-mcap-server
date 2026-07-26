@@ -13,6 +13,23 @@
 namespace {
 constexpr const char* kGrpcScheme = "grpc://";
 constexpr const char* kGrpcTlsScheme = "grpc+tls://";
+constexpr const char* kWsScheme = "ws://";
+constexpr const char* kWssScheme = "wss://";
+
+// Case-insensitive prefix match (schemes are conventionally lowercase, but a
+// pasted URI may not be).
+bool startsWithCaseInsensitive(const std::string& value, const char* prefix) {
+  const std::size_t len = std::strlen(prefix);
+  if (value.size() < len) {
+    return false;
+  }
+  for (std::size_t i = 0; i < len; ++i) {
+    if (std::tolower(static_cast<unsigned char>(value[i])) != std::tolower(static_cast<unsigned char>(prefix[i]))) {
+      return false;
+    }
+  }
+  return true;
+}
 
 std::string trimmed(const std::string& value) {
   constexpr const char* whitespace = " \t\n\r\f\v";
@@ -37,10 +54,22 @@ std::string normalizeServerKey(const std::string& uri) {
     return {};
   }
 
+  // `grpc://` and `grpc+tls://` collapse to the SAME key (historical
+  // behavior: the scheme is dropped entirely, so plaintext/TLS grpc share
+  // one credential bucket). `ws://` and `wss://` must stay DISTINCT keys
+  // (different servers can listen on each), so their scheme is preserved
+  // (lowercased) rather than stripped.
+  std::string schemePrefix;
   if (s.rfind(kGrpcTlsScheme, 0) == 0) {
     s.erase(0, std::strlen(kGrpcTlsScheme));
   } else if (s.rfind(kGrpcScheme, 0) == 0) {
     s.erase(0, std::strlen(kGrpcScheme));
+  } else if (startsWithCaseInsensitive(s, kWssScheme)) {
+    schemePrefix = kWssScheme;
+    s.erase(0, std::strlen(kWssScheme));
+  } else if (startsWithCaseInsensitive(s, kWsScheme)) {
+    schemePrefix = kWsScheme;
+    s.erase(0, std::strlen(kWsScheme));
   }
 
   if (!s.empty() && s.back() == '/') {
@@ -51,13 +80,15 @@ std::string normalizeServerKey(const std::string& uri) {
   }
 
   const auto colon = s.find(':');
+  std::string canonicalized;
   if (colon == std::string::npos) {
-    return toLowerAscii(s);
+    canonicalized = toLowerAscii(s);
+  } else {
+    std::string host = toLowerAscii(s.substr(0, colon));
+    const std::string rest = s.substr(colon);
+    canonicalized = host + rest;
   }
-
-  std::string host = toLowerAscii(s.substr(0, colon));
-  const std::string rest = s.substr(colon);
-  return host + rest;
+  return schemePrefix + canonicalized;
 }
 
 std::vector<std::string> promoteToHead(const std::vector<std::string>& history, const std::string& key, int cap) {
