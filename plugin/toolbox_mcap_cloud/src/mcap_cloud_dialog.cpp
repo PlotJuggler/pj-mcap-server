@@ -3,6 +3,18 @@
 
 #include "mcap_cloud_dialog.hpp"
 
+// The vendored PJ3 query engine (query/token.h) declares `enum class
+// TokenType` at global scope, and winnt.h declares a global ENUMERATOR of the
+// same name (TOKEN_INFORMATION_CLASS::TokenType). In C++ an enumerator HIDES
+// a same-named enum-class at the same scope, so on Windows these headers must
+// be parsed BEFORE any windows.h-pulling include — in this TU
+// <pj_base/sdk/platform.hpp> (includes <windows.h> directly) and
+// "fetch_worker.hpp" (-> backend_connection -> ixwebsocket -> winsock2).
+// Keep this query/ block immediately after the own header.
+#include "query/edit.h"
+#include "query/engine.h"
+#include "query/query.h"
+
 #include <fmt/format.h>
 
 #include <algorithm>
@@ -30,9 +42,6 @@
 #include "mcap_cloud_panel_manifest.hpp"
 #include "mcap_cloud_panel_ui.hpp"
 #include "name_filter.h"
-#include "query/edit.h"
-#include "query/engine.h"
-#include "query/query.h"
 #include "query_filter.h"
 #include "server_history.h"
 #include "settings_store.hpp"

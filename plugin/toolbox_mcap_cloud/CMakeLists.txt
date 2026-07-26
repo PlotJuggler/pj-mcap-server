@@ -29,6 +29,18 @@ endif()
 # -Werror bar stays owned by the gcc/clang (Linux CI) leg.
 set(PJ_NOT_MSVC "$<NOT:$<CXX_COMPILER_ID:MSVC>>")
 
+if(MSVC)
+  # Conformant preprocessor: the SDK's PJ_TOOLBOX_PLUGIN / PJ_DIALOG_PLUGIN
+  # 1-arg/2-arg __VA_ARGS__ dispatch mis-expands under MSVC's traditional
+  # preprocessor (the manifest argument bleeds into the vtable template-id ->
+  # C2912 on dialogVtableFor). Newer SDK packaging injects this flag from the
+  # Conan recipe; the pinned 0.11.0 package predates that, so set it here.
+  add_compile_options(/Zc:preprocessor)
+  # Keep windows.h from defining min/max macros (they break std::min/std::max)
+  # and from dragging the full Win32 surface into every TU.
+  add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN)
+endif()
+
 find_package(GTest REQUIRED)
 find_package(plotjuggler_sdk CONFIG REQUIRED COMPONENTS base plugin_sdk plugin_host)
 
