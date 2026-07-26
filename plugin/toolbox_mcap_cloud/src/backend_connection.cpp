@@ -511,6 +511,7 @@ std::vector<SequenceInfo> BackendConnection::listSequences(bool* complete,
         generation = list_response.catalog_generation();
       }
       std::vector<SequenceInfo> page;
+      page.reserve(static_cast<std::size_t>(list_response.files_size()));
       for (auto& mapped : mapListFilesResponse(list_response)) {
         file_ids[mapped.info.name] = mapped.file_id;
         page.push_back(std::move(mapped.info));

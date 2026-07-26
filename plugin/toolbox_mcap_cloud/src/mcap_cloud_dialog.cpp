@@ -64,6 +64,13 @@ std::string credentialsSettingsPrefix(const std::string& uri) {
   return "mcap_cloud/server_cache/" + normalizeServerKey(uri) + "/";
 }
 
+// Per-server persisted gate (customer/site) selection keys. `server_key` is
+// already a normalized server key (state_.active_server_key / the local
+// variable of the same name at each call site) — NOT re-normalized here.
+std::string gateSettingsPrefix(const std::string& server_key) {
+  return "mcap_cloud/gate/" + server_key + "/";
+}
+
 // D6: the bearer token (the SECRET) now lives in the CredentialStore (0600
 // file, libsecret-ready seam), NOT in plaintext SettingsView. The non-secret
 // prefs (cert_path, allow_insecure) stay in SettingsView keyed by the same
@@ -1191,21 +1198,29 @@ std::string McapCloudDialog::widget_data() {
       wd.setCurrentIndex(combo, idx);
     }
 
-    // Browse-gate combos (customer/site): fed straight from the vocabulary,
-    // in vocabulary order, with NO "(any)" entry — the gate is mandatory, so
-    // there is no unconstrained option to offer. -1 = unselected (either no
-    // vocabulary yet, or the persisted/typed name isn't in this vocabulary).
+    // Browse-gate combos (customer/site): fed from the CACHED item lists (see
+    // gate_customer_items/gate_site_items's header comment) — rebuilt only in
+    // onVocabularyReady and the filter_customer/filter_customer_site
+    // onIndexChanged handlers, never here. widget_data() only does the cheap
+    // part every tick: two small linear scans over the already-built vectors to
+    // find the selected index. In vocabulary order, with NO "(any)" entry — the
+    // gate is mandatory, so there is no unconstrained option to offer. -1 =
+    // unselected (either no vocabulary yet, or the persisted/typed name isn't in
+    // this vocabulary).
     {
-      std::vector<std::string> customers, sites;
       int customer_idx = -1, site_idx = -1;
-      if (state_.vocabulary) {
-        for (const auto& c : state_.vocabulary->customers) {
-          if (c.name == state_.gate_customer) { customer_idx = static_cast<int>(customers.size()); }
-          customers.push_back(c.name);
+      const auto& customers = state_.gate_customer_items;
+      const auto& sites = state_.gate_site_items;
+      for (std::size_t i = 0; i < customers.size(); ++i) {
+        if (customers[i] == state_.gate_customer) {
+          customer_idx = static_cast<int>(i);
+          break;
         }
-        sites = siteNamesFor(*state_.vocabulary, state_.gate_customer);
-        for (std::size_t i = 0; i < sites.size(); ++i) {
-          if (sites[i] == state_.gate_site) { site_idx = static_cast<int>(i); }
+      }
+      for (std::size_t i = 0; i < sites.size(); ++i) {
+        if (sites[i] == state_.gate_site) {
+          site_idx = static_cast<int>(i);
+          break;
         }
       }
       wd.setItems("filter_customer", customers);
@@ -1271,14 +1286,26 @@ std::string McapCloudDialog::widget_data() {
   // needs a customer/site pick, or an error — since a bare empty table gives no
   // hint that a gate is even in play. show_pill additionally requires empty
   // rows so cached rows left on screen after e.g. a disconnect aren't covered.
+  // gateHintText is recomputed only when its inputs change (see GateHintCache):
+  // most phases return a literal, but kNeedsSelection — the mandatory gate
+  // state the user often SITS in — does two std::to_string() calls + string
+  // concatenation, wasted work on 59 of every 60 unconditional per-tick calls.
   {
-    const std::string hint = gateHintText(
-        state_.gate_phase, state_.vocabulary ? state_.vocabulary->totalFiles() : 0,
-        state_.vocabulary ? state_.vocabulary->totalSites() : 0);
-    const bool show_pill = !hint.empty() && state_.sequences.empty();
+    const std::uint64_t total_files = state_.vocabulary ? state_.vocabulary->totalFiles() : 0;
+    const std::size_t total_sites = state_.vocabulary ? state_.vocabulary->totalSites() : 0;
+    auto& cache = state_.gate_hint_cache;
+    if (!cache.valid || cache.phase != state_.gate_phase || cache.total_files != total_files ||
+        cache.total_sites != total_sites) {
+      cache.text = gateHintText(state_.gate_phase, total_files, total_sites);
+      cache.phase = state_.gate_phase;
+      cache.total_files = total_files;
+      cache.total_sites = total_sites;
+      cache.valid = true;
+    }
+    const bool show_pill = !cache.text.empty() && state_.sequences.empty();
     wd.setVisible("gateHintLabel", show_pill);
     if (show_pill) {
-      wd.setLabel("gateHintLabel", hint);
+      wd.setLabel("gateHintLabel", cache.text);
     }
   }
 
@@ -2224,11 +2251,12 @@ bool McapCloudDialog::onIndexChanged(std::string_view widget_name, int index) {
       // A new customer invalidates any site pick made under the OLD one.
       state_.gate_customer = new_customer;
       state_.gate_site.clear();
+      refreshGateComboItemsLocked();  // the site list is scoped to the new customer
       server_key = state_.active_server_key;
       (void)beginGateRequestLocked(GatePhase::kNeedsSelection);  // clears the old site's rows immediately
     }
     SettingsStore settings(settings_);
-    const std::string prefix = "mcap_cloud/gate/" + server_key + "/";
+    const std::string prefix = gateSettingsPrefix(server_key);
     settings.setString(prefix + "customer", new_customer);
     settings.remove(prefix + "site");
     return true;
@@ -2255,12 +2283,13 @@ bool McapCloudDialog::onIndexChanged(std::string_view widget_name, int index) {
         return true;  // no-op re-pick
       }
       state_.gate_site = new_site;
+      refreshGateComboItemsLocked();  // same customer/site list, new selection
       customer = state_.gate_customer;
       server_key = state_.active_server_key;
       id = beginGateRequestLocked(GatePhase::kListLoading);
     }
     SettingsStore settings(settings_);
-    settings.setString("mcap_cloud/gate/" + server_key + "/site", new_site);
+    settings.setString(gateSettingsPrefix(server_key) + "site", new_site);
     notify(PJ::ToolboxMessageLevel::kInfo, fmt::format("Loading {}/{}…", customer, new_site));
     postCommand([w = worker_.get(), id, customer, new_site] { w->listSequencesFilteredAsync(id, customer, new_site); });
     return true;
@@ -2361,6 +2390,10 @@ std::uint64_t McapCloudDialog::beginGateRequestLocked(GatePhase next_phase) {
   state_.sequences.clear();
   state_.sequence_names.clear();
   progressive_seqs_.clear();
+  // A new sweep must always render its first page immediately, not wait out
+  // whatever is left of the PREVIOUS sweep's 150 ms progressive-render window
+  // (see onGatePageReady / last_progressive_render_'s header comment).
+  last_progressive_render_ = {};
   ++state_.seq_epoch;
   clearSelectionStateLocked();
   // Reset the sequence-level date filter to "All" (unbounded): dateFilterMatches
@@ -2372,6 +2405,23 @@ std::uint64_t McapCloudDialog::beginGateRequestLocked(GatePhase next_phase) {
   const std::uint64_t id = ++state_.gate_request_seq;
   worker_->supersedeGateRequests(id);  // atomic — safe from the GUI thread
   return id;
+}
+
+bool McapCloudDialog::gateRequestStaleLocked(std::uint64_t request_id) const {
+  return request_id != state_.gate_request_seq;
+}
+
+void McapCloudDialog::refreshGateComboItemsLocked() {
+  state_.gate_customer_items.clear();
+  state_.gate_site_items.clear();
+  if (!state_.vocabulary) {
+    return;
+  }
+  state_.gate_customer_items.reserve(state_.vocabulary->customers.size());
+  for (const auto& c : state_.vocabulary->customers) {
+    state_.gate_customer_items.push_back(c.name);
+  }
+  state_.gate_site_items = siteNamesFor(*state_.vocabulary, state_.gate_customer);
 }
 
 bool McapCloudDialog::onSelectionChanged(std::string_view widget_name, const std::vector<std::string>& selected) {
@@ -2588,19 +2638,22 @@ void McapCloudDialog::onVocabularyReady(std::uint64_t request_id, VocabularyInfo
   std::uint64_t id = 0;
   {
     std::lock_guard<std::mutex> lock(state_.mu);
-    if (request_id != state_.gate_request_seq) {
+    if (gateRequestStaleLocked(request_id)) {
       return;  // stale answer; a newer gate transition already superseded it
     }
     state_.vocabulary = vocab;
     if (recovery) {
-      // The combos pick up state_.vocabulary next tick automatically. This
-      // refresh came from INSIDE listSequencesFilteredAsync's own stale-
-      // vocabulary retry loop, which owns retrying the sweep itself — starting
-      // a second one here would double-sweep the same request id.
+      // The vocabulary changed, so the cached combo items must be rebuilt even
+      // though customer/site stay whatever they already were. This refresh
+      // came from INSIDE listSequencesFilteredAsync's own stale-vocabulary
+      // retry loop, which owns retrying the sweep itself — starting a second
+      // one here would double-sweep the same request id.
+      refreshGateComboItemsLocked();
       return;
     }
     if (vocab.customers.empty()) {
       state_.gate_phase = GatePhase::kEmptyCatalog;
+      refreshGateComboItemsLocked();  // empty vocabulary -> both item lists empty
       return;
     }
 
@@ -2611,7 +2664,7 @@ void McapCloudDialog::onVocabularyReady(std::uint64_t request_id, VocabularyInfo
     site = state_.gate_site;
     if (customer.empty() || site.empty()) {
       SettingsStore settings(settings_);
-      const std::string prefix = "mcap_cloud/gate/" + state_.active_server_key + "/";
+      const std::string prefix = gateSettingsPrefix(state_.active_server_key);
       if (customer.empty()) {
         customer = settings.getString(prefix + "customer");
       }
@@ -2667,6 +2720,7 @@ void McapCloudDialog::onVocabularyReady(std::uint64_t request_id, VocabularyInfo
     }
     state_.gate_customer = customer;
     state_.gate_site = site;
+    refreshGateComboItemsLocked();  // customer/site (hence the site list) just resolved
     if (customer.empty() || site.empty()) {
       state_.gate_phase = GatePhase::kNeedsSelection;
       return;
@@ -2678,7 +2732,7 @@ void McapCloudDialog::onVocabularyReady(std::uint64_t request_id, VocabularyInfo
 
 void McapCloudDialog::onVocabularyFailed(std::uint64_t request_id) {
   std::lock_guard<std::mutex> lock(state_.mu);
-  if (request_id != state_.gate_request_seq) {
+  if (gateRequestStaleLocked(request_id)) {
     return;  // stale answer
   }
   state_.gate_phase = GatePhase::kVocabularyError;
@@ -2686,7 +2740,7 @@ void McapCloudDialog::onVocabularyFailed(std::uint64_t request_id) {
 
 void McapCloudDialog::onGatePageReady(std::uint64_t request_id, std::vector<SequenceInfo> page, bool reset) {
   std::lock_guard<std::mutex> lock(state_.mu);
-  if (request_id != state_.gate_request_seq) {
+  if (gateRequestStaleLocked(request_id)) {
     return;  // a newer gate transition owns progressive_seqs_/the table now
   }
   // reset semantics matter: it is NOT merely "page one". A builder rebuild
@@ -2695,11 +2749,25 @@ void McapCloudDialog::onGatePageReady(std::uint64_t request_id, std::vector<Sequ
   // aborted attempt's rows twice.
   if (reset) {
     progressive_seqs_.clear();
+    last_progressive_render_ = {};  // force an immediate render of this sweep's first page
   }
+  // ALWAYS accumulate the page — the throttle below only gates how often the
+  // accumulated rows are rendered, never whether they are kept.
   progressive_seqs_.insert(progressive_seqs_.end(), std::make_move_iterator(page.begin()),
                            std::make_move_iterator(page.end()));
-  populateSequencesLocked(progressive_seqs_, /*seed_dates=*/false);
-  sortSequencesLocked();
+
+  // Throttle stopgap (see last_progressive_render_'s header comment for the
+  // O(n^2 log n)-over-one-sweep numbers this avoids): populate+sort the WHOLE
+  // accumulated vector at most once per 150 ms. A skipped page's rows are not
+  // lost — they are still in progressive_seqs_ and render on the next
+  // qualifying page, or (if this was the last page) via the always-authoritative
+  // onGateListFinished -> onSequencesReady repopulate at the end of the sweep.
+  const auto now = std::chrono::steady_clock::now();
+  if (reset || now - last_progressive_render_ >= std::chrono::milliseconds(150)) {
+    populateSequencesLocked(progressive_seqs_, /*seed_dates=*/false);
+    sortSequencesLocked();
+    last_progressive_render_ = now;
+  }
 }
 
 void McapCloudDialog::onGateListFinished(FetchWorker::GateListResult result) {
@@ -2712,7 +2780,7 @@ void McapCloudDialog::onGateListFinished(FetchWorker::GateListResult result) {
   std::string warning;
   {
     std::lock_guard<std::mutex> lock(state_.mu);
-    if (result.request_id != state_.gate_request_seq) {
+    if (gateRequestStaleLocked(result.request_id)) {
       return;  // stale answer
     }
     switch (result.error) {

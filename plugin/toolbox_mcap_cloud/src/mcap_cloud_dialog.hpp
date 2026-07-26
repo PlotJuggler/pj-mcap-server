@@ -79,6 +79,28 @@ struct DialogState {
   GatePhase gate_phase = GatePhase::kDisconnected;
   std::string active_server_key;        // canonical key of the CONNECTED server
 
+  // Cached gate-combo item lists (see widget_data()'s gate-combo block): rebuilt
+  // ONLY in onVocabularyReady and the filter_customer/filter_customer_site
+  // onIndexChanged handlers -- never on a per-tick basis. widget_data() runs
+  // every host tick (~20-60Hz); at 50 customers x 20 sites, rebuilding these by
+  // rescanning the vocabulary (+ siteNamesFor's own scan) every tick was ~1000
+  // string copies + JSON encoding on 59 of every 60 ticks for nothing.
+  std::vector<std::string> gate_customer_items;
+  std::vector<std::string> gate_site_items;
+
+  // Cached pill-hint text (see widget_data()): gateHintText's kNeedsSelection
+  // branch does two std::to_string() calls + concatenation, and kNeedsSelection
+  // is the mandatory gate state the user often SITS in — recompute only when
+  // (phase, total_files, total_sites) actually changes, not on every tick.
+  struct GateHintCache {
+    bool valid = false;
+    GatePhase phase = GatePhase::kDisconnected;
+    std::uint64_t total_files = 0;
+    std::size_t total_sites = 0;
+    std::string text;
+  };
+  GateHintCache gate_hint_cache;
+
   // Discovery
   std::vector<SequenceRecord> sequences;
   std::vector<std::string> sequence_names;  // mirrors sequences[i].name (the real S3 key) for fast scan
@@ -407,6 +429,18 @@ class McapCloudDialog : public PJ::DialogPluginTyped {
   // monotonic request id and supersedes any in-flight worker sweep. Caller
   // MUST hold state_.mu.
   [[nodiscard]] std::uint64_t beginGateRequestLocked(GatePhase next_phase);
+  // True when `request_id` is not the CURRENT gate transition (a newer
+  // beginGateRequestLocked()/supersedeGateRequests() call already moved on), so
+  // any worker answer carrying this id is stale and must be dropped. Single
+  // source of truth for the drop check + comment repeated across the 4 gate-
+  // result handlers below. Caller MUST hold state_.mu.
+  [[nodiscard]] bool gateRequestStaleLocked(std::uint64_t request_id) const;
+  // Rebuild gate_customer_items / gate_site_items from the current
+  // state_.vocabulary + state_.gate_customer. Called only where those inputs
+  // actually change (onVocabularyReady; the filter_customer/filter_customer_site
+  // onIndexChanged handlers) — widget_data() reads the cached result instead of
+  // rebuilding it every tick. Caller MUST hold state_.mu.
+  void refreshGateComboItemsLocked();
   // Vocabulary arrived (the gate's data source). Drops a stale id. When
   // `recovery` is true this came from INSIDE a filtered-list stale-recovery
   // retry (the worker owns that retry) — only combos refresh, never a new
@@ -528,6 +562,20 @@ class McapCloudDialog : public PJ::DialogPluginTyped {
   // onTick, so no lock; cleared on reset and again when the authoritative
   // onSequencesReady lands (which re-populates from its own complete vector).
   std::vector<SequenceInfo> progressive_seqs_;
+  // Throttle stopgap for onGatePageReady (2026-07-26): populateSequencesLocked
+  // + sortSequencesLocked() together are O(n^2 log n) over one sweep (a full
+  // rebuild of `sequences` from `progressive_seqs_`, deep-copying every
+  // SequenceRecord, then a full re-sort) — at 500 rows/page and a 14,480-row
+  // site (29 pages) that is ~217,500 deep row copies instead of ~14,500 (~15x)
+  // and ~2.6M sort ops instead of ~200k (~13x), all on the GUI thread, and it
+  // gets WORSE as the sweep progresses (more accumulated rows each page). Pages
+  // still ALWAYS accumulate into progressive_seqs_; only the populate+sort is
+  // throttled to at most once per 150 ms (see onGatePageReady) — the rows
+  // aren't lost, they render on the next qualifying page, and the final
+  // authoritative render always happens via onGateListFinished/onSequencesReady
+  // regardless of whether the last progressive page rendered. GUI-thread only,
+  // same as progressive_seqs_ above (no lock needed).
+  std::chrono::steady_clock::time_point last_progressive_render_{};
 
   std::thread worker_thread_;
   std::unique_ptr<FetchWorker> worker_;

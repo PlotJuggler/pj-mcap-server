@@ -181,12 +181,10 @@ void FetchWorker::listSequencesFilteredAsync(std::uint64_t request_id, std::stri
     // this queued command started running: NO-OP rather than sweep the
     // now-irrelevant selection (F4 — commands are FIFO on one worker thread,
     // so a stale request can sit behind a full sweep without this check).
-    finish(GateListResult::Error::kSuperseded, {});
-    return;
+    return finish(GateListResult::Error::kSuperseded, {});
   }
   if (!backend_) {
-    finish(GateListResult::Error::kConnectionLost, {});
-    return;
+    return finish(GateListResult::Error::kConnectionLost, {});
   }
   // Remembered even if this attempt ultimately fails/is superseded: it is
   // "the last gate selection the user asked for", which the tag-edit re-list
@@ -211,8 +209,7 @@ void FetchWorker::listSequencesFilteredAsync(std::uint64_t request_id, std::stri
         // fired) and the misdiagnosis read as "catalog rebuilding" instead
         // of "reconnect".
         notifyConnectionLostOnce();
-        finish(GateListResult::Error::kConnectionLost, {});
-        return;
+        return finish(GateListResult::Error::kConnectionLost, {});
       }
       if (!fresh) {
         break;  // vocabulary RPC failed on a live socket -> kRebuildStorm below
@@ -229,8 +226,7 @@ void FetchWorker::listSequencesFilteredAsync(std::uint64_t request_id, std::stri
       // Names no longer resolve against the (possibly just-refreshed)
       // vocabulary: a rebuild renamed/removed the site, or this is a stale
       // persisted selection typed before any vocabulary existed.
-      finish(GateListResult::Error::kSelectionGone, {});
-      return;
+      return finish(GateListResult::Error::kSelectionGone, {});
     }
     bool complete = false;
     bool stale = false;
@@ -244,16 +240,14 @@ void FetchWorker::listSequencesFilteredAsync(std::uint64_t request_id, std::stri
     auto sequences = backend_->listSequences(&complete, on_page, &*filter, &stale, abort);
     if (backend_->isClosed()) {
       notifyConnectionLostOnce();
-      finish(GateListResult::Error::kConnectionLost, std::move(sequences));
-      return;
+      return finish(GateListResult::Error::kConnectionLost, std::move(sequences));
     }
     if (latest_gate_request_.load() != request_id) {
       // Superseded mid-sweep (the abort predicate stopped listSequences()
       // early): the partial `sequences` it returned belong to a request the
       // dialog no longer cares about, so they are dropped rather than passed
       // to finish().
-      finish(GateListResult::Error::kSuperseded, {});
-      return;
+      return finish(GateListResult::Error::kSuperseded, {});
     }
     if (stale) {
       // The filter's dimension ids died with the old generation (a builder
@@ -262,8 +256,7 @@ void FetchWorker::listSequencesFilteredAsync(std::uint64_t request_id, std::stri
       vocab_.reset();
       continue;
     }
-    finish(complete ? GateListResult::Error::kNone : GateListResult::Error::kPartial, std::move(sequences));
-    return;
+    return finish(complete ? GateListResult::Error::kNone : GateListResult::Error::kPartial, std::move(sequences));
   }
   // Both attempts were exhausted without a usable result (a vocabulary
   // refresh failed, or the generation kept dying out from under us): the
