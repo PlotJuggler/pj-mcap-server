@@ -1,0 +1,311 @@
+name: release
+
+# Tag-triggered release build, modeled on pj-official-plugins' build-release.yml
+# (the reference plugin repo) adapted to this repo's single-product shape:
+#
+#   TAG CONTRACT: push a tag `vX.Y.Z` -> this workflow builds the connector
+#   plugin + mcap-cloud-cli for linux-x64 and windows-x64, cross-builds the Go
+#   server for linux amd64/arm64, and publishes ONE GitHub release with every
+#   artifact + sha256. The tag MUST equal `v<version>` from
+#   plugin/toolbox_mcap_cloud/manifest.json — the plugin leg fails fast on a
+#   mismatch (mirrors the reference repo's verify-version-consistency).
+#
+# VALIDATION TRIGGERS (no release is created for either):
+#   - workflow_dispatch: manual full-matrix build; artifacts land on the run.
+#   - pull_request touching the plugin / proto / this workflow: this doubles as
+#     the repo's ONLY native C++ plugin CI (ci.yml is Go + Python-builder only;
+#     wasm.yml compiles just the decode core) — a plugin PR proves the native
+#     build + hermetic ctest on both OSes before merge.
+#   Release-publishing steps are all gated on `startsWith(github.ref,
+#   'refs/tags/')`.
+#
+# SDK ACQUISITION: scripts/ensure-sdk.sh — Conan-cache check, else clone the
+# PUBLIC PlotJuggler/plotjuggler_sdk repo at tag v<plugin/SDK_VERSION> and
+# `conan create` it. Upstream v0.11.0 is the squash merge of the
+# parser-ingest/rangeslider branch (PR #133), verified content-identical to the
+# source the dev-box 0.11.0 package was built from.
+#
+# NO WINDOWS SERVER BINARY: internal/catalog/readonly.go's (dev,inode) catalog
+# swap detection uses syscall.Stat_t (POSIX-only) — `GOOS=windows go build`
+# fails today. The server's deploy targets are Linux (EC2/GCE Docker) anyway;
+# revisit only if a real Windows-server need appears.
+#
+# CONAN CACHE: explicit restore/save keyed on the plugin conanfile + SDK pin
+# (the whole third-party closure), saved with `if: always()` so a failed plugin
+# compile still persists the expensive dependency build — copied from the
+# reference repo's ci-windows.yml, where the rationale is spelled out.
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+  pull_request:
+    paths:
+      - '.github/workflows/release.yml'
+      - 'scripts/ensure-sdk.sh'
+      - 'plugin/**'
+      - 'proto/pj_cloud.proto'
+
+permissions:
+  contents: write
+
+# One in-flight run per ref; a new push cancels the previous run.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  plugin:
+    name: plugin (${{ matrix.os_label }}-${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    # A cold run rebuilds the whole Conan closure (protobuf 6.x dominates) from
+    # source before the cache save persists it; keep margin for that bootstrap
+    # case (reference repo uses the same bound for the same reason).
+    timeout-minutes: 150
+    strategy:
+      # A windows-leg failure must not cancel the linux artifacts (and vice
+      # versa) — each leg's artifacts upload independently.
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            os_label: linux
+            arch: x64
+          - runner: windows-2022
+            os_label: windows
+            arch: x64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Conan
+        uses: conan-io/setup-conan@v1.3.0
+        with:
+          # Binaries come from the explicitly keyed Actions cache below. Do not
+          # also archive ~/.conan2 through setup-conan's coarse per-workflow
+          # cache (misses after any change, re-saves multi-GB archives).
+          cache_packages: false
+
+      - name: Install cmake and ninja
+        run: pip install cmake ninja
+
+      - name: Set up MSVC environment
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Compute Conan cache key
+        id: conan-key
+        shell: bash
+        # Key inputs: the plugin conanfile (the whole third-party closure) and
+        # SDK_VERSION (the plotjuggler_sdk package ensure-sdk.sh builds into
+        # the same cache). Bump the v1 to force a cold rebuild.
+        run: |
+          hash="$(cat plugin/toolbox_mcap_cloud/conanfile.py plugin/SDK_VERSION | sha256sum | cut -c1-16)"
+          echo "key=conan-${{ runner.os }}-${{ matrix.arch }}-release-v1-${hash}" >> "$GITHUB_OUTPUT"
+          echo "restore_prefix=conan-${{ runner.os }}-${{ matrix.arch }}-release-v1-" >> "$GITHUB_OUTPUT"
+
+      - name: Restore Conan cache
+        id: conan-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.conan2
+          key: ${{ steps.conan-key.outputs.key }}
+          restore-keys: |
+            ${{ steps.conan-key.outputs.restore_prefix }}
+
+      - name: Acquire plotjuggler_sdk
+        shell: bash
+        run: |
+          conan profile detect --force
+          bash scripts/ensure-sdk.sh
+
+      - name: Build
+        shell: bash
+        run: |
+          cd plugin/toolbox_mcap_cloud
+          conan install . --output-folder=build --build=missing \
+            -s build_type=Release -s compiler.cppstd=20 -s:b compiler.cppstd=20 \
+            -c tools.cmake.cmaketoolchain:generator=Ninja
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE=build/conan_toolchain.cmake \
+            -DCMAKE_BUILD_TYPE=Release
+          cmake --build build
+
+      - name: Test (hermetic ctest)
+        shell: bash
+        # Live tests self-skip without MCAP_CLOUD_LIVE_URL. Windows excludes
+        # McapCloudCredentialStoreTest: it asserts POSIX 0600/0700 perms, which
+        # std::filesystem cannot represent on NTFS (group/other bits read as
+        # set). The dlopen smoke + ldd no-Qt guard are already POSIX-gated in
+        # CMakeLists.
+        run: |
+          exclude=()
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            exclude=(-E McapCloudCredentialStoreTest)
+          fi
+          ctest --test-dir plugin/toolbox_mcap_cloud/build --output-on-failure "${exclude[@]}"
+
+      - name: Resolve package version
+        id: pkg
+        shell: bash
+        # Tags: version = tag minus the leading v, and it must match the plugin
+        # manifest (fail fast on drift). Everything else: a dev version from
+        # the short SHA — dispatch/PR runs still produce inspectable artifacts.
+        run: |
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            version="${GITHUB_REF_NAME#v}"
+            manifest_version="$(jq -r .version plugin/toolbox_mcap_cloud/manifest.json)"
+            if [[ "${version}" != "${manifest_version}" ]]; then
+              echo "::error::tag ${GITHUB_REF_NAME} does not match manifest.json version ${manifest_version} — bump plugin/toolbox_mcap_cloud/manifest.json before tagging"
+              exit 1
+            fi
+          else
+            version="dev-${GITHUB_SHA::7}"
+          fi
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "zip_name=toolbox_mcap_cloud-${version}-${{ matrix.os_label }}-${{ matrix.arch }}.zip" >> "$GITHUB_OUTPUT"
+
+      - name: Stage distribution
+        shell: bash
+        # Ships the plugin library, its .pjmanifest.json sidecar (the host
+        # scans it PRE-dlopen — a bare library without it will not load), the
+        # Qt-free CLI, and license/readme.
+        run: |
+          bin=plugin/toolbox_mcap_cloud/build/bin
+          mkdir dist
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            cp "${bin}/toolbox_mcap_cloud_plugin.dll" dist/
+            cp "${bin}/mcap-cloud-cli.exe" dist/
+          else
+            cp "${bin}/libtoolbox_mcap_cloud_plugin.so" dist/
+            cp "${bin}/mcap-cloud-cli" dist/
+          fi
+          cp "${bin}/toolbox_mcap_cloud_plugin.pjmanifest.json" dist/
+          cp LICENSE dist/
+          cp plugin/toolbox_mcap_cloud/README.md dist/
+
+      - name: Compress artifacts (Linux)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          (cd dist && zip -r "../${{ steps.pkg.outputs.zip_name }}" .)
+          sha256sum "${{ steps.pkg.outputs.zip_name }}" > "${{ steps.pkg.outputs.zip_name }}.sha256"
+          cat "${{ steps.pkg.outputs.zip_name }}.sha256"
+
+      - name: Compress artifacts (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Compress-Archive -Path dist\* -DestinationPath "${{ steps.pkg.outputs.zip_name }}"
+          $hash = (Get-FileHash -Algorithm SHA256 "${{ steps.pkg.outputs.zip_name }}").Hash.ToLower()
+          "$hash  ${{ steps.pkg.outputs.zip_name }}" | Out-File -Encoding ascii "${{ steps.pkg.outputs.zip_name }}.sha256"
+          Get-Content "${{ steps.pkg.outputs.zip_name }}.sha256"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: plugin-${{ matrix.os_label }}-${{ matrix.arch }}
+          path: |
+            ${{ steps.pkg.outputs.zip_name }}
+            ${{ steps.pkg.outputs.zip_name }}.sha256
+          if-no-files-found: error
+
+      - name: Trim Conan cache before saving
+        # Drop build/source/temp trees so only recipes + package binaries
+        # persist.
+        if: always() && steps.conan-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: conan cache clean "*" --build --source --temp || true
+
+      - name: Save Conan cache
+        # always(): a failed plugin compile must still persist the expensive
+        # third-party closure. Immutable keys make a re-save a no-op, so skip
+        # only on an exact-key hit.
+        if: always() && steps.conan-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.conan2
+          key: ${{ steps.conan-key.outputs.key }}
+
+  server:
+    name: server (linux amd64/arm64)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    env:
+      GOTOOLCHAIN: local   # go.mod says `go 1.23`; never download a newer toolchain.
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+          cache: true
+          cache-dependency-path: server/go.sum
+
+      - name: Resolve package version
+        id: pkg
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            version="${GITHUB_REF_NAME#v}"
+          else
+            version="dev-${GITHUB_SHA::7}"
+          fi
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
+      - name: Cross-build and package
+        shell: bash
+        # CGO_ENABLED=0 is exact here: the catalog reader is modernc.org/sqlite
+        # (pure Go), so these are true static cross-builds. No windows target —
+        # see the workflow header.
+        run: |
+          version="${{ steps.pkg.outputs.version }}"
+          for target in linux/amd64 linux/arm64; do
+            goos="${target%/*}"; goarch="${target#*/}"
+            stage="$(mktemp -d)"
+            ( cd server && CGO_ENABLED=0 GOOS="${goos}" GOARCH="${goarch}" \
+                go build -trimpath -ldflags '-s -w' \
+                -o "${stage}/pj-cloud-server" ./cmd/pj-cloud-server )
+            cp LICENSE "${stage}/"
+            tarball="pj-cloud-server-${version}-${goos}-${goarch}.tar.gz"
+            tar -czf "${tarball}" -C "${stage}" pj-cloud-server LICENSE
+            sha256sum "${tarball}" > "${tarball}.sha256"
+            cat "${tarball}.sha256"
+          done
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: server-linux
+          path: |
+            pj-cloud-server-*.tar.gz
+            pj-cloud-server-*.tar.gz.sha256
+          if-no-files-found: error
+
+  release:
+    name: publish GitHub release
+    # Strict by design: every leg must be green before a release exists — no
+    # partial releases with a missing OS. If one leg flakes, re-run it; the
+    # release job then publishes everything at once.
+    needs: [plugin, server]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: assets
+          merge-multiple: true
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: assets/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
