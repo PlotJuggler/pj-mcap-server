@@ -471,8 +471,12 @@ std::vector<SequenceInfo> BackendConnection::listSequences(bool* complete,
       list->set_limit(kListFilesPageLimit);
       if (filter != nullptr && !filter->empty()) {
         auto* wire_filter = list->mutable_filter();
-        if (filter->customer_id) { wire_filter->set_customer_id(*filter->customer_id); }
-        if (filter->site_id)     { wire_filter->set_site_id(*filter->site_id); }
+        if (filter->customer_id) {
+          wire_filter->set_customer_id(*filter->customer_id);
+        }
+        if (filter->site_id) {
+          wire_filter->set_site_id(*filter->site_id);
+        }
         // Page-one-only echo: later pages carry the generation inside
         // page_token (server contract, handlers_catalog.go:157).
         if (page_token.empty()) {
@@ -490,7 +494,9 @@ std::vector<SequenceInfo> BackendConnection::listSequences(bool* complete,
           // Filtered ids belong to a dead generation: retrying is at best
           // futile, at worst selects a renumbered WRONG dimension. Abort;
           // the caller re-resolves names -> ids from a fresh vocabulary.
-          if (stale_vocabulary != nullptr) { *stale_vocabulary = true; }
+          if (stale_vocabulary != nullptr) {
+            *stale_vocabulary = true;
+          }
           return {};
         }
         stale = true;  // unfiltered: bounded restart (existing behaviour)

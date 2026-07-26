@@ -129,15 +129,7 @@ class FakePagingServer {
           err->set_message("catalog rebuilt mid-pagination");
         } else {
           const int rows_for_request = filtered ? site_rows_ : total_rows_;
-          const int requested_limit = req.limit() == 0 ? 200 : std::min<int>(req.limit(), 1000);
-          // site_rows_ (300) is smaller than a real client page
-          // (kListFilesPageLimit==500), so an unmodified filtered sweep would
-          // always finish in a single page and the stale-on-page-two test
-          // could never exercise a genuine second request. Cap the SERVED
-          // chunk for filtered results only (limits_seen_ still records the
-          // client's real requested limit, untouched) so 300 filtered rows
-          // still spans multiple pages.
-          const int limit = filtered ? std::min(requested_limit, kFilteredPageChunk) : requested_limit;
+          const int limit = req.limit() == 0 ? 200 : std::min<int>(req.limit(), 1000);
           auto* list = response.mutable_list_files();
           list->set_catalog_generation("gen-1");
           const int start = page_index * limit;
@@ -197,11 +189,11 @@ class FakePagingServer {
   int stale_at_page_;
   // Total rows served for a FILTERED (site_id/customer_id) request, independent
   // of total_rows_ (the unfiltered count) — mirrors the real server's dimension
-  // scoping without needing a second fake.
-  int site_rows_ = 300;
-  // Per-page chunk size for filtered results only — see the comment at its use
-  // site (below, in the list_files branch).
-  static constexpr int kFilteredPageChunk = 200;
+  // scoping without needing a second fake. Deliberately > kListFilesPageLimit
+  // (500) and < total_rows_ (1200) so a filtered sweep naturally spans two
+  // pages through the SAME req.limit()-driven chunking as an unfiltered one —
+  // no filtered-only page-size special case needed.
+  int site_rows_ = 700;
   std::atomic<bool> stale_fired_{false};
   std::atomic<int> page_delay_ms_{0};
   bool ok_ = false;
@@ -395,7 +387,7 @@ TEST(FilteredList, SendsSiteIdWithGenerationOnPageOneOnly) {
   const auto rows = conn.listSequences(&complete, {}, &filter, &stale);
   EXPECT_TRUE(complete);
   EXPECT_FALSE(stale);
-  EXPECT_EQ(rows.size(), 300u);  // the fake's site_rows_
+  EXPECT_EQ(rows.size(), 700u);  // the fake's site_rows_
   const auto gens = server.generationsSeen();
   ASSERT_GE(gens.size(), 1u);
   EXPECT_EQ(gens[0], "gen-1");            // page one: explicit echo
