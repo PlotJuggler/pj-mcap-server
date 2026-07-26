@@ -3,7 +3,6 @@
 
 #include "backend_connection.hpp"
 
-#include <ixwebsocket/IXNetSystem.h>
 #include <ixwebsocket/IXWebSocket.h>
 
 #include <algorithm>
@@ -16,6 +15,16 @@
 #include "pj_cloud.pb.h"
 #include "session_decode.hpp"
 #include "wire_mapping.hpp"
+
+// Deliberately NOT #include <ixwebsocket/IXNetSystem.h>: on Windows it pulls
+// in windows.h, whose winerror.h defines ERROR_NOT_FOUND (and other ERROR_*
+// names) as numeric macros that textually clobber the pj_cloud::v1::ERROR_*
+// enumerators in errorCodeName() below (C2589). Forward-declare the one free
+// function the constructor needs — the signature is pinned by ixwebsocket, so
+// a drift would be a loud link error, never a silent mismatch.
+namespace ix {
+bool initNetSystem();
+}  // namespace ix
 
 namespace mcap_cloud {
 
