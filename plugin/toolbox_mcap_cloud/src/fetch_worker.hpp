@@ -237,6 +237,48 @@ class FetchWorker {
   void notifyConnectionLostOnce();
   bool connection_lost_notified_ = false;
 
+ public:
+  /// Terminal result of ONE gated (filtered) list request. Exactly one is
+  /// emitted per listSequencesFilteredAsync call that is not superseded before
+  /// starting. `complete=false` + error explains why (the dialog must NOT
+  /// render "no recordings" for anything but a complete empty result).
+  struct GateListResult {
+    std::uint64_t request_id = 0;
+    bool complete = false;
+    enum class Error { kNone, kPartial, kConnectionLost, kSelectionGone, kRebuildStorm, kSuperseded };
+    Error error = Error::kNone;
+    std::vector<SequenceInfo> sequences;
+  };
+
+  /// Vocabulary result. recovery=true when this refresh was triggered from
+  /// INSIDE a filtered-list stale recovery — the dialog must then only refresh
+  /// combos, never auto-start another sweep (the recovery owns the retry).
+  std::function<void(VocabularyInfo vocab, bool recovery)> vocabularyReady;
+  /// GetVocabulary failed on a live connection (the kVocabularyError phase).
+  std::function<void(std::uint64_t request_id)> vocabularyFailed;
+  /// One page of a gated sweep; reset semantics as in BackendConnection.
+  std::function<void(std::uint64_t request_id, std::vector<SequenceInfo> page, bool reset)>
+      gatePageReady;
+  std::function<void(GateListResult result)> gateListFinished;
+
+  /// Fetch the vocabulary (the gate's data source). request_id is echoed to
+  /// vocabularyReady/vocabularyFailed so the dialog can ignore stale answers.
+  void fetchVocabularyAsync(std::uint64_t request_id);
+  /// List ONE site server-filtered, resolving (customer, site) NAMES against
+  /// the worker's latest vocabulary; supersedable by a later gate request id.
+  void listSequencesFilteredAsync(std::uint64_t request_id, std::string customer, std::string site);
+  /// Called from the GUI thread when a NEW gate request id is issued, so an
+  /// in-flight sweep aborts promptly (atomic; safe cross-thread).
+  void supersedeGateRequests(std::uint64_t latest) { latest_gate_request_.store(latest); }
+
+ private:
+  // ---- gate (customer/site filtered browse) state, worker-thread only, plus
+  // the one cross-thread atomic (see supersedeGateRequests above) ------------
+  std::optional<VocabularyInfo> vocab_;
+  std::atomic<std::uint64_t> latest_gate_request_{0};
+  std::string last_gate_customer_;
+  std::string last_gate_site_;
+
   std::unique_ptr<BackendConnection> backend_;  // catalog-browse socket
   // Credentials remembered from the last successful connectAsync, so a pull can
   // open its OWN fresh session connection (isolated from the browse socket; a

@@ -25,6 +25,7 @@
 #include "session_cache.hpp"
 #include "session_decode.hpp"
 #include "session_key.hpp"
+#include "vocab_select.hpp"
 
 namespace mcap_cloud {
 
@@ -72,6 +73,13 @@ void FetchWorker::connectAsync(std::string uri, std::string cert_path, std::stri
   // worker thread.
   try {
     backend_ = std::make_unique<BackendConnection>(uri, cert_path, api_key, allow_insecure);
+    // A NEW connection (even one that goes on to fail) may talk to a
+    // different/rebuilt server: the cached vocabulary and the last gate
+    // selection belong to the OLD backend_ and must not silently carry over
+    // (stale ids, or a customer/site pair the new server doesn't have).
+    vocab_.reset();
+    last_gate_customer_.clear();
+    last_gate_site_.clear();
     std::string error;
     if (!backend_->connect(&error)) {
       backend_.reset();
@@ -174,6 +182,126 @@ void FetchWorker::listSequencesAsync() {
   }
 }
 
+void FetchWorker::fetchVocabularyAsync(std::uint64_t request_id) {
+  if (!backend_) {
+    if (vocabularyFailed) {
+      vocabularyFailed(request_id);
+    }
+    return;
+  }
+  auto vocab = backend_->getVocabulary();
+  if (backend_->isClosed()) {
+    // A dead browse socket during the fetch: route through the same
+    // once-per-connection connectionLost signal as every other RPC here,
+    // rather than a bespoke vocabularyFailed (the dialog's connected-state
+    // gating already reacts to connectionLost).
+    notifyConnectionLostOnce();
+    return;
+  }
+  if (!vocab) {
+    if (vocabularyFailed) {
+      vocabularyFailed(request_id);
+    }
+    return;
+  }
+  vocab_ = std::move(*vocab);
+  if (vocabularyReady) {
+    vocabularyReady(*vocab_, /*recovery=*/false);
+  }
+}
+
+void FetchWorker::listSequencesFilteredAsync(std::uint64_t request_id, std::string customer,
+                                             std::string site) {
+  // The ONLY terminal signal for a gated list: exactly one finish() call on
+  // every path out of this function (including the pre-start supersession
+  // no-op below) — see F5/F4 in the task's design rationale.
+  auto finish = [this, request_id](bool complete, GateListResult::Error error,
+                                   std::vector<SequenceInfo> sequences) {
+    if (gateListFinished) {
+      gateListFinished(GateListResult{request_id, complete, error, std::move(sequences)});
+    }
+  };
+  if (latest_gate_request_.load() != request_id) {
+    // A newer gate request was already issued (supersedeGateRequests) before
+    // this queued command started running: NO-OP rather than sweep the
+    // now-irrelevant selection (F4 — commands are FIFO on one worker thread,
+    // so a stale request can sit behind a full sweep without this check).
+    finish(false, GateListResult::Error::kSuperseded, {});
+    return;
+  }
+  if (!backend_) {
+    finish(false, GateListResult::Error::kConnectionLost, {});
+    return;
+  }
+  // Remembered even if this attempt ultimately fails/is superseded: it is
+  // "the last gate selection the user asked for", which the tag-edit re-list
+  // path below reuses to stay scoped to the same site after a commit.
+  last_gate_customer_ = customer;
+  last_gate_site_ = site;
+
+  // Two resolution attempts: the cached vocabulary, then ONE refresh when the
+  // generation died mid-request (builder rebuild raced the sweep).
+  for (int attempt = 0; attempt < 2; ++attempt) {
+    if (!vocab_) {
+      auto fresh = backend_->getVocabulary();
+      if (!fresh) {
+        break;  // connection-level failure — the final kRebuildStorm below explains it
+      }
+      vocab_ = std::move(*fresh);
+      // recovery=true: combos refresh, but the dialog must NOT start a second
+      // sweep — THIS loop owns the retry (F3, the duplicate-sweep finding).
+      if (vocabularyReady) {
+        vocabularyReady(*vocab_, /*recovery=*/true);
+      }
+    }
+    const auto filter = resolveGateFilter(*vocab_, customer, site);
+    if (!filter) {
+      // Names no longer resolve against the (possibly just-refreshed)
+      // vocabulary: a rebuild renamed/removed the site, or this is a stale
+      // persisted selection typed before any vocabulary existed.
+      finish(false, GateListResult::Error::kSelectionGone, {});
+      return;
+    }
+    bool complete = false;
+    bool stale = false;
+    auto abort = [this, request_id] { return latest_gate_request_.load() != request_id; };
+    BackendConnection::PageCallback on_page;
+    if (gatePageReady) {
+      on_page = [this, request_id](const std::vector<SequenceInfo>& page, bool reset) {
+        gatePageReady(request_id, page, reset);
+      };
+    }
+    auto sequences = backend_->listSequences(&complete, on_page, &*filter, &stale, abort);
+    if (backend_->isClosed()) {
+      notifyConnectionLostOnce();
+      finish(false, GateListResult::Error::kConnectionLost, std::move(sequences));
+      return;
+    }
+    if (latest_gate_request_.load() != request_id) {
+      // Superseded mid-sweep (the abort predicate stopped listSequences()
+      // early): the partial `sequences` it returned belong to a request the
+      // dialog no longer cares about, so they are dropped rather than passed
+      // to finish().
+      finish(false, GateListResult::Error::kSuperseded, {});
+      return;
+    }
+    if (stale) {
+      // The filter's dimension ids died with the old generation (a builder
+      // rebuild raced the sweep): refresh the vocabulary and retry ONCE, per
+      // BackendConnection::listSequences()'s filtered-abort contract.
+      vocab_.reset();
+      continue;
+    }
+    finish(complete, complete ? GateListResult::Error::kNone : GateListResult::Error::kPartial,
+           std::move(sequences));
+    return;
+  }
+  // Both attempts were exhausted without a usable result (a vocabulary
+  // refresh failed, or the generation kept dying out from under us): the
+  // catalog is rebuilding faster than this loop can keep up.
+  finish(false, GateListResult::Error::kRebuildStorm, {});
+}
+
 void FetchWorker::notifyConnectionLostOnce() {
   if (connection_lost_notified_) {
     return;
@@ -263,11 +391,24 @@ void FetchWorker::updateTagsAsync(std::string sequence_name,
     return;
   }
 
-  // Re-list to refresh the flat metadata + Lua filter view. Guard on the
-  // `complete` flag exactly like the browse path (listSequencesAsync): a PARTIAL
-  // re-list (a page dropped, or a rebuild racing the pagination) must NOT replace
-  // the dialog's authoritative catalog with a truncated snapshot — surface it as
-  // an error and keep the existing view instead.
+  // Re-list to refresh the flat metadata + Lua filter view. If the dialog has
+  // an active gate selection (the last customer/site the user browsed to —
+  // and a tag edit implies a listed, hence gated, file, so the pair is set in
+  // practice), stay scoped to it via the SAME gated path the browse gate
+  // uses, rather than re-sweeping the WHOLE catalog. No gate selection on
+  // record (e.g. the browse gate machinery hasn't landed on the dialog side
+  // yet, or the ungated fallback path is in use) falls back to the legacy
+  // unfiltered re-list below — just a guard, no assert.
+  if (!last_gate_customer_.empty() && !last_gate_site_.empty()) {
+    listSequencesFilteredAsync(latest_gate_request_.load(), last_gate_customer_, last_gate_site_);
+    return;
+  }
+
+  // Guard on the `complete` flag exactly like the browse path
+  // (listSequencesAsync): a PARTIAL re-list (a page dropped, or a rebuild
+  // racing the pagination) must NOT replace the dialog's authoritative
+  // catalog with a truncated snapshot — surface it as an error and keep the
+  // existing view instead.
   bool complete = false;
   std::vector<SequenceInfo> sequences = backend_->listSequences(&complete);
   if (!complete) {
