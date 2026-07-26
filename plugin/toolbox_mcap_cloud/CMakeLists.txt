@@ -448,6 +448,19 @@ if(BUILD_TESTING)
   )
   add_test(NAME McapCloudTlsUtilsTest COMMAND toolbox_mcap_cloud_tls_utils_test)
 
+  # Pure gate helpers (customer/site resolver + GatePhase pill text). Header-
+  # only (src/vocab_select.hpp), std only + backend_types.hpp — no ix/proto/Qt.
+  add_executable(toolbox_mcap_cloud_vocab_select_test
+    tests/vocab_select_test.cpp
+  )
+  target_link_libraries(toolbox_mcap_cloud_vocab_select_test PRIVATE
+    GTest::gtest_main
+  )
+  target_include_directories(toolbox_mcap_cloud_vocab_select_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+  )
+  add_test(NAME McapCloudVocabSelectTest COMMAND toolbox_mcap_cloud_vocab_select_test)
+
   add_executable(toolbox_mcap_cloud_time_format_test
     tests/time_format_test.cpp
     src/core/time_format.cpp
