@@ -122,6 +122,17 @@ struct DialogState {
   // calendar hover preview + unresponsive topic clicks).
   bool seq_rows_pushed = false;
   std::vector<int> seq_visible_pushed = {-1};  // sentinel: never delivered
+  // Same gating for the topicTable rows/headers: false = re-send on the next
+  // widget_data() (set at every topic_names/topic_infos mutation — union
+  // recompute, sort, selection clears). The light per-call keys (visible/
+  // disabled/selected/labels) are NOT gated — they depend on filter text and
+  // selection, which change independently and serialize to a few ints.
+  bool topic_rows_pushed = false;
+  // MRU server history ("mcap_cloud/server_history"): seeded by
+  // initFromSettings at bind time and refreshed on every history write
+  // (onConnectFinished) — the previous per-call read crossed the plugin->host
+  // settings ABI on every widget_data().
+  std::vector<std::string> server_history;
   std::vector<std::string> topic_names;
   std::vector<TopicInfo> topic_infos;  // partial info from listTopics (size/ts/created)
   // Slice 7: per-sequence topic cache, keyed by sequence name. When N sequences
