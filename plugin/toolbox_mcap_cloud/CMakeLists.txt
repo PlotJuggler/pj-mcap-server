@@ -308,6 +308,17 @@ if(BUILD_TESTING)
   )
   add_test(NAME McapCloudS3KeyFieldsTest COMMAND toolbox_mcap_cloud_s3_key_fields_test)
 
+  # Canonical filter fields + one-pass sorted-unique vocabulary (the epoch-cached
+  # replacement for the per-dropdown-per-call key re-parse). Header-only, std only.
+  add_executable(toolbox_mcap_cloud_canonical_fields_test
+    tests/canonical_fields_test.cpp
+  )
+  target_link_libraries(toolbox_mcap_cloud_canonical_fields_test PRIVATE GTest::gtest_main)
+  target_include_directories(toolbox_mcap_cloud_canonical_fields_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+  )
+  add_test(NAME McapCloudCanonicalFieldsTest COMMAND toolbox_mcap_cloud_canonical_fields_test)
+
   # SequencePicker date/time filter incl. "Every day". Header-only, std only.
   add_executable(toolbox_mcap_cloud_date_filter_test
     tests/date_filter_test.cpp
