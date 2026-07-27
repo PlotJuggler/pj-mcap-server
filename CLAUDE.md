@@ -52,8 +52,8 @@ schema/IPC changes MUST update it.
   builder gaps by design: `derive_tags()` stub, GCS Pub/Sub discovery, `file_metrics`.
 - **The C++ facet UI has LANDED** (2026-07-26): browse is now gated on a required
   customer+site selection fed by `GetVocabulary`, server-filtered (`ListFiles`) and
-  progressively rendered, persisted per server -- see
-  `docs/2026-07-26-facet-gated-browse-plan.md` for the design.
+  progressively rendered, persisted per server -- the executed plan doc was removed
+  once it landed (recover from git history if the design record is ever needed).
 - **Team rule:** technical decisions are cross-checked with a standing Codex instance
   before they're locked; milestone boundaries get adversarial review (Codex + Claude —
   this caught ~35 real defects across the M6 tail).
