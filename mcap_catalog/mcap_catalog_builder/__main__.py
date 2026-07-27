@@ -19,6 +19,7 @@ from .db import Caches, load_caches, open_db
 from .builder import catalog_object, delete_by_key
 from .publish import build_and_publish
 from .reconcile import SourceSpec, full_reconcile
+from .status import ReconcileProgress, StatusWriter
 from .storage import LocalSource
 from .tag_ipc import TagEditItem, TagEditServer, handle_tag_edit
 from .watcher import McapEventHandler, WatchEvent, start_observer
@@ -98,6 +99,7 @@ def worker_loop(
     work_q: "queue.Queue[WatchEvent | TagEditItem]",
     workers: int = 1,
     source_spec: "SourceSpec | None" = None,
+    progress=None,
 ) -> None:
     """Drain the work queue and perform all DB writes (the single writer).
 
@@ -126,7 +128,10 @@ def worker_loop(
             elif ev.kind == "delete":
                 delete_by_key(conn, caches, source.event_key(ev.path))
             elif ev.kind == "rescan":
-                full_reconcile(conn, caches, source, workers=workers, source_spec=source_spec)
+                full_reconcile(conn, caches, source, workers=workers,
+                               source_spec=source_spec, progress=progress)
+                if progress is not None:
+                    progress.idle()
             else:
                 logger.warning("unknown event: %r", ev)
         except Exception:  # noqa: BLE001 - the worker must never die
@@ -220,15 +225,30 @@ def main(argv: list[str] | None = None) -> int:
     except WriterLockError as e:
         logger.error("%s", e)
         return 3
+    # The status sidecar is constructed only AFTER the flock succeeds — holding
+    # the writer lock is what makes this process the owner of <db>.status.json
+    # (a refused second builder must never clobber the incumbent's status). The
+    # heartbeat keeps updated_at fresh for the container healthcheck through
+    # phases with no per-file progress (long LISTs, idle daemon).
+    status = StatusWriter(args.db)
+    status.heartbeat_start(stop_event)
     try:
         return _locked_main(args, source, start_producer, work_q, stop_event,
-                            lambda: observer, lambda: handler)
+                            lambda: observer, lambda: handler, status)
+    except Exception as e:
+        # Funnel any fatal error (missing credentials surfacing at the first
+        # LIST, a failed publish, ...) into the sidecar so "unhealthy" comes
+        # with a reason, then re-raise for the traceback + nonzero exit.
+        status.fatal(f"{type(e).__name__}: {e}")
+        raise
     finally:
+        stop_event.set()
+        status.heartbeat_stop()
         writer_lock.release()
 
 
 def _locked_main(args, source, start_producer, work_q, stop_event,
-                 get_observer, get_handler) -> int:
+                 get_observer, get_handler, status) -> int:
     """The post-lock body of main(): everything that reads or writes the served
     DB / binds the tag socket runs under the single-writer lock. The observer/
     handler are read through GETTERS because the local-source start_producer
@@ -254,12 +274,15 @@ def _locked_main(args, source, start_producer, work_q, stop_event,
     # (catalog-migration §6.2a), instead of creating/mutating args.db directly.
     use_publish = args.rebuild or not os.path.exists(args.db)
 
+    progress = ReconcileProgress(status=status)
+
     if use_publish:
         logger.info("rebuild-publish (db=%s, rebuild=%s)", args.db, args.rebuild)
         build_and_publish(
             args.db,
             lambda c, ca: full_reconcile(
-                c, ca, source, workers=args.extract_workers, source_spec=extract_spec
+                c, ca, source, workers=args.extract_workers, source_spec=extract_spec,
+                progress=progress,
             ),
         )
         # One-shot mode: the publish above already built + published the full
@@ -267,6 +290,7 @@ def _locked_main(args, source, start_producer, work_q, stop_event,
         # caller (the Go read-only server, the cross-language e2e, CI) takes over
         # the DB from here.
         if args.once:
+            progress.idle()
             logger.info("--once --rebuild: publish complete, exiting")
             return 0
         # Daemon mode: continue watching the just-PUBLISHED path in place (the
@@ -279,15 +303,18 @@ def _locked_main(args, source, start_producer, work_q, stop_event,
 
         logger.info("startup reconcile (db=%s)", args.db)
         full_reconcile(conn, caches, source, workers=args.extract_workers,
-                       source_spec=extract_spec)  # synchronous, before watching
+                       source_spec=extract_spec, progress=progress)  # synchronous, before watching
 
         # One-shot mode: the synchronous reconcile above already built the full catalog.
         # Exit cleanly without starting any producer/rescan thread — the caller (the
         # Go read-only server, the cross-language e2e, CI) takes over the DB from here.
         if args.once:
             conn.close()
+            progress.idle()
             logger.info("--once: reconcile complete, exiting")
             return 0
+
+    progress.idle()  # daemon steady state: first build done, catalog published
 
     # Tag-edit IPC (D2(a)): daemon mode only (both --once early-returns above
     # already skip this), and only after the served DB is open in-place — a
@@ -322,7 +349,7 @@ def _locked_main(args, source, start_producer, work_q, stop_event,
 
     try:
         worker_loop(conn, caches, source, work_q, workers=args.extract_workers,
-                    source_spec=extract_spec)
+                    source_spec=extract_spec, progress=progress)
     finally:
         stop_event.set()
         if tag_server is not None:
