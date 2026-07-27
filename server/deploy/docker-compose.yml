@@ -25,22 +25,19 @@
 #     also runs as 65532, see Dockerfile.builder) so ordinary owner
 #     read/write is enough — no shared-group dance needed. The builder
 #     unlinks any stale socket from a previous run itself (crash-safe).
-#   - First-boot ordering: `server` has NO healthy catalog to read until
-#     `builder` publishes its first build. Rather than the fragile
-#     `depends_on: condition: service_completed_successfully` (which cannot
-#     express "the builder is a long-running daemon that ALSO must have
-#     produced its first output"), `builder` gets its OWN container
-#     healthcheck (a python3 one-liner: open catalog.db read-only, check
-#     build_metadata.last_build_ns > 0 — python3 ships in the builder's base
-#     image already, no extra tooling needed) and `server` is gated on
-#     `depends_on: builder: condition: service_healthy` — so the `server`
-#     container is not even STARTED until the builder has published its
-#     first catalog. Watch `docker compose logs -f builder` for "initial
-#     catalog build" progress while compose waits. `server` still keeps
-#     `restart: unless-stopped` too, as a belt-and-suspenders fallback for a
-#     LATER transient catalog hiccup (e.g. a rebuild racing this container's
-#     very first open) — but it is no longer the first-boot ordering
-#     mechanism, the healthcheck gate is.
+#   - First-boot ordering: NONE NEEDED (degraded start). The server now boots
+#     WITHOUT a catalog: /health answers 503 "waiting for first catalog build"
+#     (with the builder's live progress), catalog RPCs fail fast with the
+#     retryable ERROR_CATALOG_UNAVAILABLE, and the 30s reopen tick picks the
+#     catalog up the moment the builder's atomic publish lands. `up -d`
+#     therefore completes in seconds however big the bucket is — the old
+#     "builder must FINISH its first build within the healthcheck budget"
+#     gate (which timed out real production first scans at 20 minutes) is
+#     gone. The builder healthcheck below now means "alive and progressing,
+#     not fatally failed" — read from the builder's <db>.status.json sidecar
+#     (CATALOG_CONTRACT.md §12), NOT "first build complete". Watch
+#     `docker compose logs -f builder` for reconcile progress lines, or
+#     `docker exec <builder> cat /var/lib/pj-cloud/catalog.db.status.json`.
 #
 # USAGE
 #   cd server/deploy
@@ -113,18 +110,20 @@ services:
       - "--db=/var/lib/pj-cloud/catalog.db"
       - "--rescan-interval=300"
       - "--log-level=INFO"
-    # Healthcheck: open the catalog DB read-only and confirm a build has
-    # actually been published (build_metadata.last_build_ns > 0) — NOT just
-    # "is the process alive". python3 + the stdlib sqlite3 module are already
-    # in this image, no extra tooling needed. Generous interval/retries (up
-    # to 20 minutes total) so a real cold-bucket first scan has time to
-    # finish before compose gives up waiting — see `server`'s `depends_on`.
+    # Healthcheck: "alive, progressing, and not fatally failed" — NEVER "first
+    # build complete" (that made deploy success a function of bucket size and
+    # timed out real first scans). The builder maintains <db>.status.json
+    # (atomic tmp+rename, heartbeat-refreshed every 10s — CATALOG_CONTRACT.md
+    # §12); unhealthy means the sidecar reports phase=error (e.g. missing
+    # credentials — the reason is in its last_error field) or went stale
+    # (process hung/dead). start_period covers process boot + the first
+    # milestone write; probe failures during it don't count.
     healthcheck:
-      test: ["CMD", "python3", "-c", "import sqlite3,sys; c=sqlite3.connect('file:/var/lib/pj-cloud/catalog.db?mode=ro', uri=True); row=c.execute('SELECT last_build_ns FROM build_metadata WHERE id=1').fetchone(); sys.exit(0 if row and row[0] and row[0] > 0 else 1)"]
-      interval: 5s
+      test: ["CMD", "python3", "-c", "import json,sys,time; d=json.load(open('/var/lib/pj-cloud/catalog.db.status.json')); sys.exit(1 if d.get('phase')=='error' or time.time()-d.get('updated_at_unix',0)>60 else 0)"]
+      interval: 10s
       timeout: 3s
-      retries: 240
-      start_period: 5s
+      retries: 6
+      start_period: 30s
     restart: unless-stopped
 
   server:
@@ -138,7 +137,7 @@ services:
       minio-init:
         condition: service_completed_successfully
       builder:
-        condition: service_healthy   # waits for builder's FIRST published catalog — see ARCHITECTURE note
+        condition: service_started   # NO completion gate: the server starts degraded and picks the catalog up live (see ARCHITECTURE note)
     environment:
       # Single shared bearer token (design-spec §3 auth). Auth is FAIL-CLOSED:
       # unset => the server refuses to start unless PJ_CLOUD_ALLOW_ANONYMOUS=1.
@@ -164,13 +163,10 @@ services:
       - "--db=/var/lib/pj-cloud/catalog.db"
       - "--tag-ipc-socket=/var/lib/pj-cloud/tag.sock"
     # No container healthcheck: the distroless/static image ships no shell or curl,
-    # so liveness is probed EXTERNALLY via the always-unauthenticated HTTP endpoint
-    #   curl -fsS http://localhost:8080/health   # -> "ok" once the catalog is up
-    # restart: unless-stopped is a belt-and-suspenders fallback now, NOT the
-    # first-boot ordering mechanism (that's `depends_on: builder: condition:
-    # service_healthy` above) — it still helps if a LATER transient catalog
-    # hiccup (e.g. a rebuild racing this container's very first open) makes
-    # OpenReadOnly fail once even after the builder is healthy.
+    # so readiness is probed EXTERNALLY via the always-unauthenticated HTTP endpoint
+    #   curl -fsS http://localhost:8080/health
+    # -> 503 "waiting for first catalog build (builder: extracting 123/456)"
+    #    while the first build runs, then 200 "ok" once it lands.
     restart: unless-stopped
 
 volumes:
