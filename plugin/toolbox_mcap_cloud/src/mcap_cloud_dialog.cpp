@@ -35,7 +35,6 @@
 #include "date_filter.h"
 #include "elide_name.h"
 #include "canonical_fields.h"
-#include "s3_key_fields.h"
 #include "seq_display.h"
 #include "fetch_summary.h"
 #include "fetch_worker.hpp"
@@ -170,16 +169,10 @@ std::vector<std::string> queryAssistKeys(const Schema& schema, const std::vector
   return std::vector<std::string>(merged.begin(), merged.end());
 }
 
-// Distinct, sorted values recorded for `key` across the dataset. The schema is
-// built by buildCanonicalSchema (sorted-unique per key — the Schema type
-// contract), so this is a plain lookup + copy, not a per-call sort.
-std::vector<std::string> schemaValues(const Schema& schema, const std::string& key) {
-  auto it = schema.find(key);
-  return it == schema.end() ? std::vector<std::string>{} : it->second;
-}
-
 // Reference into the schema's value vector for `key` (empty vector when the
-// key has no values). For per-call consumers that must not copy.
+// key has no values). The schema is built by buildCanonicalSchema
+// (sorted-unique per key — the Schema type contract), so consumers need no
+// per-call sort or copy.
 const std::vector<std::string>& schemaValuesRef(const Schema& schema, std::string_view key) {
   static const std::vector<std::string> kEmpty;
   auto it = schema.find(key);
@@ -265,11 +258,6 @@ std::string sessionLabel(const mcap_cloud::AggSession& s) {
   return fmt::format("{} - {} ({} files)", base, dateTimeUtc(s.min_ts_ns), s.keys.size());
 }
 
-// kBasicFilterKeys (the full 4-field canonical set), canonicalFilterFields and
-// canonicalVocabularyKeys moved to canonical_fields.h, next to
-// buildCanonicalSchema — the one-pass sorted-unique vocabulary that
-// ensureQuerySchemaLocked caches per seq_epoch.
-
 // The LOCAL Basic-tab dropdowns (combo feed + matchesBasicFilter + Basic-tab
 // persistence). customer/site moved OUT to the mandatory browse gate
 // (server-filtered, fed from GetVocabulary — gateRow's filter_customer /
@@ -289,15 +277,9 @@ const std::array<std::pair<const char*, const char*>, 2> kLocalBasicFilterKeys =
 // tick later, scrambling clicks and drags; 2026-07-12).
 constexpr std::array<std::string_view, 2> kForcedTopics = {"/tf", "/tf_static"};
 
-// (distinctFieldValues was RETIRED here: re-parsing every S3 key per dropdown
-// per widget_data() call cost ~1.3 ms per 1000 files per call at the 20 Hz tick
-// plus every forwarded widget event — dropdown values now come from the
-// epoch-cached query_schema via schemaValuesRef.)
-
-// Does a sequence pass the Basic-tab equality filters (AND across non-empty
-// selections)? Empty selections impose no constraint.
-bool matchesBasicFilter(const SequenceRecord& rec, const std::map<std::string, std::string, std::less<>>& filters) {
-  const Metadata fields = parseS3KeyFields(rec.name);
+// Do a sequence's parsed canonical fields pass the Basic-tab equality filters
+// (AND across non-empty selections)? Empty selections impose no constraint.
+bool matchesBasicFilter(const Metadata& fields, const std::map<std::string, std::string, std::less<>>& filters) {
   for (const auto& [key, value] : filters) {
     if (value.empty()) {
       continue;
@@ -309,14 +291,6 @@ bool matchesBasicFilter(const SequenceRecord& rec, const std::map<std::string, s
   }
   return true;
 }
-
-// (canonicalFilterFields / canonicalVocabularyKeys live in canonical_fields.h.
-// The canonical fields are the ONLY filter dimension: the Advanced (Lua) tab
-// evaluates against this map too, NOT against rec.metadata (which carries
-// MCAP-content stats like chunk_count/message_count/duration for DISPLAY +
-// stitching only). A query referencing any other key resolves to absent, so
-// MCAP contents can never be a filter — only the dedicated server-derived key
-// fields.)
 
 std::string buildSequenceInfoText(const SequenceRecord& rec) {
   std::string text;
@@ -594,10 +568,13 @@ void McapCloudDialog::initFromSettings() {
   // parity). Runs at bind time, before the tick loop or any worker result can
   // touch state_, so the unlocked access here is safe.
   SettingsStore settings(settings_);
-  const std::vector<std::string> history = settings.getStringList("mcap_cloud/server_history");
+  std::vector<std::string> history = settings.getStringList("mcap_cloud/server_history");
   if (!history.empty()) {
     state_.uri = history.front();
   }
+  // Seed the comboUri item cache so widget_data() never re-reads the settings
+  // ABI per call; onConnectFinished refreshes it on every history write.
+  state_.server_history = std::move(history);
   state_.query_text = settings.getString("mcap_cloud/metadata_query");
   state_.range_lower = std::clamp(settings.getInt("mcap_cloud/range_lower", 0), 0, DialogState::kSliderSteps);
   state_.range_upper =
@@ -760,11 +737,7 @@ std::string McapCloudDialog::widget_data() {
   {
     static const std::string kDefaultServer = "ws://localhost:8080";
     std::vector<std::string> items;
-    if (!state_.server_history_loaded) {
-      state_.server_history = SettingsStore(settings_).getStringList("mcap_cloud/server_history");
-      state_.server_history_loaded = true;
-    }
-    const std::vector<std::string>& history = state_.server_history;
+    const std::vector<std::string>& history = state_.server_history;  // seeded in initFromSettings
     bool has_default = false;
     for (const std::string& s : history) {
       items.push_back(s);
@@ -825,7 +798,7 @@ std::string McapCloudDialog::widget_data() {
     wd.setEnabled("opCombo", ctx.can_pick_op());
     wd.setCurrentIndex("opCombo", -1);
 
-    wd.setItems("valCombo", schemaValues(state_.query_schema, ctx.context_key));
+    wd.setItems("valCombo", schemaValuesRef(state_.query_schema, ctx.context_key));
     wd.setEnabled("valCombo", ctx.can_pick_value());
     wd.setCurrentIndex("valCombo", -1);
   }
@@ -1000,19 +973,6 @@ std::string McapCloudDialog::widget_data() {
                      cache.query_text == state_.query_text && cache.date_from_ns == state_.date_from_ns &&
                      cache.date_to_ns == state_.date_to_ns;
     if (!cache_hit) {
-      // Build a schema from the union of every sequence's CANONICAL filter fields
-      // (the 4 S3-key fields) — the PJ3 query engine uses it for shorthand
-      // expansion. NOT rec.metadata: the Advanced query filters only by the
-      // canonical fields, never by MCAP-content stats. Only needed when a query
-      // is present (Advanced tab).
-      Schema schema;
-      if (!state_.query_text.empty()) {
-        for (const auto& rec : state_.sequences) {
-          for (const auto& kv : canonicalFilterFields(rec.name)) {
-            schema[kv.first].push_back(kv.second);
-          }
-        }
-      }
       std::vector<FilterSequence> filter_seqs;
       filter_seqs.reserve(state_.sequences.size());
       for (const auto& rec : state_.sequences) {
@@ -1028,13 +988,19 @@ std::string McapCloudDialog::widget_data() {
       params.date_to_ns = state_.date_to_ns;
       // Per-file visible set (indices into state_.sequences): name + date + the
       // active tab's metadata filter. Advanced -> the Lua query (computed by the
-      // shared helper). Basic -> the dropdown equality filters on the S3 fields.
-      std::vector<int> file_visible = computeVisibleSequences(filter_seqs, params, schema);
+      // shared helper, fed the epoch-cached canonical schema for shorthand
+      // expansion — the Advanced query filters only by the canonical fields,
+      // never by MCAP-content stats). Basic -> the dropdown equality filters
+      // on the S3 fields.
+      ensureQuerySchemaLocked();
+      std::vector<int> file_visible = computeVisibleSequences(filter_seqs, params, state_.query_schema);
       if (state_.filter_tab == 0 && !state_.basic_filter.empty()) {
         std::vector<int> narrowed;
         narrowed.reserve(file_visible.size());
         for (int idx : file_visible) {
-          if (matchesBasicFilter(state_.sequences[static_cast<std::size_t>(idx)], state_.basic_filter)) {
+          // filter_seqs[idx].metadata already holds the parsed canonical fields
+          // for this record — no second key parse.
+          if (matchesBasicFilter(filter_seqs[static_cast<std::size_t>(idx)].metadata, state_.basic_filter)) {
             narrowed.push_back(idx);
           }
         }
@@ -1151,9 +1117,9 @@ std::string McapCloudDialog::widget_data() {
     wd.setChecked("radioFilterAdvanced", state_.filter_tab == 1);
     wd.setVisible("basicPane", state_.filter_tab == 0);
     wd.setVisible("advancedPane", state_.filter_tab == 1);
-    // Dropdown values come from the epoch-cached canonical schema (already
-    // refreshed by the assist block's ensureQuerySchemaLocked above) — never
-    // from a per-call sweep over the sequences.
+    // Dropdown values come from the epoch-cached canonical schema — never from
+    // a per-call sweep over the sequences. The guard is an O(1) epoch compare.
+    ensureQuerySchemaLocked();
     for (const auto& [key, label] : kLocalBasicFilterKeys) {
       const std::vector<std::string>& values = schemaValuesRef(state_.query_schema, key);
       std::vector<std::string> items;
@@ -2192,8 +2158,9 @@ void McapCloudDialog::ensureQuerySchemaLocked() {
   // Basic-tab combos offer the 4 S3-key fields, never MCAP-content stats
   // (matches the filter eval). Sorted-unique per key (the Schema contract), so
   // every consumer — combo items, index->value resolution, valCombo — reads it
-  // without a per-call re-sort or key re-parse.
-  state_.query_schema = buildCanonicalSchema(state_.sequences);
+  // without a per-call re-sort or key re-parse. sequence_names mirrors
+  // sequences[i].name and moves under the same seq_epoch.
+  state_.query_schema = buildCanonicalSchema(state_.sequence_names);
   state_.query_schema_epoch = state_.seq_epoch;
 }
 
@@ -2333,7 +2300,7 @@ bool McapCloudDialog::onIndexChanged(std::string_view widget_name, int index) {
     item = ops[static_cast<std::size_t>(index)];
     action = ctx.op_action;
   } else {
-    const auto values = schemaValues(state_.query_schema, ctx.context_key);
+    const std::vector<std::string>& values = schemaValuesRef(state_.query_schema, ctx.context_key);
     if (index >= static_cast<int>(values.size())) {
       return true;
     }
@@ -2607,7 +2574,6 @@ void McapCloudDialog::onConnectFinished(bool ok, std::string uri, std::string st
       // Keep the widget_data() combo cache in lockstep with the persisted list.
       std::lock_guard<std::mutex> lock(state_.mu);
       state_.server_history = std::move(history);
-      state_.server_history_loaded = true;
     }
 
     notify(PJ::ToolboxMessageLevel::kInfo, status);

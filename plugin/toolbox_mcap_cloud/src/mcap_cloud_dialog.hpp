@@ -128,11 +128,11 @@ struct DialogState {
   // disabled/selected/labels) are NOT gated — they depend on filter text and
   // selection, which change independently and serialize to a few ints.
   bool topic_rows_pushed = false;
-  // MRU server history ("mcap_cloud/server_history"), read from the settings
-  // store ONCE and refreshed on every history write — the previous per-call
-  // read crossed the plugin->host settings ABI on every widget_data().
+  // MRU server history ("mcap_cloud/server_history"): seeded by
+  // initFromSettings at bind time and refreshed on every history write
+  // (onConnectFinished) — the previous per-call read crossed the plugin->host
+  // settings ABI on every widget_data().
   std::vector<std::string> server_history;
-  bool server_history_loaded = false;
   std::vector<std::string> topic_names;
   std::vector<TopicInfo> topic_infos;  // partial info from listTopics (size/ts/created)
   // Slice 7: per-sequence topic cache, keyed by sequence name. When N sequences

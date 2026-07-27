@@ -22,10 +22,6 @@ using mcap_cloud::buildCanonicalSchema;
 using mcap_cloud::canonicalFilterFields;
 using mcap_cloud::parseS3KeyFields;
 
-struct Rec {
-  std::string name;
-};
-
 std::string hiveKey(const std::string& customer, const std::string& site, const std::string& robot,
                     const std::string& source, const std::string& file) {
   return "customer=" + customer + "/customer_site=" + site + "/robot=" + robot + "/source=" + source +
@@ -49,14 +45,14 @@ TEST(CanonicalFields, FilterFieldsDegradeOnFlatKey) {
 
 TEST(CanonicalFields, SchemaIsSortedUniquePerKey) {
   // Duplicates, out-of-order values, and a partial (flat) key.
-  const std::vector<Rec> recs = {
-      {hiveKey("acme", "s1", "zeta", "ros-bags", "a.mcap")},
-      {hiveKey("acme", "s1", "alpha", "ros-bags", "b.mcap")},
-      {hiveKey("acme", "s2", "alpha", "ros-bags", "c.mcap")},
-      {hiveKey("acme", "s1", "zeta", "flight-logs", "d.mcap")},
-      {"flat_key.mcap"},
+  const std::vector<std::string> keys = {
+      hiveKey("acme", "s1", "zeta", "ros-bags", "a.mcap"),
+      hiveKey("acme", "s1", "alpha", "ros-bags", "b.mcap"),
+      hiveKey("acme", "s2", "alpha", "ros-bags", "c.mcap"),
+      hiveKey("acme", "s1", "zeta", "flight-logs", "d.mcap"),
+      "flat_key.mcap",
   };
-  const Schema schema = buildCanonicalSchema(recs);
+  const Schema schema = buildCanonicalSchema(keys);
 
   ASSERT_EQ(schema.count("robot"), 1u);
   EXPECT_EQ(schema.at("robot"), (std::vector<std::string>{"alpha", "zeta"}));
@@ -74,16 +70,16 @@ TEST(CanonicalFields, SchemaIsSortedUniquePerKey) {
 TEST(CanonicalFields, SchemaMatchesNaiveDistinctPerKey) {
   // Equivalence with the retired per-key scan (std::set over parseS3KeyFields):
   // the dropdowns must offer the same values in the same order as before.
-  std::vector<Rec> recs;
+  std::vector<std::string> object_keys;
   for (int i = 0; i < 200; ++i) {
-    recs.push_back({hiveKey("c" + std::to_string(i % 3), "s" + std::to_string(i % 5), "r" + std::to_string(i % 17),
-                            i % 2 == 0 ? "ros-bags" : "flight-logs", "f" + std::to_string(i) + ".mcap")});
+    object_keys.push_back(hiveKey("c" + std::to_string(i % 3), "s" + std::to_string(i % 5), "r" + std::to_string(i % 17),
+                                  i % 2 == 0 ? "ros-bags" : "flight-logs", "f" + std::to_string(i) + ".mcap"));
   }
-  const Schema schema = buildCanonicalSchema(recs);
+  const Schema schema = buildCanonicalSchema(object_keys);
   for (const char* key : {"customer", "customer_site", "robot", "source"}) {
     std::set<std::string, std::less<>> naive;
-    for (const auto& rec : recs) {
-      const Metadata fields = parseS3KeyFields(rec.name);
+    for (const auto& object_key : object_keys) {
+      const Metadata fields = parseS3KeyFields(object_key);
       if (auto it = fields.find(key); it != fields.end()) {
         naive.insert(it->second);
       }
@@ -94,7 +90,7 @@ TEST(CanonicalFields, SchemaMatchesNaiveDistinctPerKey) {
 }
 
 TEST(CanonicalFields, EmptyRecordsYieldEmptySchema) {
-  EXPECT_TRUE(buildCanonicalSchema(std::vector<Rec>{}).empty());
+  EXPECT_TRUE(buildCanonicalSchema({}).empty());
 }
 
 }  // namespace

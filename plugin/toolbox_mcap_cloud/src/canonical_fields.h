@@ -50,26 +50,33 @@ inline Metadata canonicalFilterFields(std::string_view s3_key) {
 }
 
 // The Advanced-tab query-assist vocabulary: exactly the canonical keys, a
-// constant independent of the server.
-inline std::vector<std::string> canonicalVocabularyKeys() {
-  std::vector<std::string> keys;
-  keys.reserve(kBasicFilterKeys.size());
-  for (const auto& kv : kBasicFilterKeys) {
-    keys.emplace_back(kv.first);
-  }
-  return keys;
+// constant independent of the server (built once — this is called on the
+// 20 Hz widget_data() path).
+inline const std::vector<std::string>& canonicalVocabularyKeys() {
+  static const std::vector<std::string> kKeys = [] {
+    std::vector<std::string> keys;
+    keys.reserve(kBasicFilterKeys.size());
+    for (const auto& kv : kBasicFilterKeys) {
+      keys.emplace_back(kv.first);
+    }
+    return keys;
+  }();
+  return kKeys;
 }
 
-// One-pass canonical vocabulary across the records (anything with a `.name`
-// object key): canonical field -> SORTED UNIQUE values, honoring the Schema
-// type contract ("key -> sorted unique values"). Keys with no values anywhere
-// are absent from the result.
-template <typename Records>
-Schema buildCanonicalSchema(const Records& records) {
+// One-pass canonical vocabulary across the object keys: canonical field ->
+// SORTED UNIQUE values, honoring the Schema type contract ("key -> sorted
+// unique values"). Keys with no values anywhere are absent from the result.
+// Reads the parse directly (no per-record canonicalFilterFields map) — this
+// sweeps the whole catalog on every rebuild.
+inline Schema buildCanonicalSchema(const std::vector<std::string>& object_keys) {
   Schema schema;
-  for (const auto& rec : records) {
-    for (const auto& kv : canonicalFilterFields(rec.name)) {
-      schema[kv.first].push_back(kv.second);
+  for (const std::string& object_key : object_keys) {
+    const Metadata all = parseS3KeyFields(object_key);
+    for (const auto& kv : kBasicFilterKeys) {
+      if (auto it = all.find(kv.first); it != all.end()) {
+        schema[kv.first].push_back(it->second);
+      }
     }
   }
   for (auto& [key, values] : schema) {
