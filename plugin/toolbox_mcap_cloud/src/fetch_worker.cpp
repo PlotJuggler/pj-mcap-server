@@ -171,9 +171,10 @@ void FetchWorker::listSequencesFilteredAsync(std::uint64_t request_id, std::stri
   // The ONLY terminal signal for a gated list: exactly one finish() call on
   // every path out of this function (including the pre-start supersession
   // no-op below) — see F5/F4 in the task's design rationale.
-  auto finish = [this, request_id](GateListResult::Error error, std::vector<SequenceInfo> sequences) {
+  auto finish = [this, request_id](GateListResult::Error error, std::vector<SequenceInfo> sequences,
+                                   std::string message = {}) {
     if (gateListFinished) {
-      gateListFinished(GateListResult{request_id, error, std::move(sequences)});
+      gateListFinished(GateListResult{request_id, error, std::move(sequences), std::move(message)});
     }
   };
   if (latest_gate_request_.load() != request_id) {
@@ -237,7 +238,8 @@ void FetchWorker::listSequencesFilteredAsync(std::uint64_t request_id, std::stri
         gatePageReady(request_id, page, reset);
       };
     }
-    auto sequences = backend_->listSequences(&complete, on_page, &*filter, &stale, abort);
+    std::string list_error;
+    auto sequences = backend_->listSequences(&complete, on_page, &*filter, &stale, abort, &list_error);
     if (backend_->isClosed()) {
       notifyConnectionLostOnce();
       return finish(GateListResult::Error::kConnectionLost, std::move(sequences));
@@ -256,7 +258,8 @@ void FetchWorker::listSequencesFilteredAsync(std::uint64_t request_id, std::stri
       vocab_.reset();
       continue;
     }
-    return finish(complete ? GateListResult::Error::kNone : GateListResult::Error::kPartial, std::move(sequences));
+    return finish(complete ? GateListResult::Error::kNone : GateListResult::Error::kPartial,
+                  std::move(sequences), std::move(list_error));
   }
   // Both attempts were exhausted without a usable result (a vocabulary
   // refresh failed, or the generation kept dying out from under us): the
@@ -377,11 +380,13 @@ void FetchWorker::updateTagsAsync(std::string sequence_name,
   // catalog with a truncated snapshot — surface it as an error and keep the
   // existing view instead.
   bool complete = false;
-  std::vector<SequenceInfo> sequences = backend_->listSequences(&complete);
+  std::string list_error;
+  std::vector<SequenceInfo> sequences = backend_->listSequences(&complete, {}, nullptr, nullptr, {}, &list_error);
   if (!complete) {
     if (errorOccurred) {
-      errorOccurred("Tag saved, but the recording-list refresh was incomplete "
-                    "(server paging error) — the list may be stale; retry to refresh.");
+      errorOccurred("Tag saved, but the recording-list refresh failed"
+                    + (list_error.empty() ? std::string(" (server paging error)") : ": " + list_error)
+                    + " — the list may be stale; retry to refresh.");
     }
     return;
   }

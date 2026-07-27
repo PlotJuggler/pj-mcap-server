@@ -168,10 +168,30 @@ int runHello(mcap_cloud::BackendConnection& conn, const std::string& error) {
   return kExitOk;
 }
 
+// Sweep the catalog, failing LOUDLY on an incomplete listing. failure != empty
+// catalog: a degraded-start server's ERROR_CATALOG_UNAVAILABLE ("first build in
+// progress"), a timeout, or exhausted stale retries previously rendered as
+// "0 sequence(s)" / exit 0 — indistinguishable from an empty bucket.
+bool listSequencesChecked(mcap_cloud::BackendConnection& conn, const char* cmd,
+                          std::vector<mcap_cloud::SequenceInfo>* out) {
+  bool complete = false;
+  std::string error;
+  *out = conn.listSequences(&complete, {}, nullptr, nullptr, {}, &error);
+  if (!complete) {
+    std::cerr << cmd << ": listing failed: " << (error.empty() ? "incomplete listing" : error)
+              << '\n';
+    return false;
+  }
+  return true;
+}
+
 // ---- list -----------------------------------------------------------------
 
 int runList(mcap_cloud::BackendConnection& conn, bool as_json) {
-  const std::vector<mcap_cloud::SequenceInfo> sequences = conn.listSequences();
+  std::vector<mcap_cloud::SequenceInfo> sequences;
+  if (!listSequencesChecked(conn, "list", &sequences)) {
+    return kExitFailure;
+  }
 
   if (as_json) {
     nlohmann::json arr = nlohmann::json::array();
@@ -217,7 +237,10 @@ int runList(mcap_cloud::BackendConnection& conn, bool as_json) {
 int runTopics(mcap_cloud::BackendConnection& conn, const std::string& sequence_name, bool as_json) {
   // listSequences() must run first: it builds the name->file_id index that
   // listTopics() resolves the sequence name against.
-  const std::vector<mcap_cloud::SequenceInfo> sequences = conn.listSequences();
+  std::vector<mcap_cloud::SequenceInfo> sequences;
+  if (!listSequencesChecked(conn, "topics", &sequences)) {
+    return kExitFailure;
+  }
   bool known = false;
   for (const auto& seq : sequences) {
     if (seq.name == sequence_name) {
@@ -316,7 +339,10 @@ int runDownload(mcap_cloud::BackendConnection& conn, const std::vector<std::stri
   // The listing supplies the per-sequence time ranges the ordering + overlap
   // guard needs (OpenFresh itself is key-addressed in wire v2 — no file_id
   // resolution).
-  const std::vector<mcap_cloud::SequenceInfo> sequences = conn.listSequences();
+  std::vector<mcap_cloud::SequenceInfo> sequences;
+  if (!listSequencesChecked(conn, "download", &sequences)) {
+    return kExitFailure;
+  }
 
   // Build a name -> SequenceInfo lookup for the time-ordering + overlap guard,
   // and reject unknown names with a clean CLI error up front (the server would
@@ -441,7 +467,10 @@ bool resolveStitchedParams(mcap_cloud::BackendConnection& conn, const std::vecto
     }
   }
 
-  const std::vector<mcap_cloud::SequenceInfo> sequences = conn.listSequences();
+  std::vector<mcap_cloud::SequenceInfo> sequences;
+  if (!listSequencesChecked(conn, "debug", &sequences)) {
+    return kExitFailure;
+  }
   std::unordered_map<std::string, const mcap_cloud::SequenceInfo*> by_name;
   for (const auto& seq : sequences) {
     by_name.emplace(seq.name, &seq);
@@ -614,7 +643,16 @@ int runTag(mcap_cloud::BackendConnection& conn, const std::string& sequence_name
 
   // Re-list so the printed metadata reflects the post-update flat view (the
   // exact path the GUI relies on for its Lua filter). Find the refreshed entry.
-  const std::vector<mcap_cloud::SequenceInfo> sequences = conn.listSequences();
+  // The tag update itself SUCCEEDED — a failed refresh only degrades the
+  // printed metadata, so warn instead of failing the command.
+  bool refresh_complete = false;
+  std::string refresh_error;
+  const std::vector<mcap_cloud::SequenceInfo> sequences =
+      conn.listSequences(&refresh_complete, {}, nullptr, nullptr, {}, &refresh_error);
+  if (!refresh_complete) {
+    std::cerr << "tag: saved, but the metadata refresh failed: "
+              << (refresh_error.empty() ? "incomplete listing" : refresh_error) << '\n';
+  }
   const mcap_cloud::SequenceInfo* refreshed = nullptr;
   for (const auto& seq : sequences) {
     if (seq.name == sequence_name) {
