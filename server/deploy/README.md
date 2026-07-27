@@ -67,27 +67,27 @@ corruption or a tag-edit path that silently stops working:
 3. **Stale-socket unlink is builder-side, already implemented.** If the
    builder is killed uncleanly, the next startup unlinks any leftover
    `tag.sock` itself before rebinding — nothing extra to configure.
-4. **First-boot ordering: two different mechanisms for two different deploy
-   shapes.**
-   - **Compose** expresses this properly: `builder` has its own container
-     healthcheck (a python3 one-liner — open the catalog DB read-only,
-     check `build_metadata.last_build_ns > 0`), and `server` is gated on
-     `depends_on: builder: condition: service_healthy` — so the `server`
-     container is not even started until the builder has published its
-     first catalog. `server` still keeps `restart: unless-stopped` too, as
-     a belt-and-suspenders fallback for a later transient hiccup, but it is
-     no longer the first-boot ordering mechanism.
-   - **systemd (bare metal)** has no equivalent health-gate primitive for
-     "and it has also completed its first build", so it still relies on
-     `catalog.OpenReadOnly` failing fast (server process exits 1) plus
-     `Restart=on-failure` — the server unit crash-loops at `RestartSec`
-     intervals until the builder's first scan publishes a DB. This only
-     works because both units also set `StartLimitIntervalSec=0` (systemd's
-     default 5-starts/10s rate limit would otherwise give up and leave the
-     unit permanently `failed` long before a cold-bucket scan finishes) —
-     see each unit's `[Unit]` section. Watch `journalctl -u
-     pj-cloud-builder` for build progress; the crash-loop is normal, not a
-     bug.
+4. **First-boot ordering: NONE NEEDED (degraded start).** The server boots
+   without a catalog in EVERY deploy shape: `/health` answers 503 `waiting
+   for first catalog build (builder: extracting 123/456)` (the progress
+   detail comes from the builder's `<db>.status.json` sidecar —
+   CATALOG_CONTRACT.md §12), catalog RPCs fail fast with the retryable
+   `ERROR_CATALOG_UNAVAILABLE`, and the 30 s reopen tick opens the catalog
+   the moment the builder's first atomic publish lands. Consequences:
+   - **Compose:** `server` depends on `builder` only with
+     `condition: service_started`; the builder's healthcheck now means
+     "alive and progressing, not fatally failed" (status sidecar fresh and
+     `phase != "error"`), NEVER "first build complete" — deploy success is
+     no longer a function of bucket size. A builder with broken credentials
+     goes unhealthy within ~1 minute with the reason in the sidecar's
+     `last_error`.
+   - **systemd (bare metal):** the old crash-loop-until-published dance is
+     gone — the server unit starts cleanly on the first attempt and simply
+     reports 503 until the catalog appears. `Restart=on-failure` +
+     `StartLimitIntervalSec=0` stay as ordinary crash protection.
+   Watch `docker compose logs -f builder` / `journalctl -u
+   pj-cloud-builder` for the periodic reconcile-progress lines, or read the
+   sidecar directly.
 5. **Every SUCCESSFUL tag edit is logged server-side with the client's WS
    remote address.** The WS `UpdateTags` handler logs `remote` before
    forwarding to the builder's IPC socket; the failure paths (bad file id,
@@ -119,8 +119,8 @@ docker build -t pj-cloud-builder:dev -f server/deploy/Dockerfile.builder .
 
 The server image is distroless/static (no shell, no curl): probe liveness over
 HTTP from outside the container —
-`curl -fsS http://HOST:8080/health` returns `ok` once the catalog DB is
-reachable. Config is supplied with `--config /etc/pj-cloud/config.yaml` (the
+`curl -fsS http://HOST:8080/health` returns 503 `waiting for first catalog
+build (...)` while the builder's first scan runs, then `ok`. Config is supplied with `--config /etc/pj-cloud/config.yaml` (the
 default `CMD`); mount your config there. Secrets come from the environment
 (`PJ_CLOUD_TOKEN`, `PJ_CLOUD_S3_*`, `PJ_CLOUD_DASHBOARD_PASSWORD`,
 `PJ_CLOUD_TLS_*`); the config's `${ENV}` references are expanded at load.
@@ -150,9 +150,9 @@ cd server/deploy
 #   mc cp *.mcap local/recordings/
 # PJ_CLOUD_TOKEN is REQUIRED — the server is fail-closed and refuses to start without
 # it (or set PJ_CLOUD_ALLOW_ANONYMOUS=1 to run with no auth on purpose):
-PJ_CLOUD_TOKEN=changeme docker compose up -d --build
-docker compose logs -f builder     # watch the initial catalog build
-curl -fsS http://localhost:8080/health        # -> ok (once the builder's first scan lands)
+PJ_CLOUD_TOKEN=changeme docker compose up -d --build   # completes in seconds — no build gate
+docker compose logs -f builder     # periodic reconcile-progress lines
+curl -fsS http://localhost:8080/health   # 503 "waiting for first catalog build (...)" -> ok
 ```
 
 - Ports: `8080` (ws:// + http dashboard/health/metrics), `9000`/`9001` (Minio API/console).

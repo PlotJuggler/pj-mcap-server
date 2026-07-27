@@ -134,11 +134,21 @@ class BackendConnection {
   // the first). When it returns true the sweep stops immediately and returns
   // whatever has been accumulated so far, with *complete left false (a
   // superseded sweep — e.g. the user changed the filter mid-listing).
+  //
+  // `error_out` (optional out): cleared on entry; set to a human-readable
+  // reason whenever the sweep FAILED (timeout, a hard server Error frame —
+  // e.g. a degraded-start server's ERROR_CATALOG_UNAVAILABLE "first build in
+  // progress" — an unexpected payload, or exhausted stale retries). Left empty
+  // on success AND on the two deliberate non-failures (abort-superseded, the
+  // filtered stale-vocabulary abort). failure != empty catalog: callers must
+  // check this (or *complete) instead of treating an empty vector as "no
+  // recordings".
   [[nodiscard]] std::vector<SequenceInfo> listSequences(bool* complete = nullptr,
                                                         const PageCallback& on_page = {},
                                                         const ListFilter* filter = nullptr,
                                                         bool* stale_vocabulary = nullptr,
-                                                        const std::function<bool()>& abort = {});
+                                                        const std::function<bool()>& abort = {},
+                                                        std::string* error_out = nullptr);
 
   // GetVocabulary RPC: the customer->site filter tree + the generation its ids
   // are bound to. nullopt on timeout / dead socket / server Error. ids are ONLY

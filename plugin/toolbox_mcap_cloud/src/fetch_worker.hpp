@@ -226,6 +226,11 @@ class FetchWorker {
     enum class Error { kNone, kPartial, kConnectionLost, kSelectionGone, kRebuildStorm, kSuperseded };
     Error error = Error::kNone;
     std::vector<SequenceInfo> sequences;
+    // kPartial only: the backend's failure reason (listSequences error_out —
+    // e.g. a degraded-start server's "catalog not yet available — first build
+    // in progress"). May be empty; the dialog then falls back to its generic
+    // paging-error wording.
+    std::string message;
   };
 
   /// Vocabulary result. request_id is echoed (uniformly with vocabularyFailed/

@@ -400,17 +400,17 @@ func (c *connState) dispatch(ctx context.Context, msg *pb.ClientMessage) {
 	case *pb.ClientMessage_Hello:
 		c.handleHello(reqID, payload.Hello)
 	case *pb.ClientMessage_ListFiles:
-		if !c.requireAuth(reqID) {
+		if !c.requireAuth(reqID) || !c.requireCatalog(reqID) {
 			return
 		}
 		c.handleListFiles(ctx, reqID, payload.ListFiles)
 	case *pb.ClientMessage_GetFile:
-		if !c.requireAuth(reqID) {
+		if !c.requireAuth(reqID) || !c.requireCatalog(reqID) {
 			return
 		}
 		c.handleGetFile(ctx, reqID, payload.GetFile)
 	case *pb.ClientMessage_OpenSession:
-		if !c.requireAuth(reqID) {
+		if !c.requireAuth(reqID) || !c.requireCatalog(reqID) {
 			return
 		}
 		if c.h.sess == nil {
@@ -441,18 +441,33 @@ func (c *connState) dispatch(ctx context.Context, msg *pb.ClientMessage) {
 		}
 		c.handleAck(payload.Ack)
 	case *pb.ClientMessage_UpdateTags:
-		if !c.requireAuth(reqID) {
+		if !c.requireAuth(reqID) || !c.requireCatalog(reqID) {
 			return
 		}
 		c.handleUpdateTags(ctx, reqID, payload.UpdateTags)
 	case *pb.ClientMessage_GetVocabulary:
-		if !c.requireAuth(reqID) {
+		if !c.requireAuth(reqID) || !c.requireCatalog(reqID) {
 			return
 		}
 		c.handleGetVocabulary(ctx, reqID, payload.GetVocabulary)
 	default:
 		c.sendError(reqID, 0, pb.ErrorCode_ERROR_INVALID_REQUEST, "empty or unknown payload", "")
 	}
+}
+
+// requireCatalog gates every catalog-dependent RPC during a DEGRADED start:
+// the server may now come up before the Python builder has published its first
+// catalog (catalog.NewAwaiting), and until the ReopenIfSwapped tick picks that
+// publish up, these RPCs fail fast with the retryable ERROR_CATALOG_UNAVAILABLE
+// instead of panicking on a nil catalog handle. Ready() never goes false again
+// once true, so this check cannot flap mid-session.
+func (c *connState) requireCatalog(reqID uint64) bool {
+	if c.h.store.Ready() {
+		return true
+	}
+	c.sendError(reqID, 0, pb.ErrorCode_ERROR_CATALOG_UNAVAILABLE,
+		"catalog not yet available — first build in progress; retry shortly", "")
+	return false
 }
 
 func (c *connState) requireAuth(reqID uint64) bool {

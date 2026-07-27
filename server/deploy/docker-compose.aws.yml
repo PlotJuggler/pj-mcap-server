@@ -3,24 +3,43 @@
 # minio/minio-init services, pointing both services at real S3, and taking
 # credentials from the EC2 instance IAM role (no static keys on the box).
 #
-# This is SPECIFIC TO THE S3 USE CASE (bucket/region/prefix below). The GCS use
-# case is a separate GCS deploy. Full walkthrough: docs/ec2-deploy.md.
+# This is SPECIFIC TO THE S3 USE CASE. The GCS use case is a separate GCS
+# deploy. Full walkthrough: docs/ec2-deploy.md.
+#
+# REQUIRED environment (compose refuses to start without them — a template
+# value silently scanning the wrong bucket/region has bitten before):
+#   PJ_CLOUD_S3_BUCKET   the bucket to catalog+serve
+#   PJ_CLOUD_S3_PREFIX   key prefix to scope the scan (MUST be set; may be set
+#                        to the empty string to mean "whole bucket" — an
+#                        EXPLICIT choice, since an unscoped scan of a shared
+#                        bucket catalogs every other tenant's partition too).
+#                        Keep in sync with config.aws-ec2.yaml's storage.s3.prefix.
+#   AWS_REGION           the BUCKET's region (cross-region = WAN latency)
+#   PJ_CLOUD_TOKEN       client bearer token (or PJ_CLOUD_ALLOW_ANONYMOUS=1)
 #
 # USAGE (on the EC2 box, from server/deploy/):
-#   PJ_CLOUD_TOKEN=<token> docker compose -f docker-compose.aws.yml up -d --build
-#   docker compose -f docker-compose.aws.yml logs -f builder    # watch the first catalog build
-#   curl -fsS http://localhost:8080/health                          # -> ok once the catalog lands
+#   PJ_CLOUD_S3_BUCKET=... PJ_CLOUD_S3_PREFIX=customer=dexory/ AWS_REGION=eu-west-2 \
+#     PJ_CLOUD_TOKEN=<token> docker compose -f docker-compose.aws.yml up -d --build
+#   docker compose -f docker-compose.aws.yml logs -f builder   # reconcile progress lines
+#   curl -fsS http://localhost:8080/health
+#     # -> 503 "waiting for first catalog build (builder: extracting 123/456)"
+#     #    while the first scan runs, then 200 "ok". `up -d` itself completes in
+#     #    seconds regardless of bucket size — there is NO completion gate anymore.
 #
-# ARCHITECTURE (unchanged from the base compose — read that file's header for the
-# full rationale): two services share ONE local named volume (`catalog-data`,
-# the SQLite DB + tag-edit socket) which MUST be local, never EFS/NFS. `builder`
-# is the sole catalog writer + tag-edit IPC server; `server` reads it read-only.
-# `server` is gated on `builder`'s healthcheck (build_metadata.last_build_ns > 0)
-# so it never starts before the first catalog is published.
+# ARCHITECTURE (unchanged from the base compose — read that file's header for
+# the full rationale): two services share ONE local named volume (`catalog-data`,
+# the SQLite DB + status sidecar + tag-edit socket) which MUST be local, never
+# EFS/NFS. `builder` is the sole catalog writer; `server` reads it read-only,
+# STARTS IMMEDIATELY (degraded: /health 503 + ERROR_CATALOG_UNAVAILABLE on
+# catalog RPCs), and picks the first published catalog up live within ~30s of
+# the builder's atomic publish. The builder healthcheck means "alive and
+# progressing" (status sidecar fresh, phase != error) — never "build done".
 #
 # CREDENTIALS: no AWS_ACCESS_KEY_ID/SECRET here — both containers use the EC2
 # instance IAM role via IMDS. That REQUIRES the instance metadata hop limit set
-# to 2 (a container is one extra network hop); see docs/ec2-deploy.md §1.
+# to 2 (a container is one extra network hop); see docs/ec2-deploy.md §1. A
+# hop-limit of 1 shows up as the builder going unhealthy with
+# "NoCredentialsError" in its status sidecar / logs within a minute.
 services:
   builder:
     build:
@@ -28,27 +47,32 @@ services:
       dockerfile: server/deploy/Dockerfile.builder
     image: pj-cloud-builder:aws
     environment:
-      AWS_REGION: us-east-1
-      AWS_DEFAULT_REGION: us-east-1
+      AWS_REGION: ${AWS_REGION:?set AWS_REGION to the bucket's region}
+      AWS_DEFAULT_REGION: ${AWS_REGION:?set AWS_REGION to the bucket's region}
     volumes:
       - catalog-data:/var/lib/pj-cloud
     command:
       - "--source=s3"
-      - "--s3-bucket=REPLACE_ME_with_your_s3_bucket"
-      # Scope to one MCAP partition if the bucket is large; keep this in sync
-      # with config.aws-ec2.yaml's storage.s3.prefix. "" = whole bucket.
-      - "--s3-prefix="
+      - "--s3-bucket=${PJ_CLOUD_S3_BUCKET:?set PJ_CLOUD_S3_BUCKET}"
+      # ${VAR?} (no colon): must be SET, but MAY be empty — "" = whole bucket,
+      # as an explicit operator choice rather than a forgotten default.
+      - "--s3-prefix=${PJ_CLOUD_S3_PREFIX?set PJ_CLOUD_S3_PREFIX (empty string = whole bucket)}"
       - "--no-watch"
       - "--tag-socket=/var/lib/pj-cloud/tag.sock"
       - "--db=/var/lib/pj-cloud/catalog.db"
       - "--rescan-interval=300"
       - "--log-level=INFO"
+    # "Alive, progressing, not fatally failed" — from the <db>.status.json
+    # sidecar (atomic, heartbeat-refreshed every 10s; CATALOG_CONTRACT.md §12).
+    # NOT "first build complete": build time scales with bucket size and must
+    # never be a deploy-failure axis. phase=error carries the reason (e.g.
+    # NoCredentialsError from a wrong IMDS hop limit) in last_error.
     healthcheck:
-      test: ["CMD", "python3", "-c", "import sqlite3,sys; c=sqlite3.connect('file:/var/lib/pj-cloud/catalog.db?mode=ro', uri=True); row=c.execute('SELECT last_build_ns FROM build_metadata WHERE id=1').fetchone(); sys.exit(0 if row and row[0] and row[0] > 0 else 1)"]
-      interval: 5s
+      test: ["CMD", "python3", "-c", "import json,sys,time; d=json.load(open('/var/lib/pj-cloud/catalog.db.status.json')); sys.exit(1 if d.get('phase')=='error' or time.time()-d.get('updated_at_unix',0)>60 else 0)"]
+      interval: 10s
       timeout: 3s
-      retries: 240                   # up to ~20 min for a cold WAN first scan
-      start_period: 5s
+      retries: 3            # unhealthy ~90s after real staleness (60s window + 3x10s)
+      start_period: 30s
     restart: unless-stopped
 
   server:
@@ -58,15 +82,15 @@ services:
     image: pj-cloud-server:aws
     depends_on:
       builder:
-        condition: service_healthy   # waits for the builder's FIRST published catalog
+        condition: service_started   # NO completion gate — the server starts degraded and reopens live
     environment:
       # Auth is FAIL-CLOSED: with no token the server refuses to start. Set a
       # token, or opt into no-auth on purpose with PJ_CLOUD_ALLOW_ANONYMOUS=1.
       PJ_CLOUD_TOKEN: ${PJ_CLOUD_TOKEN:-}                       # unset => server won't start (unless allow-anonymous)
       PJ_CLOUD_ALLOW_ANONYMOUS: ${PJ_CLOUD_ALLOW_ANONYMOUS:-}   # "1" => run with NO authentication (never on a public port)
       PJ_CLOUD_DASHBOARD_PASSWORD: ${PJ_CLOUD_DASHBOARD_PASSWORD:-}   # empty => dashboard disabled
-      AWS_REGION: us-east-1
-      AWS_DEFAULT_REGION: us-east-1
+      AWS_REGION: ${AWS_REGION:?set AWS_REGION to the bucket's region}
+      AWS_DEFAULT_REGION: ${AWS_REGION:?set AWS_REGION to the bucket's region}
     ports:
       - "8080:8080"                  # plaintext ws:// + http dashboard/health/metrics
     volumes:
@@ -75,7 +99,8 @@ services:
     command:
       - "--config=/etc/pj-cloud/config.yaml"
     # No container healthcheck: the distroless/static image has no shell/curl —
-    # probe externally: curl -fsS http://localhost:8080/health
+    # probe externally: curl -fsS http://localhost:8080/health (503 while the
+    # first catalog build runs, with the builder's progress in the body).
     restart: unless-stopped
 
 volumes:

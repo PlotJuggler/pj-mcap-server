@@ -2,6 +2,7 @@ package catalog
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -68,6 +69,24 @@ func OpenReadOnly(ctx context.Context, dbPath string) (*Store, error) {
 		_ = db.Close()
 		return nil, err
 	}
+	return s, nil
+}
+
+// NewAwaiting constructs a Store in the DEGRADED "awaiting first catalog"
+// state: dbPath does not exist yet because the Python builder has not finished
+// (or even started) its first build. Ready() is false, catalog accessors return
+// nil-safe zero values, and the regular ReopenIfSwapped tick performs the first
+// verified open the moment the builder's atomic publish (os.replace) lands —
+// the same identity-swap machinery that handles every later rebuild.
+//
+// OpenReadOnly keeps its fail-fast contract for an EXPLICITLY expected catalog;
+// awaiting is an opt-in state main() chooses only when the DB is absent.
+func NewAwaiting(dbPath string) (*Store, error) {
+	s := &Store{dbPath: dbPath}
+	if _, err := rand.Read(s.epoch[:]); err != nil {
+		return nil, fmt.Errorf("catalog: generation epoch: %w", err)
+	}
+	s.ordinal = 0 // the first successful pickup advances it to 1
 	return s, nil
 }
 

@@ -594,3 +594,62 @@ and `--once` modes, and holds it for the process lifetime.
   DB read-only and follows §9. The socket stale-cleanup in §10 is now provably
   safe: a leftover socket can only belong to a dead builder, because a live one
   would have held this lock.
+
+## 12. Builder status sidecar (`<db_path>.status.json`)
+
+The builder maintains a small JSON **status sidecar** next to the served DB —
+the machine-readable answer to *"is the builder alive, what is it doing, and
+did it fail?"*. It exists because the first cold scan of a large bucket can
+take a long time during which the DB does not exist yet: deploy healthchecks
+and the Go server's degraded-mode `/health` need a progress/liveness signal
+that is not "the finished catalog".
+
+- **Path** = `<db_path>` + **`.status.json`** (sibling of `-wal`/`-shm`,
+  `.building`, `.writer.lock`). Written via temp-file + `os.replace` (temp =
+  `<db_path>.status.json.tmp.<pid>` — pid-suffixed so a shutdown-stuck write
+  can never hand a successor builder a shared, torn temp file), so a reader
+  never observes a torn document. Writes are ADVISORY-grade: a failed write
+  is logged and retried on the next update, never raised into the daemon.
+  The document is small (hundreds of bytes); readers MUST cap what they will
+  parse (the Go reader refuses > 64 KiB) and treat a missing/malformed file as
+  "no information", never as an error surfaced to clients.
+- **Writer = the flock holder only.** The sidecar is part of the
+  `<db_path>.*` namespace owned by the §11 writer lock: the builder constructs
+  its status writer only AFTER `flock` succeeds, so a refused second builder
+  (exit 3) never touches the incumbent's sidecar. Corollary: failures that
+  occur BEFORE the lock (argument validation, GCS client construction) are
+  reported only via logs/exit code, not the sidecar.
+- **Fields** (schema `version` 1; unknown fields must be ignored — the
+  builder may add fields freely):
+  `version`, `phase`, `pid`, `updated_at` (ISO-8601 UTC), `updated_at_unix`
+  (float seconds — the freshness field consumers compare against), and the
+  reconcile counters `listed_total`, `extract_total`, `extract_done`,
+  `cataloged`, `skipped`, `failed`, `deleted`, plus `last_error` (set with
+  `phase="error"`).
+- **Phases**: `listing` → `extracting` → `idle` (build + publish complete;
+  daemon steady state between rescans, or a finished `--once`), and `error`
+  (fatal failure — the exception that killed the run, truncated, in
+  `last_error`). There is no `starting` phase BY DESIGN: the first write is
+  deferred until a real milestone — the first object yielded by the LIST
+  (proof that bucket access/credentials work), within seconds of a healthy
+  start — so a crash-looping builder cannot overwrite its previous run's
+  `error` verdict with an empty "just booted" state.
+- **Freshness = heartbeat.** A daemon-mode builder refreshes `updated_at*`
+  every ~10 s for its whole lifetime, independent of per-file progress (long
+  LISTs and idle periods stay fresh). Consumers should treat staleness beyond
+  ~60 s as "builder hung or dead". The deploy healthcheck is exactly
+  `phase != "error" AND now - updated_at_unix < 60`; with its probe interval
+  and retries the container transitions to `unhealthy` ~90 s after real
+  staleness begins (the freshness window plus 3 consecutive 10 s probes).
+- **Consumers**: (a) the container healthcheck (above — "alive and
+  progressing", NEVER "first build complete"; deploy success must not scale
+  with bucket size); (b) the Go server, best-effort, to enrich its degraded
+  `/health`/dashboard message ("waiting for first catalog build (builder:
+  extracting 1234/39279)") — Go-side reader: `catalog.ReadBuilderStatus`,
+  suffix constant `catalog.StatusSidecarSuffix`, Python-side writer:
+  `mcap_catalog_builder/status.py`. Keep the two in lockstep.
+- **The sidecar is advisory.** It never gates correctness: the catalog's
+  publish/reopen protocol (§9) is complete without it, the Go server serves
+  fine if it is absent, and it is NOT fsync-durable across power loss (a
+  post-crash sidecar may briefly lag reality until the restarted builder's
+  first milestone write).

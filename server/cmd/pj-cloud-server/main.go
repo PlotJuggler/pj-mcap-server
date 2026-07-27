@@ -11,11 +11,14 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
+	"io/fs"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -159,13 +162,32 @@ func main() {
 	// stable rowids that survive a builder rescan for unchanged keys.
 	mx := metrics.New()
 	store, err := catalog.OpenReadOnly(ctx, cfg.Catalog.DBPath)
-	if err != nil {
-		log.Error("catalog: open SQLite store (read-only) failed — has the Python builder run?",
+	switch {
+	case err == nil:
+		log.Info("catalog: opened SQLite store READ-ONLY (external builder)", "db", cfg.Catalog.DBPath)
+	case errors.Is(err, fs.ErrNotExist):
+		// DEGRADED START: the builder has not published its first catalog yet
+		// (a fresh deploy's first cold scan can take a long time on a big
+		// bucket). Serve /health as 503 "waiting for first catalog build" and
+		// let the reopen tick below pick the catalog up the moment the
+		// builder's atomic publish lands — deploys no longer gate container
+		// startup on build completion.
+		store, err = catalog.NewAwaiting(cfg.Catalog.DBPath)
+		if err != nil {
+			log.Error("catalog: degraded-start store init failed", "err", err)
+			os.Exit(1)
+		}
+		log.Warn("catalog: DB absent — starting DEGRADED, waiting for the builder's first publish",
+			"db", cfg.Catalog.DBPath)
+	default:
+		// Any error other than "file absent" (schema mismatch, corruption,
+		// permissions) keeps the fail-fast contract: a catalog that EXISTS but
+		// cannot be verified must never be silently waited out.
+		log.Error("catalog: open SQLite store (read-only) failed",
 			"db", cfg.Catalog.DBPath, "err", err)
 		os.Exit(1)
 	}
 	defer func() { _ = store.Close() }()
-	log.Info("catalog: opened SQLite store READ-ONLY (external builder)", "db", cfg.Catalog.DBPath)
 	log.Info("indexer: DISABLED (external-builder read-only mode); Python builder owns the catalog")
 
 	// Shared chunk-index cache: starts empty (there is no in-process scan to
@@ -190,11 +212,19 @@ func main() {
 		Store: store, Codec: codec, Blob: bs, Cache: idxCache,
 		Concurrency: 4, Budget: cacheBytes, Log: log, Metrics: mx,
 	}
-	go func() {
-		if werr := warmer.Run(ctx); werr != nil {
-			log.Warn("chunk-index warmer: list failed", "err", werr)
-		}
-	}()
+	// Deferred under a degraded start: the one-shot warm sweep needs an open
+	// catalog, so it launches on the first tick that sees the store Ready
+	// (immediately, when the catalog was already there at boot).
+	startWarmer := sync.OnceFunc(func() {
+		go func() {
+			if werr := warmer.Run(ctx); werr != nil {
+				log.Warn("chunk-index warmer: list failed", "err", werr)
+			}
+		}()
+	})
+	if store.Ready() {
+		startWarmer()
+	}
 
 	// Catalog-freshness updater (§6.5): mirror the Python builder's build_metadata
 	// onto the pj_cloud_catalog_* gauges so monitoring sees staleness once the
@@ -220,6 +250,10 @@ func main() {
 			if swapped {
 				mx.CatalogReopensTotal.Inc()
 			}
+			if !store.Ready() {
+				return // degraded start: nothing to warm or report until the first publish
+			}
+			startWarmer() // no-op after the first call
 
 			bi, err := catalog.GetBuildInfo(ctx, store)
 			if err != nil {
@@ -299,9 +333,11 @@ func main() {
 	mux.Handle("/api/ws", handler)
 
 	// /health: always unauthenticated; readiness = catalog DB reachable (spec §8.5).
-	mux.Handle("/health", metrics.HealthHandler(func(hctx context.Context) error {
-		return store.DB().PingContext(hctx)
-	}))
+	// /health readiness: 503 "waiting for first catalog build" (with the
+	// builder's sidecar progress when readable) during a degraded start, then a
+	// catalog ping once the first publish has been picked up.
+	mux.Handle("/health", metrics.HealthHandler(
+		catalog.ReadinessCheck(store, cfg.Catalog.DBPath+catalog.StatusSidecarSuffix)))
 
 	// /metrics: enabled by default; auth optional (metrics.require_auth gates it
 	// behind the dashboard Basic credentials, spec §8.6).

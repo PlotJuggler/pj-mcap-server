@@ -2775,7 +2775,12 @@ void McapCloudDialog::onGateListFinished(FetchWorker::GateListResult result) {
       case Err::kPartial:
         state_.gate_phase = GatePhase::kListError;
         notify_warning = true;
-        warning = "Recording list is incomplete (server paging error) — use Refresh to retry";
+        // Prefer the backend's own reason (e.g. a degraded-start server's
+        // "catalog not yet available — first build in progress") over the
+        // generic paging wording.
+        warning = result.message.empty()
+                      ? "Recording list is incomplete (server paging error) — use Refresh to retry"
+                      : "Recording list unavailable: " + result.message + " — use Refresh to retry";
         break;
       case Err::kConnectionLost:
         // onConnectionLost already set kDisconnected + notified for this same

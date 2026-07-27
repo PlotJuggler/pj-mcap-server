@@ -119,6 +119,16 @@ type pageHandler struct {
 }
 
 func (h *pageHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if !h.deps.Store.Ready() {
+		// Degraded start: no catalog to render yet. 503 with the same
+		// waiting/progress line /health reports, so an operator watching the
+		// dashboard sees WHAT the builder is doing rather than template errors.
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		fmt.Fprintf(w, "PJ Cloud dashboard: %s\n",
+			catalog.DegradedMessage(h.deps.Store.DBPath()+catalog.StatusSidecarSuffix))
+		return
+	}
 	path := r.URL.Path
 	switch {
 	case path == "/dashboard/" || path == "/dashboard":

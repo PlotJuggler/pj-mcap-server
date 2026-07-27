@@ -431,16 +431,24 @@ std::vector<SequenceInfo> BackendConnection::listSequences(bool* complete,
                                                            const PageCallback& on_page,
                                                            const ListFilter* filter,
                                                            bool* stale_vocabulary,
-                                                           const std::function<bool()>& abort) {
+                                                           const std::function<bool()>& abort,
+                                                           std::string* error_out) {
   if (complete != nullptr) {
     *complete = false;
   }
   if (stale_vocabulary != nullptr) {
     *stale_vocabulary = false;
   }
+  auto set_list_error = [error_out](const std::string& msg) {
+    if (error_out != nullptr) {
+      *error_out = msg;
+    }
+  };
+  set_list_error({});  // cleared on entry: empty after return means "no failure"
   std::vector<SequenceInfo> sequences;
   std::unordered_map<std::string, std::uint64_t> file_ids;
   if (!socket_) {
+    set_list_error("not connected");
     return sequences;
   }
 
@@ -486,6 +494,7 @@ std::vector<SequenceInfo> BackendConnection::listSequences(bool* complete,
 
       pj_cloud::v1::ServerMessage response;
       if (!sendAndWait(request, &response)) {
+        set_list_error("no response to ListFiles from " + buildWsUrl(uri_));
         return sequences;  // timeout / closed — PARTIAL (exhausted stays false)
       }
       if (response.has_error() &&
@@ -503,7 +512,13 @@ std::vector<SequenceInfo> BackendConnection::listSequences(bool* complete,
         break;
       }
       if (!response.has_list_files()) {
-        return sequences;  // other error or unexpected payload — PARTIAL
+        // A hard (non-stale) server Error, or an unexpected payload: NEVER
+        // swallow it as an empty/partial catalog — a degraded-start server's
+        // clean ERROR_CATALOG_UNAVAILABLE ("first build in progress") looked
+        // exactly like an empty bucket before this was surfaced.
+        set_list_error(response.has_error() ? formatWireError(response.error())
+                                            : std::string("unexpected reply to ListFiles"));
+        return sequences;  // PARTIAL (exhausted stays false)
       }
 
       const auto& list_response = response.list_files();
@@ -541,6 +556,7 @@ std::vector<SequenceInfo> BackendConnection::listSequences(bool* complete,
     // partial index over the last complete one (a dropped page must not
     // silently shrink the browse index). Return the partial vector so the
     // caller can decide to warn/discard.
+    set_list_error("catalog kept rebuilding during the listing (stale retries exhausted)");
     return sequences;
   }
   // Publish the freshly-built COMPLETE index atomically (listTopics reads it next).

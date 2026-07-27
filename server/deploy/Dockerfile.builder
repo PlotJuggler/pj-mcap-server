@@ -8,10 +8,8 @@
 # sibling of server/, not under server/deploy/):
 #   docker build -t pj-cloud-builder:dev -f server/deploy/Dockerfile.builder .
 #
-# PREREQUISITE: mcap_catalog/ is a git submodule of this repo — run
-#   git submodule update --init mcap_catalog
-# (from the repo root) before building, or the COPY below finds an empty
-# directory and the build fails.
+# mcap_catalog/ is VENDORED directly in this repo (de-submoduled 2026-07-17),
+# so a plain checkout is enough for the COPY below — no submodule step.
 FROM python:3.12-slim
 
 # Pins match CI (.github/workflows/ci.yml) and scripts/{smoke,ci-integration}.sh's

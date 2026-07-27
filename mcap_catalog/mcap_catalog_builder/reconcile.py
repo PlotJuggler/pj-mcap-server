@@ -107,7 +107,7 @@ def _composite_ids(caches: Caches, dims) -> tuple | None:
 
 def full_reconcile(
     conn: sqlite3.Connection, caches: Caches, source, workers: int = 1,
-    source_spec: "SourceSpec | None" = None,
+    source_spec: "SourceSpec | None" = None, progress=None,
 ) -> dict[str, int]:
     """Catalog all objects in ``source``, then delete catalog rows with no object.
 
@@ -117,13 +117,25 @@ def full_reconcile(
     When ``source_spec`` is given (a picklable recipe for the ``Source``), that read
     phase runs in a PROCESS pool instead, so the GIL-bound pure-Python MCAP parse
     scales across cores; the DB apply stays serial on this thread either way.
+    ``progress`` is an optional ``status.ReconcileProgress`` — milestone/per-file
+    callbacks stay on THIS thread (worker processes never see it).
     Returns a tally ``{"cataloged", "skipped", "failed", "deleted"}``.
     """
     if isinstance(source, str):
         source = LocalSource(source)
 
     tally = {"cataloged": 0, "skipped": 0, "failed": 0, "deleted": 0}
-    listings = list(source.list_all())
+    listings = []
+    for lst in source.list_all():
+        listings.append(lst)
+        # First object = the LIST provably began (credentials/bucket access
+        # work) — that is the sidecar's first-milestone write (§12), so the
+        # healthcheck sees a fresh phase=listing within seconds, not after
+        # 5000 objects. Then periodic count updates.
+        if progress is not None and (len(listings) == 1 or len(listings) % 5000 == 0):
+            progress.listing(len(listings))
+    if progress is not None:
+        progress.listed(len(listings))
 
     # Fingerprints already catalogued, keyed by the composite id-tuple. An unchanged
     # file is then skipped in classification below with NO network at all (R4) —
@@ -158,6 +170,15 @@ def full_reconcile(
             continue
         to_extract.append((lst.key, lst.stat, dims, eff_key))
 
+    if progress is not None:
+        progress.extract_start(len(to_extract), tally["skipped"], tally["failed"])
+
+    def _apply(ex) -> None:
+        st = apply_extract(conn, caches, ex).status
+        tally[st] += 1
+        if progress is not None:
+            progress.file_done(st)
+
     # Read phase (parallel, network-bound, NO DB) -> apply phase (serial, DB writes
     # on this thread only). as_completed lets each summary apply as soon as it lands
     # while other fetches are still in flight.
@@ -180,10 +201,10 @@ def full_reconcile(
             else:
                 futures = [pool.submit(extract_summary, source, *item) for item in to_extract]
             for fut in as_completed(futures):
-                tally[apply_extract(conn, caches, fut.result()).status] += 1
+                _apply(fut.result())
     else:
         for item in to_extract:
-            tally[apply_extract(conn, caches, extract_summary(source, *item)).status] += 1
+            _apply(extract_summary(source, *item))
 
     # Deletion sweep: composite keys present in the source (parseable + cached ids).
     # Reuses the dims parsed above; caches are now fully populated post-apply.
@@ -219,6 +240,8 @@ def full_reconcile(
         outcome="partial" if tally["failed"] else "ok",
     )
 
+    if progress is not None:
+        progress.finished(tally)
     logger.info(
         "reconcile: cataloged=%d skipped=%d failed=%d deleted=%d",
         tally["cataloged"], tally["skipped"], tally["failed"], tally["deleted"],

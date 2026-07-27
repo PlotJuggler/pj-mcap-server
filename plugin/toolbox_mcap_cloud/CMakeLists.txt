@@ -740,6 +740,26 @@ if(BUILD_TESTING)
   )
   add_test(NAME McapCloudListPaginationTest COMMAND toolbox_mcap_cloud_list_pagination_test)
 
+  # HERMETIC: a hard server Error frame during ListFiles is SURFACED via
+  # listSequences()'s error_out (complete=false + formatted wire error), never
+  # swallowed as an empty catalog — the degraded-start "0 sequence(s)" bug.
+  add_executable(toolbox_mcap_cloud_list_error_surface_test
+    tests/list_error_surface_test.cpp
+    tests/find_free_port.cpp
+    src/backend_connection.cpp
+    src/wire_mapping.cpp
+    src/session_decode.cpp
+    ${MCAP_CLOUD_PROTO_SRCS}
+  )
+  target_include_directories(toolbox_mcap_cloud_list_error_surface_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${MCAP_CLOUD_PROTO_OUT_DIR}
+  )
+  target_link_libraries(toolbox_mcap_cloud_list_error_surface_test PRIVATE
+    protobuf::libprotobuf ixwebsocket::ixwebsocket zstd::libzstd_static LZ4::lz4_static GTest::gtest_main
+  )
+  add_test(NAME McapCloudListErrorSurfaceTest COMMAND toolbox_mcap_cloud_list_error_surface_test)
+
   add_executable(toolbox_mcap_cloud_server_caps_test
     tests/server_caps_test.cpp
     tests/find_free_port.cpp

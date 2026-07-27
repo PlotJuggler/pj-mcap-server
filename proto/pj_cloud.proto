@@ -451,6 +451,12 @@ enum ErrorCode {
   // client-transparent: discard cached vocabulary/partial pages, re-fetch,
   // restart the listing (bounded retries).
   ERROR_STALE_CATALOG       = 10;
+  // The server started before the catalog builder published its first catalog
+  // (degraded start) and cannot answer catalog RPCs yet. Retryable: the
+  // catalog appears as soon as the builder's first build lands; poll /health
+  // or simply retry later. Session streaming for already-known keys is equally
+  // unavailable (OpenSession needs the catalog for key resolution).
+  ERROR_CATALOG_UNAVAILABLE = 11;
 }
 
 message Error {

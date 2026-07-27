@@ -7,15 +7,16 @@ clients over WebSocket, using the container/compose deploy shape.
 > **This runbook is SPECIFIC TO THE S3 USE CASE.** The bucket, region, the Hive
 > prefix, and the S3 backend are all specific to your deployment. **The GCS use
 > case is a separate GCS-on-GCE deploy** — see `docs/gce-deploy-smoke.md`, not
-> this file. The S3 settings are supplied via two committed template artifacts you
-> fill in below: `server/deploy/config.aws-ec2.yaml` and
-> `server/deploy/docker-compose.aws.yml` (both ship with `REPLACE_ME` placeholders
-> for the bucket + prefix). The main per-environment knobs are the bucket, region,
-> and the S3 **prefix** (how much data to serve) — called out below.
+> this file. The S3 settings are supplied via `server/deploy/config.aws-ec2.yaml`
+> (ships with a `REPLACE_ME` placeholder for the server's bucket) and, for the
+> builder, three **required environment variables** on the compose command line:
+> `PJ_CLOUD_S3_BUCKET`, `PJ_CLOUD_S3_PREFIX` (may be set to the empty string =
+> whole bucket — but must be SET), and `AWS_REGION` (the bucket's region).
+> Compose refuses to start with any of them missing, so a template value can no
+> longer silently scan the wrong bucket or region.
 
 The systemd (bare-metal) shape is an alternative for a box without Docker — see
-`server/deploy/pj-cloud-{server,builder}.service`. This runbook uses Compose
-because it health-gates the builder→server first-boot ordering properly.
+`server/deploy/pj-cloud-{server,builder}.service`.
 
 ---
 
@@ -30,10 +31,14 @@ static binary. In this deploy they are two containers on one box:
 | **server** | `pj-cloud-server` (Go, `distroless/static`) | **Read-only catalog reader + streamer**: opens the SQLite DB `mode=ro`, serves WS (catalog RPCs + session streaming), forwards tag edits over the builder's socket. |
 
 They share **one Docker named volume** (`catalog-data`, mounted at
-`/var/lib/pj-cloud` in both) holding the SQLite DB and the tag-edit socket.
-Compose gates `server` on the builder's healthcheck
-(`build_metadata.last_build_ns > 0`), so the server never starts before the
-first catalog is published.
+`/var/lib/pj-cloud` in both) holding the SQLite DB, the builder's
+`catalog.db.status.json` progress sidecar, and the tag-edit socket. There is
+**no first-boot ordering gate**: the server starts immediately in a degraded
+state (`/health` → 503 `waiting for first catalog build (builder: extracting
+123/456)`, catalog RPCs → retryable `ERROR_CATALOG_UNAVAILABLE`) and opens the
+catalog live within ~30 s of the builder's first atomic publish. The builder's
+healthcheck means "alive and progressing" (sidecar fresh, `phase != error`) —
+deploy success no longer depends on how long the first scan takes.
 
 > **HARD RULE:** `catalog-data` MUST be a **local** Docker named volume (the
 > default — on the instance's EBS storage). **NEVER back it with EFS / NFS /
@@ -154,8 +159,13 @@ Example prefix — all ROS bags for one robot at one site:
 
 ```bash
 cd server/deploy
+PJ_CLOUD_S3_BUCKET='<your-bucket>' \
+PJ_CLOUD_S3_PREFIX='customer=<x>/' \
+AWS_REGION='<bucket-region>' \
 PJ_CLOUD_TOKEN='<a-long-random-shared-bearer-token>' \
   docker compose -f docker-compose.aws.yml up -d --build
+# completes in seconds regardless of bucket size — the server starts degraded
+# and flips healthy on its own when the first catalog build lands.
 ```
 
 - `PJ_CLOUD_TOKEN` is the single shared bearer token clients must present. **Auth
@@ -172,8 +182,16 @@ PJ_CLOUD_TOKEN='<a-long-random-shared-bearer-token>' \
   on the builder (not `always`) so a transient exit never double-starts it — keep
   it that way, and don't run a manual `--rebuild` builder against the live DB.
 
-Compose builds both images, starts `builder`, waits for its first catalog to
-publish (its healthcheck), then starts `server`.
+Compose builds both images and starts both containers immediately. For a very
+large first scan you can optionally **pre-seed the catalog** before `up -d`
+(identical end state, but the catalog is complete the moment the stack starts):
+
+```bash
+PJ_CLOUD_S3_BUCKET=... PJ_CLOUD_S3_PREFIX=... AWS_REGION=... \
+  docker compose -f docker-compose.aws.yml run --rm builder \
+  --source=s3 "--s3-bucket=$PJ_CLOUD_S3_BUCKET" "--s3-prefix=$PJ_CLOUD_S3_PREFIX" \
+  --once --db /var/lib/pj-cloud/catalog.db
+```
 
 ---
 
@@ -182,14 +200,20 @@ publish (its healthcheck), then starts `server`.
 ```bash
 cd server/deploy
 
-# 1. Builder scanning / publishing (a large first scan takes a few minutes):
+# 1. Builder progress — periodic "reconcile progress: 1234/39279 (3%), 210
+#    files/min, ETA 3h01m" lines, or the machine-readable sidecar:
 docker compose -f docker-compose.aws.yml logs -f builder
+docker compose -f docker-compose.aws.yml exec builder \
+  cat /var/lib/pj-cloud/catalog.db.status.json
 
-# 2. Server (only starts once the builder is healthy):
+# 2. Server (starts immediately; serves degraded until the first catalog lands):
 docker compose -f docker-compose.aws.yml logs -f server
 
-# 3. Health endpoint (external probe — the distroless image has no curl inside):
-curl -fsS http://localhost:8080/health          # -> ok
+# 3. Health endpoint (external probe — the distroless image has no curl inside).
+#    While the first build runs it returns 503 WITH the builder's progress:
+curl -sS http://localhost:8080/health
+#   -> "waiting for first catalog build (builder: extracting 1234/39279)"
+#   -> "ok"                                   (once the first publish lands)
 
 # 4. End-to-end through the real client stack (from a box with the CLI built):
 mcap-cloud-cli --url ws://<ec2-host>:8080 list
@@ -197,7 +221,10 @@ mcap-cloud-cli --url ws://<ec2-host>:8080 list
 
 **AWS gotchas:**
 - **Health never becomes `ok` / builder stuck** with `NoCredentialProviders` or
-  timeouts to `169.254.169.254` → the **IMDS hop limit** is still 1 (§1). Fix it,
+  timeouts to `169.254.169.254` → the **IMDS hop limit** is still 1 (§1). The
+  builder container goes **unhealthy within ~1 minute** with the exception in
+  its status sidecar's `last_error` (`docker inspect
+  --format='{{json .State.Health}}' <builder>` / the sidecar above). Fix it,
   then `docker compose ... restart`.
 - **301 / PermanentRedirect on the first List** → wrong region. The error names
   the real one; fix `region:` in `config.aws-ec2.yaml` and `AWS_REGION` in the
