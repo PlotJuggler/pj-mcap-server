@@ -1,7 +1,9 @@
-# Canonical Cloud Layouts — Replay via Materializable Cached Files (design v3.1)
+# Canonical Cloud Layouts — Replay via Materializable Cached Files (design v3.2)
 
-**Status:** DRAFT v3.1 — Codex adversarial pass complete (21 findings), all 13 mandatory
-amendments incorporated below. Awaiting user approval before the implementation plan.
+**Status:** DRAFT v3.2 — Codex adversarial pass complete (21 findings, all 13 mandatory
+amendments incorporated), plus the ImportJob-timing consult's `LayoutImportBatch`
+forward-compatibility amendment (§6.2/§8) and the hardened deferral trigger (§11).
+Awaiting user approval before the implementation plan.
 **Date:** 2026-07-27
 **Repos touched:** this repo (plugin `toolbox_mcap_cloud`, docs) + PJ4 (host + SDK, upstreamed
 like prior cloud hooks) + `pj-official-plugins` (`data_load_mcap` version pinned in the matrix).
@@ -239,6 +241,20 @@ per-job outcomes, one final drain signal, and the **interactive vs non-interacti
 returns, `MainWindow.cpp:5059`, so it cannot govern late provider jobs; and today's drain calls
 `promptMissingCurves()` unconditionally, `MainWindow.cpp:5485`).
 
+**Forward-compatibility shape (ImportJob-readiness, without building ImportJob):** the batch
+tracks its children through a **request-scoped completion seam**, never by inferring ownership
+from path-based `fileLoaded`/`fileLoadFailed` signals or the global `queueDrained`. `FileLoader`
+gains a small additive API — a `LoadTicket` (`LoadRequestId`) returned per enqueued load, an
+**exactly-once terminal result** (success / cancel / failure, effective path, `DatasetId`), and
+cancellation by request id — while the existing `loadFile()` / `queueDrained` surface stays for
+all current callers. Materialize and file-load children sit behind one small internal
+`start / cancel / join / terminal-result` interface. The batch stays free of
+progress-strip/publish/worker logic (those remain #470's and `FileLoader`'s); provider ABI job
+handles stay independent of any future C++ ImportJob class; **no job ids or execution state are
+ever persisted in the layout XML**. A later ImportJob envelope can then absorb the batch's
+child-operation plumbing wholesale — the document-transaction semantics (working layout, trust
+decisions, workspace rollback, missing-curve policy, final commit) stay in the batch either way.
+
 Ordering per `<fileInfo>` with a `<materialize>` child (review Blocker 3 — resolution must
 rewrite the *document*, not just pick a path):
 
@@ -340,7 +356,11 @@ SDK / ABI (all `struct_size`-gated tail additions, no protocol bump):
 Host:
 
 - **`LayoutImportBatch`** (§6.2) — the one new coordinator; deliberately small (it owns the
-  restore transaction, not progress/publish/stop, which are #470's).
+  restore transaction, not progress/publish/stop, which are #470's), built on the
+  request-scoped completion seam and child-operation interface (§6.2 forward-compat shape).
+- `FileLoader` (additive): `LoadTicket` request-scoped API — exactly-once terminal result
+  (success/cancel/failure + effective path + `DatasetId`) and cancel-by-request-id;
+  `loadFile()` / `queueDrained` retained unchanged for existing callers.
 - `SessionManager`: source records ({provider, descriptor, identity}) attached to
   `LoadedSource`/dataset; invalidated on dataset delete; updated on merge (WASM-ledger
   discipline); registry queryable by identity → `DatasetId`. Includes the lifecycle-tracking
@@ -401,10 +421,26 @@ Explicitly **not** built (v2 components dissolved or #470-supplied): `<replay_so
 
 - **v1 virtual `FileSourceBase`** — no-go per first adversarial review.
 - **v2 parallel replay rail** — superseded; #470/#464 + cache-file unification (§3).
-- **Unified ImportJob host refactor** — deferred by rule-of-three; the provider-generic *schema*
-  is the part of the unified model that must exist now, because persistence outlives code.
-  `LayoutImportBatch` is deliberately the smallest coordinator that closes the async gap, not a
-  general import pipeline.
+- **Unified ImportJob host refactor NOW** — examined a third time (2026-07-27 Codex consult,
+  scoped against the real code: ~12–18 files / 2–3.5k LOC even keeping the existing drivers;
+  4–7k LOC if the execution engines unify, reopening most of #453) and deferred **AFTER v3.1
+  with a hard trigger**. Rationale: there is no common driver today — `FileLoader` is
+  pull-driven, toolbox imports are push-driven, materialize is a third independently-owned
+  operation; the tractable abstraction is a lifecycle **envelope**
+  (`ImportOperation { id, phase, dataset_id?, progress, cancel, exactly-once outcome }`), not a
+  shared engine, and building it first would rework the reviewed #470 while it is still open.
+  Mosaico does not advance the rule of three: it is a second provider *implementation*, not a
+  second provider *orchestration* — counting implementations rather than orchestration
+  semantics misapplies the rule. `StreamingSourceManager` stays outside the finite-job model
+  permanently (long-lived session, not a transaction). **Trigger — execute the envelope
+  refactor when ALL of:** (1) #470 and v3.x are merged with stable E2E tests; (2) a Mosaico
+  provider/companion-loader prototype exists so two providers validate the envelope; (3) a
+  behavior is actually duplicated across three finite producers (strip arbitration,
+  cancel-all/shutdown, request outcomes, composite chaining). **Hard gate:** the refactor must
+  land before enabling concurrent provider materializations or adding a third UI-visible finite
+  import producer. v3's ImportJob-readiness is baked in via the §6.2 forward-compat shape.
+  `LayoutImportBatch` is a stepping stone, not dead-end code: an ImportJob absorbs its
+  child-operation plumbing; the document-transaction semantics remain the batch's either way.
 - **File-routed interactive Fetch** (download, then load — single path, no eager ingest) —
   rejected: discards plot-while-downloading, the exact UX #470 exists to provide. The adoption
   step gets the same end state without the UX loss.
@@ -431,8 +467,10 @@ Explicitly **not** built (v2 components dissolved or #470-supplied): `<replay_so
   green at every stage.
 - **PJ4:** `layout_xml` round-trip for `<materialize>` (incl. old-reader ignore + WASM
   diagnostic paths); rewrite-then-classify ordering unit tests (steps 1–7, §6.2);
+  `LoadTicket` tests (exactly-once terminal result incl. cancel and failure paths,
+  cancel-by-id, legacy `loadFile`/`queueDrained` callers unaffected);
   `LayoutImportBatch` tests (per-job failure isolation, non-interactive policy persistence,
-  cancellation, drain); a **fake source-provider test plugin** driving load-time integration
+  cancellation, drain — all via the ticket seam, never path-matching); a **fake source-provider test plugin** driving load-time integration
   incl. non-interactive `--layout`; adoption tests (eager→file refill keeps ids; rollback on
   failed adoption; **catalog equality** between an authored-and-adopted dataset and a
   replay-loaded one — semantic equality, not just `mcapdiff`); stable-ID + name-fallback loader
@@ -491,3 +529,10 @@ fallback; explicit WASM diagnostic; cross-repo SDK/build sequencing). Verified-t
 old reader ignores `<materialize>`; out-of-tree cache paths stay absolute. Open items tracked
 for implementation: tee backpressure measurement, production S3 immutability check, Windows
 two-process behavior, #470 pre-merge drift.
+
+**Third consult (same thread, 2026-07-27): ImportJob-refactor timing.** Question: do the
+unified ImportJob refactor now instead of waiting for the rule of three? Answer: **AFTER
+v3.x, with the hard trigger** recorded in §11 — scoped blast radius, the push/pull control-flow
+analysis, the Mosaico implementation-vs-orchestration distinction, and one mandatory v3
+amendment applied in this revision: the `LayoutImportBatch` request-scoped completion seam
+(`LoadTicket`), the child-operation interface, and the no-job-state-in-XML rule (§6.2, §8).
