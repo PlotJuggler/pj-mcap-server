@@ -260,8 +260,9 @@ std::string sessionLabel(const mcap_cloud::AggSession& s) {
 
 // The LOCAL Basic-tab dropdowns (combo feed + matchesBasicFilter + Basic-tab
 // persistence). customer/site moved OUT to the mandatory browse gate
-// (server-filtered, fed from GetVocabulary — gateRow's filter_customer /
-// filter_customer_site, resolved in onIndexChanged and populated in
+// (server-filtered, fed from GetVocabulary — filter_customer /
+// filter_customer_site, which share basicPane's grid but stay visible in
+// Advanced mode; resolved in onIndexChanged and populated in
 // getWidgetData()); only robot/source remain as client-side equality filters
 // applied on top of the already gate-scoped result set.
 const std::array<std::pair<const char*, const char*>, 2> kLocalBasicFilterKeys = {{
@@ -1115,7 +1116,18 @@ std::string McapCloudDialog::widget_data() {
     // constraint. Exactly one pane is visible per mode.
     wd.setChecked("radioFilterBasic", state_.filter_tab == 0);
     wd.setChecked("radioFilterAdvanced", state_.filter_tab == 1);
-    wd.setVisible("basicPane", state_.filter_tab == 0);
+    // basicPane holds all four filter rows in ONE grid so the combo columns
+    // align. Customer/Site are the MANDATORY browse gate, so the pane stays
+    // visible in Advanced mode and only the Robot/Source rows are hidden —
+    // otherwise an Advanced-mode user with no restored site could never pass
+    // the gate. Their grid rows collapse to zero height once both the label
+    // and the combo in them are hidden.
+    const bool basic_mode = state_.filter_tab == 0;
+    wd.setVisible("basicPane", true);
+    wd.setVisible("labelRobot", basic_mode);
+    wd.setVisible("filter_robot", basic_mode);
+    wd.setVisible("labelSource", basic_mode);
+    wd.setVisible("filter_source", basic_mode);
     wd.setVisible("advancedPane", state_.filter_tab == 1);
     // Dropdown values come from the epoch-cached canonical schema — never from
     // a per-call sweep over the sequences. The guard is an O(1) epoch compare.

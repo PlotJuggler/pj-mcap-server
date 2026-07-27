@@ -182,41 +182,6 @@
                 ToggleSwitch). The plugin shows exactly ONE of basicPane /
                 advancedPane per the selected mode (state_.filter_tab). Replaces
                 the former QTabWidget (2026-07-12). -->
-           <!-- Mandatory customer/site gate: ALWAYS visible, regardless of
-                Basic/Advanced filter mode (an Advanced-mode user with no
-                restored site would otherwise have no way to pass the gate).
-                Widget names are unchanged (labelCustomer/filter_customer/
-                labelSite/filter_customer_site), moved here out of
-                basicForm, which the dialog's event plumbing keys off. -->
-           <item>
-            <layout class="QHBoxLayout" name="gateRow">
-             <property name="spacing"><number>8</number></property>
-             <item>
-              <widget class="QLabel" name="labelCustomer">
-               <property name="text"><string>Customer</string></property>
-              </widget>
-             </item>
-             <item>
-              <widget class="PJ::ComboBox" name="filter_customer">
-               <property name="sizePolicy">
-                <sizepolicy hsizetype="Expanding" vsizetype="Fixed"><horstretch>1</horstretch><verstretch>0</verstretch></sizepolicy>
-               </property>
-              </widget>
-             </item>
-             <item>
-              <widget class="QLabel" name="labelSite">
-               <property name="text"><string>Site</string></property>
-              </widget>
-             </item>
-             <item>
-              <widget class="PJ::ComboBox" name="filter_customer_site">
-               <property name="sizePolicy">
-                <sizepolicy hsizetype="Expanding" vsizetype="Fixed"><horstretch>1</horstretch><verstretch>0</verstretch></sizepolicy>
-               </property>
-              </widget>
-             </item>
-            </layout>
-           </item>
            <item>
             <layout class="QHBoxLayout" name="filterModeRow">
              <property name="spacing"><number>8</number></property>
@@ -249,16 +214,26 @@
            <item>
             <widget class="QWidget" name="basicPane" native="true">
               <!-- QGridLayout (not QFormLayout) so rowstretch can distribute the
-                   rows over the pane height; QFormLayout always top-packs. -->
-              <layout class="QGridLayout" name="basicForm" rowstretch="1,1" columnstretch="0,1">
+                   rows over the pane height; QFormLayout always top-packs.
+                   ONE grid holds all four fields so their combo columns align.
+                   Customer/Site are the MANDATORY browse gate and stay visible
+                   in Advanced mode too (an Advanced-mode user with no restored
+                   site would otherwise have no way to pass the gate), so the
+                   pane itself is always shown and the dialog hides only the
+                   Robot/Source label+combo pairs when Advanced is selected. -->
+              <layout class="QGridLayout" name="basicForm" rowstretch="1,1,1,1" columnstretch="0,1">
                <property name="leftMargin"><number>4</number></property>
                <property name="topMargin"><number>4</number></property>
                <property name="rightMargin"><number>4</number></property>
                <property name="bottomMargin"><number>4</number></property>
-               <item row="0" column="0"><widget class="QLabel" name="labelRobot"><property name="text"><string>Robot</string></property></widget></item>
-               <item row="0" column="1"><widget class="PJ::ComboBox" name="filter_robot"><property name="sizePolicy"><sizepolicy hsizetype="Expanding" vsizetype="Fixed"><horstretch>1</horstretch><verstretch>0</verstretch></sizepolicy></property></widget></item>
-               <item row="1" column="0"><widget class="QLabel" name="labelSource"><property name="text"><string>Source</string></property></widget></item>
-               <item row="1" column="1"><widget class="PJ::ComboBox" name="filter_source"><property name="sizePolicy"><sizepolicy hsizetype="Expanding" vsizetype="Fixed"><horstretch>1</horstretch><verstretch>0</verstretch></sizepolicy></property></widget></item>
+               <item row="0" column="0"><widget class="QLabel" name="labelCustomer"><property name="text"><string>Customer</string></property></widget></item>
+               <item row="0" column="1"><widget class="PJ::ComboBox" name="filter_customer"><property name="sizePolicy"><sizepolicy hsizetype="Expanding" vsizetype="Fixed"><horstretch>1</horstretch><verstretch>0</verstretch></sizepolicy></property></widget></item>
+               <item row="1" column="0"><widget class="QLabel" name="labelSite"><property name="text"><string>Site</string></property></widget></item>
+               <item row="1" column="1"><widget class="PJ::ComboBox" name="filter_customer_site"><property name="sizePolicy"><sizepolicy hsizetype="Expanding" vsizetype="Fixed"><horstretch>1</horstretch><verstretch>0</verstretch></sizepolicy></property></widget></item>
+               <item row="2" column="0"><widget class="QLabel" name="labelRobot"><property name="text"><string>Robot</string></property></widget></item>
+               <item row="2" column="1"><widget class="PJ::ComboBox" name="filter_robot"><property name="sizePolicy"><sizepolicy hsizetype="Expanding" vsizetype="Fixed"><horstretch>1</horstretch><verstretch>0</verstretch></sizepolicy></property></widget></item>
+               <item row="3" column="0"><widget class="QLabel" name="labelSource"><property name="text"><string>Source</string></property></widget></item>
+               <item row="3" column="1"><widget class="PJ::ComboBox" name="filter_source"><property name="sizePolicy"><sizepolicy hsizetype="Expanding" vsizetype="Fixed"><horstretch>1</horstretch><verstretch>0</verstretch></sizepolicy></property></widget></item>
               </layout>
              </widget>
            </item>
