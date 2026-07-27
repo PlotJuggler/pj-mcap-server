@@ -77,6 +77,20 @@ be and how to re-obtain it" — not a cloud one-off:
 Persistence formats outlive code: the schema is where the unified model lives; host
 orchestration can converge later (§11).
 
+**Provider precondition (P)** — implicit in the adoption step, made explicit here as part of
+the provider contract: *a provider must be able to serialize its session into a single file
+that an installed `FileSource` loader ingests with semantics identical to the provider's eager
+path.* MCAP Cloud satisfies P natively (payload is MCAP; `data_load_mcap` exists; both paths
+decode through the same host parsers). Generality check against the twin `toolbox_mosaico`
+plugin (2026-07-27): every host/SDK seam applies unchanged (its tuple —
+`pullTopicsAsync(sequence, topics[], start_ns, end_ns)` — is a simpler twin of ours), but P
+fails today on two counts: a Mosaico session is N Arrow tables with N schemas (one
+Parquet/Arrow-IPC file holds one), and its eager `arrow_ingest.cpp` transformation (direct
+ingest + ontology routing) is not what `data_load_parquet` would reproduce. Its P-satisfying
+path: a small companion loader DSO reading a multi-stream Arrow container that **reuses
+`arrow_ingest` as a shared TU** — semantic equality by construction, provider-local cost only.
+The loader need not pre-exist; it must merely share the eager path's ingest code.
+
 ## 3. Dependencies and lineage
 
 - **PJ4 #470** `feat/toolbox-ingest-progress` (OPEN, assumed merging; reviewed at branch tip
