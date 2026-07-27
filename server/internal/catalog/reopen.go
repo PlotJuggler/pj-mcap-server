@@ -76,6 +76,12 @@ func (s *Store) ReopenIfSwapped(ctx context.Context) (swapped bool, err error) {
 	s.ordinal++
 	next := &snapshot{db: newDB, ident: newIdent, gen: s.newGenToken(s.ordinal)}
 	next.refs.Store(1) // the "current" ref
-	s.publish(next)
+	if !s.publish(next) {
+		// A Close won the race: the snapshot was rejected (and its db closed).
+		// Roll the ordinal back (reopenMu still held, so this is safe) and
+		// report no swap — a generation that never served must not be counted.
+		s.ordinal--
+		return false, nil
+	}
 	return true, nil
 }

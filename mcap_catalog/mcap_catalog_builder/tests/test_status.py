@@ -257,3 +257,84 @@ def test_lock_conflict_never_touches_status(tmp_path):
     finally:
         lock.release()
     assert _read_status(db) == sentinel  # refused builder wrote NOTHING
+
+
+# --------------------------------------------------- Codex review follow-ups
+
+
+def test_listing_writes_status_on_first_object(tmp_path):
+    # The sidecar's first write must land as soon as the LIST provably began
+    # (first object yielded — S3 access works), NOT after 5000 objects: a slow
+    # listing must not leave the healthcheck staring at an absent sidecar.
+    root = str(tmp_path / "watch")
+    for name in ("a.mcap", "b.mcap", "c.mcap"):
+        _hive(root, name)
+    db = str(tmp_path / "catalog.db")
+    conn = open_db(db)
+    caches = load_caches(conn)
+    w = StatusWriter(db, min_interval=0.0)
+    p = ReconcileProgress(status=w, log_interval=0.0)
+
+    from mcap_catalog_builder.storage import LocalSource
+
+    seen_at_second_yield = []
+
+    class _AssertingSource(LocalSource):
+        def list_all(self):
+            for i, lst in enumerate(super().list_all()):
+                if i == 1:  # by the SECOND object, the first must have written
+                    seen_at_second_yield.append(os.path.exists(db + ".status.json"))
+                yield lst
+
+    full_reconcile(conn, caches, _AssertingSource(root), progress=p)
+    assert seen_at_second_yield == [True]
+    conn.close()
+
+
+def test_rescan_resets_progress_counters(tmp_path):
+    # ONE ReconcileProgress instance is reused across every daemon rescan;
+    # per-reconcile counters must reset, not accumulate.
+    root = str(tmp_path / "watch")
+    _hive(root)
+    db = str(tmp_path / "catalog.db")
+    conn = open_db(db)
+    caches = load_caches(conn)
+    w = StatusWriter(db, min_interval=0.0)
+    p = ReconcileProgress(status=w, log_interval=0.0)
+
+    full_reconcile(conn, caches, root, progress=p)   # rescan 1: catalogs 1
+    full_reconcile(conn, caches, root, progress=p)   # rescan 2: all skipped
+    doc = _read_status(db)
+    assert doc["extract_total"] == 0
+    assert doc["extract_done"] == 0    # NOT 1 carried over from rescan 1
+    assert doc["cataloged"] == 0       # NOT accumulated across rescans
+    assert doc["skipped"] == 1
+    conn.close()
+
+
+def test_status_write_failure_is_swallowed_and_recovers(tmp_path, monkeypatch, caplog):
+    # The sidecar is ADVISORY: a failed write must never raise into the
+    # reconcile/daemon (or kill the heartbeat thread) — log, then recover on
+    # the next update.
+    import mcap_catalog_builder.status as status_mod
+
+    db = str(tmp_path / "catalog.db")
+    w = StatusWriter(db, min_interval=0.0)
+    real_replace = os.replace
+    calls = {"n": 0}
+
+    def flaky_replace(src, dst):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise OSError(28, "No space left on device")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(status_mod.os, "replace", flaky_replace)
+    with caplog.at_level("WARNING"):
+        w.update(phase="listing")  # first write fails -> swallowed + logged
+    assert "status sidecar" in caplog.text
+    assert not os.path.exists(db + ".status.json")
+    w.update(listed_total=5)       # next write recovers
+    doc = _read_status(db)
+    assert doc["phase"] == "listing"
+    assert doc["listed_total"] == 5

@@ -606,7 +606,10 @@ that is not "the finished catalog".
 
 - **Path** = `<db_path>` + **`.status.json`** (sibling of `-wal`/`-shm`,
   `.building`, `.writer.lock`). Written via temp-file + `os.replace` (temp =
-  `<db_path>.status.json.tmp`), so a reader never observes a torn document.
+  `<db_path>.status.json.tmp.<pid>` — pid-suffixed so a shutdown-stuck write
+  can never hand a successor builder a shared, torn temp file), so a reader
+  never observes a torn document. Writes are ADVISORY-grade: a failed write
+  is logged and retried on the next update, never raised into the daemon.
   The document is small (hundreds of bytes); readers MUST cap what they will
   parse (the Go reader refuses > 64 KiB) and treat a missing/malformed file as
   "no information", never as an error surfaced to clients.
@@ -627,14 +630,17 @@ that is not "the finished catalog".
   daemon steady state between rescans, or a finished `--once`), and `error`
   (fatal failure — the exception that killed the run, truncated, in
   `last_error`). There is no `starting` phase BY DESIGN: the first write is
-  deferred until a real milestone (the LIST actually began), so a
-  crash-looping builder cannot overwrite its previous run's `error` verdict
-  with an empty "just booted" state.
+  deferred until a real milestone — the first object yielded by the LIST
+  (proof that bucket access/credentials work), within seconds of a healthy
+  start — so a crash-looping builder cannot overwrite its previous run's
+  `error` verdict with an empty "just booted" state.
 - **Freshness = heartbeat.** A daemon-mode builder refreshes `updated_at*`
   every ~10 s for its whole lifetime, independent of per-file progress (long
   LISTs and idle periods stay fresh). Consumers should treat staleness beyond
   ~60 s as "builder hung or dead". The deploy healthcheck is exactly
-  `phase != "error" AND now - updated_at_unix < 60`.
+  `phase != "error" AND now - updated_at_unix < 60`; with its probe interval
+  and retries the container transitions to `unhealthy` ~90 s after real
+  staleness begins (the freshness window plus 3 consecutive 10 s probes).
 - **Consumers**: (a) the container healthcheck (above — "alive and
   progressing", NEVER "first build complete"; deploy success must not scale
   with bucket size); (b) the Go server, best-effort, to enrich its degraded

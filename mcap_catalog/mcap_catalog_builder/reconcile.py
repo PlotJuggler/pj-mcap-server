@@ -128,7 +128,11 @@ def full_reconcile(
     listings = []
     for lst in source.list_all():
         listings.append(lst)
-        if progress is not None and len(listings) % 5000 == 0:
+        # First object = the LIST provably began (credentials/bucket access
+        # work) — that is the sidecar's first-milestone write (§12), so the
+        # healthcheck sees a fresh phase=listing within seconds, not after
+        # 5000 objects. Then periodic count updates.
+        if progress is not None and (len(listings) == 1 or len(listings) % 5000 == 0):
             progress.listing(len(listings))
     if progress is not None:
         progress.listed(len(listings))

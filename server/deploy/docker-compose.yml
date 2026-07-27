@@ -122,7 +122,7 @@ services:
       test: ["CMD", "python3", "-c", "import json,sys,time; d=json.load(open('/var/lib/pj-cloud/catalog.db.status.json')); sys.exit(1 if d.get('phase')=='error' or time.time()-d.get('updated_at_unix',0)>60 else 0)"]
       interval: 10s
       timeout: 3s
-      retries: 6
+      retries: 3            # unhealthy ~90s after real staleness (60s window + 3x10s)
       start_period: 30s
     restart: unless-stopped
 

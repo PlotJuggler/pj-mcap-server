@@ -138,3 +138,28 @@ func newAwaitingT(t *testing.T, dbPath string) *Store {
 	}
 	return st
 }
+
+func TestClosedStore_ReopenRejectedWithoutFalseSwap(t *testing.T) {
+	// A Close racing the reopen tick: publish is rejected, so ReopenIfSwapped
+	// must NOT report swapped=true (that would inc CatalogReopensTotal for a
+	// generation that never served) and must not advance the ordinal.
+	dir := t.TempDir()
+	path := filepath.Join(dir, "catalog.db")
+	st := newAwaitingT(t, path)
+	_ = st.Close()
+
+	tmp := filepath.Join(dir, "catalog.db.building")
+	buildNamedAurynDB(t, tmp, "late")
+	replaceFile(t, path, tmp)
+
+	swapped, err := st.ReopenIfSwapped(context.Background())
+	if err != nil {
+		t.Fatalf("ReopenIfSwapped on closed store: %v", err)
+	}
+	if swapped {
+		t.Fatal("ReopenIfSwapped on a CLOSED store reported swapped=true")
+	}
+	if st.Ready() {
+		t.Fatal("closed store became Ready")
+	}
+}

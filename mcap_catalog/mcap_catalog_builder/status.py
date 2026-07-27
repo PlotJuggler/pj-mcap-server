@@ -39,7 +39,12 @@ class StatusWriter:
 
     def __init__(self, db_path: str, *, min_interval: float = 1.0, clock=time.monotonic) -> None:
         self.path = db_path + STATUS_SUFFIX
-        self._tmp = self.path + ".tmp"
+        # pid-suffixed temp: a heartbeat thread stuck >join-timeout in a write
+        # during shutdown could otherwise share a temp file with the NEXT
+        # builder process and hand it a torn document to rename. Distinct temp
+        # paths make the worst case a stale-but-well-formed sidecar, which the
+        # new builder's next write (≤10 s later) self-heals.
+        self._tmp = f"{self.path}.tmp.{os.getpid()}"
         self._lock = threading.Lock()
         self._state: dict = {}
         self._min_interval = min_interval
@@ -79,12 +84,19 @@ class StatusWriter:
 
         def _beat() -> None:
             while not stop_event.wait(interval):
-                self.update(force=True)
+                if stop_event.is_set():  # narrows the stop→write race window
+                    return
+                self.update(force=True)  # write failures are swallowed+logged inside
 
         self._hb_thread = threading.Thread(target=_beat, name="status-heartbeat", daemon=True)
         self._hb_thread.start()
 
     def heartbeat_stop(self) -> None:
+        """Best-effort join (the caller sets the stop event first). A thread
+        stuck >5 s inside a single tiny-file write is pathological; if it ever
+        loses this race against a successor builder, the pid-suffixed temp
+        (see __init__) bounds the damage to one stale-but-well-formed sidecar
+        that the successor overwrites within a heartbeat interval."""
         if self._hb_thread is not None:
             self._hb_thread.join(timeout=5.0)
             self._hb_thread = None
@@ -96,11 +108,23 @@ class StatusWriter:
         wall = time.time()
         doc["updated_at_unix"] = wall
         doc["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(wall))
-        with open(self._tmp, "w") as f:
-            json.dump(doc, f)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(self._tmp, self.path)
+        # The sidecar is ADVISORY (§12): a write failure must never propagate
+        # into the reconcile or kill the heartbeat thread. Log and retry on the
+        # next update — _last_write is only advanced on success, so the throttle
+        # cannot swallow the retry.
+        try:
+            with open(self._tmp, "w") as f:
+                json.dump(doc, f)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(self._tmp, self.path)
+        except Exception as e:  # noqa: BLE001 - advisory signal, never fatal
+            logger.warning("status sidecar write failed (advisory, retried on next update): %s", e)
+            try:
+                os.unlink(self._tmp)
+            except OSError:
+                pass
+            return
         self._last_write = now
 
 
@@ -135,9 +159,12 @@ class ReconcileProgress:
         logger.info("reconcile: listed %d objects", total)
 
     def extract_start(self, to_extract: int, skipped: int, failed: int) -> None:
+        # Full per-reconcile reset: ONE ReconcileProgress instance is reused
+        # across every daemon rescan, so carried-over counters would
+        # double-count (extract_done > extract_total on the second rescan).
         self._total = to_extract
-        self._counts["skipped"] = skipped
-        self._counts["failed"] = failed
+        self._done = 0
+        self._counts = {"cataloged": 0, "skipped": skipped, "failed": failed}
         self._t0 = self._clock()
         self._last_log = None
         self._set_status(

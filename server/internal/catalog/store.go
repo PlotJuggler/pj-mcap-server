@@ -98,13 +98,14 @@ func (s *Store) newGenToken(ordinal uint64) []byte {
 // retires the previous one, whose db then closes once its last lease releases.
 // If the Store has already been Closed, sn is NOT installed — its current ref is
 // dropped so it closes cleanly (a ReopenIfSwapped that raced shutdown must not
-// leak the db it just opened).
-func (s *Store) publish(sn *snapshot) {
+// leak the db it just opened) — and publish reports installed=false so the
+// caller does not count/report a swap that never served.
+func (s *Store) publish(sn *snapshot) (installed bool) {
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
 		sn.release() // never became current; drop its ref so it closes
-		return
+		return false
 	}
 	old := s.cur
 	oldLive := s.curRefLive
@@ -114,6 +115,7 @@ func (s *Store) publish(sn *snapshot) {
 	if old != nil && oldLive {
 		old.release() // drop the retired "current" ref; leases keep it alive until they finish
 	}
+	return true
 }
 
 // Snapshot is a refcounted lease on ONE catalog generation: its DB and
