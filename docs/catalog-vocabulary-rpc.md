@@ -4,9 +4,12 @@
 proto (`GetVocabulary` RPC + `FileFilter` dimension fields), Go bindings, the
 `catalog.GetVocabulary` builder (tree + flat source + tag facets with the cap), the
 dimension filter predicates in `aurynFilterFiles`, and the WS handler/dispatch are
-all landed + tested (hermetic + cross-language). **DEFERRED — the C++ client facet
-UI** (§9: replace the `comboPrefix` hack with the cascading comboboxes): a
-client-plugin effort needing the C++/SDK toolchain; the server RPC unblocks it.
+all landed + tested (hermetic + cross-language). **CLIENT FACET UI LANDED — 2026-07-26:**
+the C++ plugin gates browsing on a required customer+site selection fed by this RPC
+(server-filtered `ListFiles`, progressively rendered, persisted per server) --
+see `docs/2026-07-26-facet-gated-browse-plan.md`. Robot and source stay
+client-side narrowing over the loaded site's rows (not server-cascaded like
+this document's original robot-level vision).
 Reviewed by Claude + Codex at the M3 boundary.
 **Scope:** the wire design for **filtering the catalog** by a strict
 customer→site→robot hierarchy plus flat tags, and the RPC that ships the

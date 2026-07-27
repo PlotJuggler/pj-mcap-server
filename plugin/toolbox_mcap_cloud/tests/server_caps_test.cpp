@@ -24,15 +24,7 @@
 
 #include <gtest/gtest.h>
 
-#include <ixwebsocket/IXNetSystem.h>
-#ifdef _WIN32
-#include <winsock2.h>  // sockaddr_in, htonl/ntohs, getsockname, closesocket
-#else
-#include <arpa/inet.h>
-#include <netinet/in.h>
-#include <sys/socket.h>
-#include <unistd.h>
-#endif
+#include "find_free_port.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -48,44 +40,7 @@
 
 namespace {
 
-// Discover a free loopback port by binding a throwaway socket to port 0 (the
-// OS assigns one) and reading it back via getsockname, then releasing it
-// immediately. ix::WebSocketServer's SocketServer::getPort() only echoes back
-// its constructor argument (it never calls getsockname() itself after an
-// OS-assigned bind), so this has to happen out-of-band on the client side.
-// Small TOCTOU race (another process could grab the same port in the
-// microseconds before WebSocketServer binds it) — an accepted trade-off for a
-// hermetic unit test; unlike backend_connection_error_test.cpp's reserved
-// closed port (127.0.0.1:9), a real listener needs an actually-free port.
-int findFreePort() {
-  // WSAStartup before the raw ::socket below AND the ix server/client the
-  // tests stand up (ixwebsocket does not self-initialize on Windows); no-op
-  // on POSIX. Windows/POSIX also disagree on the socket handle type, the
-  // getsockname length type, and the close call — alias all three.
-  ix::initNetSystem();
-#ifdef _WIN32
-  using probe_socket_t = SOCKET;
-  using probe_socklen_t = int;
-#else
-  using probe_socket_t = int;
-  using probe_socklen_t = socklen_t;
-#endif
-  const probe_socket_t probe = ::socket(AF_INET, SOCK_STREAM, 0);
-  sockaddr_in addr{};
-  addr.sin_family = AF_INET;
-  addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-  addr.sin_port = 0;
-  ::bind(probe, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
-  probe_socklen_t len = sizeof(addr);
-  ::getsockname(probe, reinterpret_cast<sockaddr*>(&addr), &len);
-  const int port = ntohs(addr.sin_port);
-#ifdef _WIN32
-  ::closesocket(probe);
-#else
-  ::close(probe);
-#endif
-  return port;
-}
+using mcap_cloud_test::findFreePort;
 
 // Minimal fake pj_cloud.v1 server for THIS test file only: answers Hello with
 // a fixed HelloResponse carrying the capabilities under test, optionally

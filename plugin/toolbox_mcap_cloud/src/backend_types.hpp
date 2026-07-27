@@ -2,16 +2,16 @@
 // SPDX-License-Identifier: MIT
 //
 // Local replacements for the mosaico_sdk flight/types.hpp structs. The cloud
-// connector plugin is a visual copy of toolbox_mosaico with the Apache Arrow /
-// Arrow Flight / gRPC / mosaico_sdk transport removed and replaced by an inert
-// stub (backend_connection.hpp). These structs carry only the fields the
-// dialog + worker actually read; the arrow::Schema field of the SDK's TopicInfo
-// is flattened into a plain (name,type) string vector so the Info panel can
-// still render a "Fields (N):" block without Arrow.
+// connector plugin started as a visual copy of toolbox_mosaico with the Apache
+// Arrow / Arrow Flight / gRPC / mosaico_sdk transport removed; the real
+// ixwebsocket+Protobuf transport (backend_connection.hpp/.cpp) now populates
+// these structs from the wire (see wire_mapping.cpp). These structs carry only
+// the fields the dialog + worker actually read; the arrow::Schema field of the
+// SDK's TopicInfo is flattened into a plain (name,type) string vector so the
+// Info panel can still render a "Fields (N):" block without Arrow.
 //
 // This header is deliberately self-contained — it must NOT transitively include
-// any flight/* / arrow/* header. When the real WS+Protobuf client-core lands,
-// these types stay (or are repopulated) behind the same names.
+// any flight/* / arrow/* header.
 #pragma once
 
 #include <cstdint>
@@ -138,6 +138,44 @@ struct BackendCaps {
 struct ServerCaps {
   bool resume_supported = false;
   bool tag_edit_supported = false;
+};
+
+// GetVocabularyResponse mapped for the client (catalog-vocabulary-rpc.md).
+// ids are SESSION HANDLES bound to `generation` — they renumber across builder
+// rebuilds and MUST only be echoed together with the generation they came from.
+struct VocabSite {
+  std::uint64_t id = 0;
+  std::string name;
+  std::uint64_t file_count = 0;
+};
+struct VocabCustomer {
+  std::uint64_t id = 0;
+  std::string name;
+  std::uint64_t file_count = 0;
+  std::vector<VocabSite> sites;
+};
+struct VocabularyInfo {
+  std::vector<VocabCustomer> customers;
+  std::string generation;  // opaque bytes; echo with any dimension-id filter
+  [[nodiscard]] std::uint64_t totalFiles() const {
+    std::uint64_t n = 0;
+    for (const auto& c : customers) { n += c.file_count; }
+    return n;
+  }
+  [[nodiscard]] std::size_t totalSites() const {
+    std::size_t n = 0;
+    for (const auto& c : customers) { n += c.sites.size(); }
+    return n;
+  }
+};
+
+// Server-side ListFiles dimension filter. ids come from a VocabularyInfo and
+// are ONLY meaningful with that vocabulary's generation (echoed on page one).
+struct ListFilter {
+  std::optional<std::uint64_t> customer_id;
+  std::optional<std::uint64_t> site_id;
+  std::string generation;  // REQUIRED when any id is set (server: INVALID_REQUEST otherwise)
+  [[nodiscard]] bool empty() const { return !customer_id && !site_id; }
 };
 
 // ---------------------------------------------------------------------------

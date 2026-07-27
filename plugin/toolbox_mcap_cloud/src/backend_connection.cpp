@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <iterator>
 #include <string>
 #include <thread>
 #include <utility>
@@ -426,9 +427,16 @@ std::optional<ServerCaps> BackendConnection::serverCapabilities() const {
   return server_caps_;
 }
 
-std::vector<SequenceInfo> BackendConnection::listSequences(bool* complete) {
+std::vector<SequenceInfo> BackendConnection::listSequences(bool* complete,
+                                                           const PageCallback& on_page,
+                                                           const ListFilter* filter,
+                                                           bool* stale_vocabulary,
+                                                           const std::function<bool()>& abort) {
   if (complete != nullptr) {
     *complete = false;
+  }
+  if (stale_vocabulary != nullptr) {
+    *stale_vocabulary = false;
   }
   std::vector<SequenceInfo> sequences;
   std::unordered_map<std::string, std::uint64_t> file_ids;
@@ -450,10 +458,31 @@ std::vector<SequenceInfo> BackendConnection::listSequences(bool* complete) {
     std::string page_token;
     std::string generation;  // the generation attempt-page-1 was served from
     bool stale = false;
+    // First page of THIS attempt: tells a progressive consumer to drop whatever
+    // a previous (stale-aborted) attempt already handed it.
+    bool reset_consumer = true;
     for (;;) {
+      if (abort && abort()) {
+        return sequences;  // superseded — PARTIAL (exhausted stays false)
+      }
       pj_cloud::v1::ClientMessage request;
       auto* list = request.mutable_list_files();
       list->set_page_token(page_token);
+      list->set_limit(kListFilesPageLimit);
+      if (filter != nullptr && !filter->empty()) {
+        auto* wire_filter = list->mutable_filter();
+        if (filter->customer_id) {
+          wire_filter->set_customer_id(*filter->customer_id);
+        }
+        if (filter->site_id) {
+          wire_filter->set_site_id(*filter->site_id);
+        }
+        // Page-one-only echo: later pages carry the generation inside
+        // page_token (server contract, handlers_catalog.go:157).
+        if (page_token.empty()) {
+          list->set_expected_catalog_generation(filter->generation);
+        }
+      }
 
       pj_cloud::v1::ServerMessage response;
       if (!sendAndWait(request, &response)) {
@@ -461,7 +490,16 @@ std::vector<SequenceInfo> BackendConnection::listSequences(bool* complete) {
       }
       if (response.has_error() &&
           response.error().code() == pj_cloud::v1::ERROR_STALE_CATALOG) {
-        stale = true;  // rebuild raced the pagination — restart from page one
+        if (filter != nullptr && !filter->empty()) {
+          // Filtered ids belong to a dead generation: retrying is at best
+          // futile, at worst selects a renumbered WRONG dimension. Abort;
+          // the caller re-resolves names -> ids from a fresh vocabulary.
+          if (stale_vocabulary != nullptr) {
+            *stale_vocabulary = true;
+          }
+          return {};
+        }
+        stale = true;  // unfiltered: bounded restart (existing behaviour)
         break;
       }
       if (!response.has_list_files()) {
@@ -472,10 +510,19 @@ std::vector<SequenceInfo> BackendConnection::listSequences(bool* complete) {
       if (page_token.empty()) {
         generation = list_response.catalog_generation();
       }
+      std::vector<SequenceInfo> page;
+      page.reserve(static_cast<std::size_t>(list_response.files_size()));
       for (auto& mapped : mapListFilesResponse(list_response)) {
         file_ids[mapped.info.name] = mapped.file_id;
-        sequences.push_back(std::move(mapped.info));
+        page.push_back(std::move(mapped.info));
       }
+      if (on_page) {
+        // Hand the page over BEFORE the sweep completes so the UI can draw it.
+        on_page(page, reset_consumer);
+        reset_consumer = false;
+      }
+      sequences.insert(sequences.end(), std::make_move_iterator(page.begin()),
+                       std::make_move_iterator(page.end()));
 
       page_token = list_response.next_page_token();
       if (page_token.empty()) {
@@ -548,6 +595,19 @@ TopicsResult BackendConnection::listTopicsChecked(const std::string& sequence_na
 
 std::vector<TopicInfo> BackendConnection::listTopics(const std::string& sequence_name) {
   return listTopicsChecked(sequence_name).topics;
+}
+
+std::optional<VocabularyInfo> BackendConnection::getVocabulary() {
+  if (!socket_) {
+    return std::nullopt;
+  }
+  pj_cloud::v1::ClientMessage request;
+  request.mutable_get_vocabulary();  // empty request message
+  pj_cloud::v1::ServerMessage response;
+  if (!sendAndWait(request, &response) || !response.has_get_vocabulary()) {
+    return std::nullopt;
+  }
+  return mapGetVocabularyResponse(response.get_vocabulary());
 }
 
 bool BackendConnection::isClosed() {

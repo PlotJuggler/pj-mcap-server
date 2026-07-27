@@ -10,6 +10,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <unordered_map>
 
 #include <pj_base/sdk/plugin_data_api.hpp>
@@ -24,10 +25,11 @@
 #include "backend_types.hpp"  // mcap_cloud::SequenceInfo / TopicInfo / TimeRange
 #include "core/types.h"
 #include "credential_store.hpp"  // mcap_cloud::CredentialStore (D6 token store)
+#include "fetch_worker.hpp"      // mcap_cloud::FetchWorker::GateListResult (onGateListFinished's param type)
+#include "vocab_select.hpp"      // mcap_cloud::GatePhase / resolveGateFilter / autoSelectCustomer / siteNamesFor
 
 namespace mcap_cloud {
 
-class FetchWorker;
 class LuaQueryEngine;
 
 struct SequenceRecord {
@@ -47,26 +49,15 @@ struct SequenceRecord {
 // GUI thread (from widget events + worker-result callbacks drained by onTick),
 // serialized into WidgetData on every getWidgetData().
 struct DialogState {
-  // mutable: saveConfig() is const (DataSource ABI) but must lock to read the
-  // accepted-selection snapshot consistently with the GUI thread.
+  // mutable: saveConfig() is const (the DialogPluginTyped saveConfig()/
+  // loadConfig() contract) but must lock to read the accepted-selection
+  // snapshot consistently with the GUI thread.
   mutable std::mutex mu;
   std::string uri = "ws://localhost:8080";
   bool connected = false;
   // True between a Connect click and the connectFinished result — drives
   // the Connect button's disabled state (PJ3 parity).
   bool connecting = false;
-  // Set after a plaintext fallback has been attempted for the current
-  // URI; prevents infinite TLS-fail → plaintext-fail → TLS-retry loop.
-  bool attempted_plaintext_fallback = false;
-
-  // D8: BackendCapabilities the server advertised at connect (HelloResponse.
-  // backend). supports_file_hierarchy gates the additive '/'-prefix combo over
-  // the seqTable (the as-built adaptation of Plan D's unrenderable QTreeWidget);
-  // metadata_key_vocabulary seeds the keyCombo query-assist. For the flat S3-use-case
-  // corpus the server reports supports_file_hierarchy=false, so the prefix combo
-  // stays hidden and the dialog behaves exactly as before (default off).
-  bool supports_file_hierarchy = false;
-  std::vector<std::string> metadata_key_vocabulary;
 
   // D2: HelloResponse.capabilities.tag_edit_supported, latched from
   // serverCapabilitiesReady (see onServerCapabilitiesReady). false (the safe default,
@@ -78,18 +69,49 @@ struct DialogState {
   // gate is the authoritative enforcement point; this is UI-only.
   bool tag_edit_supported = false;
 
+  // Browse gate: the catalog is NEVER fetched unfiltered. One monotonic id per
+  // gate transition; every worker callback echoes it and stale echoes are
+  // dropped. Phase drives the pill.
+  std::optional<VocabularyInfo> vocabulary;
+  std::string gate_customer;  // selected NAMES (durable identity, persisted)
+  std::string gate_site;
+  std::uint64_t gate_request_seq = 0;   // last issued id
+  GatePhase gate_phase = GatePhase::kDisconnected;
+  std::string active_server_key;        // canonical key of the CONNECTED server
+
+  // Cached gate-combo item lists (see widget_data()'s gate-combo block): rebuilt
+  // ONLY in onVocabularyReady and the filter_customer/filter_customer_site
+  // onIndexChanged handlers -- never on a per-tick basis. widget_data() runs
+  // every host tick (~20-60Hz); at 50 customers x 20 sites, rebuilding these by
+  // rescanning the vocabulary (+ siteNamesFor's own scan) every tick was ~1000
+  // string copies + JSON encoding on 59 of every 60 ticks for nothing.
+  std::vector<std::string> gate_customer_items;
+  std::vector<std::string> gate_site_items;
+
+  // Cached pill-hint text (see widget_data()): gateHintText's kNeedsSelection
+  // branch does two std::to_string() calls + concatenation, and kNeedsSelection
+  // is the mandatory gate state the user often SITS in — recompute only when
+  // (phase, total_files, total_sites) actually changes, not on every tick.
+  struct GateHintCache {
+    bool valid = false;
+    GatePhase phase = GatePhase::kDisconnected;
+    std::uint64_t total_files = 0;
+    std::size_t total_sites = 0;
+    std::string text;
+  };
+  GateHintCache gate_hint_cache;
+
   // Discovery
   std::vector<SequenceRecord> sequences;
   std::vector<std::string> sequence_names;  // mirrors sequences[i].name (the real S3 key) for fast scan
   // DISPLAY-ONLY shortening for the seqTable Name column: the Hive `date=` path
   // segment is dropped (the table has a dedicated Date column). The real S3 key
   // in sequence_names stays the identity for every backend call; the PanelEngine
-  // harvests column-0 (display) text on selection, so display_to_key translates
-  // it back at the single re-entry point (onSelectionChanged). Collision-safe:
-  // any display that two keys share falls back to the full key (see
-  // rebuildSeqDisplayLocked). Parallel to sequence_names by index.
+  // harvests column-0 (display) text on selection, which onSelectionChanged
+  // resolves back to real S3 key(s) via seq_view_cache.row_to_keys (see below).
+  // Collision-safe: any display that two keys share falls back to the full key
+  // (see rebuildSeqDisplayLocked). Parallel to sequence_names by index.
   std::vector<std::string> seq_display_names;
-  std::unordered_map<std::string, std::string> display_to_key;
   // Bumped on every content/order change to `sequences` (populate + sort) so the
   // seqTable view cache below can detect staleness with a cheap counter compare.
   std::size_t seq_epoch = 0;
@@ -157,20 +179,12 @@ struct DialogState {
   // so selection is plural. seq_selected_rows is sorted ascending (highlight);
   // selected_sequences is the selected names. primary_sequence is the
   // single-selection-scoped handle (selected_sequences.front() when size>=1) for
-  // the paths that are intentionally single-sequence: Edit Tags, the
-  // single-sequence Info header, and persisted restore.
+  // the paths that are intentionally single-sequence: Edit Tags and the
+  // single-sequence Info header.
   std::vector<int> seq_selected_rows;
   std::vector<int> topic_selected_rows;
   std::vector<std::string> selected_sequences;
   std::string primary_sequence;
-
-  // PJ3 parity (main_window.cpp:1051-1052,1064-1065): the last sequence + topic
-  // selection is persisted and re-selected on the next connect. These hold the
-  // restored values until the matching sequence/topic list arrives; the
-  // restore-on-arrival is one-shot (cleared once consumed) so a later manual
-  // selection or re-fetch doesn't keep snapping back to the saved one.
-  std::string restore_selected_sequence;
-  std::vector<std::string> restore_selected_topics;
 
   // Global timestamp span across all sequences, used to seed the date-range
   // edits and the "All" preset. Computed when sequences load.
@@ -184,11 +198,8 @@ struct DialogState {
   int range_lower = 0;
   int range_upper = kSliderSteps;
 
-  // Sequence-level date filter: ISO-8601 strings driven by the
-  // date picker pair. Empty = no filter on that side.
-  std::string date_from_iso;
-  std::string date_to_iso;
-  // Latched epoch-ns of the picked range; recomputed on every change.
+  // Sequence-level date filter: epoch-ns of the picked range (from the date
+  // picker pair), recomputed on every change. 0/0 = unbounded ("All").
   std::int64_t date_from_ns = 0;
   std::int64_t date_to_ns = 0;
 
@@ -331,9 +342,6 @@ struct DialogState {
   // last-wins; unset_keys removes an override / masks an embedded tag.
   std::vector<std::pair<std::string, std::string>> staged_set_tags;
   std::vector<std::string> staged_unset_keys;
-  // True between an Edit-Tags open and the commit's listSequences refresh —
-  // keeps the table reflecting staged edits across ticks while open.
-  bool tag_dialog_open = false;
 
   // Staged credential edits from the cert sub-dialog. PanelEngine fires
   // onTextChanged for each text/checkable child after the user
@@ -400,20 +408,57 @@ class McapCloudDialog : public PJ::DialogPluginTyped {
   // settings view is bound, before the tick loop.
   void initFromSettings();
 
-  void onConnectFinished(bool ok, std::string status, std::string error);
-  // D8: latch the server's BackendCapabilities (hierarchy flag + query-assist
-  // vocabulary) into state_. Runs on the GUI thread (event-drained).
+  // `uri` is the URI ACTUALLY CONNECTED (captured at the connect() call site,
+  // not re-read from state_.uri — the editable field may have changed since
+  // the connect was issued; see beginGateRequestLocked's caller).
+  void onConnectFinished(bool ok, std::string uri, std::string status, std::string error);
+  // D8: the server's BackendCapabilities arrive here (GUI thread, event-
+  // drained). Neither field (supports_file_hierarchy, metadata_key_vocabulary)
+  // is latched into state_ today — see the .cpp definition for why.
   void onCapabilitiesReady(BackendCaps caps);
   // D2: latch the server's Capabilities (resume_supported/tag_edit_supported)
   // into state_ so getWidgetData()'s buttonEditTags gate can see it. Runs on
   // the GUI thread (event-drained), same as onCapabilitiesReady above.
   void onServerCapabilitiesReady(ServerCaps caps);
   void onSequencesReady(std::vector<SequenceInfo> sequences);
-  // Progressive discovery (PJ3 parity): populate the table from the initial
-  // list as soon as it arrives, then fill each row's Date/Size as the server
-  // streams per-sequence detail (onSequenceInfoReady), before the final list.
-  void onSequenceListStarted(std::vector<SequenceInfo> sequences);
-  void onSequenceInfoReady(SequenceInfo sequence);
+
+  // ---- Browse gate (customer/site) — GatePhase state machine -------------
+  // EVERY gate transition funnels through this: it drops all site-scoped
+  // state (rows, selection, topics, date filter) so nothing from the
+  // previous site can leak into (or mask) the next one, then issues a fresh
+  // monotonic request id and supersedes any in-flight worker sweep. Caller
+  // MUST hold state_.mu.
+  [[nodiscard]] std::uint64_t beginGateRequestLocked(GatePhase next_phase);
+  // True when `request_id` is not the CURRENT gate transition (a newer
+  // beginGateRequestLocked()/supersedeGateRequests() call already moved on), so
+  // any worker answer carrying this id is stale and must be dropped. Single
+  // source of truth for the drop check + comment repeated across the 4 gate-
+  // result handlers below. Caller MUST hold state_.mu.
+  [[nodiscard]] bool gateRequestStaleLocked(std::uint64_t request_id) const;
+  // Rebuild gate_customer_items / gate_site_items from the current
+  // state_.vocabulary + state_.gate_customer. Called only where those inputs
+  // actually change (onVocabularyReady; the filter_customer/filter_customer_site
+  // onIndexChanged handlers) — widget_data() reads the cached result instead of
+  // rebuilding it every tick. Caller MUST hold state_.mu.
+  void refreshGateComboItemsLocked();
+  // Vocabulary arrived (the gate's data source). Drops a stale id. When
+  // `recovery` is true this came from INSIDE a filtered-list stale-recovery
+  // retry (the worker owns that retry) — only combos refresh, never a new
+  // sweep. Otherwise resolves/auto-selects customer+site and either starts a
+  // gated sweep or lands on kNeedsSelection/kEmptyCatalog.
+  void onVocabularyReady(std::uint64_t request_id, VocabularyInfo vocab, bool recovery);
+  // GetVocabulary failed on a live connection: phase -> kVocabularyError.
+  void onVocabularyFailed(std::uint64_t request_id);
+  // One ListFiles page, mid-sweep: append into progressive_seqs_ (or clear it
+  // first when reset — first page, or a stale-catalog restart) and repopulate
+  // the table so the browse renders in ~150 ms instead of after the full ~8 s
+  // sweep, gated on the request id instead of always accepted. The final
+  // onGateListFinished stays authoritative (dates, reselect).
+  void onGatePageReady(std::uint64_t request_id, std::vector<SequenceInfo> page, bool reset);
+  // Terminal result of one gated list sweep. May arrive WITHOUT a preceding
+  // dialog-initiated transition (the tag-edit re-list reuses the stored gate
+  // id) — gating is by request_id alone, never by an assumed prior phase.
+  void onGateListFinished(FetchWorker::GateListResult result);
   void onTopicsReady(std::string sequence_name, std::vector<std::string> topic_names);
   void onTopicInfosReady(std::string sequence_name, std::vector<TopicInfo> topics);
   // Failure twin of onTopicInfosReady: records the error WITHOUT caching (so
@@ -481,9 +526,9 @@ class McapCloudDialog : public PJ::DialogPluginTyped {
   // picker is reseeded to the dataset's full [min,max] span (final result
   // only — the progressive early populate leaves the picker untouched).
   void populateSequencesLocked(std::vector<SequenceInfo>& sequences, bool seed_dates);
-  // Recompute seq_display_names + display_to_key from sequence_names. Call after
-  // any rebuild of sequence_names (populate + sort). Collision-safe: a display
-  // shared by two distinct keys falls back to the full key for those rows.
+  // Recompute seq_display_names from sequence_names. Call after any rebuild of
+  // sequence_names (populate + sort). Collision-safe: a display shared by two
+  // distinct keys falls back to the full key for those rows.
   void rebuildSeqDisplayLocked();
 
   // Re-order the sequence / topic row models per the current sort column+order
@@ -506,18 +551,32 @@ class McapCloudDialog : public PJ::DialogPluginTyped {
   // sequence has a cache entry. Caller MUST hold state_.mu.
   void recomputeTopicUnionLocked();
 
-  // Re-apply the persisted topic selection (restore_selected_topics) onto the
-  // freshly-listed topic rows of the restored sequence. One-shot: clears the
-  // restore slot once consumed. Returns the restored topic names that still need
-  // an on-demand metadata fetch (Info panel) — the caller posts those after
-  // releasing the lock. Caller MUST hold state_.mu.
-  std::vector<std::string> restoreSelectedTopicsLocked();
-
   // Persist the Lua query + slider proportions to settings (PJ3 parity:
   // restored next time the panel opens). Caller must NOT hold state_.mu.
   void persistState();
 
   DialogState state_;
+
+  // Pages accumulated across one in-flight catalog sweep (onGatePageReady).
+  // GUI-thread only: written exclusively inside postEvent lambdas drained by
+  // onTick, so no lock; cleared on reset and again when the authoritative
+  // onSequencesReady lands (which re-populates from its own complete vector).
+  std::vector<SequenceInfo> progressive_seqs_;
+  // Throttle stopgap for onGatePageReady (2026-07-26): populateSequencesLocked
+  // + sortSequencesLocked() together are O(n^2 log n) over one sweep (a full
+  // rebuild of `sequences` from `progressive_seqs_`, deep-copying every
+  // SequenceRecord, then a full re-sort) — at 500 rows/page and a 14,480-row
+  // site (29 pages) that is ~217,500 deep row copies instead of ~14,500 (~15x)
+  // and ~2.6M sort ops instead of ~200k (~13x), all on the GUI thread, and it
+  // gets WORSE as the sweep progresses (more accumulated rows each page). Pages
+  // still ALWAYS accumulate into progressive_seqs_; only the populate+sort is
+  // throttled to at most once per 150 ms (see onGatePageReady) — the rows
+  // aren't lost, they render on the next qualifying page, and the final
+  // authoritative render always happens via onGateListFinished/onSequencesReady
+  // regardless of whether the last progressive page rendered. GUI-thread only,
+  // same as progressive_seqs_ above (no lock needed).
+  std::chrono::steady_clock::time_point last_progressive_render_{};
+
   std::thread worker_thread_;
   std::unique_ptr<FetchWorker> worker_;
   std::mutex cmd_mu_;

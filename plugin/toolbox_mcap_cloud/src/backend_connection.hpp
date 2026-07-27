@@ -45,6 +45,17 @@ class Hello;
 
 namespace mcap_cloud {
 
+// Page size requested for every ListFiles page.
+//
+// Leaving ListFilesRequest.limit unset takes the server's 200 default, which on
+// a 25,550-file catalog is 128 strictly-serial round trips. Measured against a
+// remote server (RTT ~37 ms) the sweep behaves as `pages * RTT + rows * 0.18 ms`:
+// 200 -> 10.6 s, 500 -> 7.8 s, 1000 -> 8.1 s. 500 is the measured optimum —
+// 1000 removes 26 more round trips but its per-page latency tail degrades
+// (mean 323 ms vs p50 233 ms) and gives the time back. The server clamps
+// anything above 1000.
+inline constexpr std::uint32_t kListFilesPageLimit = 500;
+
 // Defined in session_decode.hpp; only a reference to it appears in this header
 // (the MessageHandler typedef), so a forward declaration suffices.
 struct DecodedMessage;
@@ -97,7 +108,42 @@ class BackendConnection {
   // with the partial snapshot (the last COMPLETE index is retained), so a
   // dropped page can't silently shrink the browse index; the caller decides
   // whether to surface the partial vector or discard it.
-  [[nodiscard]] std::vector<SequenceInfo> listSequences(bool* complete = nullptr);
+  // Called once per ListFiles page, on the calling thread, BEFORE the sweep
+  // finishes — so a browse UI can draw page one (~110 ms) instead of waiting for
+  // the whole listing (~8 s over 25k files).
+  //
+  // `reset` is true for the first page of an attempt. It is NOT merely "page
+  // one": an ERROR_STALE_CATALOG (a builder rebuild racing the pagination) makes
+  // the client discard every page it already delivered and restart on the new
+  // generation, and the consumer is told by a SECOND reset. Treat it as "drop
+  // everything shown so far", or a rebuild mid-browse duplicates rows.
+  using PageCallback = std::function<void(const std::vector<SequenceInfo>& page, bool reset)>;
+
+  // `filter` (optional): a server-side dimension filter (customer_id/site_id)
+  // bound to a VocabularyInfo generation. A FILTERED request that hits
+  // ERROR_STALE_CATALOG ABORTS immediately (*stale_vocabulary = true, empty
+  // result) rather than retrying — its dimension ids belong to a dead
+  // generation, and a blind retry could silently select a renumbered WRONG
+  // site. The caller must re-fetch the vocabulary and re-resolve names to ids.
+  // An UNFILTERED request keeps the existing bounded-restart behaviour.
+  //
+  // `stale_vocabulary` (optional out): set true only on the filtered-abort
+  // path above; always cleared to false on entry.
+  //
+  // `abort` (optional): polled at the top of every page iteration (including
+  // the first). When it returns true the sweep stops immediately and returns
+  // whatever has been accumulated so far, with *complete left false (a
+  // superseded sweep — e.g. the user changed the filter mid-listing).
+  [[nodiscard]] std::vector<SequenceInfo> listSequences(bool* complete = nullptr,
+                                                        const PageCallback& on_page = {},
+                                                        const ListFilter* filter = nullptr,
+                                                        bool* stale_vocabulary = nullptr,
+                                                        const std::function<bool()>& abort = {});
+
+  // GetVocabulary RPC: the customer->site filter tree + the generation its ids
+  // are bound to. nullopt on timeout / dead socket / server Error. ids are ONLY
+  // valid together with result.generation — echo both, never cache ids alone.
+  [[nodiscard]] std::optional<VocabularyInfo> getVocabulary();
 
   // GetFile RPC for the file backing `sequence_name`, addressed by s3_key
   // (sequence_name is sent verbatim as s3_key — see the key-addressing note

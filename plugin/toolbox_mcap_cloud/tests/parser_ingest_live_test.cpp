@@ -72,7 +72,7 @@ class LiveWorker {
   bool connect(const std::string& url) {
     bool done = false;
     bool ok = false;
-    worker_.connectFinished = [&](bool success, std::string, std::string err) {
+    worker_.connectFinished = [&](bool success, std::string, std::string, std::string err) {
       ok = success;
       if (!success) {
         last_error_ = std::move(err);

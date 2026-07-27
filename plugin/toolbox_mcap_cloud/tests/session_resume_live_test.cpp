@@ -190,7 +190,7 @@ TEST(McapCloudSessionResumeLive, RepeatFetchIsCacheHitZeroTransport) {
 
   bool connected = false;
   std::string connect_err;
-  worker.connectFinished = [&](bool ok, std::string, std::string err) {
+  worker.connectFinished = [&](bool ok, std::string, std::string, std::string err) {
     connected = ok;
     if (!ok) {
       connect_err = std::move(err);
@@ -198,10 +198,15 @@ TEST(McapCloudSessionResumeLive, RepeatFetchIsCacheHitZeroTransport) {
   };
   worker.connectAsync(url, "", "", false);
   ASSERT_TRUE(connected) << "connect failed: " << connect_err;
-  // The cache key resolves file_ids from the BROWSE backend's index — populate it
-  // (mirrors the GUI: the user browses before fetching). Without this the key
-  // cannot be computed and the fetch is a documented MISS (never a wrong HIT).
-  worker.listSequencesAsync();
+  // Browse once first, mirroring the GUI (connect -> gated browse -> fetch).
+  // Post-M6 the SessionCache key is name-based (sequence_names, never a
+  // wire-resolved file_id — see session_key.hpp / fetch_worker.cpp's
+  // pullTopicsAsync), so this isn't required for the cache lookup below; it
+  // exercises the real gated list path the dialog always uses before a pull.
+  // request_id 0 matches FetchWorker's default latest_gate_request_, so this
+  // standalone call is never treated as superseded. customer/site match the
+  // fixture's pinned Hive path (kSeq above).
+  worker.listSequencesFilteredAsync(0, "test", "lab");
 
   const std::vector<std::string> topics = allTopics();
 

@@ -13,8 +13,13 @@
 // query filter comes from ListFilesResponse.metadata[file_id], keyed by the
 // file id rendered as a DECIMAL STRING, copied verbatim (NO transform) into
 // SequenceInfo.user_metadata. SequenceInfo.name is the human-readable s3_key
-// (the MCAP filename) so the table shows filenames, not numeric ids; the caller
-// keeps the name->file_id map for later GetFile / OpenSession calls.
+// (the MCAP filename) so the table shows filenames, not numeric ids. Wire v2
+// is key-addressed: GetFile / UpdateTags address the file by this SAME s3_key
+// verbatim, and OpenFresh sessions are opened by s3_keys[] directly — none of
+// them depend on a file_id. BackendConnection still keeps a name->file_id
+// index built from the last listSequences() as a harmless best-effort
+// fallback (the server ignores it whenever s3_key is present), since file ids
+// renumber across builder rebuilds and are never a stable identity.
 #pragma once
 
 #include <cstdint>
@@ -59,5 +64,10 @@ struct MappedSequence {
 
 // Map the topics of a GetFileResponse into a TopicInfo vector (preserving order).
 [[nodiscard]] std::vector<TopicInfo> mapGetFileResponseTopics(const pj_cloud::v1::GetFileResponse& response);
+
+// Map a GetVocabularyResponse (the customer->site filter tree) onto
+// VocabularyInfo, preserving order. catalog_generation carries the opaque
+// generation the customer/site ids are bound to (see backend_types.hpp).
+[[nodiscard]] VocabularyInfo mapGetVocabularyResponse(const pj_cloud::v1::GetVocabularyResponse& response);
 
 }  // namespace mcap_cloud

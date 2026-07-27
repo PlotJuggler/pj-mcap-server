@@ -11,7 +11,6 @@
 #include <pj_base/sdk/plugin_data_api.hpp>
 #include <pj_base/sdk/toolbox_plugin_base.hpp>
 #include <string>
-#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -22,8 +21,9 @@
 namespace mcap_cloud {
 
 /// Thin background adapter for the cloud backend, running on the dialog's worker
-/// thread. The worker itself is transport-agnostic: callers serialize commands
-/// and route callbacks to the GUI thread.
+/// thread. It owns the concrete ixwebsocket+Protobuf BackendConnection(s) (the
+/// catalog-browse socket plus one fresh session connection per pull); callers
+/// serialize commands onto this thread and route callbacks back to the GUI thread.
 ///
 /// TOOLBOX shape (Slice 5/16): the worker owns BOTH the catalog browse path
 /// (connect / listSequences / listTopics / getTopicMetadata) AND the in-dialog
@@ -75,18 +75,8 @@ class FetchWorker {
     return cancel_flag_.load(std::memory_order_relaxed);
   }
 
-  /// Cache topic infos from the most recent listTopicsAsync so per-topic
-  /// metadata can be looked up later without another round trip. Keyed by
-  /// topic_name.
-  void setTopicInfoCache(std::unordered_map<std::string, TopicInfo> by_name) {
-    topic_info_by_name_ = std::move(by_name);
-  }
-
   /// Connect (or reconnect) to the given URI. Calls connectFinished on completion.
   void connectAsync(std::string uri, std::string cert_path, std::string api_key, bool allow_insecure);
-
-  /// List all sequences from the connected server.
-  void listSequencesAsync();
 
   /// List topics for a given sequence (partial metadata).
   void listTopicsAsync(std::string sequence_name);
@@ -133,7 +123,11 @@ class FetchWorker {
   void pullTopicsAsync(std::vector<std::string> sequence_names, std::string group_name,
                        std::vector<std::string> topic_names, std::int64_t start_ns, std::int64_t end_ns);
 
-  std::function<void(bool ok, std::string status, std::string error)> connectFinished;
+  // `uri` echoes the EXACT uri this connectAsync() call was invoked with (not
+  // re-read from any mutable dialog state), so a caller that may have edited
+  // its own editable URI field since issuing the connect can still learn which
+  // server this result is actually about.
+  std::function<void(bool ok, std::string uri, std::string status, std::string error)> connectFinished;
   /// D8: the BackendCapabilities (HelloResponse.backend) the server advertised,
   /// emitted once on a successful connect BEFORE connectFinished so the dialog
   /// can drive additive UI (the '/'-prefix hierarchy combo + the query-assist
@@ -152,17 +146,8 @@ class FetchWorker {
   /// conservative default for an ancient/odd server too).
   std::function<void(ServerCaps caps)> serverCapabilitiesReady;
   /// Full SequenceInfo entries, including user_metadata (used by the Lua
-  /// metadata filter). The name-only callback is kept
-  /// for code paths that only want names.
+  /// metadata filter).
   std::function<void(std::vector<SequenceInfo> sequences)> sequencesReady;
-  std::function<void(std::vector<std::string> names)> sequenceNamesReady;
-  // Progressive discovery (PJ3 parity): the initial list, so the table can
-  // populate before per-sequence detail finishes streaming in...
-  std::function<void(std::vector<SequenceInfo> sequences)> sequenceListStarted;
-  // ...and one callback per sequence as the server fills in its detail
-  // (min/max timestamp, size, metadata), so Date/Size columns populate
-  // incrementally rather than snapping in all at once.
-  std::function<void(SequenceInfo sequence)> sequenceInfoReady;
   std::function<void(std::string sequence_name, std::vector<std::string> topic_names)> topicsReady;
   /// Full TopicInfo list from listTopics (name + size + timestamp range +
   /// created/locked/chunks). Schema/ontology/user_metadata are NOT populated
@@ -230,6 +215,52 @@ class FetchWorker {
   void notifyConnectionLostOnce();
   bool connection_lost_notified_ = false;
 
+ public:
+  /// Terminal result of ONE gated (filtered) list request. Exactly one is
+  /// emitted per listSequencesFilteredAsync call that is not superseded before
+  /// starting. `error != kNone` explains why the result isn't authoritative
+  /// (the dialog must NOT render "no recordings" for anything but a genuinely
+  /// complete, error==kNone, result).
+  struct GateListResult {
+    std::uint64_t request_id = 0;
+    enum class Error { kNone, kPartial, kConnectionLost, kSelectionGone, kRebuildStorm, kSuperseded };
+    Error error = Error::kNone;
+    std::vector<SequenceInfo> sequences;
+  };
+
+  /// Vocabulary result. request_id is echoed (uniformly with vocabularyFailed/
+  /// gatePageReady/gateListFinished) so the dialog can drop a stale answer by
+  /// simple id comparison, with no special case for this callback.
+  /// recovery=true when this refresh was triggered from INSIDE a
+  /// filtered-list stale recovery — the dialog must then only refresh combos,
+  /// never auto-start another sweep (the recovery owns the retry).
+  std::function<void(std::uint64_t request_id, VocabularyInfo vocab, bool recovery)> vocabularyReady;
+  /// GetVocabulary failed on a live connection (the kVocabularyError phase).
+  std::function<void(std::uint64_t request_id)> vocabularyFailed;
+  /// One page of a gated sweep; reset semantics as in BackendConnection.
+  std::function<void(std::uint64_t request_id, std::vector<SequenceInfo> page, bool reset)>
+      gatePageReady;
+  std::function<void(GateListResult result)> gateListFinished;
+
+  /// Fetch the vocabulary (the gate's data source). request_id is echoed to
+  /// vocabularyReady/vocabularyFailed so the dialog can ignore stale answers.
+  void fetchVocabularyAsync(std::uint64_t request_id);
+  /// List ONE site server-filtered, resolving (customer, site) NAMES against
+  /// the worker's latest vocabulary; supersedable by a later gate request id.
+  void listSequencesFilteredAsync(std::uint64_t request_id, std::string customer, std::string site);
+  /// Called from the GUI thread when a NEW gate request id is issued, so an
+  /// in-flight sweep aborts promptly (atomic; safe cross-thread).
+  void supersedeGateRequests(std::uint64_t latest) { latest_gate_request_.store(latest); }
+
+ private:
+  // ---- gate (customer/site filtered browse) state, worker-thread only, plus
+  // the one cross-thread atomic (see supersedeGateRequests above) ------------
+  std::optional<VocabularyInfo> vocab_;
+  std::atomic<std::uint64_t> latest_gate_request_{0};
+  std::string last_gate_customer_;
+  std::string last_gate_site_;
+  std::uint64_t last_gate_request_id_ = 0;  // worker-thread only: the id last_gate_customer_/site_ were requested under
+
   std::unique_ptr<BackendConnection> backend_;  // catalog-browse socket
   // Credentials remembered from the last successful connectAsync, so a pull can
   // open its OWN fresh session connection (isolated from the browse socket; a
@@ -241,7 +272,6 @@ class FetchWorker {
   std::function<PJ::sdk::ToolboxHostView()> host_provider_;
   std::function<PJ::ToolboxRuntimeHostView()> runtime_host_provider_;
   std::atomic<bool> cancel_flag_{false};
-  std::unordered_map<std::string, TopicInfo> topic_info_by_name_;
 
   std::optional<PJ::sdk::DataSourceHandle> fetch_dataset_;
   std::mutex fetch_dataset_mu_;
