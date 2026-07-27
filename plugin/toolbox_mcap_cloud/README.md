@@ -37,11 +37,13 @@ made the browse table sit blank for a long time. Instead:
 - On connect the plugin fetches only the **filter vocabulary**
   (`GetVocabulary`): a customer -> site tree with a per-node file count and a
   catalog generation. Nothing else loads yet.
-- A permanent **gate row** (customer combo + site combo) sits above the
-  filter panes and stays visible in both **Basic** and **Advanced** modes. The
-  customer combo auto-selects when the vocabulary has exactly one customer;
-  otherwise the user must pick one. No recordings load until a customer AND a
-  site are both chosen.
+- The **Customer** and **Site** combos are the first two rows of the Basic
+  filter grid (above Robot/Source, sharing their column alignment), and they
+  stay visible in **Advanced** mode too — only the Robot/Source rows hide with
+  the mode swap, so the mandatory gate is always reachable. The customer combo
+  auto-selects when the vocabulary has exactly one customer; otherwise the user
+  must pick one. No recordings load until a customer AND a site are both
+  chosen.
 - Picking a site issues a **server-filtered** `ListFiles` request
   (`FileFilter.customer_id`/`site_id`, with the vocabulary's generation echoed
   on the first page) and renders it **progressively** -- the table fills in
