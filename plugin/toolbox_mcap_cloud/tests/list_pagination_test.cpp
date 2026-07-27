@@ -26,10 +26,7 @@
 
 #include <gtest/gtest.h>
 
-#include <arpa/inet.h>
-#include <netinet/in.h>
-#include <sys/socket.h>
-#include <unistd.h>
+#include "find_free_port.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -47,19 +44,7 @@
 
 namespace {
 
-int findFreePort() {
-  const int probe = ::socket(AF_INET, SOCK_STREAM, 0);
-  sockaddr_in addr{};
-  addr.sin_family = AF_INET;
-  addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-  addr.sin_port = 0;
-  ::bind(probe, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
-  socklen_t len = sizeof(addr);
-  ::getsockname(probe, reinterpret_cast<sockaddr*>(&addr), &len);
-  const int port = ntohs(addr.sin_port);
-  ::close(probe);
-  return port;
-}
+using mcap_cloud_test::findFreePort;
 
 // Serves `total_rows` files in pages of whatever limit the client asks for
 // (clamped like the real server), records every requested limit, and can inject

@@ -714,6 +714,7 @@ if(BUILD_TESTING)
   # shape as server_caps_test below.
   add_executable(toolbox_mcap_cloud_list_pagination_test
     tests/list_pagination_test.cpp
+    tests/find_free_port.cpp
     src/backend_connection.cpp
     src/wire_mapping.cpp
     src/session_decode.cpp
@@ -730,6 +731,7 @@ if(BUILD_TESTING)
 
   add_executable(toolbox_mcap_cloud_server_caps_test
     tests/server_caps_test.cpp
+    tests/find_free_port.cpp
     src/backend_connection.cpp
     src/wire_mapping.cpp
     src/session_decode.cpp
