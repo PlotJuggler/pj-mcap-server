@@ -3,6 +3,7 @@ package catalog
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"sort"
 )
 
@@ -101,6 +102,11 @@ func BackendCaps(ctx context.Context, s *Store) (vocab []string, hierarchy bool,
 	lease := s.Acquire() // one snapshot for both queries (and drain-then-close)
 	defer lease.Release()
 	db := lease.DB()
+	if db == nil {
+		// Degraded start: no catalog yet. The Hello handler already treats a
+		// BackendCaps error as non-fatal and falls back to the derived-key floor.
+		return nil, false, errors.New("catalog not yet available (first build in progress)")
+	}
 	vocab, err = distinctMetadataKeysDB(ctx, db)
 	if err != nil {
 		return nil, false, err

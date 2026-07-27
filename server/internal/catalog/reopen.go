@@ -2,6 +2,8 @@ package catalog
 
 import (
 	"context"
+	"errors"
+	"io/fs"
 )
 
 // ReopenIfSwapped implements the READER side of "atomic catalog publish +
@@ -44,12 +46,18 @@ func (s *Store) ReopenIfSwapped(ctx context.Context) (swapped bool, err error) {
 	s.reopenMu.Lock()
 	defer s.reopenMu.Unlock()
 
-	cur := s.identitySnapshot()
+	cur, hasCur := s.identitySnapshot()
 	stat, statErr := statIdentity(s.dbPath)
 	if statErr != nil {
+		if !hasCur && errors.Is(statErr, fs.ErrNotExist) {
+			// Degraded start (NewAwaiting) and the builder has not published its
+			// first catalog yet: an absent file is the EXPECTED state, not an
+			// error — stay quiet until it appears.
+			return false, nil
+		}
 		return false, statErr
 	}
-	if cur == stat {
+	if hasCur && cur == stat {
 		return false, nil
 	}
 

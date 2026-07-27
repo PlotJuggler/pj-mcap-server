@@ -125,19 +125,29 @@ type Snapshot struct {
 	released atomic.Bool
 }
 
-// DB returns the leased generation's handle. Valid until Release.
-func (l *Snapshot) DB() *sql.DB { return l.sn.db }
+// DB returns the leased generation's handle, or nil when the lease was taken
+// from a store with no catalog yet (degraded start — callers gate on
+// Store.Ready() before doing real reads). Valid until Release.
+func (l *Snapshot) DB() *sql.DB {
+	if l.sn == nil {
+		return nil
+	}
+	return l.sn.db
+}
 
 // Generation returns the leased generation's opaque token (a copy; callers may
-// retain it).
+// retain it), or nil when no catalog is open yet.
 func (l *Snapshot) Generation() []byte {
+	if l.sn == nil {
+		return nil
+	}
 	return append([]byte(nil), l.sn.gen...)
 }
 
 // Release drops the lease. Idempotent; after the last lease on a retired
 // generation releases, its db handle is closed.
 func (l *Snapshot) Release() {
-	if l.released.Swap(true) {
+	if l.released.Swap(true) || l.sn == nil {
 		return
 	}
 	l.sn.release()
@@ -150,11 +160,11 @@ func (l *Snapshot) Release() {
 func (s *Store) Acquire() *Snapshot {
 	s.mu.Lock()
 	sn := s.cur
-	if s.closed {
-		// Shutting down: do NOT resurrect a possibly-zero-ref snapshot. Hand back
-		// a pre-released lease over the (closed) handle — DB() then yields the
-		// closed *sql.DB and the caller's query fails cleanly, the accepted
-		// shutdown transient. No refcount is touched.
+	if s.closed || sn == nil {
+		// Shutting down, or degraded start with no catalog published yet: do NOT
+		// resurrect a possibly-zero-ref snapshot. Hand back a pre-released lease —
+		// DB() then yields the closed handle (shutdown) or nil (awaiting) and the
+		// caller fails cleanly. No refcount is touched.
 		s.mu.Unlock()
 		l := &Snapshot{sn: sn}
 		l.released.Store(true)
@@ -165,14 +175,26 @@ func (s *Store) Acquire() *Snapshot {
 	return &Snapshot{sn: sn}
 }
 
+// Ready reports whether a catalog generation is currently being served. It is
+// false only for a degraded-start store whose first catalog has not been
+// published yet (NewAwaiting), or after Close. Once true it stays true for the
+// store's lifetime (swaps replace the snapshot, never remove it).
+func (s *Store) Ready() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.cur != nil && !s.closed
+}
+
 // Generation returns the CURRENT generation token (a copy). For a token that is
 // guaranteed consistent with the queries of a multi-query request, use
 // Acquire and read both from the lease instead.
 func (s *Store) Generation() []byte {
 	s.mu.Lock()
-	gen := append([]byte(nil), s.cur.gen...)
-	s.mu.Unlock()
-	return gen
+	defer s.mu.Unlock()
+	if s.cur == nil {
+		return nil
+	}
+	return append([]byte(nil), s.cur.gen...)
 }
 
 // DB returns the current *sql.DB for SINGLE-SHOT queries. Callers must not hold
@@ -180,17 +202,27 @@ func (s *Store) Generation() []byte {
 // re-call DB(), or better, Acquire a Snapshot for multi-query reads).
 func (s *Store) DB() *sql.DB {
 	s.mu.Lock()
-	db := s.cur.db
-	s.mu.Unlock()
-	return db
+	defer s.mu.Unlock()
+	if s.cur == nil {
+		return nil
+	}
+	return s.cur.db
 }
 
-// identitySnapshot returns the current snapshot's verified (dev,inode).
-func (s *Store) identitySnapshot() fileIdentity {
+// DBPath returns the served catalog path this Store watches (set at
+// construction, immutable). Consumers derive sidecar paths from it (e.g. the
+// dashboard's degraded page locating <db>.status.json).
+func (s *Store) DBPath() string { return s.dbPath }
+
+// identitySnapshot returns the current snapshot's verified (dev,inode); ok is
+// false when no catalog has been opened yet (degraded start).
+func (s *Store) identitySnapshot() (fileIdentity, bool) {
 	s.mu.Lock()
-	ident := s.cur.ident
-	s.mu.Unlock()
-	return ident
+	defer s.mu.Unlock()
+	if s.cur == nil {
+		return fileIdentity{}, false
+	}
+	return s.cur.ident, true
 }
 
 // Close retires the current snapshot. Idempotent: a second Close (a shutdown
