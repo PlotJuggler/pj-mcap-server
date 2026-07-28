@@ -542,6 +542,10 @@ Explicitly **not** built (v2 components dissolved or #470-supplied): `<replay_so
 1. **Plugin foundations** *(no host dependency, each shippable)* — descriptor module + vectors;
    cancel predicate; credential origin binding + trusted-origin ledger; cache manager
    (re-targeting the PR #4 writer via the §9.0 seams).
+   *(LANDED 2026-07-28, branch `feat/layout-replay-foundations`: sha256 `6954fdf`,
+   descriptor+vectors `2a7e7df`, cancel fix `18e4d0b`, origin binding `6ce0eda`,
+   trusted-origin ledger `a706fc9`, §9.0 writer seams `ecdfb47`, cache core `b3c02ad`;
+   the tee re-target consuming the cache stays stage 4.)*
 2. **Plugin adopts the #470 progress surface** (#470 is merged; this is its still-missing live
    verification) — progressive eager ingest becomes host-visible, the precondition for both
    authoring UX and replay-job binding.

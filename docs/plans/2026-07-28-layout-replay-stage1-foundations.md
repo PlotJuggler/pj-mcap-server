@@ -538,14 +538,14 @@ Touch stamps: sidecar `<name>.touch` files updated on `lookup` hit and `finalize
 
 ### Task 8: Wrap-up
 
-- [ ] **Step 8.1:** Full build + `ctest` (all targets) + `git diff --check`.
-- [ ] **Step 8.2:** Run `make smoke` from the repo ROOT of this worktree (server + plugin
+- [x] **Step 8.1:** Full build + `ctest` (all targets) + `git diff --check`.
+- [x] **Step 8.2:** Run `make smoke` from the repo ROOT of this worktree (server + plugin
   legs; needs the builder venv — see repo CLAUDE.md). Expected `SMOKE PASS`.
-- [ ] **Step 8.3:** Update `docs/canonical-layout-replay.md` §13 stage-1 line: mark the
+- [x] **Step 8.3:** Update `docs/canonical-layout-replay.md` §13 stage-1 line: mark the
   landed items (descriptor+vectors, cancel fix, origin binding, ledger, writer seams,
   cache core) as done-with-commit-hashes. Commit —
   `docs(layout-replay): stage 1 foundations landed`.
-- [ ] **Step 8.4:** Push branch, open PR titled
+- [x] **Step 8.4:** Push branch, open PR titled
   `feat(replay): stage-1 foundations — descriptor, trust, cancel fix, cache core`,
   body: summary + spec reference + test counts; note that Codex review is required
   before merge (team rule).
