@@ -68,7 +68,7 @@ namespace mcap_cloud {
 }  // namespace mcap_cloud
 ```
 
-- [ ] **Step 1.1: Write the failing test** — `tests/sha256_test.cpp` with the FIPS/NIST
+- [x] **Step 1.1: Write the failing test** — `tests/sha256_test.cpp` with the FIPS/NIST
   vectors (these exact strings and digests):
 
 ```cpp
@@ -107,15 +107,15 @@ TEST(Sha256, HexPrefix) {
 }
 ```
 
-- [ ] **Step 1.2: Register the test target in CMakeLists.txt, run it, verify it FAILS to
+- [x] **Step 1.2: Register the test target in CMakeLists.txt, run it, verify it FAILS to
   compile** (`sha256.h` missing). Run:
   `cmake -B build ... && cmake --build build --target toolbox_mcap_cloud_sha256_test`
-- [ ] **Step 1.3: Implement `src/core/sha256.cpp`** — straightforward FIPS 180-4: message
+- [x] **Step 1.3: Implement `src/core/sha256.cpp`** — straightforward FIPS 180-4: message
   schedule W[64], the standard K constants table, init vector H0..H7, 512-bit block loop,
   length padding. ~120 lines. No heap, no endian assumptions (assemble words with shifts).
-- [ ] **Step 1.4: Build + run:**
+- [x] **Step 1.4: Build + run:**
   `ctest --test-dir build -R McapCloudSha256Test --output-on-failure` → 2 tests PASS.
-- [ ] **Step 1.5: Commit** — `feat(replay): vendor FIPS 180-4 sha256 (digest foundation)`
+- [x] **Step 1.5: Commit** — `feat(replay): vendor FIPS 180-4 sha256 (digest foundation)`
 
 ---
 

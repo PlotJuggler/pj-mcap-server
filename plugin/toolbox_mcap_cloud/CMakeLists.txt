@@ -524,6 +524,23 @@ if(BUILD_TESTING)
   )
   add_test(NAME McapCloudMcapSavePathTest COMMAND toolbox_mcap_cloud_mcap_save_path_test)
 
+  # Vendored FIPS 180-4 SHA-256 (hermetic, std-only): the replay-descriptor
+  # digest foundation. Pinned to the NIST vectors incl. the one-million-'a'
+  # block-boundary case; no crypto dependency (mbedtls is only a transitive
+  # detail of ixwebsocket and deliberately NOT linked).
+  add_executable(toolbox_mcap_cloud_sha256_test
+    tests/sha256_test.cpp
+    src/core/sha256.cpp
+  )
+  target_compile_features(toolbox_mcap_cloud_sha256_test PRIVATE cxx_std_20)
+  target_include_directories(toolbox_mcap_cloud_sha256_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+  )
+  target_link_libraries(toolbox_mcap_cloud_sha256_test PRIVATE
+    GTest::gtest_main
+  )
+  add_test(NAME McapCloudSha256Test COMMAND toolbox_mcap_cloud_sha256_test)
+
   # Shared GUI/CLI MCAP writer round trip (hermetic): schemas, channels,
   # timestamps, payloads, per-channel sequence, chunking and Zstd. Uses the
   # test-only reader+writer implementation TU (product targets are writer-only).
