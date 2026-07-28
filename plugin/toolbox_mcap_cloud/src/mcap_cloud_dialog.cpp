@@ -597,8 +597,8 @@ void McapCloudDialog::initFromSettings() {
   state_.aggregate = settings.getBool("mcap_cloud/aggregate", false);
   state_.topics_all = settings.getBool("mcap_cloud/topics_all", false);
   state_.filter_tab = std::clamp(settings.getInt("mcap_cloud/filter_tab", 0), 0, 1);
-  state_.save_mcap = settings.getBool("mcap_cloud/save_mcap", true);
-  state_.save_directory = settings.getString("mcap_cloud/save_directory");
+  state_.save_mcap = settings.getBool("mcap_cloud/export_mcap", false);
+  state_.save_directory = settings.getString("mcap_cloud/export_directory");
   if (state_.save_directory.empty()) {
     state_.save_directory = defaultMcapSaveDirectory();
   }
@@ -2961,10 +2961,18 @@ void McapCloudDialog::onPullFinished(
 void McapCloudDialog::onMcapSaveFinished(McapSaveResult result) {
   {
     std::lock_guard<std::mutex> lock(state_.mu);
-    state_.mcap_save_failed = result.status != McapSaveStatus::Complete;
+    // Skipped never latches: the export produced nothing because the pull
+    // itself aborted, and the pull's own failure reporting keeps the panel
+    // open — an extra latch would only echo it.
+    state_.mcap_save_failed = result.status != McapSaveStatus::Complete &&
+                              result.status != McapSaveStatus::Skipped;
   }
   if (result.status == McapSaveStatus::Complete) {
-    notify(PJ::ToolboxMessageLevel::kInfo, fmt::format("Saved MCAP: {}", result.path));
+    notify(PJ::ToolboxMessageLevel::kInfo, fmt::format("Exported MCAP: {}", result.path));
+    return;
+  }
+  if (result.status == McapSaveStatus::Skipped) {
+    notify(PJ::ToolboxMessageLevel::kInfo, fmt::format("MCAP export skipped: {}", result.error));
     return;
   }
   if (result.status == McapSaveStatus::Partial) {
@@ -2973,7 +2981,7 @@ void McapCloudDialog::onMcapSaveFinished(McapSaveResult result) {
         fmt::format("Partial MCAP retained: {} ({})", result.path, result.error));
     return;
   }
-  std::string message = "MCAP save failed";
+  std::string message = "MCAP export failed";
   if (!result.error.empty()) {
     message += ": " + result.error;
   }
@@ -3088,8 +3096,8 @@ void McapCloudDialog::persistState() {
   settings.setStringList("mcap_cloud/selected_topics", selected_topics);
   settings.setBool("mcap_cloud/aggregate", aggregate);
   settings.setBool("mcap_cloud/topics_all", topics_all);
-  settings.setBool("mcap_cloud/save_mcap", save_mcap);
-  settings.setString("mcap_cloud/save_directory", save_directory);
+  settings.setBool("mcap_cloud/export_mcap", save_mcap);
+  settings.setString("mcap_cloud/export_directory", save_directory);
   settings.setInt("mcap_cloud/filter_tab", filter_tab);
   // One key per LOCAL Basic-tab field (robot/source — customer/site are the
   // gate now, persisted per-server in onIndexChanged/onVocabularyReady, not

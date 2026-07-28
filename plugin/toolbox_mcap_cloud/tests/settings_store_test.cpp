@@ -56,15 +56,15 @@ TEST(SettingsStore, BoolRoundTrip) {
   EXPECT_TRUE(store.getBool("key", false));
 }
 
-TEST(SettingsStore, McapSavePreferencesRoundTrip) {
+TEST(SettingsStore, McapExportPreferencesRoundTrip) {
   Fixture fx;
   auto store = fx.store();
-  store.setBool("mcap_cloud/save_mcap", true);
-  store.setString("mcap_cloud/save_directory", "/tmp/plotjuggler-mcaps");
+  store.setBool("mcap_cloud/export_mcap", true);
+  store.setString("mcap_cloud/export_directory", "/tmp/plotjuggler-mcaps");
 
-  EXPECT_TRUE(fx.store().getBool("mcap_cloud/save_mcap", false));
+  EXPECT_TRUE(fx.store().getBool("mcap_cloud/export_mcap", false));
   EXPECT_EQ(
-      fx.store().getString("mcap_cloud/save_directory"),
+      fx.store().getString("mcap_cloud/export_directory"),
       "/tmp/plotjuggler-mcaps");
 }
 

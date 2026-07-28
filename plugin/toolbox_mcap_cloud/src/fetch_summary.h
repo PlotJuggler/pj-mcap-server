@@ -36,6 +36,8 @@ inline std::string summarizeErrors(const std::map<std::string, int, std::less<>>
 // PJ3 parity completion policy:
 //   * cancelling           → "Download cancelled", stay open, no import
 //   * any topic imported   → import + close (partial success still imports)
+//     …UNLESS the MCAP export failed → import, stay OPEN (the export-error
+//     notification must remain visible; mcap_save_failed latch)
 //   * nothing imported     → stay open showing the (deduped) errors
 inline FetchSummary buildFetchSummary(
     int fetch_total, int fetch_done, int fetch_failed, bool imported_any, bool cancelling,

@@ -24,6 +24,11 @@ enum class McapSaveStatus {
   Complete,
   Partial,
   Failed,
+  /// The download aborted before the export could produce anything (connect /
+  /// open-session failure, empty plan, nothing decodable). Distinct from
+  /// Failed: no writer ran, no file exists, and the pull's own error reporting
+  /// already covers the cause — the dialog treats this as informational.
+  Skipped,
 };
 
 struct McapSaveResult {
@@ -119,8 +124,9 @@ class FetchWorker {
   /// OR MORE sequences (the Mosaico Fetch shape; Slice 7 stitched multi-file
   /// selection). `sequence_names` is the deterministically-ordered list (sorted
   /// by start time so a reordered UI selection yields the same request); they
-  /// resolve to file_ids[] and open EXACTLY ONE OpenFresh session (the server
-  /// stitches them into one continuous logical stream). `group_name` is the
+  /// go key-addressed into EXACTLY ONE OpenFresh session (wire v2 — the names
+  /// ARE the durable s3_keys; no file_id resolution) and the server
+  /// stitches them into one continuous logical stream. `group_name` is the
   /// display/group handle used for the dataset label + the per-topic ledger
   /// callbacks ("first (+N-1 more)" for N>1; the single name for N==1). Opens a
   /// FRESH session over its own BackendConnection (the browse socket is
@@ -132,6 +138,12 @@ class FetchWorker {
   /// Honors requestCancel(). The whole host-write critical section is serialized
   /// by host_write_mu_. driver.finalize() seals host parser writes (flushAll)
   /// while still inside the critical section, before notifyDataChanged.
+  /// A non-empty `save_directory` additionally tees the raw session records
+  /// into one collision-safe local MCAP (export). The export is strictly
+  /// SECONDARY: any export open/write/finalize failure is reported via
+  /// mcapSaveFinished but never aborts the download or the host import. A
+  /// non-empty save_directory also bypasses the count-only SessionCache HIT
+  /// (the cache holds no raw payloads to reconstruct a file from).
   void pullTopicsAsync(std::vector<std::string> sequence_names, std::string group_name,
                        std::vector<std::string> topic_names, std::int64_t start_ns, std::int64_t end_ns,
                        std::string save_directory = {});
@@ -207,12 +219,13 @@ class FetchWorker {
   /// in-memory SessionCache (zero transport). Routed to a "served from cache"
   /// notify on the dialog.
   std::function<void(std::string group)> pullServedFromCache;
-  /// Local MCAP result when saving was requested. Complete names the final
-  /// `.mcap`; Partial names the readable `.partial.mcap` retained after a
-  /// cancellation/session failure; Failed carries the RAW open/write/rename
-  /// cause (no "MCAP save failed" prefix — the dialog owns the user-facing
-  /// wording). Fires before allFetchesComplete so the dialog's close policy
-  /// sees it.
+  /// Local MCAP export result — EXACTLY ONE per pull that requested an export
+  /// (every exit path emits: Complete names the final `.mcap`; Partial names
+  /// the READABLE `.mcap.partial` retained after a cancellation/transport
+  /// drop; Failed carries the RAW prepare/open/write/rename cause, no "MCAP
+  /// export failed" prefix — the dialog owns the user-facing wording; Skipped
+  /// = the download aborted before the export started, no file exists).
+  /// Fires before allFetchesComplete so the dialog's close policy sees it.
   std::function<void(McapSaveResult result)> mcapSaveFinished;
   /// Tag-edit commit result. ok=false carries the verbatim server/transport
   /// error. On ok=true a sequencesReady follows so the dialog refreshes the

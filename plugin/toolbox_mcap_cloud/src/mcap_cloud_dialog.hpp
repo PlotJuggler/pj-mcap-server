@@ -314,13 +314,17 @@ struct DialogState {
   // whole batch lands, and only when not cancelling.
   bool fetch_active = false;
   bool cancelling = false;
-  // Optional raw-session reconstruction. Checked by default; the path is a
-  // directory because the plugin stays Qt-free and generates collision-safe
-  // filenames itself.
-  bool save_mcap = true;
+  // Optional raw-session EXPORT (persisted as mcap_cloud/export_*). Default
+  // OFF: an involuntary full-session file per fetch is not a sane default,
+  // and the future replay cache (docs/canonical-layout-replay.md) is a
+  // separate, capped store — this toggle governs only the user-owned export
+  // copy. The path is a directory because the plugin stays Qt-free and
+  // generates collision-safe filenames itself.
+  bool save_mcap = false;
   std::string save_directory;
-  // Latched before allFetchesComplete so a local save failure suppresses the
-  // otherwise automatic close after a successful host import.
+  // Latched before allFetchesComplete so a non-Complete export result (Failed
+  // or Partial — Skipped excluded) suppresses the otherwise automatic close
+  // after a successful host import, keeping the notification visible.
   bool mcap_save_failed = false;
   int fetch_total = 0;   // topics requested this batch
   int fetch_done = 0;    // topics that reported pullFinished (ok or fail)

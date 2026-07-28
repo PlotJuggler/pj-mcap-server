@@ -18,8 +18,11 @@ struct McapOutputPaths {
 [[nodiscard]] std::string utcTimestampForFilename();
 
 /// Create `directory` when needed and allocate collision-free final/partial
-/// paths for one download. `utc_stamp` is injected so naming is deterministic
-/// in tests. Returns nullopt on failure; `*error` is only meaningful then.
+/// paths for one download. The partial (`<name>.mcap.partial`) is RESERVED by
+/// exclusive creation before returning — no check-then-open race — so the
+/// caller owns a zero-byte file it must either write+finalize or remove on
+/// every other exit. `utc_stamp` is injected so naming is deterministic in
+/// tests. Returns nullopt on failure; `*error` is only meaningful then.
 [[nodiscard]] std::optional<McapOutputPaths> prepareMcapOutputPaths(
     const std::filesystem::path& directory, const std::vector<std::string>& sequence_names,
     const std::string& utc_stamp, std::string* error);

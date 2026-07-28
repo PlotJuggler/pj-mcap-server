@@ -126,19 +126,24 @@ correctness can be exercised without launching the GUI. It links **zero Qt**
 
 Exit codes: `0` success · `1` connection/RPC failure · `2` usage error.
 
-## Saving Toolbox downloads
+## Exporting Toolbox downloads
 
-The **Save MCAP** checkbox is enabled by default. The adjacent **Directory**
-field defaults to PlotJuggler's per-user data directory under
-`mcap_cloud/downloads` and is persisted between runs.
+The **Export MCAP** checkbox is **off by default** (an involuntary full-session
+file per fetch is not a sane default; enabling it is persisted per user as
+`mcap_cloud/export_*`). The adjacent **Directory** field defaults to
+PlotJuggler's per-user data directory under `mcap_cloud/downloads`.
 
 Each Download click creates one collision-safe file. A single recording uses
 `<source>_download_<UTC>.mcap`; stitched selections use
-`<first-source>_plus_<N>_download_<UTC>.mcap`. The worker writes to a sibling
-`.partial.mcap` while data is arriving and renames it only after a clean session
-completion. Cancellation or transport failure retains the readable partial
-file and reports its path. Disable the checkbox to retain the previous
-import-only behavior and count-only session-cache hits.
+`<first-source>_plus_<N>_download_<UTC>.mcap`. The worker reserves and writes a
+sibling `<name>.mcap.partial` (never `*.mcap`-suffixed — a truncated file must
+not look loadable) while data is arriving and renames it only after a clean
+session completion. Cancellation or a transport drop retains the finalized,
+readable partial and reports its path; a disk/write failure removes the
+unreadable partial and reports the cause. **The export is strictly secondary:
+no export failure ever aborts the download or the imported data.** With the
+checkbox enabled, repeat fetches bypass the count-only session cache (the
+export needs the raw bytes); disable it to keep cache hits.
 
 The reconstructed file contains the session protocol's messages, schemas,
 channels, and log/publish timestamps. Attachments and source MCAP metadata are

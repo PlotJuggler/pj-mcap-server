@@ -480,7 +480,7 @@
     <layout class="QHBoxLayout" name="saveMcapRow">
      <item>
       <widget class="QCheckBox" name="checkSaveMcap">
-       <property name="text"><string>Save MCAP</string></property>
+       <property name="text"><string>Export MCAP</string></property>
        <property name="toolTip"><string>Save every downloaded message as one local MCAP file</string></property>
        <property name="checked"><bool>true</bool></property>
       </widget>

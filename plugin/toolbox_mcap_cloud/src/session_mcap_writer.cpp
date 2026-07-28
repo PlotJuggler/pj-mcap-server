@@ -17,11 +17,13 @@ namespace {
 
 class CheckedFileWriter final : public mcap::IWritable {
  public:
-  bool open(const std::string& path) {
+  bool open(const std::filesystem::path& path) {
     errno = 0;  // stale errno would otherwise decorate the failure message
+    // The path overload — never path.string(): on Windows that narrows through
+    // the active code page and mangles non-ACP profile/directory names.
     stream_.open(path, std::ios::binary | std::ios::trunc);
     if (!stream_.is_open()) {
-      error_ = "could not open output MCAP '" + path + "'";
+      error_ = "could not open output MCAP '" + path.string() + "'";
       if (errno != 0) {
         error_ += ": ";
         error_ += std::strerror(errno);
@@ -33,6 +35,9 @@ class CheckedFileWriter final : public mcap::IWritable {
 
   void handleWrite(const std::byte* data, std::uint64_t size) override {
     if (!error_.empty()) {
+      // Keep size_ advancing after a latched error: mcap::McapWriter reads
+      // IWritable::size() for its offset bookkeeping, which must stay
+      // self-consistent while the stream is drained to close().
       size_ += size;
       return;
     }
@@ -93,6 +98,7 @@ struct SessionMcapWriter::Impl {
     std::uint32_t next_sequence = 0;
   };
   std::unordered_map<std::uint32_t, ChannelState> channels_by_topic;
+  std::uint64_t skipped_unknown_topics = 0;
   bool open = false;
 };
 
@@ -105,7 +111,7 @@ SessionMcapWriter::~SessionMcapWriter() {
   }
 }
 
-bool SessionMcapWriter::open(const std::string& path, const SessionInfo& info, std::string* error) {
+bool SessionMcapWriter::open(const std::filesystem::path& path, const SessionInfo& info, std::string* error) {
   auto fail = [error](std::string message) {
     if (error != nullptr) {
       *error = std::move(message);
@@ -131,6 +137,13 @@ bool SessionMcapWriter::open(const std::string& path, const SessionInfo& info, s
     // Nothing valuable was written yet — don't leave a garbage partial behind.
     std::error_code remove_ec;
     std::filesystem::remove(path, remove_ec);
+    if (remove_ec) {
+      // The caller reports "no file left behind" on open failure — when the
+      // remove itself fails (read-only remount, permission flip) that would be
+      // a lie, so name the stray file in the error instead.
+      return fail(message + " (a stray partial remains at '" + path.string() +
+                  "': " + remove_ec.message() + ")");
+    }
     return fail(message);
   }
   impl_->open = true;
@@ -168,7 +181,11 @@ bool SessionMcapWriter::write(const DecodedMessage& message, std::string* error)
   }
   const auto channel_it = impl_->channels_by_topic.find(message.topic_id);
   if (channel_it == impl_->channels_by_topic.end()) {
-    return fail("message references unknown session topic id " + std::to_string(message.topic_id));
+    // A topic_id outside the session dictionary is a violated server
+    // invariant. Skip defensively with a count rather than fail: one stray
+    // record must never abort (or un-save) a multi-GiB stream.
+    ++impl_->skipped_unknown_topics;
+    return true;
   }
 
   Impl::ChannelState& channel = channel_it->second;
@@ -187,6 +204,10 @@ bool SessionMcapWriter::write(const DecodedMessage& message, std::string* error)
     return fail("MCAP write failed: " + impl_->output.error());
   }
   return true;
+}
+
+std::uint64_t SessionMcapWriter::skippedUnknownTopics() const {
+  return impl_->skipped_unknown_topics;
 }
 
 bool SessionMcapWriter::close(std::string* error) {

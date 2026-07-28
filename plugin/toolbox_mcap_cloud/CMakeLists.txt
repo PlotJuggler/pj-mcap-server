@@ -676,6 +676,33 @@ if(BUILD_TESTING)
   # and a clean cancel-mid-pull (finalize still releases the context). Same
   # worker/transport sources as the resume live test (no rosx — the plugin
   # ships no decoders).
+  add_executable(toolbox_mcap_cloud_fetch_worker_export_contract_test
+    tests/fetch_worker_export_contract_test.cpp
+    src/parser_ingest_driver.cpp
+    src/fetch_worker.cpp
+    src/backend_connection.cpp
+    src/wire_mapping.cpp
+    src/session_decode.cpp
+    src/session_mcap_writer.cpp
+    src/mcap_save_path.cpp
+    src/core/time_format.cpp
+    src/mcap_implementation.cpp
+    ${MCAP_CLOUD_PROTO_SRCS}
+  )
+  target_compile_features(toolbox_mcap_cloud_fetch_worker_export_contract_test PRIVATE cxx_std_20)
+  target_include_directories(toolbox_mcap_cloud_fetch_worker_export_contract_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/core
+    ${MCAP_CLOUD_PROTO_OUT_DIR}
+  )
+  target_link_libraries(toolbox_mcap_cloud_fetch_worker_export_contract_test PRIVATE
+    plotjuggler_sdk::plugin_sdk
+    protobuf::libprotobuf ixwebsocket::ixwebsocket nlohmann_json::nlohmann_json
+    zstd::libzstd_static LZ4::lz4_static mcap::mcap GTest::gtest_main
+  )
+  add_test(NAME McapCloudFetchWorkerExportContractTest
+           COMMAND toolbox_mcap_cloud_fetch_worker_export_contract_test)
+
   add_executable(toolbox_mcap_cloud_parser_ingest_live_test
     tests/parser_ingest_live_test.cpp
     src/parser_ingest_driver.cpp

@@ -73,6 +73,12 @@ TEST(SessionMcapWriter, RoundTripsSchemasChannelsTimesPayloadsAndSequences) {
   ASSERT_EQ(reader.channels().size(), 2u);
   ASSERT_EQ(reader.chunkIndexes().size(), 1u);
   EXPECT_EQ(reader.chunkIndexes().front().compression, "zstd");
+  // Statistics presence is load-bearing: the server-side FormatCodec (and any
+  // future cache-adoption load) REJECTS unsummarized/statistics-less files —
+  // an options tweak dropping them must fail here, not in production.
+  ASSERT_TRUE(reader.statistics().has_value());
+  EXPECT_EQ(reader.statistics()->messageCount, 3u);
+  EXPECT_EQ(reader.statistics()->channelCount, 2u);
 
   struct Seen {
     std::string topic;
@@ -111,13 +117,16 @@ TEST(SessionMcapWriter, RoundTripsSchemasChannelsTimesPayloadsAndSequences) {
   EXPECT_EQ(seen[2].payload, "one-b");
 }
 
-TEST(SessionMcapWriter, RejectsUnknownTopicAndBadOutputPath) {
+TEST(SessionMcapWriter, SkipsUnknownTopicAndRejectsBadOutputPath) {
   TempMcap temp;
   mcap_cloud::SessionMcapWriter writer;
   std::string error;
   ASSERT_TRUE(writer.open(temp.path.string(), sessionInfo(), &error)) << error;
-  EXPECT_FALSE(writer.write({.topic_id = 999, .payload = "bad"}, &error));
-  EXPECT_NE(error.find("unknown session topic id 999"), std::string::npos);
+  // An out-of-dictionary topic_id is a violated server invariant: skipped
+  // defensively with a count — one stray record must never abort (or un-save)
+  // a multi-GiB stream.
+  EXPECT_TRUE(writer.write({.topic_id = 999, .payload = "bad"}, &error)) << error;
+  EXPECT_EQ(writer.skippedUnknownTopics(), 1u);
   ASSERT_TRUE(writer.close(&error)) << error;
 
   mcap_cloud::SessionMcapWriter bad_writer;

@@ -44,7 +44,12 @@ TEST(McapSavePath, CreatesDirectoryAndSingleFileName) {
 
   EXPECT_TRUE(fs::is_directory(temp.path() / "nested"));
   EXPECT_EQ(paths->final_path.filename(), "drive_download_20260726T120000Z.mcap");
-  EXPECT_EQ(paths->partial_path.filename(), "drive_download_20260726T120000Z.partial.mcap");
+  // `.mcap.partial` order: a truncated file must never carry a final `.mcap`
+  // suffix that extension-gated pickers would present as loadable.
+  EXPECT_EQ(paths->partial_path.filename(), "drive_download_20260726T120000Z.mcap.partial");
+  // The partial is RESERVED (exclusively created) at allocation time.
+  EXPECT_TRUE(fs::exists(paths->partial_path));
+  EXPECT_FALSE(fs::exists(paths->final_path));
 }
 
 TEST(McapSavePath, SanitizesAndNamesStitchedSelection) {
@@ -62,7 +67,7 @@ TEST(McapSavePath, AvoidsFinalAndPartialCollisions) {
   TempDirectory temp;
   fs::create_directories(temp.path());
   std::ofstream(temp.path() / "drive_download_20260726T120000Z.mcap").put('x');
-  std::ofstream(temp.path() / "drive_download_20260726T120000Z_2.partial.mcap").put('x');
+  std::ofstream(temp.path() / "drive_download_20260726T120000Z_2.mcap.partial").put('x');
 
   std::string error;
   const auto paths = mcap_cloud::prepareMcapOutputPaths(
@@ -70,7 +75,27 @@ TEST(McapSavePath, AvoidsFinalAndPartialCollisions) {
   ASSERT_TRUE(paths.has_value()) << error;
 
   EXPECT_EQ(paths->final_path.filename(), "drive_download_20260726T120000Z_3.mcap");
-  EXPECT_EQ(paths->partial_path.filename(), "drive_download_20260726T120000Z_3.partial.mcap");
+  EXPECT_EQ(paths->partial_path.filename(), "drive_download_20260726T120000Z_3.mcap.partial");
+}
+
+TEST(McapSavePath, ReservationSerializesConcurrentAllocators) {
+  // Two prepares with the SAME stamp (two processes racing in one second):
+  // the first's exclusive reservation forces the second onto a fresh
+  // candidate — no shared name, no silent truncation of the winner's file.
+  TempDirectory temp;
+  std::string error;
+  const auto first = mcap_cloud::prepareMcapOutputPaths(
+      temp.path(), {"drive.mcap"}, "20260726T120000Z", &error);
+  ASSERT_TRUE(first.has_value()) << error;
+  const auto second = mcap_cloud::prepareMcapOutputPaths(
+      temp.path(), {"drive.mcap"}, "20260726T120000Z", &error);
+  ASSERT_TRUE(second.has_value()) << error;
+
+  EXPECT_NE(first->partial_path, second->partial_path);
+  EXPECT_NE(first->final_path, second->final_path);
+  EXPECT_TRUE(fs::exists(first->partial_path));
+  EXPECT_TRUE(fs::exists(second->partial_path));
+  EXPECT_EQ(second->final_path.filename(), "drive_download_20260726T120000Z_2.mcap");
 }
 
 TEST(McapSavePath, RejectsAFileAsDirectory) {
