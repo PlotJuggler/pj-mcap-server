@@ -1,9 +1,12 @@
-# Canonical Cloud Layouts — Replay via Materializable Cached Files (design v3.2)
+# Canonical Cloud Layouts — Replay via Materializable Cached Files (design v3.3 / V3+B)
 
-**Status:** DRAFT v3.2 — Codex adversarial pass complete (21 findings, all 13 mandatory
-amendments incorporated), plus the ImportJob-timing consult's `LayoutImportBatch`
-forward-compatibility amendment (§6.2/§8) and the hardened deferral trigger (§11).
-Awaiting user approval before the implementation plan.
+**Status:** DRAFT v3.3 — the **V3+B variant is adopted** (user decision 2026-07-28 after a
+three-way V2 / V3.2 / V3+B comparison): cache-miss replay reuses the authoring dual path
+(progressive eager ingest + cache tee → adoption), so **plots grow during every download,
+in every mode**. Incorporates: the v3 Codex pass (21 findings), the ImportJob-timing
+consult (`LoadTicket` seam, §6.2/§8), and the PR #4 alignment (§9 — the save-MCAP write
+path is the tee's foundation; PR #4 merges first). Awaiting spec re-review before the
+implementation plan.
 **Date:** 2026-07-27
 **Repos touched:** this repo (plugin `toolbox_mcap_cloud`, docs) + PJ4 (host + SDK, upstreamed
 like prior cloud hooks) + `pj-official-plugins` (`data_load_mcap` version pinned in the matrix).
@@ -64,8 +67,10 @@ On layout load:
 
 - **Cache hit** (file present, structurally valid) → the stock reload path runs. Zero new code
   on the load itself, **zero network**. Works even if the provider plugin is absent (§6.4).
-- **Cache miss** → identity-first resolution → trust gate → provider
-  `materialize(descriptor)` (download-to-file only, no ingest) → stock `FileLoader` load.
+- **Cache miss** (V3+B) → identity-first resolution → trust gate → provider **replay job** =
+  the authoring dual path driven headlessly: progressive eager ingest (plots grow during the
+  download, #470 surface) + the cache tee, **adopted** into the cache file at completion.
+  One download path in the product — replay-on-miss IS the Fetch path minus the dialog.
 
 The `<materialize>` element is a **provider-generic source record** — "how this dataset came to
 be and how to re-obtain it" — not a cloud one-off:
@@ -95,8 +100,9 @@ The loader need not pre-exist; it must merely share the eager path's ingest code
 
 ## 3. Dependencies and lineage
 
-- **PJ4 #470** `feat/toolbox-ingest-progress` (OPEN, assumed merging; reviewed at branch tip
-  `f4bd56df`): host-side progressive toolbox imports — per-dataset lifecycle pairing, throttled
+- **PJ4 #470** `feat/toolbox-ingest-progress` (**MERGED** `31ca5eb9`; post-review drift from
+  reviewed tip `f4bd56df` was one benign strip-code tidy in `MainWindow.{h,cpp}` only —
+  `ToolboxRuntimeHost` untouched): host-side progressive toolbox imports — per-dataset lifecycle pairing, throttled
   progressive publish, cooperative stop, title-bar strip; zero SDK/ABI change (lights up the
   progress surface on the `create_parser_ingest` fat pointer,
   `data_source_host_views.hpp:144-167`). Our plugin adopts this surface and is its live
@@ -121,7 +127,11 @@ The loader need not pre-exist; it must merely share the eager path's ingest code
   data; lazy vs eager storage is the only real difference — and we can save the download and go
   lazy too") collapses the parallel rail into the file rail. v2's descriptor/identity/trust work
   carries forward intact. v3.0 → v3.1: thirteen mandatory amendments from the second Codex pass
-  (§15).
+  (§15). v3.2 → v3.3: **V3+B adopted** — an independent three-way comparison (V2 / V3.2 / V3+B,
+  §15) confirmed V3's cache+adoption economics and memory model; the user chose to also keep
+  V2's signature UX (progressive plots on cache-miss replay) by pulling the growing-import
+  curve binder into scope rather than gating it. V3+B = V3.2 ∪ (V2's binder); nothing from
+  v3.2 is discarded.
 
 ## 4. The descriptor — public, allowlisted, versioned
 
@@ -228,6 +238,15 @@ cache-hit** fetches whose disk file is missing cannot "re-tee from memory" (the 
 `SessionCache` stores counts, not bytes — `session_cache.hpp:53`): the in-memory entry is
 evicted and a normal network fetch runs. A cache hit whose disk file exists re-adopts it.
 
+**Foundation: PR #4 ("save downloads as MCAP") merges first.** It already ships the shared
+writer TU (`SessionMcapWriter` + `CheckedFileWriter` error-latching sink — a genuine fix for
+the vendored writer's swallowed short-writes), the in-loop tee wiring, `.partial` path
+discipline (`mcap_save_path`), and the CLI refactored onto the same writer. The cache tee is
+that write path re-targeted (content-addressed destination, delete-not-keep retention,
+provenance record) — **one write path, two policies**; the user-facing export ("Save MCAP")
+and the cache must never become two writers. Stage-1 follow-ups hardening PR #4's path for
+tee duty are enumerated in §9.0.
+
 ### 6.2 Replay (Load Layout / `--layout`) — rewrite first, then classify
 
 A small host coordinator — **`LayoutImportBatch`** — owns the restore transaction. It exists
@@ -267,13 +286,19 @@ rewrite the *document*, not just pick a path):
    LayoutXml.cpp:546)
 6. rewrite the loader preset filepath (FileLoader rewrite_preset_filepath hint)
 7. classify: already-loaded (registry match by identity -> #464 replace_dataset_id if a refresh
-   is wanted, else skip) / cache hit -> stock load / miss -> trust-gated materialize job
-   chained into the stock load
+   is wanted, else skip) / cache hit -> stock load / miss -> trust-gated PROVIDER REPLAY JOB
+   (dual path: progressive eager ingest + tee -> adoption), finalized as a stock-recorded
+   file-backed dataset
 ```
 
-Widgets restore immediately; curves bind progressively via the stock busy-restore path once the
-batch has loads in flight. Failures are per-job (§10). Materialize jobs are sequential in v1 of
-the feature.
+Widgets restore immediately. Curve binding is progressive on **both** load kinds: cache-hit
+loads bind via the stock busy-restore path, and replay jobs bind via the **growing-import
+binder** — the existing `CatalogModel::itemsAdded` binder generalized to run while a
+batch-owned toolbox import grows (#470's publish ticks provide the growth events; the batch,
+not `FileLoader::queueDrained`, provides the drain signal for these jobs — the `LoadTicket`
+seam already decouples that). This is V2's binder work, pulled into scope by the V3+B
+decision; it is batch-scoped and does not touch the ordinary non-cloud layout-load path.
+Failures are per-job (§10). Replay jobs are sequential in v1 of the feature.
 
 ### 6.3 Provider query — strict contract
 
@@ -282,7 +307,7 @@ Runs synchronously on the GUI thread (the settings backend owns one unsynchroniz
 parse/validation, in-memory trust lookup, cheap file stat + structural/identity check — **no
 network, no lock waits, no full-file scan, no credential resolution** (a cache-hit answer must
 not touch credentials at all). One provider instance is bound once per batch and queried for all
-descriptors. The async `materialize` ABI specifies: exactly-once completion, callback thread,
+descriptors. The async `replay` ABI specifies: exactly-once completion, callback thread,
 descriptor/callback lifetimes, provider DSO lifetime, cancel-and-join semantics, the
 cancellation-vs-successful-rename race, and shutdown ordering (batch jobs are owned by the batch
 — #470's shutdown only joins `FileLoader` and panel ingest hosts).
@@ -345,8 +370,12 @@ SDK / ABI (all `struct_size`-gated tail additions, no protocol bump):
 
 - Capability flag `PJ_TOOLBOX_CAPABILITY_SOURCE_PROVIDER`.
 - Toolbox plugin vtable tail: `source_provider_query(descriptor) -> {trust, cached_path?}`
-  (strict §6.3 contract) and `source_provider_materialize(descriptor, callbacks) -> job`
-  (async download-to-file; fully specified lifetime/threading ABI).
+  (strict §6.3 contract) and `source_provider_replay(descriptor, callbacks) -> job` (async
+  **dual-path replay**: progressive eager ingest into a new dataset + cache tee, adoption at
+  completion; fully specified lifetime/threading ABI). A P-failing provider (§2, e.g. Mosaico
+  before its companion loader exists) may implement replay as eager-ingest-only without
+  adoption — V2-style behavior under the same schema; its datasets are then not re-saveable
+  as replay sources until it satisfies P.
 - Toolbox runtime host vtable tail: `adopt_materialized_source(dataset_id, cache_path,
   descriptor_json)` — GUI-marshalled; host re-checks dataset existence/generation, then drives
   the stock `FileLoader` replace + descriptor attach as one ordered transaction whose result is
@@ -371,12 +400,39 @@ Host:
   fallback (existing name-vs-id mismatch, `FileLoader.cpp:1135` vs captured name `:2154`).
   `sameSourceIdentity` **unchanged**.
 
+- **Growing-import binder** (V3+B): the batch-scoped generalization of the progressive
+  curve binder to bind against a toolbox import growing under a replay job (#470 publish
+  ticks as growth events; batch drain instead of `queueDrained`). Scoped so ordinary
+  non-cloud layout loads never traverse new code.
+
 Explicitly **not** built (v2 components dissolved or #470-supplied): `<replay_sources>`,
 `ReplayRecord` as a separate registry concept, the `ReplayManager` batch coordinator (shrunk to
-`LayoutImportBatch`), the progressive-restore generalization, and any second plugin family.
+`LayoutImportBatch`), and any second plugin family.
 
 ## 9. Plugin changes (this repo)
 
+0. **PR #4 follow-ups** (after it merges as-is; each hardens the save path for tee duty —
+   sourced from the 2026-07-28 four-agent review):
+   - **A save-side write failure must not abort the download/import** — today
+     `write()==false` in the pull loop cancels the whole session and truncates the host
+     import; latch the error, discard the writer, let the import finish. This is also the
+     prerequisite for the async tee (§6.5-style bounded queue) and for adoption semantics.
+   - **Save must not disable the SessionCache HIT path** — save-on (the default) currently
+     bypasses the count-cache entirely, so repeat fetches re-download; consult the cache
+     first and report "served from cache, no MCAP written" (or explicit evict-and-refetch).
+   - **Exactly-one → at-most-one `McapSaveResult`**: fire a result (or documented skip) on
+     every post-allocation early exit; fix the over-claiming contract comments.
+   - **Writer seam for the cache**: `SessionMcapWriter::open` overload taking a pre-opened
+     `mcap::IWritable`/fd (symlink-safe 0600 exclusive create, fsync, per-process partial
+     naming live outside the writer); `RetentionPolicy` parameter (export keeps readable
+     partials — deliberate product choice; cache deletes); Metadata-record provenance hook.
+   - **Naming**: partial files ordered `<name>.mcap.partial[.pid]` (never `*.mcap`-suffixed,
+     they look loadable); settings renamed `mcap_cloud/export_*` (once the cache tee is
+     always-on, "save" toggling a *file write* is a contradiction — the toggle governs the
+     user-visible export copy only).
+   - CLI regression: unmapped `topic_id` should skip-with-count (old behavior), not abort
+     the session; Windows: pass `std::filesystem::path` through to `ofstream::open` (no
+     narrow-ACP round-trip); TOCTOU: reserve the output name at pick time (`noreplace`).
 1. **Descriptor module** — schema, validation + limits, canonical serialization, sha256/128
    digest; shared vectors. *(Independently shippable.)*
 2. **Cancel hardening** — cancellation joins `sendAndWait`'s wake predicate (cancel during
@@ -389,16 +445,19 @@ Explicitly **not** built (v2 components dissolved or #470-supplied): `<replay_so
 5. **Cache manager** — request-addressed store, embedded-descriptor provenance,
    validate-then-rename finalization, cross-platform shared/exclusive leases, per-process
    partials, LRU + touch-files + free-space reserve, orphan cleanup with lock + age threshold.
-6. **Fetch tee** — bounded async queue with owned payload copies off the ingest hot path;
-   explicit backpressure when full; writer failure cancels the fetch and prevents adoption.
+6. **Fetch tee** — PR #4's in-loop write evolved to a bounded async queue with owned payload
+   copies off the ingest hot path; explicit backpressure when full. **Uniform failure policy
+   (supersedes the v3.1 wording): a writer/tee failure never aborts the import** — the eager
+   ingest completes for the user; the failure only prevents adoption (no cache file, no
+   source record) and is reported. Applies identically to the export save and the cache tee.
    (`SessionCache` stores `DatasetId`; missing-disk-file hits evict and refetch — §6.1.)
 7. **#470 progress-surface adoption** in `ParserIngestDriver`/`FetchWorker` — also #470's live
    verification.
 8. **Provider implementation** — headless bind mode (no auto-connect), `source_provider_query`,
-   `source_provider_materialize` (the CLI's `downloadToMcap` writer refactored into a shared
-   sink TU — it currently lives in the CLI target only, `CMakeLists.txt:184`, and must avoid a
-   duplicate `MCAP_IMPLEMENTATION` definition), `adopt_materialized_source` calls at fetch
-   completion.
+   `source_provider_replay` (the authoring dual path — FetchWorker progressive eager ingest +
+   the PR #4 `SessionMcapWriter` tee — driven headlessly by descriptor; the shared-TU and
+   `MCAP_IMPLEMENTATION` concerns are already solved by PR #4), `adopt_materialized_source`
+   calls at fetch completion.
 
 ## 10. Semantics, failure behavior
 
@@ -480,18 +539,26 @@ Explicitly **not** built (v2 components dissolved or #470-supplied): `<replay_so
 
 ## 13. Build order (cross-repo hazards resolved)
 
+0. **PR #4 merges as-is** (standalone user value), then its §9.0 follow-ups land as the first
+   plugin commits (each independently shippable; the write-failure decoupling and the
+   cache-HIT restoration are user-visible fixes on their own).
 1. **Plugin foundations** *(no host dependency, each shippable)* — descriptor module + vectors;
-   cancel predicate; credential origin binding + trusted-origin ledger; cache manager.
-2. **#470 lands** (merge/rebase); plugin adopts the progress surface (its live verification).
+   cancel predicate; credential origin binding + trusted-origin ledger; cache manager
+   (re-targeting the PR #4 writer via the §9.0 seams).
+2. **Plugin adopts the #470 progress surface** (#470 is merged; this is its still-missing live
+   verification) — progressive eager ingest becomes host-visible, the precondition for both
+   authoring UX and replay-job binding.
 3. **SDK ABI + host** — capability + three tail slots + fake-provider host tests;
-   `LayoutImportBatch`; source records + registry (incl. lifecycle hoist); layout
-   rewrite-then-classify; stable-ID loader matching. **Publish the new SDK package and bump the
-   plugin's SDK pin** (currently `plugin/SDK_VERSION` = 0.11.0 vs PJ4's SDK recipe 0.19.0 —
-   the provider implementation cannot compile before this step).
-4. **Plugin dual-path + provider** — shared writer-sink TU refactor; fetch tee;
-   `SessionCache` DatasetId; headless bind mode; query/materialize/adopt implementations.
-5. **End-to-end + docs** — GUI flow, `--layout` flow, team-sharing runbook (incl. metadata/path
-   leakage note), pinned-loader matrix, live coverage.
+   `LayoutImportBatch` + `LoadTicket`; **growing-import binder** (batch-scoped); source
+   records + registry (incl. lifecycle hoist); layout rewrite-then-classify; stable-ID loader
+   matching. **Publish the new SDK package and bump the plugin's SDK pin** (currently
+   `plugin/SDK_VERSION` = 0.11.0 vs PJ4's SDK recipe 0.19.0 — the provider implementation
+   cannot compile before this step).
+4. **Plugin dual-path + provider** — fetch tee re-target (content-addressed + delete-retention
+   + provenance); `SessionCache` DatasetId; headless bind mode; query/replay/adopt
+   implementations.
+5. **End-to-end + docs** — GUI flow, `--layout` flow (incl. progressive miss replay), team-
+   sharing runbook (metadata/path leakage note), pinned-loader matrix, live coverage.
 
 ## 14. References
 
@@ -536,3 +603,16 @@ v3.x, with the hard trigger** recorded in §11 — scoped blast radius, the push
 analysis, the Mosaico implementation-vs-orchestration distinction, and one mandatory v3
 amendment applied in this revision: the `LayoutImportBatch` request-scoped completion seam
 (`LoadTicket`), the child-operation interface, and the no-job-state-in-XML rule (§6.2, §8).
+
+**V2/V3 reopened + V3+B decision (2026-07-28).** The user reopened the V2-vs-V3 choice over
+the progressive-update concern; an independent Fable-agent three-way comparison
+(V2 / V3.2 / V3+B — code-grounded, 23 tool calls) recommended V3.2-with-gated-B at ~75-80%
+confidence, decisive factors: V2's eager-forever memory is structural, team layouts imply
+repeat opens, V3's host diff is additive vs V2's restore-state-machine rework, and
+`<replay_sources>` would be a forever-supported parallel schema. The user chose **V3+B now**
+(progressive everywhere; the binder is in scope, §6.2/§8). PR #4 ("save downloads as MCAP")
+was then identified as the tee's foundation, rebased onto main (39/39 tests), and reviewed by
+four specialist agents (code / silent-failure / tests / comments); the merge-relevant findings
+are folded into §9.0. Verified empirically during that review: the PR's writer output is
+chunked + summarized + carries Statistics (`mcap doctor` clean) — the adoption prerequisite —
+and `CheckedFileWriter` genuinely closes the vendored writer's swallowed-error hole.
