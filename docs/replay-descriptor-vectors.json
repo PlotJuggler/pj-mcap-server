@@ -1,0 +1,17 @@
+{
+  "comment": "Cross-repo contract: canonical serialization + identity vectors for the replay descriptor (docs/canonical-layout-replay.md §4). PJ4-side tests must consume this file byte-identically. Regenerating requires bumping the descriptor version.",
+  "cases": [
+    { "name": "minimal-whole-range-all-topics",
+      "descriptor": {"v":1,"kind":"mcap-cloud-session","server_uri":"ws://localhost:8080","s3_keys":["a.mcap"],"topics":[],"start_ns":"0","end_ns":"0","include_latched":true,"display_name":"A"},
+      "canonical": "{\"end_ns\":\"0\",\"include_latched\":true,\"kind\":\"mcap-cloud-session\",\"s3_keys\":[\"a.mcap\"],\"server_uri\":\"ws://localhost:8080\",\"start_ns\":\"0\",\"topics\":[],\"v\":1}",
+      "identity": "mcap-cloud:v1:sha256/128:fe76ca171ffd761049e981a15abeb662" },
+    { "name": "stitched-window-custom-topics",
+      "descriptor": {"v":1,"kind":"mcap-cloud-session","server_uri":"wss://mcap.example.com","s3_keys":["cust=x/site=y/2026/a.mcap","cust=x/site=y/2026/b.mcap"],"topics":["/imu","/tf","/tf_static"],"start_ns":"1780012345000000000","end_ns":"1780012399000000000","include_latched":true,"display_name":"Run 42"},
+      "canonical": "{\"end_ns\":\"1780012399000000000\",\"include_latched\":true,\"kind\":\"mcap-cloud-session\",\"s3_keys\":[\"cust=x/site=y/2026/a.mcap\",\"cust=x/site=y/2026/b.mcap\"],\"server_uri\":\"wss://mcap.example.com\",\"start_ns\":\"1780012345000000000\",\"topics\":[\"/imu\",\"/tf\",\"/tf_static\"],\"v\":1}",
+      "identity": "mcap-cloud:v1:sha256/128:68cbb9d6fd04e14b70c0690336b610b4" },
+    { "name": "display-name-does-not-change-identity",
+      "descriptor": {"v":1,"kind":"mcap-cloud-session","server_uri":"wss://mcap.example.com","s3_keys":["k.mcap"],"topics":["/a"],"start_ns":"5","end_ns":"9","include_latched":false,"display_name":"RENAMED"},
+      "canonical": "{\"end_ns\":\"9\",\"include_latched\":false,\"kind\":\"mcap-cloud-session\",\"s3_keys\":[\"k.mcap\"],\"server_uri\":\"wss://mcap.example.com\",\"start_ns\":\"5\",\"topics\":[\"/a\"],\"v\":1}",
+      "identity": "mcap-cloud:v1:sha256/128:d9d979cff7534cee367d460097f2a133" }
+  ]
+}

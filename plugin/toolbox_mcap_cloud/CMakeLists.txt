@@ -541,6 +541,29 @@ if(BUILD_TESTING)
   )
   add_test(NAME McapCloudSha256Test COMMAND toolbox_mcap_cloud_sha256_test)
 
+  # Canonical replay descriptor (spec docs/canonical-layout-replay.md §4):
+  # allowlisted parse/validate -> canonical serialization -> sha256/128
+  # identity. The canonicalization vectors are a CROSS-REPO contract
+  # (repo-root docs/replay-descriptor-vectors.json; PJ4-side tests consume
+  # the same file byte-identically — CATALOG_CONTRACT discipline), so the
+  # test reads them from the source tree via a compile definition.
+  add_executable(toolbox_mcap_cloud_replay_descriptor_test
+    tests/replay_descriptor_test.cpp
+    src/replay_descriptor.cpp
+    src/core/sha256.cpp
+  )
+  target_compile_features(toolbox_mcap_cloud_replay_descriptor_test PRIVATE cxx_std_20)
+  target_include_directories(toolbox_mcap_cloud_replay_descriptor_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+  )
+  target_compile_definitions(toolbox_mcap_cloud_replay_descriptor_test PRIVATE
+    MCAP_CLOUD_VECTORS_JSON="${CMAKE_CURRENT_SOURCE_DIR}/../../docs/replay-descriptor-vectors.json"
+  )
+  target_link_libraries(toolbox_mcap_cloud_replay_descriptor_test PRIVATE
+    nlohmann_json::nlohmann_json GTest::gtest_main
+  )
+  add_test(NAME McapCloudReplayDescriptorTest COMMAND toolbox_mcap_cloud_replay_descriptor_test)
+
   # Shared GUI/CLI MCAP writer round trip (hermetic): schemas, channels,
   # timestamps, payloads, per-channel sequence, chunking and Zstd. Uses the
   # test-only reader+writer implementation TU (product targets are writer-only).

@@ -217,7 +217,7 @@ hand-verify the first case with `python3 - <<'EOF'` + hashlib before committing)
 }
 ```
 
-- [ ] **Step 2.1: Write failing tests** — `tests/replay_descriptor_test.cpp`:
+- [x] **Step 2.1: Write failing tests** — `tests/replay_descriptor_test.cpp`:
   - Round-trip: parse(toReplayJson(d)) == d for a fully-populated descriptor.
   - Vector conformance: load `MCAP_CLOUD_VECTORS_JSON`, for each case parse
     `descriptor` (re-serialized compactly to feed the parser), assert
@@ -230,15 +230,15 @@ hand-verify the first case with `python3 - <<'EOF'` + hashlib before committing)
     `"wss://h/#f"` (fragment) · `"http://h"` (scheme) · 513 keys (limit) ·
     `start_ns:"abc"` (non-numeric) · `end_ns:"5"` with `start_ns:"9"` (order) ·
     input larger than `kMaxDescriptorBytes`.
-- [ ] **Step 2.2: Register test target; verify compile FAILS** (missing header).
-- [ ] **Step 2.3: Implement** `replay_descriptor.cpp` per the notes above.
-- [ ] **Step 2.4: Fill the vectors**: temporarily print `canonicalReplayJson` +
+- [x] **Step 2.2: Register test target; verify compile FAILS** (missing header).
+- [x] **Step 2.3: Implement** `replay_descriptor.cpp` per the notes above.
+- [x] **Step 2.4: Fill the vectors**: temporarily print `canonicalReplayJson` +
   `replayIdentity` for the vector descriptors (a throwaway `TEST` or `std::cerr` in the
   test), paste into `docs/replay-descriptor-vectors.json`, **independently verify case 1**:
   `python3 -c "import hashlib;print(hashlib.sha256(open('canonical-bytes.txt','rb').read()).hexdigest()[:32])"`.
   Remove the throwaway printing.
-- [ ] **Step 2.5: Run** `ctest --test-dir build -R McapCloudReplayDescriptorTest` → PASS.
-- [ ] **Step 2.6: Commit** — `feat(replay): canonical descriptor module + cross-repo vectors`
+- [x] **Step 2.5: Run** `ctest --test-dir build -R McapCloudReplayDescriptorTest` → PASS.
+- [x] **Step 2.6: Commit** — `feat(replay): canonical descriptor module + cross-repo vectors`
 
 ---
 
