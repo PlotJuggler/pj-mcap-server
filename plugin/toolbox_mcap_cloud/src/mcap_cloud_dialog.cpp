@@ -37,7 +37,6 @@
 #include "canonical_fields.h"
 #include "seq_display.h"
 #include "fetch_summary.h"
-#include "mcap_save_path.hpp"
 #include "fetch_worker.hpp"
 #include "format_utils.h"
 #include "mcap_cloud_panel_manifest.hpp"
@@ -60,6 +59,11 @@ struct ServerCredentials {
   std::string api_key;
   bool allow_insecure = false;
 };
+
+// Cross-platform first-launch default for the Save-MCAP directory field.
+std::string defaultMcapSaveDirectory() {
+  return (PJ::sdk::userDataDir() / "mcap_cloud" / "downloads").string();
+}
 
 std::string credentialsSettingsPrefix(const std::string& uri) {
   return "mcap_cloud/server_cache/" + normalizeServerKey(uri) + "/";
@@ -594,8 +598,7 @@ void McapCloudDialog::initFromSettings() {
   state_.topics_all = settings.getBool("mcap_cloud/topics_all", false);
   state_.filter_tab = std::clamp(settings.getInt("mcap_cloud/filter_tab", 0), 0, 1);
   state_.save_mcap = settings.getBool("mcap_cloud/save_mcap", true);
-  state_.save_directory =
-      settings.getString("mcap_cloud/save_directory", defaultMcapSaveDirectory());
+  state_.save_directory = settings.getString("mcap_cloud/save_directory");
   if (state_.save_directory.empty()) {
     state_.save_directory = defaultMcapSaveDirectory();
   }
@@ -745,8 +748,9 @@ std::string McapCloudDialog::widget_data() {
   wd.setText("comboUri", state_.uri);
   wd.setChecked("checkSaveMcap", state_.save_mcap);
   wd.setText("saveDirectory", state_.save_directory);
-  wd.setEnabled("saveDirectory", state_.save_mcap && !state_.fetch_active);
-  wd.setEnabled("labelSaveDirectory", state_.save_mcap && !state_.fetch_active);
+  const bool save_dir_enabled = state_.save_mcap && !state_.fetch_active;
+  wd.setEnabled("saveDirectory", save_dir_enabled);
+  wd.setEnabled("labelSaveDirectory", save_dir_enabled);
   wd.setEnabled("checkSaveMcap", !state_.fetch_active);
 
   // PJ3 parity: combo always lists the MRU history + the default server pin.

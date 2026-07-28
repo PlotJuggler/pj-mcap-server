@@ -209,8 +209,10 @@ class FetchWorker {
   std::function<void(std::string group)> pullServedFromCache;
   /// Local MCAP result when saving was requested. Complete names the final
   /// `.mcap`; Partial names the readable `.partial.mcap` retained after a
-  /// cancellation/session failure; Failed carries an open/write/rename error.
-  /// Fires before allFetchesComplete so the dialog's close policy sees it.
+  /// cancellation/session failure; Failed carries the RAW open/write/rename
+  /// cause (no "MCAP save failed" prefix — the dialog owns the user-facing
+  /// wording). Fires before allFetchesComplete so the dialog's close policy
+  /// sees it.
   std::function<void(McapSaveResult result)> mcapSaveFinished;
   /// Tag-edit commit result. ok=false carries the verbatim server/transport
   /// error. On ok=true a sequencesReady follows so the dialog refreshes the

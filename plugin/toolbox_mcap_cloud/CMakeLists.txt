@@ -225,7 +225,11 @@ set_source_files_properties(
 )
 # Upstream MCAP's implementation is intentionally not held to this project's
 # warning-as-error policy.
-set_source_files_properties(src/mcap_implementation.cpp PROPERTIES COMPILE_OPTIONS "-w")
+set_source_files_properties(
+  src/mcap_implementation.cpp
+  tests/mcap_roundtrip_implementation.cpp
+  PROPERTIES COMPILE_OPTIONS "-w"
+)
 target_link_libraries(mcap-cloud-cli PRIVATE
   protobuf::libprotobuf
   ixwebsocket::ixwebsocket
@@ -504,26 +508,29 @@ if(BUILD_TESTING)
   )
   add_test(NAME McapCloudSettingsStoreTest COMMAND toolbox_mcap_cloud_settings_store_test)
 
-  # Collision-safe local output naming + directory validation (hermetic).
+  # Collision-safe local output naming + directory validation (hermetic,
+  # SDK-free: the module only uses local helpers + the std library).
   add_executable(toolbox_mcap_cloud_mcap_save_path_test
     tests/mcap_save_path_test.cpp
     src/mcap_save_path.cpp
+    src/core/time_format.cpp
   )
   target_compile_features(toolbox_mcap_cloud_mcap_save_path_test PRIVATE cxx_std_20)
   target_include_directories(toolbox_mcap_cloud_mcap_save_path_test PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
   )
   target_link_libraries(toolbox_mcap_cloud_mcap_save_path_test PRIVATE
-    plotjuggler_sdk::plugin_sdk GTest::gtest_main
+    GTest::gtest_main
   )
   add_test(NAME McapCloudMcapSavePathTest COMMAND toolbox_mcap_cloud_mcap_save_path_test)
 
   # Shared GUI/CLI MCAP writer round trip (hermetic): schemas, channels,
-  # timestamps, payloads, per-channel sequence, chunking and Zstd.
+  # timestamps, payloads, per-channel sequence, chunking and Zstd. Uses the
+  # test-only reader+writer implementation TU (product targets are writer-only).
   add_executable(toolbox_mcap_cloud_session_mcap_writer_test
     tests/session_mcap_writer_test.cpp
     src/session_mcap_writer.cpp
-    src/mcap_implementation.cpp
+    tests/mcap_roundtrip_implementation.cpp
   )
   target_compile_features(toolbox_mcap_cloud_session_mcap_writer_test PRIVATE cxx_std_20)
   target_include_directories(toolbox_mcap_cloud_session_mcap_writer_test PRIVATE
@@ -635,6 +642,7 @@ if(BUILD_TESTING)
     src/session_decode.cpp
     src/session_mcap_writer.cpp
     src/mcap_save_path.cpp
+    src/core/time_format.cpp
     src/mcap_implementation.cpp
     ${MCAP_CLOUD_PROTO_SRCS}
   )
@@ -677,6 +685,7 @@ if(BUILD_TESTING)
     src/session_decode.cpp
     src/session_mcap_writer.cpp
     src/mcap_save_path.cpp
+    src/core/time_format.cpp
     src/mcap_implementation.cpp
     ${MCAP_CLOUD_PROTO_SRCS}
   )

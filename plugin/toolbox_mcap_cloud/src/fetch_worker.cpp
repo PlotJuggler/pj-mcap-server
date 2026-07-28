@@ -22,10 +22,10 @@
 #include <utility>
 #include <vector>
 
+#include "decoded_message.hpp"
 #include "parser_ingest_driver.hpp"
 #include "mcap_save_path.hpp"
 #include "session_cache.hpp"
-#include "session_decode.hpp"
 #include "session_key.hpp"
 #include "session_mcap_writer.hpp"
 #include "vocab_select.hpp"
@@ -424,6 +424,9 @@ void FetchWorker::pullTopicsAsync(std::vector<std::string> sequence_names, std::
       }
     }
   };
+  // Per-topic ledger wording for a save failure. McapSaveResult::error always
+  // carries the RAW cause — the dialog owns the user-facing prefix.
+  auto save_failed_text = [](const std::string& cause) { return "MCAP save failed: " + cause; };
 
   if (topic_names.empty() || sequence_names.empty()) {
     finish_all();
@@ -435,18 +438,17 @@ void FetchWorker::pullTopicsAsync(std::vector<std::string> sequence_names, std::
   // cache holds no raw payloads from which a new MCAP could be reconstructed.
   std::optional<McapOutputPaths> save_paths;
   if (!save_directory.empty()) {
-    McapOutputPaths paths;
     std::string path_error;
-    if (!prepareMcapOutputPaths(
-            std::filesystem::path(save_directory), sequence_names, utcTimestampForFilename(), &paths, &path_error)) {
+    save_paths = prepareMcapOutputPaths(
+        std::filesystem::path(save_directory), sequence_names, utcTimestampForFilename(), &path_error);
+    if (!save_paths.has_value()) {
       if (mcapSaveFinished) {
         mcapSaveFinished(McapSaveResult{McapSaveStatus::Failed, {}, path_error});
       }
-      finish_all_topics(false, "MCAP save failed: " + path_error);
+      finish_all_topics(false, save_failed_text(path_error));
       finish_all();
       return;
     }
-    save_paths = std::move(paths);
   }
 
   if (!host_provider_) {
@@ -687,11 +689,11 @@ void FetchWorker::pullTopicsAsync(std::vector<std::string> sequence_names, std::
     mcap_writer = std::make_unique<SessionMcapWriter>();
     if (!mcap_writer->open(save_paths->partial_path.string(), session_info, &mcap_write_error)) {
       write_lock.unlock();
+      // No path in the result: a failed open leaves no file behind.
       if (mcapSaveFinished) {
-        mcapSaveFinished(
-            McapSaveResult{McapSaveStatus::Failed, save_paths->partial_path.string(), mcap_write_error});
+        mcapSaveFinished(McapSaveResult{McapSaveStatus::Failed, {}, mcap_write_error});
       }
-      finish_all_topics(false, "MCAP save failed: " + mcap_write_error);
+      finish_all_topics(false, save_failed_text(mcap_write_error));
       finish_all();
       return;
     }
@@ -771,36 +773,37 @@ void FetchWorker::pullTopicsAsync(std::vector<std::string> sequence_names, std::
       mcap_write_error = std::move(close_error);
     }
 
+    // Exactly one McapSaveResult per save; `error` carries the raw cause.
+    McapSaveResult result{McapSaveStatus::Failed, save_paths->partial_path.string(), mcap_write_error};
     if (!mcap_write_error.empty()) {
-      stats.eos = SessionEos::Error;
-      stats.error = "MCAP save failed: " + mcap_write_error;
-      if (mcapSaveFinished) {
-        mcapSaveFinished(
-            McapSaveResult{McapSaveStatus::Failed, save_paths->partial_path.string(), stats.error});
+      // A mid-stream write failure aborted the session (eos != Complete), so
+      // the import is genuinely partial — fail the topics with the cause. A
+      // close/finalize failure after a COMPLETE session is a purely local
+      // problem: the host import succeeded and stays ok; the mcap_save_failed
+      // latch keeps the panel open and only the save is reported failed.
+      if (stats.eos != SessionEos::Complete) {
+        stats.eos = SessionEos::Error;
+        stats.error = save_failed_text(mcap_write_error);
       }
     } else if (stats.eos == SessionEos::Complete &&
                !cancel_flag_.load(std::memory_order_relaxed)) {
       std::error_code rename_error;
       std::filesystem::rename(save_paths->partial_path, save_paths->final_path, rename_error);
       if (rename_error) {
-        mcap_write_error =
+        result.error =
             "could not finalize MCAP '" + save_paths->final_path.string() + "': " + rename_error.message();
-        if (mcapSaveFinished) {
-          mcapSaveFinished(
-              McapSaveResult{McapSaveStatus::Failed, save_paths->partial_path.string(), mcap_write_error});
-        }
-      } else if (mcapSaveFinished) {
-        mcapSaveFinished(McapSaveResult{McapSaveStatus::Complete, save_paths->final_path.string(), {}});
+      } else {
+        result = McapSaveResult{McapSaveStatus::Complete, save_paths->final_path.string(), {}};
       }
-    } else if (mcapSaveFinished) {
-      std::string partial_reason = stats.error;
-      if (partial_reason.empty()) {
-        partial_reason =
-            stats.eos == SessionEos::Cancelled ? std::string("download cancelled")
-                                                : std::string("download ended before completion");
-      }
-      mcapSaveFinished(
-          McapSaveResult{McapSaveStatus::Partial, save_paths->partial_path.string(), std::move(partial_reason)});
+    } else {
+      result.status = McapSaveStatus::Partial;
+      result.error = !stats.error.empty()
+                         ? stats.error
+                         : (stats.eos == SessionEos::Cancelled ? "download cancelled"
+                                                               : "download ended before completion");
+    }
+    if (mcapSaveFinished) {
+      mcapSaveFinished(std::move(result));
     }
   }
 

@@ -5,6 +5,7 @@
 #include <cerrno>
 #include <cstddef>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <unordered_map>
 #include <utility>
@@ -17,6 +18,7 @@ namespace {
 class CheckedFileWriter final : public mcap::IWritable {
  public:
   bool open(const std::string& path) {
+    errno = 0;  // stale errno would otherwise decorate the failure message
     stream_.open(path, std::ios::binary | std::ios::trunc);
     if (!stream_.is_open()) {
       error_ = "could not open output MCAP '" + path + "'";
@@ -82,10 +84,15 @@ class CheckedFileWriter final : public mcap::IWritable {
 }  // namespace
 
 struct SessionMcapWriter::Impl {
-  mcap::McapWriter writer;
+  // `output` must outlive `writer`: ~McapWriter() calls close(), which writes
+  // the footer through the IWritable it was opened with.
   CheckedFileWriter output;
-  std::unordered_map<std::uint32_t, mcap::ChannelId> channel_id_map;
-  std::unordered_map<mcap::ChannelId, std::uint32_t> sequence_by_channel;
+  mcap::McapWriter writer;
+  struct ChannelState {
+    mcap::ChannelId id = 0;
+    std::uint32_t next_sequence = 0;
+  };
+  std::unordered_map<std::uint32_t, ChannelState> channels_by_topic;
   bool open = false;
 };
 
@@ -118,8 +125,13 @@ bool SessionMcapWriter::open(const std::string& path, const SessionInfo& info, s
   options.chunkSize = 4 * 1024 * 1024;
   impl_->writer.open(impl_->output, options);
   if (!impl_->output.error().empty()) {
+    const std::string message = impl_->output.error();
     impl_->writer.terminate();
-    return fail(impl_->output.error());
+    impl_->output.end();
+    // Nothing valuable was written yet — don't leave a garbage partial behind.
+    std::error_code remove_ec;
+    std::filesystem::remove(path, remove_ec);
+    return fail(message);
   }
   impl_->open = true;
 
@@ -139,10 +151,7 @@ bool SessionMcapWriter::open(const std::string& path, const SessionInfo& info, s
     }
     mcap::Channel channel(session_topic.topic_name, session_topic.message_encoding, schema_id);
     impl_->writer.addChannel(channel);
-    impl_->channel_id_map[session_topic.topic_id] = channel.id;
-  }
-  if (error != nullptr) {
-    error->clear();
+    impl_->channels_by_topic[session_topic.topic_id] = {channel.id, 0};
   }
   return true;
 }
@@ -157,15 +166,15 @@ bool SessionMcapWriter::write(const DecodedMessage& message, std::string* error)
   if (!impl_->open) {
     return fail("MCAP writer is not open");
   }
-  const auto channel_it = impl_->channel_id_map.find(message.topic_id);
-  if (channel_it == impl_->channel_id_map.end()) {
+  const auto channel_it = impl_->channels_by_topic.find(message.topic_id);
+  if (channel_it == impl_->channels_by_topic.end()) {
     return fail("message references unknown session topic id " + std::to_string(message.topic_id));
   }
 
-  const mcap::ChannelId channel_id = channel_it->second;
+  Impl::ChannelState& channel = channel_it->second;
   mcap::Message record;
-  record.channelId = channel_id;
-  record.sequence = impl_->sequence_by_channel[channel_id]++;
+  record.channelId = channel.id;
+  record.sequence = channel.next_sequence++;
   record.logTime = static_cast<mcap::Timestamp>(message.log_time_ns);
   record.publishTime = static_cast<mcap::Timestamp>(message.publish_time_ns);
   record.dataSize = message.payload.size();
@@ -177,17 +186,11 @@ bool SessionMcapWriter::write(const DecodedMessage& message, std::string* error)
   if (!impl_->output.error().empty()) {
     return fail("MCAP write failed: " + impl_->output.error());
   }
-  if (error != nullptr) {
-    error->clear();
-  }
   return true;
 }
 
 bool SessionMcapWriter::close(std::string* error) {
   if (!impl_->open) {
-    if (error != nullptr) {
-      error->clear();
-    }
     return true;
   }
   impl_->writer.close();
@@ -198,14 +201,7 @@ bool SessionMcapWriter::close(std::string* error) {
     }
     return false;
   }
-  if (error != nullptr) {
-    error->clear();
-  }
   return true;
-}
-
-bool SessionMcapWriter::isOpen() const {
-  return impl_->open;
 }
 
 }  // namespace mcap_cloud

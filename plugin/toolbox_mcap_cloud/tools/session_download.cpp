@@ -3,7 +3,7 @@
 //
 #include "session_download.hpp"
 
-#include "session_decode.hpp"  // full DecodedMessage definition
+#include "decoded_message.hpp"
 #include "session_mcap_writer.hpp"
 
 namespace mcap_cloud {

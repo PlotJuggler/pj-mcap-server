@@ -2,20 +2,24 @@
 // SPDX-License-Identifier: MIT
 #include "mcap_save_path.hpp"
 
-#include <chrono>
+#include <algorithm>
 #include <cctype>
-#include <ctime>
+#include <chrono>
 #include <system_error>
 
-#include <pj_base/sdk/platform.hpp>
+#include "core/time_format.h"
+#include "elide_name.h"
 
 namespace mcap_cloud {
 namespace {
 
 std::string portableStem(const std::string& sequence_name) {
-  std::string stem = std::filesystem::path(sequence_name).filename().stem().string();
-  if (stem.empty()) {
-    stem = "cloud_download";
+  // '/'-split like every other object-key consumer (see elide_name.h — a
+  // std::filesystem::path would also split on '\' on Windows), then drop the
+  // extension.
+  std::string stem = baseName(sequence_name);
+  if (const auto dot = stem.rfind('.'); dot != std::string::npos && dot > 0) {
+    stem.resize(dot);
   }
   for (char& ch : stem) {
     const unsigned char uch = static_cast<unsigned char>(ch);
@@ -41,56 +45,39 @@ std::string portableStem(const std::string& sequence_name) {
 
 }  // namespace
 
-std::string defaultMcapSaveDirectory() {
-  return (PJ::sdk::userDataDir() / "mcap_cloud" / "downloads").string();
-}
-
 std::string utcTimestampForFilename() {
-  const std::time_t now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
-  std::tm utc{};
-#if defined(_WIN32)
-  gmtime_s(&utc, &now);
-#else
-  gmtime_r(&now, &utc);
-#endif
-  char text[32] = {};
-  (void)std::strftime(text, sizeof(text), "%Y%m%dT%H%M%SZ", &utc);
-  return text;
+  const auto now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                          std::chrono::system_clock::now().time_since_epoch())
+                          .count();
+  // formatIso8601Utc -> "YYYY-MM-DDTHH:MM:SS"; strip the separators for a
+  // portable filename.
+  std::string stamp = formatIso8601Utc(now_ns);
+  stamp.erase(
+      std::remove_if(stamp.begin(), stamp.end(), [](char c) { return c == '-' || c == ':'; }),
+      stamp.end());
+  return stamp + "Z";
 }
 
-bool prepareMcapOutputPaths(
+std::optional<McapOutputPaths> prepareMcapOutputPaths(
     const std::filesystem::path& directory, const std::vector<std::string>& sequence_names,
-    const std::string& utc_stamp, McapOutputPaths* paths, std::string* error) {
+    const std::string& utc_stamp, std::string* error) {
   auto fail = [error](std::string message) {
     if (error != nullptr) {
       *error = std::move(message);
     }
-    return false;
+    return std::nullopt;
   };
-  if (paths == nullptr) {
-    return fail("internal error: output path result is null");
-  }
   if (directory.empty()) {
     return fail("save directory is empty");
   }
 
   std::error_code ec;
-  const bool directory_exists = std::filesystem::exists(directory, ec);
-  if (ec) {
-    return fail("could not inspect save directory '" + directory.string() + "': " + ec.message());
-  }
-  if (directory_exists && !std::filesystem::is_directory(directory, ec)) {
+  if (std::filesystem::exists(directory, ec) && !std::filesystem::is_directory(directory, ec)) {
     return fail("save path is not a directory: '" + directory.string() + "'");
   }
-  if (ec) {
-    return fail("could not inspect save directory '" + directory.string() + "': " + ec.message());
-  }
-  std::filesystem::create_directories(directory, ec);
+  std::filesystem::create_directories(directory, ec);  // no-op on an existing directory
   if (ec) {
     return fail("could not create save directory '" + directory.string() + "': " + ec.message());
-  }
-  if (!std::filesystem::is_directory(directory, ec) || ec) {
-    return fail("save path is not a directory: '" + directory.string() + "'");
   }
 
   std::string stem = portableStem(sequence_names.empty() ? std::string{} : sequence_names.front());
@@ -105,22 +92,18 @@ bool prepareMcapOutputPaths(
         .final_path = directory / (candidate + ".mcap"),
         .partial_path = directory / (candidate + ".partial.mcap"),
     };
-    ec.clear();
-    const bool final_exists = std::filesystem::exists(result.final_path, ec);
-    if (ec) {
-      return fail("could not inspect output path '" + result.final_path.string() + "': " + ec.message());
-    }
-    ec.clear();
-    const bool partial_exists = std::filesystem::exists(result.partial_path, ec);
-    if (ec) {
-      return fail("could not inspect output path '" + result.partial_path.string() + "': " + ec.message());
-    }
-    if (!final_exists && !partial_exists) {
-      *paths = std::move(result);
-      if (error != nullptr) {
-        error->clear();
+    bool taken = false;
+    for (const auto* path : {&result.final_path, &result.partial_path}) {
+      ec.clear();
+      if (std::filesystem::exists(*path, ec)) {
+        taken = true;
       }
-      return true;
+      if (ec) {
+        return fail("could not inspect output path '" + path->string() + "': " + ec.message());
+      }
+    }
+    if (!taken) {
+      return result;
     }
   }
 }

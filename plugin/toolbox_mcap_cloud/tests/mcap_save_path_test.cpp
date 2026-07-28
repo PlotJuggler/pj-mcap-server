@@ -36,28 +36,26 @@ class TempDirectory {
 
 TEST(McapSavePath, CreatesDirectoryAndSingleFileName) {
   TempDirectory temp;
-  mcap_cloud::McapOutputPaths paths;
   std::string error;
-  ASSERT_TRUE(mcap_cloud::prepareMcapOutputPaths(
+  const auto paths = mcap_cloud::prepareMcapOutputPaths(
       temp.path() / "nested", {"customer=x/date=2026-01-01/drive.mcap"},
-      "20260726T120000Z", &paths, &error))
-      << error;
+      "20260726T120000Z", &error);
+  ASSERT_TRUE(paths.has_value()) << error;
 
   EXPECT_TRUE(fs::is_directory(temp.path() / "nested"));
-  EXPECT_EQ(paths.final_path.filename(), "drive_download_20260726T120000Z.mcap");
-  EXPECT_EQ(paths.partial_path.filename(), "drive_download_20260726T120000Z.partial.mcap");
+  EXPECT_EQ(paths->final_path.filename(), "drive_download_20260726T120000Z.mcap");
+  EXPECT_EQ(paths->partial_path.filename(), "drive_download_20260726T120000Z.partial.mcap");
 }
 
 TEST(McapSavePath, SanitizesAndNamesStitchedSelection) {
   TempDirectory temp;
-  mcap_cloud::McapOutputPaths paths;
   std::string error;
-  ASSERT_TRUE(mcap_cloud::prepareMcapOutputPaths(
+  const auto paths = mcap_cloud::prepareMcapOutputPaths(
       temp.path(), {"dir/a bad:name.mcap", "b.mcap", "c.mcap"},
-      "20260726T120000Z", &paths, &error))
-      << error;
+      "20260726T120000Z", &error);
+  ASSERT_TRUE(paths.has_value()) << error;
 
-  EXPECT_EQ(paths.final_path.filename(), "a_bad_name_plus_2_download_20260726T120000Z.mcap");
+  EXPECT_EQ(paths->final_path.filename(), "a_bad_name_plus_2_download_20260726T120000Z.mcap");
 }
 
 TEST(McapSavePath, AvoidsFinalAndPartialCollisions) {
@@ -66,14 +64,13 @@ TEST(McapSavePath, AvoidsFinalAndPartialCollisions) {
   std::ofstream(temp.path() / "drive_download_20260726T120000Z.mcap").put('x');
   std::ofstream(temp.path() / "drive_download_20260726T120000Z_2.partial.mcap").put('x');
 
-  mcap_cloud::McapOutputPaths paths;
   std::string error;
-  ASSERT_TRUE(mcap_cloud::prepareMcapOutputPaths(
-      temp.path(), {"drive.mcap"}, "20260726T120000Z", &paths, &error))
-      << error;
+  const auto paths = mcap_cloud::prepareMcapOutputPaths(
+      temp.path(), {"drive.mcap"}, "20260726T120000Z", &error);
+  ASSERT_TRUE(paths.has_value()) << error;
 
-  EXPECT_EQ(paths.final_path.filename(), "drive_download_20260726T120000Z_3.mcap");
-  EXPECT_EQ(paths.partial_path.filename(), "drive_download_20260726T120000Z_3.partial.mcap");
+  EXPECT_EQ(paths->final_path.filename(), "drive_download_20260726T120000Z_3.mcap");
+  EXPECT_EQ(paths->partial_path.filename(), "drive_download_20260726T120000Z_3.partial.mcap");
 }
 
 TEST(McapSavePath, RejectsAFileAsDirectory) {
@@ -82,9 +79,9 @@ TEST(McapSavePath, RejectsAFileAsDirectory) {
   const fs::path not_directory = temp.path() / "plain-file";
   std::ofstream(not_directory).put('x');
 
-  mcap_cloud::McapOutputPaths paths;
   std::string error;
   EXPECT_FALSE(mcap_cloud::prepareMcapOutputPaths(
-      not_directory, {"drive.mcap"}, "20260726T120000Z", &paths, &error));
+                   not_directory, {"drive.mcap"}, "20260726T120000Z", &error)
+                   .has_value());
   EXPECT_NE(error.find("not a directory"), std::string::npos);
 }

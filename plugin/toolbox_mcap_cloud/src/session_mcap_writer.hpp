@@ -13,6 +13,9 @@ namespace mcap_cloud {
 /// Transport-independent reconstruction of a SessionInfo + DecodedMessage
 /// stream into one MCAP. The implementation owns the only writer-specific id
 /// mapping and is shared by the GUI worker and the headless CLI.
+///
+/// Error contract: each call returns false with the reason in `*error`;
+/// `*error` is only meaningful after a false return.
 class SessionMcapWriter {
  public:
   SessionMcapWriter();
@@ -24,7 +27,6 @@ class SessionMcapWriter {
   [[nodiscard]] bool open(const std::string& path, const SessionInfo& info, std::string* error);
   [[nodiscard]] bool write(const DecodedMessage& message, std::string* error);
   [[nodiscard]] bool close(std::string* error);
-  [[nodiscard]] bool isOpen() const;
 
  private:
   struct Impl;
