@@ -377,16 +377,16 @@ Storage format: `{"v":1,"origins":["wss://host:443","ws://host:8080", ...]}` —
 serialized origin is `scheme://host:port` with the EFFECTIVE port always explicit
 (so default-port variants compare equal).
 
-- [ ] **Step 5.1: Write failing tests**: record→trusted; unrecorded→false; default-port
+- [x] **Step 5.1: Write failing tests**: record→trusted; unrecorded→false; default-port
   equivalence (`wss://h` recorded → `wss://h:443` trusted); persistence across two
   instances on the same root; unparsable uri no-op; corrupt file tolerated as empty
   (same tolerance the credential store pins); file mode 0600 on POSIX.
-- [ ] **Step 5.2: Verify FAIL, implement (reuse the credential store's atomic-write
+- [x] **Step 5.2: Verify FAIL, implement (reuse the credential store's atomic-write
   helper pattern), verify PASS.**
-- [ ] **Step 5.3: Wire `onConnectFinished`** (ok branch): `TrustedOrigins::standard()
+- [x] **Step 5.3: Wire `onConnectFinished`** (ok branch): `TrustedOrigins::standard()
   .recordSuccessfulHello(uri)` — construct lazily like `credentialStore()` does.
-- [ ] **Step 5.4: Full suite PASS.**
-- [ ] **Step 5.5: Commit** — `feat(security): trusted-origin ledger (successful-Hello only)`
+- [x] **Step 5.4: Full suite PASS.**
+- [x] **Step 5.5: Commit** — `feat(security): trusted-origin ledger (successful-Hello only)`
 
 ---
 

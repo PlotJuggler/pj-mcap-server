@@ -570,6 +570,16 @@ CredentialStore& McapCloudDialog::credentialStore() {
   return *credentials_;
 }
 
+TrustedOrigins& McapCloudDialog::trustedOrigins() {
+  // Lazily construct the trusted-origin ledger (spec §7 guard 1), mirroring
+  // credentialStore(): a unit-load that never connects never touches the
+  // config root.
+  if (!trusted_origins_) {
+    trusted_origins_ = std::make_unique<TrustedOrigins>(TrustedOrigins::standard());
+  }
+  return *trusted_origins_;
+}
+
 void McapCloudDialog::setSettings(PJ::sdk::SettingsView settings) {
   settings_ = settings;
   initFromSettings();
@@ -2638,6 +2648,11 @@ void McapCloudDialog::onConnectFinished(bool ok, std::string uri, std::string st
       std::lock_guard<std::mutex> lock(state_.mu);
       state_.server_history = std::move(history);
     }
+
+    // Spec §7 guard 1: a successful interactive Hello is the ONLY event that
+    // marks an origin trusted for auto-replay — recorded here, alongside the
+    // MRU write, about the server that actually answered.
+    trustedOrigins().recordSuccessfulHello(uri);
 
     notify(PJ::ToolboxMessageLevel::kInfo, status);
     // The catalog is NEVER fetched unfiltered: fetch the vocabulary (the

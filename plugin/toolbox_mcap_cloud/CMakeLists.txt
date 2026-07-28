@@ -123,6 +123,7 @@ set(MCAP_CLOUD_SOURCES
   src/settings_store.cpp
   src/credential_store.cpp
   src/origin_match.cpp
+  src/trusted_origins.cpp
   src/server_history.cpp
   src/core/time_format.cpp
 )
@@ -931,6 +932,30 @@ if(BUILD_TESTING)
     protobuf::libprotobuf ixwebsocket::ixwebsocket zstd::libzstd_static LZ4::lz4_static GTest::gtest_main
   )
   add_test(NAME McapCloudServerCapsTest COMMAND toolbox_mcap_cloud_server_caps_test)
+
+  # Trusted-origin ledger (HERMETIC): spec §7 guard 1 — trusted = origin
+  # recorded after a SUCCESSFUL interactive Hello. Deliberately NOT the
+  # credential store (credentials can exist before any successful connect).
+  # Same conventions as the credential store: injectable config root, 0600
+  # file / 0700 dir, atomic replace, corrupt-file-reads-as-empty. Rooted at a
+  # private temp dir so it never touches the real $XDG_CONFIG_HOME. Links
+  # credential_store.cpp for defaultConfigRoot() (TrustedOrigins::standard())
+  # and origin_match.cpp for the strict origin parse.
+  add_executable(toolbox_mcap_cloud_trusted_origins_test
+    tests/trusted_origins_test.cpp
+    src/trusted_origins.cpp
+    src/origin_match.cpp
+    src/credential_store.cpp
+    src/server_history.cpp
+  )
+  target_compile_features(toolbox_mcap_cloud_trusted_origins_test PRIVATE cxx_std_20)
+  target_include_directories(toolbox_mcap_cloud_trusted_origins_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+  )
+  target_link_libraries(toolbox_mcap_cloud_trusted_origins_test PRIVATE
+    plotjuggler_sdk::plugin_sdk nlohmann_json::nlohmann_json GTest::gtest_main
+  )
+  add_test(NAME McapCloudTrustedOriginsTest COMMAND toolbox_mcap_cloud_trusted_origins_test)
 
   # Strict ws/wss origin parse + compare (HERMETIC, std-only): the credential
   # origin-binding guard (spec docs/canonical-layout-replay.md §7 guard 2) —
