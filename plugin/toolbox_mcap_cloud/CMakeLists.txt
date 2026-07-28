@@ -882,6 +882,31 @@ if(BUILD_TESTING)
   )
   add_test(NAME McapCloudListErrorSurfaceTest COMMAND toolbox_mcap_cloud_list_error_surface_test)
 
+  # Cancel-responsiveness of the SESSION RPC wait (HERMETIC): cancelSession()
+  # during a pending OpenSession must wake sendAndWait promptly ("cancelled"),
+  # never strand the worker for the full 120 s kOpenSessionTimeout — and the
+  # wake is SCOPED to the session request path (a stale cancel flag must not
+  # disturb browse RPCs like ListFiles). In-process fake WS server that answers
+  # Hello (+ListFiles) but deliberately never OpenSession. TIMEOUT 30 so a
+  # predicate regression fails fast instead of hanging CI on the 120 s wait.
+  add_executable(toolbox_mcap_cloud_backend_cancel_wait_test
+    tests/backend_cancel_wait_test.cpp
+    tests/find_free_port.cpp
+    src/backend_connection.cpp
+    src/wire_mapping.cpp
+    src/session_decode.cpp
+    ${MCAP_CLOUD_PROTO_SRCS}
+  )
+  target_include_directories(toolbox_mcap_cloud_backend_cancel_wait_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${MCAP_CLOUD_PROTO_OUT_DIR}
+  )
+  target_link_libraries(toolbox_mcap_cloud_backend_cancel_wait_test PRIVATE
+    protobuf::libprotobuf ixwebsocket::ixwebsocket zstd::libzstd_static LZ4::lz4_static GTest::gtest_main
+  )
+  add_test(NAME McapCloudBackendCancelWaitTest COMMAND toolbox_mcap_cloud_backend_cancel_wait_test)
+  set_tests_properties(McapCloudBackendCancelWaitTest PROPERTIES TIMEOUT 30)
+
   add_executable(toolbox_mcap_cloud_server_caps_test
     tests/server_caps_test.cpp
     tests/find_free_port.cpp

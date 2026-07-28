@@ -255,10 +255,10 @@ hand-verify the first case with `python3 - <<'EOF'` + hashlib before committing)
   `toolbox_mcap_cloud_backend_error_test` — it already demonstrates a loopback/fake-server
   harness; REUSE that harness pattern, do not invent a new one)
 
-- [ ] **Step 3.1: Read** `src/backend_connection.cpp` `sendAndWait` + `cancelSession` and
+- [x] **Step 3.1: Read** `src/backend_connection.cpp` `sendAndWait` + `cancelSession` and
   `tests/backend_error_test.cpp` (the existing hermetic harness). Identify the condition
   variable + predicate.
-- [ ] **Step 3.2: Write the failing test**: start the harness's fake server variant that
+- [x] **Step 3.2: Write the failing test**: start the harness's fake server variant that
   ACCEPTS the WebSocket but never answers an `OpenFresh` request; call
   `openSessionFresh` on a worker `std::thread`; after 200 ms call `cancelSession()`;
   `join` with a deadline: assert the call returned within **2 s** with an error mentioning
@@ -266,15 +266,15 @@ hand-verify the first case with `python3 - <<'EOF'` + hashlib before committing)
   `std::chrono::steady_clock` around the join.
   Run it: it must FAIL by timing out past the assertion bound (bound the test itself with
   the ctest `TIMEOUT 30` property so a regression fails fast rather than hanging CI).
-- [ ] **Step 3.3: Implement**: add cancellation to the wait predicate
+- [x] **Step 3.3: Implement**: add cancellation to the wait predicate
   (`cv_.wait_for(..., [&]{ return response_ready || closed_ || cancel_requested_; })`)
   and make `cancelSession()` set the flag + `notify_all` on the same cv. Return a
   distinct error `"cancelled"` so callers keep their existing closed-vs-error handling.
   Check every OTHER `sendAndWait` caller (ListFiles/GetVocabulary/…) still behaves: a
   cancel outside a session must NOT wake browse RPCs spuriously — scope the flag to the
   session request path (member reset at request start, exactly like the frame-wait flag).
-- [ ] **Step 3.4: Run** the new test + the full suite: 41+new tests PASS.
-- [ ] **Step 3.5: Commit** — `fix(backend): cancel joins sendAndWait's wake predicate (no 120s hang)`
+- [x] **Step 3.4: Run** the new test + the full suite: 41+new tests PASS.
+- [x] **Step 3.5: Commit** — `fix(backend): cancel joins sendAndWait's wake predicate (no 120s hang)`
 
 ---
 
