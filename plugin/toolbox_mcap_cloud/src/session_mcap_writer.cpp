@@ -100,6 +100,9 @@ struct SessionMcapWriter::Impl {
   std::unordered_map<std::uint32_t, ChannelState> channels_by_topic;
   std::uint64_t skipped_unknown_topics = 0;
   bool open = false;
+  // Latched by the first write() call: gates writeMetadata (a Metadata record
+  // mid-stream would close the open chunk — see mcap::McapWriter::write).
+  bool wrote_message = false;
 };
 
 SessionMcapWriter::SessionMcapWriter() : impl_(std::make_unique<Impl>()) {}
@@ -124,16 +127,20 @@ bool SessionMcapWriter::open(const std::filesystem::path& path, const SessionInf
   if (!impl_->output.open(path)) {
     return fail(impl_->output.error());
   }
-
-  mcap::McapWriterOptions options("");
-  options.compression = mcap::Compression::Zstd;
-  options.compressionLevel = mcap::CompressionLevel::Default;
-  options.chunkSize = 4 * 1024 * 1024;
-  impl_->writer.open(impl_->output, options);
+  // Delegate to the sink overload — the ONE init path for the writer options
+  // and the schema/channel dictionaries.
+  if (!open(static_cast<mcap::IWritable&>(impl_->output), info, error)) {
+    impl_->output.end();
+    std::error_code remove_ec;
+    std::filesystem::remove(path, remove_ec);
+    return false;
+  }
   if (!impl_->output.error().empty()) {
     const std::string message = impl_->output.error();
     impl_->writer.terminate();
     impl_->output.end();
+    impl_->open = false;
+    impl_->channels_by_topic.clear();
     // Nothing valuable was written yet — don't leave a garbage partial behind.
     std::error_code remove_ec;
     std::filesystem::remove(path, remove_ec);
@@ -146,7 +153,29 @@ bool SessionMcapWriter::open(const std::filesystem::path& path, const SessionInf
     }
     return fail(message);
   }
+  return true;
+}
+
+bool SessionMcapWriter::open(mcap::IWritable& sink, const SessionInfo& info, std::string* error) {
+  auto fail = [error](std::string message) {
+    if (error != nullptr) {
+      *error = std::move(message);
+    }
+    return false;
+  };
+  if (impl_->open) {
+    return fail("MCAP writer is already open");
+  }
+
+  mcap::McapWriterOptions options("");
+  options.compression = mcap::Compression::Zstd;
+  options.compressionLevel = mcap::CompressionLevel::Default;
+  options.chunkSize = 4 * 1024 * 1024;
+  // Sink write failures are the caller's to observe (the sink owns the file
+  // policy); the path overload layers its CheckedFileWriter check on top.
+  impl_->writer.open(sink, options);
   impl_->open = true;
+  impl_->wrote_message = false;
 
   std::unordered_map<std::uint32_t, mcap::SchemaId> schema_id_map;
   for (const auto& session_schema : info.schemas) {
@@ -179,6 +208,7 @@ bool SessionMcapWriter::write(const DecodedMessage& message, std::string* error)
   if (!impl_->open) {
     return fail("MCAP writer is not open");
   }
+  impl_->wrote_message = true;  // closes the writeMetadata window (see below)
   const auto channel_it = impl_->channels_by_topic.find(message.topic_id);
   if (channel_it == impl_->channels_by_topic.end()) {
     // A topic_id outside the session dictionary is a violated server
@@ -202,6 +232,36 @@ bool SessionMcapWriter::write(const DecodedMessage& message, std::string* error)
   }
   if (!impl_->output.error().empty()) {
     return fail("MCAP write failed: " + impl_->output.error());
+  }
+  return true;
+}
+
+bool SessionMcapWriter::writeMetadata(const std::string& name, const std::string& value_json,
+                                      std::string* error) {
+  auto fail = [error](std::string text) {
+    if (error != nullptr) {
+      *error = std::move(text);
+    }
+    return false;
+  };
+  if (!impl_->open) {
+    return fail("MCAP writer is not open");
+  }
+  if (impl_->wrote_message) {
+    // mcap::McapWriter::write(const Metadata&) closes the current chunk, so a
+    // mid-stream metadata record would split chunks — the provenance hook is
+    // an open()-time affair by contract.
+    return fail("writeMetadata must be called before the first write()");
+  }
+  mcap::Metadata metadata;
+  metadata.name = name;
+  metadata.metadata = {{"json", value_json}};
+  const mcap::Status status = impl_->writer.write(metadata);
+  if (!status.ok()) {
+    return fail("MCAP metadata write failed: " + status.message);
+  }
+  if (!impl_->output.error().empty()) {
+    return fail("MCAP metadata write failed: " + impl_->output.error());
   }
   return true;
 }

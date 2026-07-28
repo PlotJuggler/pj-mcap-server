@@ -418,15 +418,15 @@ Implementation: refactor the existing `open(path,...)` to open the internal
 dictionaries built in exactly one place). `writeMetadata` maps to `mcap::Metadata` with
 one KV pair `{"json": value_json}` via `mcap::McapWriter::write(const Metadata&)`.
 
-- [ ] **Step 6.1: Write failing tests**: (a) round-trip via the sink overload writing to a
+- [x] **Step 6.1: Write failing tests**: (a) round-trip via the sink overload writing to a
   `CheckedFileWriter`-like local sink... simpler: reuse the path overload for I/O and test
   the NEW overload with a small in-test `mcap::IWritable` that wraps `std::ofstream` —
   then read the file back and assert messages+summary as the existing round-trip does;
   (b) `writeMetadata("mcap_cloud/replay_descriptor", "{\"v\":1}")` → reader finds exactly
   one metadata record with that name and value via `reader.readMetadata()` /
   metadata index; (c) `writeMetadata` after first `write()` returns false.
-- [ ] **Step 6.2: FAIL → implement → PASS** (whole suite).
-- [ ] **Step 6.3: Commit** — `feat(writer): caller-owned-sink open + metadata provenance hook`
+- [x] **Step 6.2: FAIL → implement → PASS** (whole suite).
+- [x] **Step 6.3: Commit** — `feat(writer): caller-owned-sink open + metadata provenance hook`
 
 ---
 
