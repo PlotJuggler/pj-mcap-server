@@ -411,28 +411,26 @@ Explicitly **not** built (v2 components dissolved or #470-supplied): `<replay_so
 
 ## 9. Plugin changes (this repo)
 
-0. **PR #4 follow-ups** (after it merges as-is; each hardens the save path for tee duty —
-   sourced from the 2026-07-28 four-agent review):
-   - **A save-side write failure must not abort the download/import** — today
-     `write()==false` in the pull loop cancels the whole session and truncates the host
-     import; latch the error, discard the writer, let the import finish. This is also the
-     prerequisite for the async tee (§6.5-style bounded queue) and for adoption semantics.
-   - **Save must not disable the SessionCache HIT path** — save-on (the default) currently
-     bypasses the count-cache entirely, so repeat fetches re-download; consult the cache
-     first and report "served from cache, no MCAP written" (or explicit evict-and-refetch).
-   - **Exactly-one → at-most-one `McapSaveResult`**: fire a result (or documented skip) on
-     every post-allocation early exit; fix the over-claiming contract comments.
+0. **PR #4 gates + follow-ups.** The 2026-07-28 four-agent + Codex merge-gate review split
+   the findings; the five gates **landed in the PR itself** (`f775d9e`, 40/40 ctest):
+   export-is-secondary (a tee open/write/finalize failure never aborts the download or the
+   import — also the prerequisite for the async cache tee and adoption semantics);
+   **exactly-one `McapSaveResult`** per export-requested pull on every exit path (new
+   `Skipped` status; Codex's correction — never "at-most-one"); TOCTOU-closed exclusive
+   name reservation; `<name>.mcap.partial` ordering; `mcap_cloud/export_*` keys with
+   **default-off** export; plus skip-with-count for unmapped `topic_id`,
+   `std::filesystem::path` end-to-end, and the comment-rot fixes.
+   Remaining post-merge follow-ups (stage-1, each hardening the path for tee duty):
+   - **Export-on-cache-hit**: once the durable cache exists, fulfill a requested export by
+     atomic copy/reflink from the validated cache file (zero network) — never "no file
+     written" (Codex C.2); the cache becomes the sole MCAP **encoder**, exports are byte
+     copies (single-encoder dual-destination rule, C.3).
    - **Writer seam for the cache**: `SessionMcapWriter::open` overload taking a pre-opened
      `mcap::IWritable`/fd (symlink-safe 0600 exclusive create, fsync, per-process partial
      naming live outside the writer); `RetentionPolicy` parameter (export keeps readable
      partials — deliberate product choice; cache deletes); Metadata-record provenance hook.
-   - **Naming**: partial files ordered `<name>.mcap.partial[.pid]` (never `*.mcap`-suffixed,
-     they look loadable); settings renamed `mcap_cloud/export_*` (once the cache tee is
-     always-on, "save" toggling a *file write* is a contradiction — the toggle governs the
-     user-visible export copy only).
-   - CLI regression: unmapped `topic_id` should skip-with-count (old behavior), not abort
-     the session; Windows: pass `std::filesystem::path` through to `ofstream::open` (no
-     narrow-ACP round-trip); TOCTOU: reserve the output name at pick time (`noreplace`).
+   - **Raw-tee parser independence**: writer setup moves ahead of the `hasDecodable` gate
+     (a raw export/cache file must not require a bound parser).
 1. **Descriptor module** — schema, validation + limits, canonical serialization, sha256/128
    digest; shared vectors. *(Independently shippable.)*
 2. **Cancel hardening** — cancellation joins `sendAndWait`'s wake predicate (cancel during
@@ -539,9 +537,8 @@ Explicitly **not** built (v2 components dissolved or #470-supplied): `<replay_so
 
 ## 13. Build order (cross-repo hazards resolved)
 
-0. **PR #4 merges as-is** (standalone user value), then its §9.0 follow-ups land as the first
-   plugin commits (each independently shippable; the write-failure decoupling and the
-   cache-HIT restoration are user-visible fixes on their own).
+0. **PR #4 merges with its five gates applied** (done — `f775d9e`; standalone user value),
+   then the remaining §9.0 follow-ups land as the first plugin commits.
 1. **Plugin foundations** *(no host dependency, each shippable)* — descriptor module + vectors;
    cancel predicate; credential origin binding + trusted-origin ledger; cache manager
    (re-targeting the PR #4 writer via the §9.0 seams).
