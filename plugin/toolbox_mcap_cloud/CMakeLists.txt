@@ -118,6 +118,7 @@ set(MCAP_CLOUD_SOURCES
   src/wire_mapping.cpp
   src/session_decode.cpp
   src/session_mcap_writer.cpp
+  src/session_file_cache.cpp
   src/mcap_save_path.cpp
   src/mcap_implementation.cpp
   src/settings_store.cpp
@@ -125,6 +126,8 @@ set(MCAP_CLOUD_SOURCES
   src/origin_match.cpp
   src/trusted_origins.cpp
   src/server_history.cpp
+  src/core/file_lock.cpp
+  src/core/sha256.cpp
   src/core/time_format.cpp
 )
 
@@ -583,6 +586,33 @@ if(BUILD_TESTING)
     mcap::mcap zstd::libzstd_static LZ4::lz4_static GTest::gtest_main
   )
   add_test(NAME McapCloudSessionMcapWriterTest COMMAND toolbox_mcap_cloud_session_mcap_writer_test)
+
+  # Request-addressed session file cache core (spec docs/canonical-layout-
+  # replay.md §5, HERMETIC): identity validation + path mapping, per-identity
+  # exclusive materialize lock (sidecar <hex>.mcap.lock via flock/LockFileEx),
+  # validated finalization (reader: footer/summary/Statistics + embedded
+  # replay-descriptor identity, then fsync -> atomic rename -> dir fsync),
+  # touch-file LRU eviction and orphan-partial cleanup. Injects a private temp
+  # root; fixtures are REAL MCAPs built with SessionMcapWriter (+ embedded
+  # provenance); uses the test-only reader+writer implementation TU.
+  add_executable(toolbox_mcap_cloud_session_file_cache_test
+    tests/session_file_cache_test.cpp
+    src/session_file_cache.cpp
+    src/core/file_lock.cpp
+    src/session_mcap_writer.cpp
+    src/replay_descriptor.cpp
+    src/core/sha256.cpp
+    tests/mcap_roundtrip_implementation.cpp
+  )
+  target_compile_features(toolbox_mcap_cloud_session_file_cache_test PRIVATE cxx_std_20)
+  target_include_directories(toolbox_mcap_cloud_session_file_cache_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+  )
+  target_link_libraries(toolbox_mcap_cloud_session_file_cache_test PRIVATE
+    plotjuggler_sdk::plugin_sdk nlohmann_json::nlohmann_json
+    mcap::mcap zstd::libzstd_static LZ4::lz4_static GTest::gtest_main
+  )
+  add_test(NAME McapCloudSessionFileCacheTest COMMAND toolbox_mcap_cloud_session_file_cache_test)
 
   # D6 CredentialStore seam + file-backed fallback (HERMETIC): per-server token
   # round-trip, key normalization/collision, isolation, overwrite, erase,

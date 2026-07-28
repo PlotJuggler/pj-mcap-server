@@ -510,7 +510,7 @@ class SessionFileCache {
 Touch stamps: sidecar `<name>.touch` files updated on `lookup` hit and `finalize`
 (atime is unreliable under relatime/noatime). Eviction order = touch mtime ascending.
 
-- [ ] **Step 7.1: Write failing tests** (inject a temp root; build real tiny MCAPs with
+- [x] **Step 7.1: Write failing tests** (inject a temp root; build real tiny MCAPs with
   `SessionMcapWriter` + `writeMetadata` provenance):
   - `pathFor` shape + identity validation (garbage identity → distinct error).
   - materialize→finalize→lookup round-trip; lookup touches the stamp (mtime advances).
@@ -522,11 +522,17 @@ Touch stamps: sidecar `<name>.touch` files updated on `lookup` hit and `finalize
   - `cleanup`: stale orphan partial (backdate its mtime via `fs::last_write_time`)
     removed; fresh partial kept; LRU eviction removes oldest-touched first and stops
     at the byte cap (use a tiny `max_total_bytes` like 8 KiB with two ~4 KiB files).
-- [ ] **Step 7.2: FAIL → implement `file_lock` (flock/LockFileEx; lock file =
+- [x] **Step 7.2: FAIL → implement `file_lock` (flock/LockFileEx; lock file =
   `<name>.lock` beside the partial) → implement the cache → PASS.** Windows caveats get
   `#if defined(_WIN32)` branches; POSIX-only assertions (0600) guarded in tests.
-- [ ] **Step 7.3: Full suite PASS** (expect 41 + 6 new targets' tests).
-- [ ] **Step 7.4: Commit** — `feat(replay): request-addressed session file cache core`
+  NOTE (deviation, anticipated by this task's own escape hatch): `reader.hpp` and
+  `writer.hpp` BOTH pull `types.inl` (non-inline definitions) under
+  `MCAP_IMPLEMENTATION`, so a separate reader-only `src/mcap_reader_implementation.cpp`
+  beside the writer-only TU would duplicate symbols — the product
+  `src/mcap_implementation.cpp` is now ONE combined reader+writer TU instead
+  (comment updated there and in `tests/mcap_roundtrip_implementation.cpp`).
+- [x] **Step 7.3: Full suite PASS** (46/46 — 45 at task start + this test target).
+- [x] **Step 7.4: Commit** — `feat(replay): request-addressed session file cache core`
 
 ---
 
