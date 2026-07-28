@@ -24,6 +24,8 @@ the connector pipeline (server → WebSocket/Protobuf → this plugin).
   session (union of topics, one continuous time range).
 - Fetches the selection and ingests decoded scalar series into the datastore.
   ROS2/CDR messages are decoded **in the plugin** (see "Decoder rationale").
+- Optionally reconstructs every fetched session as one local, chunked +
+  Zstd-compressed MCAP while it is ingested.
 - Edits a file's override **tags** (the server keeps an effective-tags view).
 - Survives a mid-download WebSocket drop via reconnect-and-resume; repeat fetches
   of the same selection are served from an in-memory session cache.
@@ -123,6 +125,29 @@ correctness can be exercised without launching the GUI. It links **zero Qt**
 | `debug <seq1> [<seq2> …] [--topics a,b] [--time-range s,e] [--limit N] [--json]` | open a session and print the first N decoded messages (topic, log_time, payload size) **without writing a file** |
 
 Exit codes: `0` success · `1` connection/RPC failure · `2` usage error.
+
+## Exporting Toolbox downloads
+
+The **Export MCAP** checkbox is **off by default** (an involuntary full-session
+file per fetch is not a sane default; enabling it is persisted per user as
+`mcap_cloud/export_*`). The adjacent **Directory** field defaults to
+PlotJuggler's per-user data directory under `mcap_cloud/downloads`.
+
+Each Download click creates one collision-safe file. A single recording uses
+`<source>_download_<UTC>.mcap`; stitched selections use
+`<first-source>_plus_<N>_download_<UTC>.mcap`. The worker reserves and writes a
+sibling `<name>.mcap.partial` (never `*.mcap`-suffixed — a truncated file must
+not look loadable) while data is arriving and renames it only after a clean
+session completion. Cancellation or a transport drop retains the finalized,
+readable partial and reports its path; a disk/write failure removes the
+unreadable partial and reports the cause. **The export is strictly secondary:
+no export failure ever aborts the download or the imported data.** With the
+checkbox enabled, repeat fetches bypass the count-only session cache (the
+export needs the raw bytes); disable it to keep cache hits.
+
+The reconstructed file contains the session protocol's messages, schemas,
+channels, and log/publish timestamps. Attachments and source MCAP metadata are
+not transmitted by the server and therefore cannot be reconstructed.
 
 ### Environment variables and flags
 

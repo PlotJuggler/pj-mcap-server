@@ -117,6 +117,9 @@ set(MCAP_CLOUD_SOURCES
   src/backend_connection.cpp
   src/wire_mapping.cpp
   src/session_decode.cpp
+  src/session_mcap_writer.cpp
+  src/mcap_save_path.cpp
+  src/mcap_implementation.cpp
   src/settings_store.cpp
   src/credential_store.cpp
   src/server_history.cpp
@@ -151,6 +154,7 @@ target_link_libraries(toolbox_mcap_cloud_plugin PRIVATE
   ixwebsocket::ixwebsocket
   zstd::libzstd_static
   LZ4::lz4_static
+  mcap::mcap
 )
 
 pj_embed_ui(toolbox_mcap_cloud_plugin
@@ -192,6 +196,8 @@ pj_emit_plugin_manifest(toolbox_mcap_cloud_plugin
 add_executable(mcap-cloud-cli
   tools/mcap_cloud_cli.cpp
   tools/session_download.cpp
+  src/session_mcap_writer.cpp
+  src/mcap_implementation.cpp
   src/backend_connection.cpp
   src/wire_mapping.cpp
   src/session_decode.cpp
@@ -213,8 +219,16 @@ set_source_files_properties(
   src/backend_connection.cpp
   src/wire_mapping.cpp
   src/session_decode.cpp
+  src/session_mcap_writer.cpp
   tools/session_download.cpp
   PROPERTIES COMPILE_OPTIONS "$<${PJ_NOT_MSVC}:-Wno-conversion;-Wno-old-style-cast;-Wno-cast-qual;-Wno-shadow>"
+)
+# Upstream MCAP's implementation is intentionally not held to this project's
+# warning-as-error policy.
+set_source_files_properties(
+  src/mcap_implementation.cpp
+  tests/mcap_roundtrip_implementation.cpp
+  PROPERTIES COMPILE_OPTIONS "-w"
 )
 target_link_libraries(mcap-cloud-cli PRIVATE
   protobuf::libprotobuf
@@ -494,6 +508,39 @@ if(BUILD_TESTING)
   )
   add_test(NAME McapCloudSettingsStoreTest COMMAND toolbox_mcap_cloud_settings_store_test)
 
+  # Collision-safe local output naming + directory validation (hermetic,
+  # SDK-free: the module only uses local helpers + the std library).
+  add_executable(toolbox_mcap_cloud_mcap_save_path_test
+    tests/mcap_save_path_test.cpp
+    src/mcap_save_path.cpp
+    src/core/time_format.cpp
+  )
+  target_compile_features(toolbox_mcap_cloud_mcap_save_path_test PRIVATE cxx_std_20)
+  target_include_directories(toolbox_mcap_cloud_mcap_save_path_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+  )
+  target_link_libraries(toolbox_mcap_cloud_mcap_save_path_test PRIVATE
+    GTest::gtest_main
+  )
+  add_test(NAME McapCloudMcapSavePathTest COMMAND toolbox_mcap_cloud_mcap_save_path_test)
+
+  # Shared GUI/CLI MCAP writer round trip (hermetic): schemas, channels,
+  # timestamps, payloads, per-channel sequence, chunking and Zstd. Uses the
+  # test-only reader+writer implementation TU (product targets are writer-only).
+  add_executable(toolbox_mcap_cloud_session_mcap_writer_test
+    tests/session_mcap_writer_test.cpp
+    src/session_mcap_writer.cpp
+    tests/mcap_roundtrip_implementation.cpp
+  )
+  target_compile_features(toolbox_mcap_cloud_session_mcap_writer_test PRIVATE cxx_std_20)
+  target_include_directories(toolbox_mcap_cloud_session_mcap_writer_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+  )
+  target_link_libraries(toolbox_mcap_cloud_session_mcap_writer_test PRIVATE
+    mcap::mcap zstd::libzstd_static LZ4::lz4_static GTest::gtest_main
+  )
+  add_test(NAME McapCloudSessionMcapWriterTest COMMAND toolbox_mcap_cloud_session_mcap_writer_test)
+
   # D6 CredentialStore seam + file-backed fallback (HERMETIC): per-server token
   # round-trip, key normalization/collision, isolation, overwrite, erase,
   # empty-vs-absent, 0600 file / 0700 dir perms, corrupt-store tolerance, and
@@ -593,6 +640,10 @@ if(BUILD_TESTING)
     src/backend_connection.cpp
     src/wire_mapping.cpp
     src/session_decode.cpp
+    src/session_mcap_writer.cpp
+    src/mcap_save_path.cpp
+    src/core/time_format.cpp
+    src/mcap_implementation.cpp
     ${MCAP_CLOUD_PROTO_SRCS}
   )
   target_compile_features(toolbox_mcap_cloud_session_resume_live_test PRIVATE cxx_std_20)
@@ -611,7 +662,7 @@ if(BUILD_TESTING)
   target_link_libraries(toolbox_mcap_cloud_session_resume_live_test PRIVATE
     plotjuggler_sdk::plugin_sdk
     protobuf::libprotobuf ixwebsocket::ixwebsocket nlohmann_json::nlohmann_json
-    zstd::libzstd_static LZ4::lz4_static GTest::gtest_main
+    zstd::libzstd_static LZ4::lz4_static mcap::mcap GTest::gtest_main
   )
   add_test(NAME McapCloudSessionResumeLiveTest COMMAND toolbox_mcap_cloud_session_resume_live_test)
 
@@ -625,6 +676,33 @@ if(BUILD_TESTING)
   # and a clean cancel-mid-pull (finalize still releases the context). Same
   # worker/transport sources as the resume live test (no rosx — the plugin
   # ships no decoders).
+  add_executable(toolbox_mcap_cloud_fetch_worker_export_contract_test
+    tests/fetch_worker_export_contract_test.cpp
+    src/parser_ingest_driver.cpp
+    src/fetch_worker.cpp
+    src/backend_connection.cpp
+    src/wire_mapping.cpp
+    src/session_decode.cpp
+    src/session_mcap_writer.cpp
+    src/mcap_save_path.cpp
+    src/core/time_format.cpp
+    src/mcap_implementation.cpp
+    ${MCAP_CLOUD_PROTO_SRCS}
+  )
+  target_compile_features(toolbox_mcap_cloud_fetch_worker_export_contract_test PRIVATE cxx_std_20)
+  target_include_directories(toolbox_mcap_cloud_fetch_worker_export_contract_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/core
+    ${MCAP_CLOUD_PROTO_OUT_DIR}
+  )
+  target_link_libraries(toolbox_mcap_cloud_fetch_worker_export_contract_test PRIVATE
+    plotjuggler_sdk::plugin_sdk
+    protobuf::libprotobuf ixwebsocket::ixwebsocket nlohmann_json::nlohmann_json
+    zstd::libzstd_static LZ4::lz4_static mcap::mcap GTest::gtest_main
+  )
+  add_test(NAME McapCloudFetchWorkerExportContractTest
+           COMMAND toolbox_mcap_cloud_fetch_worker_export_contract_test)
+
   add_executable(toolbox_mcap_cloud_parser_ingest_live_test
     tests/parser_ingest_live_test.cpp
     src/parser_ingest_driver.cpp
@@ -632,6 +710,10 @@ if(BUILD_TESTING)
     src/backend_connection.cpp
     src/wire_mapping.cpp
     src/session_decode.cpp
+    src/session_mcap_writer.cpp
+    src/mcap_save_path.cpp
+    src/core/time_format.cpp
+    src/mcap_implementation.cpp
     ${MCAP_CLOUD_PROTO_SRCS}
   )
   target_compile_features(toolbox_mcap_cloud_parser_ingest_live_test PRIVATE cxx_std_20)
@@ -643,7 +725,7 @@ if(BUILD_TESTING)
   target_link_libraries(toolbox_mcap_cloud_parser_ingest_live_test PRIVATE
     plotjuggler_sdk::plugin_sdk
     protobuf::libprotobuf ixwebsocket::ixwebsocket nlohmann_json::nlohmann_json
-    zstd::libzstd_static LZ4::lz4_static GTest::gtest_main
+    zstd::libzstd_static LZ4::lz4_static mcap::mcap GTest::gtest_main
   )
   add_test(NAME McapCloudParserIngestLiveTest COMMAND toolbox_mcap_cloud_parser_ingest_live_test)
 

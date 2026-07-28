@@ -36,10 +36,12 @@ inline std::string summarizeErrors(const std::map<std::string, int, std::less<>>
 // PJ3 parity completion policy:
 //   * cancelling           → "Download cancelled", stay open, no import
 //   * any topic imported   → import + close (partial success still imports)
+//     …UNLESS the MCAP export failed → import, stay OPEN (the export-error
+//     notification must remain visible; mcap_save_failed latch)
 //   * nothing imported     → stay open showing the (deduped) errors
 inline FetchSummary buildFetchSummary(
     int fetch_total, int fetch_done, int fetch_failed, bool imported_any, bool cancelling,
-    const std::map<std::string, int, std::less<>>& error_counts) {
+    const std::map<std::string, int, std::less<>>& error_counts, bool mcap_save_failed = false) {
   (void)fetch_done;  // reserved for future "N/M completed" detail
   FetchSummary s;
   s.error_summary = summarizeErrors(error_counts);
@@ -50,7 +52,7 @@ inline FetchSummary buildFetchSummary(
   }
   if (imported_any) {
     s.status_text = "Imported " + std::to_string(imported) + "/" + std::to_string(fetch_total) + " topics";
-    s.should_close = true;
+    s.should_close = !mcap_save_failed;
     s.should_import = true;
     return s;
   }

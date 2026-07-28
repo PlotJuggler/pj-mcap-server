@@ -15,16 +15,19 @@
 
 #include <chrono>
 #include <cstdio>
+#include <filesystem>
 #include <string>
 #include <string_view>
 #include <unordered_map>
 #include <utility>
 #include <vector>
 
+#include "decoded_message.hpp"
 #include "parser_ingest_driver.hpp"
+#include "mcap_save_path.hpp"
 #include "session_cache.hpp"
-#include "session_decode.hpp"
 #include "session_key.hpp"
+#include "session_mcap_writer.hpp"
 #include "vocab_select.hpp"
 
 namespace mcap_cloud {
@@ -396,7 +399,8 @@ void FetchWorker::updateTagsAsync(std::string sequence_name,
 }
 
 void FetchWorker::pullTopicsAsync(std::vector<std::string> sequence_names, std::string group_name,
-                                  std::vector<std::string> topic_names, std::int64_t start_ns, std::int64_t end_ns) {
+                                  std::vector<std::string> topic_names, std::int64_t start_ns, std::int64_t end_ns,
+                                  std::string save_directory) {
   // The group/display name groups all topics of a (possibly stitched) selection
   // into one catalog dataset + addresses the per-topic ledger callbacks. For
   // N==1 it equals the single sequence name (byte-identical to the pre-Slice-7
@@ -404,9 +408,42 @@ void FetchWorker::pullTopicsAsync(std::vector<std::string> sequence_names, std::
   if (group_name.empty() && !sequence_names.empty()) {
     group_name = sequence_names.front();
   }
+  // Export bookkeeping, declared BEFORE finish_all so every exit path can
+  // flush the exactly-one-McapSaveResult contract. The export is strictly
+  // SECONDARY to the download: no export failure may abort the pull or the
+  // host import (the symmetric rule to "parser rejection must not make the
+  // reconstructed MCAP lossy").
+  std::optional<McapOutputPaths> save_paths;
+  bool save_result_emitted = false;
+  auto emit_save_result = [this, &save_result_emitted](McapSaveResult result) {
+    if (save_result_emitted) {
+      return;
+    }
+    save_result_emitted = true;
+    if (mcapSaveFinished) {
+      mcapSaveFinished(std::move(result));
+    }
+  };
+  // Remove the reserved/no-longer-wanted partial. Every exit that does not
+  // retain a READABLE partial must release its reservation (see
+  // prepareMcapOutputPaths — the partial exists from allocation time).
+  auto discard_partial = [&save_paths]() {
+    if (save_paths.has_value()) {
+      std::error_code ec;
+      std::filesystem::remove(save_paths->partial_path, ec);
+    }
+  };
   // Always emit allFetchesComplete on every exit path so the dialog clears
-  // fetch_active (and re-enables Close).
-  auto finish_all = [this, &group_name]() {
+  // fetch_active (and re-enables Close). Doubles as the terminal flush for the
+  // export contract: an export that never started reports Skipped (the pull's
+  // own error reporting already covers the cause) and releases its
+  // reservation.
+  auto finish_all = [&]() {
+    if (!save_directory.empty() && !save_result_emitted) {
+      discard_partial();
+      emit_save_result(
+          McapSaveResult{McapSaveStatus::Skipped, {}, "download ended before the export could start"});
+    }
     if (allFetchesComplete) {
       allFetchesComplete(group_name);
     }
@@ -425,6 +462,21 @@ void FetchWorker::pullTopicsAsync(std::vector<std::string> sequence_names, std::
     finish_all();
     return;
   }
+
+  // Allocate + RESERVE both names before touching the network. A non-empty
+  // save directory deliberately bypasses the count-only SessionCache below:
+  // the cache holds no raw payloads from which a new MCAP could be
+  // reconstructed. A bad export destination costs the user the EXPORT, never
+  // the download — report and pull without a tee.
+  if (!save_directory.empty()) {
+    std::string path_error;
+    save_paths = prepareMcapOutputPaths(
+        std::filesystem::path(save_directory), sequence_names, utcTimestampForFilename(), &path_error);
+    if (!save_paths.has_value()) {
+      emit_save_result(McapSaveResult{McapSaveStatus::Failed, {}, path_error});
+    }
+  }
+
   if (!host_provider_) {
     finish_all_topics(false, "toolbox host not bound");
     finish_all();
@@ -448,7 +500,7 @@ void FetchWorker::pullTopicsAsync(std::vector<std::string> sequence_names, std::
   // session_key.hpp's header comment). `sequence_names` is always available
   // here (no resolve, no MISS fallthrough needed). A HIT requires the cached
   // dataset to STILL exist in the host.
-  {
+  if (!save_paths.has_value()) {
     const PJ::cloud::SessionKey key =
         PJ::cloud::computeSessionKey(conn_uri_, sequence_names, topic_names, {start_ns, end_ns});
     const auto& exists = dataset_exists_
@@ -657,6 +709,21 @@ void FetchWorker::pullTopicsAsync(std::vector<std::string> sequence_names, std::
     return;
   }
 
+  std::unique_ptr<SessionMcapWriter> mcap_writer;
+  std::string mcap_write_error;
+  if (save_paths.has_value()) {
+    mcap_writer = std::make_unique<SessionMcapWriter>();
+    if (!mcap_writer->open(save_paths->partial_path, session_info, &mcap_write_error)) {
+      // Export is SECONDARY: report + drop the tee, keep downloading. No path
+      // in the result: a failed open leaves no file behind (the writer removes
+      // its own debris; discard covers the stream-open-failure reservation).
+      mcap_writer.reset();
+      discard_partial();
+      emit_save_result(McapSaveResult{McapSaveStatus::Failed, {}, mcap_write_error});
+      mcap_write_error.clear();
+    }
+  }
+
   // Progress throttle: emit pullProgress at most ~10 Hz per topic.
   std::unordered_map<std::uint32_t, std::int64_t> bytes_by_id;
   std::unordered_map<std::uint32_t, std::chrono::steady_clock::time_point> last_emit;
@@ -691,6 +758,20 @@ void FetchWorker::pullTopicsAsync(std::vector<std::string> sequence_names, std::
         if (cancel_flag_.load(std::memory_order_relaxed)) {
           return false;  // downloadSession sends the wire Cancel + returns
         }
+        // Save the transport record before host parsing. Parser rejection is an
+        // import concern and must not make the reconstructed MCAP lossy.
+        if (mcap_writer && !mcap_writer->write(m, &mcap_write_error)) {
+          // The symmetric rule: a disk failure on the export tee must not
+          // abort the download or truncate the host import. Without a
+          // finalized footer the partial is unreadable garbage — remove it
+          // rather than advertise it; the import continues tee-less.
+          std::string ignored;
+          (void)mcap_writer->close(&ignored);
+          mcap_writer.reset();
+          discard_partial();
+          emit_save_result(McapSaveResult{McapSaveStatus::Failed, {}, mcap_write_error});
+          mcap_write_error.clear();
+        }
         (void)driver.decode(m);  // best-effort; drops + counts on failure
 
         // Throttled per-topic progress.
@@ -718,6 +799,44 @@ void FetchWorker::pullTopicsAsync(std::vector<std::string> sequence_names, std::
   {
     std::lock_guard<std::mutex> lock(cancel_mu_);
     backend_session_for_cancel_ = nullptr;
+  }
+
+  if (mcap_writer) {
+    // The import outcome (stats/topic ledger) is NEVER touched here: any
+    // export/finalize failure is a purely local problem — the mcap_save_failed
+    // latch keeps the panel open so the notification stays visible, and only
+    // the export is reported failed.
+    std::string close_error;
+    const bool close_ok = mcap_writer->close(&close_error);
+    McapSaveResult result{McapSaveStatus::Failed, save_paths->partial_path.string(), close_error};
+    if (!close_ok) {
+      // A finalize failure means no footer/summary — the file is NOT a
+      // readable MCAP. Remove it; report no path.
+      discard_partial();
+      result.path.clear();
+    } else if (stats.eos == SessionEos::Complete &&
+               !cancel_flag_.load(std::memory_order_relaxed)) {
+      std::error_code rename_error;
+      std::filesystem::rename(save_paths->partial_path, save_paths->final_path, rename_error);
+      if (rename_error) {
+        result.error =
+            "could not finalize MCAP '" + save_paths->final_path.string() + "': " + rename_error.message();
+      } else {
+        result = McapSaveResult{McapSaveStatus::Complete, save_paths->final_path.string(), {}};
+      }
+    } else {
+      // DELIBERATE retention: a user-requested export KEEPS the readable
+      // partial after a cancellation/transport drop (close() above finalized
+      // footer + summary). The future replay-cache tee does the OPPOSITE —
+      // its partials never survive (docs/canonical-layout-replay.md §6.1) —
+      // do not "align" the two when unifying the write path.
+      result.status = McapSaveStatus::Partial;
+      result.error = !stats.error.empty()
+                         ? stats.error
+                         : (stats.eos == SessionEos::Cancelled ? "download cancelled"
+                                                               : "download ended before completion");
+    }
+    emit_save_result(std::move(result));
   }
 
   // Seal the host-side parser writes (releaseParserIngest -> flushAll) while
