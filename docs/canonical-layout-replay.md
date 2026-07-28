@@ -1,4 +1,4 @@
-# Canonical Cloud Layouts — Replay via Materializable Cached Files (design v3.3 / V3+B)
+# Canonical Cloud Layouts — Replay via Materializable Cached Files (design v3.4 / V3+B)
 
 **Status:** DRAFT v3.3 — the **V3+B variant is adopted** (user decision 2026-07-28 after a
 three-way V2 / V3.2 / V3+B comparison): cache-miss replay reuses the authoring dual path
@@ -366,21 +366,50 @@ root. Inherent to shareable layouts; a sharing-policy note, not a mechanism fix.
 
 ## 8. Host + SDK changes (PJ4)
 
-SDK / ABI (all `struct_size`-gated tail additions, no protocol bump):
+SDK / ABI (v3.4, per the 2026-07-28 SDK-minimization consult — **ZERO new slots on either
+family vtable**; the three semantic operations ride the SDK's existing extension mechanisms,
+each new struct `struct_size`-versioned, `PJ_string_view_t` + UTF-8 throughout, MINOR SDK
+release **0.20.0**, no `PJ_ABI_VERSION` / protocol-version bumps):
 
-- Capability flag `PJ_TOOLBOX_CAPABILITY_SOURCE_PROVIDER`.
-- Toolbox plugin vtable tail: `source_provider_query(descriptor) -> {trust, cached_path?}`
-  (strict §6.3 contract) and `source_provider_replay(descriptor, callbacks) -> job` (async
-  **dual-path replay**: progressive eager ingest into a new dataset + cache tee, adoption at
-  completion; fully specified lifetime/threading ABI). A P-failing provider (§2, e.g. Mosaico
-  before its companion loader exists) may implement replay as eager-ingest-only without
-  adoption — V2-style behavior under the same schema; its datasets are then not re-saveable
-  as replay sources until it satisfies P.
-- Toolbox runtime host vtable tail: `adopt_materialized_source(dataset_id, cache_path,
-  descriptor_json)` — GUI-marshalled; host re-checks dataset existence/generation, then drives
-  the stock `FileLoader` replace + descriptor attach as one ordered transaction whose result is
-  visible before any Save Layout can observe completion. (Replaces v3.0's underspecified
-  `commit_source_record`.)
+- **Toolbox plugin extension `pj.descriptor_replay.v1`** (via the existing reverse-DNS
+  `get_plugin_extension` hook, `toolbox_protocol.h:161` — presence = capability, no new
+  capability bit): `PJ_descriptor_replay_provider_v1_t` with
+  - `query_descriptor(descriptor_json) -> {trust: refused|needs_confirmation|trusted,
+    is_materialized, source_identity, local_path_utf8, message}` — sync, strictly bounded
+    (§6.3); **`source_identity` and `local_path` are ALWAYS returned** (hit or miss — the
+    host cannot compute a provider's canonical identity, and rewrite-then-classify needs
+    the planned path before any job starts);
+  - `start_replay(descriptor_json, callbacks, ctx) -> PJ_joinable_job_t` (fat-pointer job:
+    cancel non-blocking/idempotent, join returns after the terminal callback, destroy
+    cancels+joins). Callbacks are exactly TWO — `on_dataset` (zero-or-one, precedes any
+    publication/progress/adoption: the job↔dataset correlation #470 cannot provide) and
+    `on_terminal` (exactly-once, last: outcomes `SUCCEEDED_MATERIALIZED |
+    SUCCEEDED_UNMATERIALIZED | FAILED | CANCELLED`; the UNMATERIALIZED outcome is explicit
+    because "no adoption observed" is absence, not a terminal fact). **No `on_progress`** —
+    progress/publish/stop ride #470's existing dataset-scoped surface.
+- **Host service `pj.materialized_source.v1`** (via the existing `bind()` service registry —
+  optional; absence = host without adoption support): `adopt(request, result_cb)` — async,
+  exactly-once result; request carries `{dataset, source_identity, local_path_utf8,
+  loader_plugin_id, loader_config_json, descriptor_json}` — the loader id + preset are
+  provider-supplied because a non-MCAP artifact (Mosaico's Arrow container + companion
+  loader) needs its OWN loader; the host re-checks dataset generation, drives the stock
+  `FileLoader` `replace_dataset_id` transaction, captures the loader's accepted config via
+  the normal completion path, and attaches `{provider manifest id, source_identity,
+  descriptor_json}` before the callback.
+- **Co-batched in the same 0.20.0 bump** (closes the direct-ingest gap): a generic
+  `createDatasetIngest()` C++ alias + `DatasetIngestHostView` exposing the
+  progress/start/finish/stop surface for BOTH delegated parsing and direct toolbox writes
+  (today's `ParserIngestHostView` hides it, `data_source_host_views.hpp:335`, and Mosaico's
+  Arrow path never reaches #470), with contract text making it the canonical dataset-scoped
+  lifecycle; `on_dataset`-before-`progress_start` required; stable manifest-ID selection in
+  `FileLoader`; ABI-layout + old-host/null-extension tests.
+- Deferred deliberately: capability bit, ABI-level job ids/phase/progress callbacks, the
+  global ImportJob envelope, concurrent provider replays.
+- A P-failing provider (§2, e.g. Mosaico before its companion loader exists) may implement
+  replay as eager-ingest-only — it reports `SUCCEEDED_UNMATERIALIZED` and its datasets are
+  not re-saveable as replay sources until it satisfies P.
+- The full recommended C declarations are in the §15 fourth-consult record (Codex session
+  `019fa9d6-34dd-7232-9f41-a5bd71a32554`).
 
 Host:
 
@@ -613,3 +642,27 @@ four specialist agents (code / silent-failure / tests / comments); the merge-rel
 are folded into §9.0. Verified empirically during that review: the PR's writer output is
 chunked + summarized + carries Statistics (`mcap doctor` clean) — the adoption prerequisite —
 and `CheckedFileWriter` genuinely closes the vendored writer's swallowed-error hole.
+
+**Fourth consult (fresh thread `019fa9d6-34dd-7232-9f41-a5bd71a32554`, 2026-07-28): SDK
+minimization.** Governing principle from the owner: touch the SDK only when really needed,
+and only with future-proof general interfaces. Proposal attacked: 3 family-vtable tail
+slots + capability bit. Verdict: keep the three semantic operations (proven irreducible —
+`save_config`/dialog/`notify_data_changed`/`plugin_data_api` all fail as carriers by
+semantic abuse), but route them through the SDK's EXISTING extension mechanisms: the
+reverse-DNS toolbox `get_plugin_extension` hook (`toolbox_protocol.h:161`) for the
+plugin-side pair (extension `pj.descriptor_replay.v1`: `query_descriptor` + `start_replay`
+with the two-callback job), and the `bind()` service registry for the host-side adoption
+service (`pj.materialized_source.v1`: `adopt`) — **zero new slots on either family vtable,
+no capability bit** (presence = capability). Corrections adopted into §8: adoption request
+gains `loader_plugin_id` + `loader_config_json` + `source_identity` (generality — a
+non-MCAP artifact needs its own companion loader; the host cannot compute provider
+identity); `eager_only` became the explicit `SUCCEEDED_UNMATERIALIZED` outcome (absence of
+adoption is not a terminal fact); the two-callback minimization survives BUT the
+direct-ingest gap is real (Mosaico's Arrow path never reaches #470's surface —
+`data_source_host_views.hpp:335` hides progress/stop), closed by co-batching a generic
+`DatasetIngestHostView` in the same bump; SDK release = MINOR **0.20.0** (0.19.0 already
+recorded), no `PJ_ABI_VERSION`/protocol bumps. The consult's full recommended C
+declarations (struct_size-versioned result/callback/job/request/service structs,
+lifetime + threading rules per slot, FORCE_INT32-pinned enums with fail-closed unknown
+values) are the stage-3 implementation reference — recover from the Codex session or the
+conversation record.
