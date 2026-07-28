@@ -42,6 +42,7 @@
 #include "mcap_cloud_panel_manifest.hpp"
 #include "mcap_cloud_panel_ui.hpp"
 #include "name_filter.h"
+#include "origin_match.hpp"
 #include "query_filter.h"
 #include "server_history.h"
 #include "settings_store.hpp"
@@ -109,9 +110,20 @@ void saveCredentialsForUri(PJ::sdk::SettingsView view, CredentialStore& store, c
 // stored token (headless / live-test parity unchanged), then the stored token,
 // then dev-anonymous empty. Mirrors cli_url_resolve's resolveCliToken chain
 // (extended with the STORED tier via resolveStoredToken).
+//
+// ORIGIN BINDING (spec docs/canonical-layout-replay.md §7 guard 2): the env
+// token is used IFF MCAP_CLOUD_URL is set AND its parsed origin equals the
+// target's (sameWsOrigin — strict, fail-closed). Without the binding, a
+// hostile layout/replay target of a DIFFERENT origin would silently receive
+// the env bearer token. On a non-match the chain simply falls through to the
+// stored per-server token (unchanged).
 ServerCredentials resolveCredentials(PJ::sdk::SettingsView view, CredentialStore& store, const std::string& uri) {
   ServerCredentials creds = loadCredentialsForUri(view, store, uri);
-  creds.api_key = resolveStoredToken(PJ::sdk::getEnv("MCAP_CLOUD_API_KEY"), store.get(uri));
+  const std::optional<std::string> env_url = PJ::sdk::getEnv("MCAP_CLOUD_URL");
+  const bool env_origin_ok = env_url.has_value() && sameWsOrigin(*env_url, uri);
+  creds.api_key = resolveStoredToken(
+      env_origin_ok ? PJ::sdk::getEnv("MCAP_CLOUD_API_KEY") : std::optional<std::string>{},
+      store.get(uri));
   return creds;
 }
 

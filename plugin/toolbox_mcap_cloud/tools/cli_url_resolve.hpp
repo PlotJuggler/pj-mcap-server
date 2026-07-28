@@ -5,11 +5,13 @@
 // main translation unit so the precedence rule (explicit --url/--token >
 // environment > built-in default) is unit-testable WITHOUT a process env or argv.
 // The CLI passes the actual std::getenv() result + the parsed --url; tests pass
-// synthetic values. Header-only, std-only.
+// synthetic values. Header-only over std + origin_match (std-only itself).
 #pragma once
 
 #include <optional>
 #include <string>
+
+#include "origin_match.hpp"
 
 namespace mcap_cloud {
 
@@ -38,12 +40,23 @@ inline std::string resolveCliUrl(const std::optional<std::string>& cli_url,
 // an empty env value falls through to the default (also empty). So the only
 // meaningful sources are a present --token (any value, incl. empty) and a present
 // non-empty env value.
+//
+// ORIGIN BINDING (spec docs/canonical-layout-replay.md §7 guard 2): the env
+// token is bound to MCAP_CLOUD_URL's origin — it applies only when env_url is
+// set AND its parsed origin equals the EFFECTIVE URL's (sameWsOrigin, strict
+// fail-closed). A --url naming a different origin therefore never receives the
+// env bearer token; with --url absent the effective URL IS the env URL, so the
+// binding is a self-match and the old behavior is preserved. An env token
+// WITHOUT an env URL has nothing to be bound to and is ignored.
 inline std::string resolveCliToken(const std::optional<std::string>& cli_token,
-                                   const std::optional<std::string>& env_token) {
+                                   const std::optional<std::string>& env_token,
+                                   const std::string& effective_url,
+                                   const std::optional<std::string>& env_url) {
   if (cli_token.has_value()) {
     return *cli_token;  // explicit --token wins (empty allowed)
   }
-  if (env_token.has_value() && !env_token->empty()) {
+  if (env_token.has_value() && !env_token->empty() && env_url.has_value() &&
+      sameWsOrigin(*env_url, effective_url)) {
     return *env_token;
   }
   return std::string{};  // dev anonymous

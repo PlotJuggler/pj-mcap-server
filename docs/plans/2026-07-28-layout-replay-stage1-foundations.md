@@ -317,19 +317,19 @@ struct Origin {
 }  // namespace mcap_cloud
 ```
 
-- [ ] **Step 4.1: Write failing tests** — `tests/origin_match_test.cpp`:
+- [x] **Step 4.1: Write failing tests** — `tests/origin_match_test.cpp`:
   match: (`ws://h:8080`, `ws://H:8080/path`) · (`wss://h`, `wss://h:443`).
   mismatch: scheme (`ws` vs `wss`) · host · port (`wss://h` vs `wss://h:8443`).
   reject (nullopt → never matches, even against itself): `wss://u:p@h` ·
   `wss://h/?q=1` · `wss://h/#f` · `http://h` · `wss://:1` · `wss://h:bad`.
-- [ ] **Step 4.2: Verify FAIL, implement, verify PASS.**
-- [ ] **Step 4.3: Wire the dialog + CLI** per Files above. Dialog rule (exact):
+- [x] **Step 4.2: Verify FAIL, implement, verify PASS.**
+- [x] **Step 4.3: Wire the dialog + CLI** per Files above. Dialog rule (exact):
   env token used ⇔ `MCAP_CLOUD_URL` is set AND `sameWsOrigin(env_url, target_uri)`;
   otherwise fall through to the stored per-server token (existing chain unchanged).
   Extend `tests/cli_url_resolve_test.cpp`: env URL + env token + `--url` different origin
   → no token; same origin (case/port-normalized) → token.
-- [ ] **Step 4.4: Full suite PASS.**
-- [ ] **Step 4.5: Commit** — `feat(security): bind MCAP_CLOUD_API_KEY to MCAP_CLOUD_URL's origin`
+- [x] **Step 4.4: Full suite PASS.**
+- [x] **Step 4.5: Commit** — `feat(security): bind MCAP_CLOUD_API_KEY to MCAP_CLOUD_URL's origin`
 
 ---
 

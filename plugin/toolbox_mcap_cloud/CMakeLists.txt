@@ -122,6 +122,7 @@ set(MCAP_CLOUD_SOURCES
   src/mcap_implementation.cpp
   src/settings_store.cpp
   src/credential_store.cpp
+  src/origin_match.cpp
   src/server_history.cpp
   src/core/time_format.cpp
 )
@@ -201,6 +202,7 @@ add_executable(mcap-cloud-cli
   src/backend_connection.cpp
   src/wire_mapping.cpp
   src/session_decode.cpp
+  src/origin_match.cpp
   src/core/time_format.cpp
   ${MCAP_CLOUD_PROTO_SRCS}
 )
@@ -930,15 +932,34 @@ if(BUILD_TESTING)
   )
   add_test(NAME McapCloudServerCapsTest COMMAND toolbox_mcap_cloud_server_caps_test)
 
+  # Strict ws/wss origin parse + compare (HERMETIC, std-only): the credential
+  # origin-binding guard (spec docs/canonical-layout-replay.md §7 guard 2) —
+  # MCAP_CLOUD_API_KEY applies only when MCAP_CLOUD_URL's origin equals the
+  # target's. Rejected shapes (userinfo/query/fragment/bad scheme/empty host/
+  # junk port) parse to nullopt and never match, not even themselves.
+  add_executable(toolbox_mcap_cloud_origin_match_test
+    tests/origin_match_test.cpp
+    src/origin_match.cpp
+  )
+  target_compile_features(toolbox_mcap_cloud_origin_match_test PRIVATE cxx_std_20)
+  target_include_directories(toolbox_mcap_cloud_origin_match_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+  )
+  target_link_libraries(toolbox_mcap_cloud_origin_match_test PRIVATE GTest::gtest_main)
+  add_test(NAME McapCloudOriginMatchTest COMMAND toolbox_mcap_cloud_origin_match_test)
+
   # D12 env-var fallback (HERMETIC): the CLI URL/token precedence rule
   # (explicit --url/--token > env MCAP_CLOUD_URL/MCAP_CLOUD_API_KEY >
-  # default). Pure header (tools/cli_url_resolve.hpp), std only — no socket.
+  # default) + the env token's origin binding to MCAP_CLOUD_URL. Pure header
+  # (tools/cli_url_resolve.hpp) over origin_match — std only, no socket.
   add_executable(toolbox_mcap_cloud_cli_url_resolve_test
     tests/cli_url_resolve_test.cpp
+    src/origin_match.cpp
   )
   target_link_libraries(toolbox_mcap_cloud_cli_url_resolve_test PRIVATE GTest::gtest_main)
   target_include_directories(toolbox_mcap_cloud_cli_url_resolve_test PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/tools
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
   )
   add_test(NAME McapCloudCliUrlResolveTest COMMAND toolbox_mcap_cloud_cli_url_resolve_test)
 
