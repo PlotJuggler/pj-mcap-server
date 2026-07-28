@@ -8,7 +8,7 @@ the single writer thread like everything else.
 """
 
 import logging
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -65,6 +65,29 @@ def _extract_task(item):
     ``Source``. Returns a picklable ``Extract`` (``extract_summary`` never raises)."""
     key, stat, dims, eff_key = item
     return extract_summary(_worker_source, key, stat, dims, eff_key)
+
+
+def _bounded_completions(submit, items, window: int):
+    """Submit ``items`` keeping at most ``window`` futures in flight; yield each
+    result as it completes.
+
+    NEVER submit-all + ``as_completed``: a list of every future pins every
+    completed ``Extract`` (its whole FileSummary graph) until the pool closes —
+    O(bucket) memory, multi-GB on a million-object cold build (the 2026-07-28
+    production kill). Here a completed future is dropped the moment its result
+    is yielded, so retained results stay O(window) regardless of bucket size.
+    """
+    in_flight: set = set()
+    for item in items:
+        in_flight.add(submit(item))
+        if len(in_flight) >= window:
+            done, in_flight = wait(in_flight, return_when=FIRST_COMPLETED)
+            for fut in done:
+                yield fut.result()
+    while in_flight:
+        done, in_flight = wait(in_flight, return_when=FIRST_COMPLETED)
+        for fut in done:
+            yield fut.result()
 
 
 def _is_catalogable_name(name: str) -> bool:
@@ -180,8 +203,9 @@ def full_reconcile(
             progress.file_done(st)
 
     # Read phase (parallel, network-bound, NO DB) -> apply phase (serial, DB writes
-    # on this thread only). as_completed lets each summary apply as soon as it lands
-    # while other fetches are still in flight.
+    # on this thread only). Each summary applies as soon as it lands while other
+    # fetches are still in flight, through a BOUNDED submission window (see
+    # _bounded_completions) so completed results never accumulate.
     if workers > 1 and len(to_extract) > 1:
         # Parallelize fetch+parse. For a remote bucket (source_spec given) use a
         # PROCESS pool so the pure-Python MCAP parse isn't GIL-serialized — each worker
@@ -193,15 +217,15 @@ def full_reconcile(
             pool = ProcessPoolExecutor(
                 max_workers=n, initializer=_init_worker, initargs=(source_spec,)
             )
+            submit = lambda item: pool.submit(_extract_task, item)  # noqa: E731
         else:
             pool = ThreadPoolExecutor(max_workers=n)
+            submit = lambda item: pool.submit(extract_summary, source, *item)  # noqa: E731
         with pool:
-            if source_spec is not None:
-                futures = [pool.submit(_extract_task, item) for item in to_extract]
-            else:
-                futures = [pool.submit(extract_summary, source, *item) for item in to_extract]
-            for fut in as_completed(futures):
-                _apply(fut.result())
+            # window = 2n: every worker stays fed (one running + one queued each)
+            # while at most ~2n results are resident awaiting the serial apply.
+            for ex in _bounded_completions(submit, to_extract, window=2 * n):
+                _apply(ex)
     else:
         for item in to_extract:
             _apply(extract_summary(source, *item))

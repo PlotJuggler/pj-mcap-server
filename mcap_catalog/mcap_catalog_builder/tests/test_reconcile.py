@@ -219,6 +219,51 @@ def test_reconcile_worker_error_quarantines_and_continues(tmp_db, tmp_path):
     ).fetchone()[0] == 1
 
 
+def test_reconcile_extraction_results_release_incrementally(tmp_db, tmp_path, monkeypatch):
+    """The parallel read phase must not retain every completed Extract until the
+    pool closes: each Extract carries a full FileSummary (one ChannelInfo per
+    channel), so on a million-object cold build that retention is gigabytes of
+    parsed summaries held for hours (the 2026-07-28 production kill). Peak
+    simultaneously-live Extracts must stay bounded by the in-flight window,
+    far below the total file count."""
+    import threading
+    import weakref
+
+    from mcap_catalog_builder import reconcile
+
+    conn, caches = tmp_db
+    root = str(tmp_path / "watch")
+    n_files = 48
+    for i in range(n_files):
+        _hive(root, filename=f"f{i:03d}.mcap")
+
+    lock = threading.Lock()
+    state = {"live": 0, "peak": 0}
+
+    def _released():
+        with lock:
+            state["live"] -= 1
+
+    real = reconcile.extract_summary
+
+    def tracking(source, key, stat, dims, eff_key):
+        ex = real(source, key, stat, dims, eff_key)
+        with lock:
+            state["live"] += 1
+            state["peak"] = max(state["peak"], state["live"])
+        weakref.finalize(ex, _released)
+        return ex
+
+    monkeypatch.setattr(reconcile, "extract_summary", tracking)
+    workers = 4
+    tally = full_reconcile(conn, caches, LocalSource(root), workers=workers)
+    assert tally["cataloged"] == n_files
+    assert state["peak"] <= 4 * workers, (
+        f"peak live Extracts {state['peak']} ~ total files {n_files}: completed "
+        "results are being retained until pool close instead of released as applied"
+    )
+
+
 def test_reconcile_deletes_removed(tmp_db, tmp_path):
     conn, caches = tmp_db
     root = str(tmp_path / "watch")
