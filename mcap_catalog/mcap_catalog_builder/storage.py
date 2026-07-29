@@ -18,7 +18,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO, Iterator, Protocol
 
-from .mcap_summary import extract_s3_key
+from .mcap_summary import FileSummary, extract_s3_key
+from .targeted_summary import read_summary_with_fallback
 from .watcher import wait_for_stable
 
 
@@ -47,6 +48,10 @@ class Source(Protocol):
 
     def open_summary(self, key: str, size: int) -> BinaryIO:
         """A seekable, read-only stream for ``key``; only footer+summary get fetched."""
+
+    def read_summary(self, key: str, size: int) -> "tuple[FileSummary, str]":
+        """Parse ``key``'s MCAP summary cheaply; returns (summary, via) where
+        via is the targeted/fallback disposition for reconcile telemetry."""
 
     def list_all(self) -> Iterator[Listing]:
         """Every catalogable ``.mcap`` (key + fingerprint) for the reconcile sweep."""
@@ -101,6 +106,22 @@ class LocalSource:
 
     def open_summary(self, key: str, size: int) -> BinaryIO:
         return open(self._abs(key), "rb")
+
+    def read_summary(self, key: str, size: int):
+        # ONE descriptor via os.pread: a per-call open() for each targeted range
+        # could observe different file generations mid-parse (a concurrent
+        # overwrite between reads) — pread against one fd can't.
+        path = self._abs(key)
+        with open(path, "rb") as f:
+            fd = f.fileno()
+
+            def pread(lo: int, hi: int) -> bytes:
+                return os.pread(fd, hi - lo + 1, lo)
+
+            # The fallback's open_stream opens its OWN handle (acceptable: the
+            # fallback is rare and the streamed path re-validates everything).
+            return read_summary_with_fallback(
+                pread, lambda: open(path, "rb"), key, size)
 
     def event_key(self, payload: str) -> str:
         # watchdog hands absolute paths; the key is the path relative to root.

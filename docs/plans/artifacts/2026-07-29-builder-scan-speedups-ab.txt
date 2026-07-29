@@ -1,0 +1,61 @@
+# builder-scan-speedups final A/B (2026-07-29, staging bucket customer=dexory/, 25,560 objects)
+# before = 742ec0b (origin/main); after = the PR1-PR3 stack. Same link, interleaved.
+
+=== link condition ===
+	signal: -59 dBm
+	rx bitrate: 526.6 MBit/s VHT-MCS 6 80MHz VHT-NSS 2
+	tx bitrate: 780.0 MBit/s VHT-MCS 9 80MHz VHT-NSS 2
+rtt min/avg/max/mdev = 36.271/36.567/36.737/0.210 ms
+=== cold builds (fresh DB, full extraction) ===
+BENCH cold-before rc=0 elapsed=325.473327842
+BENCH cold-after rc=0 elapsed=203.945617713
+=== warm reconciles (all-skip), interleaved x2 ===
+BENCH warm-before-1 rc=0 elapsed=9.597367637
+BENCH warm-after-1 rc=0 elapsed=6.834432444
+BENCH warm-before-2 rc=0 elapsed=9.851254385
+BENCH warm-after-2 rc=0 elapsed=6.699388639
+=== LIST A/B, interleaved x3 ===
+LIST sequential-1 n=25560 elapsed=9.53
+LIST sharded-1 n=25560 elapsed=5.86
+LIST sequential-2 n=25560 elapsed=8.22
+LIST sharded-2 n=25560 elapsed=5.72
+LIST sequential-3 n=25560 elapsed=9.21
+LIST sharded-3 n=25560 elapsed=4.95
+=== semantic equality (before vs after catalogs) ===
+files: A=25550 B=25550 only-A=0 only-B=0 value-diffs=0 failures-equal=False
+ failure-differs: ('customer=dexory/customer_site=wallingford/robot=test-robot-0/source=ros-bags/date=2026-06-04/scan.mcap', 'ValueError: no summary/statistics in MCAP')
+ failure-differs: ('customer=dexory/customer_site=wallingford/robot=test-robot-0/source=bags/date=2026-04-28/multipart-valid.mcap', 'ValueError: no summary/statistics in MCAP')
+ failure-differs: ('customer=dexory/customer_site=wallingford/robot=test-robot-0/source=ros-bags/date=2026-06-04/scan.mcap', '_NoSummary: no summary/statistics in MCAP')
+ failure-differs: ('customer=dexory/customer_site=wallingford/robot=test-robot-0/source=bags/date=2026-05-01/tiny-valid.mcap', 'ValueError: no summary/statistics in MCAP')
+ failure-differs: ('customer=dexory/customer_site=wallingford/robot=test-robot-0/source=bags/date=2026-04-28/tiny-valid.mcap', '_NoSummary: no summary/statistics in MCAP')
+VERDICT: DIFFERENT
+semantic-diff exit=1
+=== AFTER-side telemetry (status sidecar) ===
+    "phase": "idle",
+    "extract_done": 9,
+    "summary_targeted_ok": 0,
+    "summary_fallbacks_unavailable": 4,
+    "summary_fallbacks_unexpected": 0,
+=== builder progress excerpts ===
+2026-07-29 16:58:26,558 INFO mcap_catalog_builder.status reconcile progress: 19887/25559 files (78%), 4954 files/min, ETA 1m08s, quarantined 3
+2026-07-29 16:58:56,561 INFO mcap_catalog_builder.status reconcile progress: 22144/25559 files (87%), 4905 files/min, ETA 41s, quarantined 3
+2026-07-29 16:59:26,570 INFO mcap_catalog_builder.status reconcile progress: 24499/25559 files (96%), 4886 files/min, ETA 13s, quarantined 3
+2026-07-29 16:59:42,149 INFO mcap_catalog_builder.reconcile reconcile: cataloged=25550 skipped=0 failed=10 deleted=0
+2026-07-29 17:01:48,473 INFO mcap_catalog_builder.status reconcile progress: 15363/25559 files (60%), 7638 files/min, ETA 1m20s, quarantined 5
+2026-07-29 17:02:18,476 INFO mcap_catalog_builder.status reconcile progress: 20614/25559 files (81%), 8208 files/min, ETA 36s, quarantined 5
+2026-07-29 17:02:48,488 INFO mcap_catalog_builder.status reconcile progress: 24676/25559 files (97%), 8194 files/min, ETA 6s, quarantined 10
+2026-07-29 17:03:06,158 INFO mcap_catalog_builder.reconcile reconcile: cataloged=25550 skipped=0 failed=10 deleted=0
+BENCH-COMPLETE
+
+# --- after the _NoSummary->ValueError fix (b3aae3a): rebuilt after-catalog + re-gate ---
+BENCH cold-after2 rc=0 elapsed=177.025782546
+files: A=25550 B=25550 only-A=0 only-B=0 value-diffs=0 failures-equal=True
+VERDICT: SEMANTICALLY IDENTICAL
+semantic-diff exit=0
+
+# after-side sidecar telemetry (cold-after2):
+    "listed_total": 25560,
+    "extract_done": 25559,
+    "summary_targeted_ok": 24604,
+    "summary_fallbacks_unavailable": 950,
+    "summary_fallbacks_unexpected": 0,

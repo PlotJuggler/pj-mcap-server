@@ -6,6 +6,9 @@ summary never downloads the message body — without touching AWS or boto3.
 """
 
 import io
+import math
+import threading
+import time
 
 import pytest
 from mcap.writer import CompressionType, Writer
@@ -17,7 +20,7 @@ from mcap_catalog_builder.s3_storage import (
     _is_missing,
     _is_permanent,
 )
-from mcap_catalog_builder.tests.fixtures import write_minimal_mcap
+from mcap_catalog_builder.tests.fixtures import _delimited_listing, write_minimal_mcap
 
 
 class _FakeClientError(Exception):
@@ -29,12 +32,16 @@ class _FakeClientError(Exception):
 
 
 class FakeS3:
-    """In-memory S3 stand-in recording the byte ranges it is asked for."""
+    """In-memory S3 stand-in recording the byte ranges (and LIST calls) it is
+    asked for. ``list_objects_v2`` is delimiter-aware (mimics real S3's
+    ``CommonPrefixes`` behavior) so it can serve both the top-level shard
+    discovery call and (via the fallback paginator) a flat listing."""
 
     def __init__(self, objects: dict[str, bytes]) -> None:
         self._objects = objects
         self.ranges: list[tuple[int, int]] = []  # (start, end) inclusive
         self.fetched = 0
+        self.list_calls: list[dict] = []
 
     def head_object(self, Bucket, Key):
         if Key not in self._objects:
@@ -50,18 +57,73 @@ class FakeS3:
         self.fetched += len(chunk)
         return {"Body": io.BytesIO(chunk)}
 
+    def list_objects_v2(self, Bucket, Prefix="", Delimiter=None, ContinuationToken=None):
+        self.list_calls.append({"Prefix": Prefix, "Delimiter": Delimiter,
+                                 "ContinuationToken": ContinuationToken})
+        assert Delimiter in (None, "/")
+        return _delimited_listing(self._objects, Prefix, Delimiter)
+
     def get_paginator(self, name):
         assert name == "list_objects_v2"
         objects = self._objects
+        list_calls = self.list_calls
 
         class _Paginator:
             def paginate(self, Bucket, Prefix=""):
+                list_calls.append({"Prefix": Prefix, "Delimiter": None,
+                                    "ContinuationToken": None, "shard_paginate": True})
                 contents = [
                     {"Key": k, "Size": len(v), "ETag": f'"etag-{k}"'}
                     for k, v in objects.items()
                     if k.startswith(Prefix)
                 ]
                 yield {"Contents": contents}
+
+        return _Paginator()
+
+
+class LazyPaginatorS3(FakeS3):
+    """A ``FakeS3`` whose shard paginator streams pages ONE AT A TIME (a real
+    generator advanced lazily by each producer thread's ``for page in
+    paginate():`` loop) instead of a pre-built list, and counts how many pages
+    have been pulled out of that generator so far (thread-safe).
+
+    A page only leaves the underlying per-shard generator when the produce()
+    loop asks for the next one — which (in a correctly bounded implementation)
+    only happens after the previous page was successfully queued. So
+    ``pages_yielded`` is a direct proxy for "pages pulled off S3 but not yet
+    retired by the consumer": if a broken implementation materializes a whole
+    shard eagerly (e.g. ``list(paginator.paginate(...))``), this counter jumps
+    by a whole shard's page count in one shot, long before the consumer has
+    dequeued anything — which is exactly the regression these tests catch.
+
+    ``pages_by_shard_prefix``: ``{prefix: [ [item-dict, ...], ... ]}`` — one
+    list of pages per shard prefix (as produced by the ``Delimiter="/"``
+    discovery call). ``fail_prefix`` (optional): a shard prefix whose
+    paginator raises ``RuntimeError`` after its first page (for the
+    error-propagation/teardown test).
+    """
+
+    def __init__(self, objects, pages_by_shard_prefix, fail_prefix=None):
+        super().__init__(objects)
+        self._pages_by_shard_prefix = pages_by_shard_prefix
+        self._fail_prefix = fail_prefix
+        self._lock = threading.Lock()
+        self.pages_yielded = 0
+
+    def get_paginator(self, name):
+        assert name == "list_objects_v2"
+        outer = self
+
+        class _Paginator:
+            def paginate(self, Bucket, Prefix=""):
+                pages = outer._pages_by_shard_prefix[Prefix]
+                for i, page_items in enumerate(pages):
+                    if outer._fail_prefix == Prefix and i == 1:
+                        raise RuntimeError(f"simulated shard failure: {Prefix}")
+                    with outer._lock:
+                        outer.pages_yielded += 1
+                    yield {"Contents": page_items}
 
         return _Paginator()
 
@@ -153,6 +215,164 @@ def test_list_all_filters_non_mcap_and_unquotes_etag():
     assert listings[1].stat.size == 2
 
 
+# --- sharded list_all -------------------------------------------------------
+
+def test_list_all_sharded_matches_flat_listing():
+    objects = {
+        f"pre/customer_site={s}/robot=r{i}/f{i}.mcap": b"x" * 10
+        for s in ("a", "b", "c") for i in range(4)
+    }
+    objects["pre/root-level.mcap"] = b"y" * 3          # key at the prefix root
+    objects["pre/customer_site=a/skip.txt"] = b"n"     # non-mcap filtered out
+    fake = FakeS3(objects)
+    src = S3Source(fake, "b", "pre/")
+    got = {l.key: l.stat for l in src.list_all()}
+    assert set(got) == {k for k in objects if k.endswith(".mcap")}
+    for k, st in got.items():
+        assert st.size == len(objects[k]) and st.etag == f"etag-{k}"
+    # the sharding actually happened: one Delimiter discovery + per-shard pagination
+    assert any(c["Delimiter"] == "/" for c in fake.list_calls)
+
+
+def test_list_all_flat_bucket_no_shards():
+    objects = {f"f{i}.mcap": b"z" for i in range(5)}   # no '/' below the prefix
+    fake = FakeS3(objects)
+    src = S3Source(fake, "b", "")
+    assert {l.key for l in src.list_all()} == set(objects)
+    # Even a flat bucket must go through the sharding discovery call (there are
+    # simply zero shards to fan out to) — not just the old flat paginator.
+    assert any(c["Delimiter"] == "/" for c in fake.list_calls)
+
+
+# Shape used by the concurrency tests below: N shards, each with the same
+# number of same-size pages, so "items consumed so far" maps exactly onto
+# "pages dequeued so far" (ceil(items / _PAGE_SIZE)) regardless of how the
+# shards interleave through the single shared queue.
+_PAGE_SIZE = 20
+_PAGES_PER_SHARD = 40  # > _LIST_QUEUE_PAGES (32): a per-shard materialization
+                       # regression spikes pages_yielded past the bound in one shot.
+_NUM_SHARDS = 4
+
+
+def _make_lazy_fixture(fail_prefix=None):
+    """Objects with one key per shard prefix (drives the Delimiter discovery
+    call) + a matching ``pages_by_shard_prefix`` map of many same-size pages."""
+    objects = {f"shard{i}/seed.mcap": b"" for i in range(_NUM_SHARDS)}
+    pages_by_shard_prefix = {}
+    for i in range(_NUM_SHARDS):
+        prefix = f"shard{i}/"
+        pages_by_shard_prefix[prefix] = [
+            [
+                {"Key": f"{prefix}f{p}_{j}.mcap", "Size": 1, "ETag": f'"e{p}_{j}"'}
+                for j in range(_PAGE_SIZE)
+            ]
+            for p in range(_PAGES_PER_SHARD)
+        ]
+    fake = LazyPaginatorS3(objects, pages_by_shard_prefix, fail_prefix=fail_prefix)
+    return fake
+
+
+def _active_threads_baseline() -> int:
+    return threading.active_count()
+
+
+def _wait_for_thread_count(baseline: int, timeout: float = 10.0) -> int:
+    """Poll ``threading.active_count()`` back to ``baseline``; return the last
+    observed count (so a failing assertion shows the leaked-thread count)."""
+    deadline = time.monotonic() + timeout
+    count = threading.active_count()
+    while count > baseline and time.monotonic() < deadline:
+        time.sleep(0.05)
+        count = threading.active_count()
+    return count
+
+
+def test_list_all_pages_stream_bounded():
+    # Read the bound straight off the module (rather than a `from ... import
+    # _LIST_QUEUE_PAGES`) so the assertion below is unmistakably checking the
+    # PRODUCTION constant, not a copy/typo'd local of the same name.
+    from mcap_catalog_builder import s3_storage as s3_storage_mod
+
+    fake = _make_lazy_fixture()
+    src = S3Source(fake, "b", "")
+    gen = src.list_all()
+
+    bound = s3_storage_mod._LIST_QUEUE_PAGES + _NUM_SHARDS  # queue + one in-flight per producer
+    max_observed_outstanding = 0
+    consumed = 0
+    total_items = _NUM_SHARDS * _PAGES_PER_SHARD * _PAGE_SIZE
+    for _ in range(total_items):
+        next(gen)  # consume ONE item at a time — deliberately slow
+        consumed += 1
+        dequeued_pages = math.ceil(consumed / _PAGE_SIZE)
+        outstanding = fake.pages_yielded - dequeued_pages
+        max_observed_outstanding = max(max_observed_outstanding, outstanding)
+    with pytest.raises(StopIteration):
+        next(gen)
+
+    assert max_observed_outstanding <= bound, (
+        f"observed {max_observed_outstanding} pages buffered/in-flight, "
+        f"expected <= {bound} (_LIST_QUEUE_PAGES + producer threads) — "
+        f"a per-shard materialization would blow well past this"
+    )
+
+
+def test_list_all_early_close_no_deadlock():
+    # The plan calls for a WATCHDOG on this deadlock-sensitive test: gen.close()
+    # itself must never be trusted to return — on a real deadlock it blocks
+    # forever, so a bare `gen.close(); assert elapsed < 10` is unreachable (the
+    # test just hangs, burning the whole CI timeout with no failure message).
+    # Running it in a daemon thread + bounded join() means a deadlock instead
+    # fails FAST (~10s) with a clear assertion, and never blocks process exit.
+    baseline = _active_threads_baseline()
+    fake = _make_lazy_fixture()
+    src = S3Source(fake, "b", "")
+    gen = src.list_all()
+    next(gen)  # take exactly one listing
+
+    result: dict = {}
+
+    def _close():
+        start = time.monotonic()
+        gen.close()
+        result["elapsed"] = time.monotonic() - start
+
+    t = threading.Thread(target=_close, daemon=True)
+    t.start()
+    t.join(10.0)
+    assert not t.is_alive(), "teardown deadlocked: gen.close() did not return within 10s"
+    assert result["elapsed"] < 10.0, f"gen.close() took {result['elapsed']:.2f}s — looks deadlocked"
+
+    final = _wait_for_thread_count(baseline)
+    assert final <= baseline, f"thread count did not return to baseline ({final} vs {baseline})"
+
+
+def test_list_all_shard_error_propagates_and_tears_down():
+    # Same watchdog rationale as test_list_all_early_close_no_deadlock: the
+    # consuming list(...) must not be trusted to return on its own.
+    baseline = _active_threads_baseline()
+    fake = _make_lazy_fixture(fail_prefix="shard0/")
+    src = S3Source(fake, "b", "")
+
+    result: dict = {}
+
+    def _consume():
+        try:
+            list(src.list_all())
+        except BaseException as e:  # noqa: BLE001 - relayed to the main thread below
+            result["exc"] = e
+
+    t = threading.Thread(target=_consume, daemon=True)
+    t.start()
+    t.join(10.0)
+    assert not t.is_alive(), "teardown deadlocked: list(src.list_all()) did not return within 10s"
+    assert isinstance(result.get("exc"), RuntimeError)
+    assert "simulated shard failure" in str(result["exc"])
+
+    final = _wait_for_thread_count(baseline)
+    assert final <= baseline, f"thread count did not return to baseline ({final} vs {baseline})"
+
+
 def test_s3_event_translation_helpers():
     src = S3Source(FakeS3({}), "bucket")
     assert src.event_key("customer=a/.../x.mcap") == "customer=a/.../x.mcap"  # key is the key
@@ -185,3 +405,27 @@ def test_open_summary_reads_real_mcap_without_downloading_body(tmp_path):
 
     assert got == read_file_summary(dest)        # identical to the local read
     assert client.fetched < 200_000              # only footer + summary fetched
+
+
+def test_s3_read_summary_parity_and_single_get(tmp_path):
+    p = tmp_path / "a.mcap"
+    write_minimal_mcap(str(p))
+    data = p.read_bytes()
+    fake = FakeS3({"k.mcap": data})
+    src = S3Source(fake, "b")
+    summary, via = src.read_summary("k.mcap", len(data))
+    assert summary == summary_from_stream(io.BytesIO(data)) and via == "targeted"
+    assert len(fake.ranges) == 1  # small file: everything in the tail read
+
+
+def test_s3_read_summary_falls_back_on_garbage(tmp_path):
+    data = b"\x00" * 4096
+    fake = FakeS3({"k.mcap": data})
+    src = S3Source(fake, "b")
+    try:
+        src.read_summary("k.mcap", len(data))
+        raised = None
+    except Exception as e:  # noqa: BLE001
+        raised = e
+    assert raised is not None                      # streamed fallback's verdict
+    assert getattr(raised, "summary_via", "") == "fallback-unavailable"

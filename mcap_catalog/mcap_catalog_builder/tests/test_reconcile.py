@@ -160,15 +160,15 @@ def test_reconcile_parallel_matches_sequential(tmp_path):
 
 
 class _ReadCountingSource(LocalSource):
-    """A LocalSource that records every ``open_summary`` (the body-region read)."""
+    """A LocalSource that records every ``read_summary`` (the body-region read)."""
 
     def __init__(self, root: str) -> None:
         super().__init__(root)
         self.reads: list[str] = []
 
-    def open_summary(self, key: str, size: int):
+    def read_summary(self, key: str, size: int):
         self.reads.append(key)
-        return super().open_summary(key, size)
+        return super().read_summary(key, size)
 
 
 def test_reconcile_skip_touches_no_summary(tmp_db, tmp_path):
@@ -189,7 +189,7 @@ def test_reconcile_skip_touches_no_summary(tmp_db, tmp_path):
 
 
 class _FlakySource(LocalSource):
-    """A LocalSource whose open_summary raises for one chosen key — simulates a
+    """A LocalSource whose read_summary raises for one chosen key — simulates a
     transient/broken read to prove a worker error quarantines only that file and
     can never abort the parallel reconcile pool."""
 
@@ -197,10 +197,10 @@ class _FlakySource(LocalSource):
         super().__init__(root)
         self._bad = bad_substr
 
-    def open_summary(self, key: str, size: int):
+    def read_summary(self, key: str, size: int):
         if self._bad in key:
             raise RuntimeError("boom")
-        return super().open_summary(key, size)
+        return super().read_summary(key, size)
 
 
 def test_reconcile_worker_error_quarantines_and_continues(tmp_db, tmp_path):
@@ -262,6 +262,97 @@ def test_reconcile_extraction_results_release_incrementally(tmp_db, tmp_path, mo
         f"peak live Extracts {state['peak']} ~ total files {n_files}: completed "
         "results are being retained until pool close instead of released as applied"
     )
+
+
+def _corrupt_post_write(path: str, size: int = 4096) -> None:
+    """Overwrite a written file with bytes that are simultaneously
+    TargetedUnavailable (bad trailing magic -> no valid MCAP framing) AND
+    rejected by the streamed baseline (``mcap.exceptions.InvalidMagic`` — the
+    library DOES validate magic once it actually parses the stream), so it
+    exercises the full targeted -> unavailable -> fallback-also-fails ->
+    quarantine path.
+
+    NOTE (adaptation from the reviewed spec, which said "trailing magic
+    corrupted"): corrupting ONLY the trailing 8 magic bytes is not enough —
+    verified empirically that ``summary_from_stream``'s ``get_summary()``
+    never itself re-checks the trailing magic (it seeks to the footer via the
+    offsets already read out of it and does not care that the last 8 bytes
+    happen to differ), so the streamed fallback would still succeed and this
+    file would never reach quarantine. Overwriting the whole file with
+    non-MCAP bytes makes both the targeted path AND the streamed fallback
+    reject it, matching the intended fallback-unavailable disposition.
+    """
+    with open(path, "wb") as f:
+        f.write(b"\x00" * size)
+
+
+def test_reconcile_reports_summary_via_dispositions(tmp_db, tmp_path):
+    """Both a healthy file (targeted read succeeds) and a quarantined file (targeted
+    unavailable, streamed fallback also fails) must land in the disposition tallies —
+    the reconcile telemetry must not undercount on the error/quarantine path."""
+    from mcap_catalog_builder.status import ReconcileProgress
+
+    conn, caches = tmp_db
+    root = str(tmp_path / "watch")
+    _hive(root, filename="good.mcap")
+    bad = _hive(root, filename="bad.mcap")
+    _corrupt_post_write(bad)
+
+    progress = ReconcileProgress()
+    tally = full_reconcile(conn, caches, root, progress=progress)
+    assert tally["cataloged"] == 1 and tally["failed"] == 1
+    assert progress.summary_via_counts["targeted"] == 1
+    assert progress.summary_via_counts["fallback-unavailable"] == 1
+    assert progress.summary_via_counts["fallback-unexpected"] == 0
+
+
+class _VanishRaceSource(LocalSource):
+    """Simulates a TOCTOU vanish where the racing read happened to hit the
+    unexpected-fallback branch and got STAMPED before the object actually
+    disappeared: ``read_summary`` for ``bad_key`` always raises a
+    fallback-unexpected-stamped exception, and ``stat`` only starts reporting
+    the object gone AFTER that first raise (so ``list_all``'s own internal
+    ``stat`` call — which must see the file as present to list it at all —
+    is unaffected)."""
+
+    def __init__(self, root: str, bad_key: str) -> None:
+        super().__init__(root)
+        self._bad_key = bad_key
+        self._raised = False
+
+    def read_summary(self, key: str, size: int):
+        if key == self._bad_key:
+            self._raised = True
+            exc = RuntimeError("boom mid-read")
+            exc.summary_via = "fallback-unexpected"
+            raise exc
+        return super().read_summary(key, size)
+
+    def stat(self, key: str):
+        if key == self._bad_key and self._raised:
+            return None  # vanished right after the stamped failure
+        return super().stat(key)
+
+
+def test_reconcile_vanish_race_does_not_inflate_unexpected_disposition(tmp_db, tmp_path):
+    """2026-07-29 review FIX 1: a file that vanishes between LIST and the read
+    phase, where the racing read happens to be stamped fallback-unexpected
+    right before the object goes away, must NOT count toward
+    summary_fallbacks_unexpected — otherwise routine lifecycle deletions on a
+    long reconcile would poison the "nonzero means bug" aggregate signal."""
+    from mcap_catalog_builder.status import ReconcileProgress
+
+    conn, caches = tmp_db
+    root = str(tmp_path / "watch")
+    dest = _hive(root, filename="ghost.mcap")
+    key = os.path.relpath(dest, root)
+
+    progress = ReconcileProgress()
+    tally = full_reconcile(conn, caches, _VanishRaceSource(root, key), progress=progress)
+    assert tally["failed"] == 1  # vanish still tallies as "failed" (unchanged)
+    assert progress.summary_via_counts["fallback-unexpected"] == 0
+    assert progress.summary_via_counts["targeted"] == 0
+    assert progress.summary_via_counts["fallback-unavailable"] == 0
 
 
 def test_reconcile_deletes_removed(tmp_db, tmp_path):

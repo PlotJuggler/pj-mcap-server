@@ -18,6 +18,7 @@ from typing import Iterator
 
 from .retry import retry_with
 from .storage import Listing, Stat
+from .targeted_summary import read_summary_with_fallback
 
 # Error codes a HEAD/GET returns when an object is absent (duck-typed off the
 # botocore ClientError shape, so botocore need not be importable here).
@@ -35,6 +36,13 @@ _PERMANENT_CODES = _MISSING_CODES | {"403", "AccessDenied", "Forbidden", "400", 
 # window keeps read-ahead pointed only toward EOF, where it stays inside the summary
 # (clamped to the object size). 64 KiB is ample for magic + Header record.
 _HEADER_WINDOW = 1 << 16
+
+# S3 pagination is SERIAL within one prefix (continuation tokens chain one GET
+# after another), so a large listing (measured: 8.6s for 25.6k objects) is
+# parallelized by sharding the key space on the first '/'-delimited level
+# beneath the configured prefix and paginating each shard concurrently.
+_LIST_SHARD_THREADS = 16
+_LIST_QUEUE_PAGES = 32  # max buffered pages (~32k listings) — bounds listing memory
 
 
 def _err_code(exc: Exception):
@@ -157,21 +165,113 @@ class S3Source:
             S3RangeReader(self._c, self._bucket, key, size), buffer_size=1 << 20
         )
 
+    def read_summary(self, key: str, size: int):
+        def pread(lo: int, hi: int) -> bytes:
+            return retry_with(
+                lambda: self._c.get_object(
+                    Bucket=self._bucket, Key=key, Range=f"bytes={lo}-{hi}",
+                )["Body"].read(),
+                is_permanent=_is_permanent,
+            )
+
+        return read_summary_with_fallback(
+            pread, lambda: self.open_summary(key, size), key, size)
+
+    def _listing(self, o) -> Listing:
+        # ETag + Size + LastModified all come from the LIST itself — R4's
+        # "fingerprint from the listing", zero GETs. Carrying mtime lets the
+        # reconcile catalog a file straight from the listing Stat, with no
+        # per-file HEAD (see builder.extract).
+        return Listing(
+            key=o["Key"],
+            stat=Stat(
+                size=o["Size"],
+                etag=o["ETag"].strip('"'),
+                mtime_ns=_last_modified_ns(o.get("LastModified")),
+            ),
+        )
+
     def list_all(self) -> Iterator[Listing]:
-        for page in self._c.get_paginator("list_objects_v2").paginate(
-            Bucket=self._bucket, Prefix=self._prefix
-        ):
-            for o in page.get("Contents", []):
+        # See the _LIST_SHARD_THREADS/_LIST_QUEUE_PAGES comment above for why
+        # this shards at all. Yield order is NOT lexicographic — reconcile is
+        # dict/set-keyed throughout, so this is safe.
+        # Memory: the shard list + submitted futures are O(first-level
+        # prefixes) (small: sites/customers), and BUFFERED LISTINGS are
+        # bounded by the queue (_LIST_QUEUE_PAGES pages) — the full-bucket
+        # O(objects) accumulation lives (as before) in the reconcile caller,
+        # not here.
+        shards: list[str] = []
+        kw: dict = {"Bucket": self._bucket, "Prefix": self._prefix, "Delimiter": "/"}
+        while True:
+            resp = self._c.list_objects_v2(**kw)
+            shards += [p["Prefix"] for p in resp.get("CommonPrefixes", [])]
+            for o in resp.get("Contents", []):  # keys at the prefix root itself
                 if o["Key"].endswith(".mcap"):
-                    # ETag + Size + LastModified all come from the LIST itself —
-                    # R4's "fingerprint from the listing", zero GETs. Carrying
-                    # mtime lets the reconcile catalog a file straight from the
-                    # listing Stat, with no per-file HEAD (see builder.extract).
-                    yield Listing(
-                        key=o["Key"],
-                        stat=Stat(
-                            size=o["Size"],
-                            etag=o["ETag"].strip('"'),
-                            mtime_ns=_last_modified_ns(o.get("LastModified")),
-                        ),
-                    )
+                    yield self._listing(o)
+            if not resp.get("IsTruncated"):
+                break
+            kw["ContinuationToken"] = resp["NextContinuationToken"]
+        if not shards:
+            return
+
+        import queue as _queue
+        import threading
+        from concurrent.futures import ThreadPoolExecutor
+
+        q: "_queue.Queue" = _queue.Queue(maxsize=_LIST_QUEUE_PAGES)
+        cancel = threading.Event()
+
+        def put_or_cancel(item) -> bool:
+            """Cancel-aware put: never blocks past teardown."""
+            while not cancel.is_set():
+                try:
+                    q.put(item, timeout=0.25)
+                    return True
+                except _queue.Full:
+                    continue
+            return False
+
+        def produce(prefix: str) -> None:
+            if cancel.is_set():
+                return  # teardown already started (e.g. an earlier shard's error) — don't even LIST
+            try:
+                for page in self._c.get_paginator("list_objects_v2").paginate(
+                        Bucket=self._bucket, Prefix=prefix):
+                    if not put_or_cancel(("page", page.get("Contents", []))):
+                        return  # consumer is gone — stop paginating
+            except Exception as e:  # noqa: BLE001 — surfaced on the consumer side
+                put_or_cancel(("err", e))
+            else:
+                put_or_cancel(("done", None))
+
+        pool = ThreadPoolExecutor(max_workers=min(_LIST_SHARD_THREADS, len(shards)))
+        try:
+            for prefix in shards:
+                pool.submit(produce, prefix)
+            finished = 0
+            while finished < len(shards):
+                kind, payload = q.get()
+                if kind == "done":
+                    finished += 1
+                elif kind == "err":
+                    raise payload  # abort-the-reconcile, same as the old paginator
+                else:
+                    for o in payload:
+                        if o["Key"].endswith(".mcap"):
+                            yield self._listing(o)
+        finally:
+            # Teardown invariant: this runs on EVERY exit — normal completion,
+            # an `err` raise, or the consumer closing/abandoning the generator
+            # (GeneratorExit) — so no producer can outlive it blocked on a full
+            # queue.
+            cancel.set()          # unblock any producer stuck in put_or_cancel
+            while True:           # drain so in-flight puts find space
+                try:
+                    q.get_nowait()
+                except _queue.Empty:
+                    break
+            # cancel_futures=True drops any shard not yet started (Python
+            # 3.9+); combined with the cancel-check at the top of produce()
+            # and put_or_cancel's own check, an already-running shard task
+            # still exits promptly instead of doing one more wasted LIST call.
+            pool.shutdown(wait=True, cancel_futures=True)

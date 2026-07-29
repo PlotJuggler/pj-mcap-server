@@ -169,14 +169,22 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 2
         import boto3  # imported lazily so local mode has no boto3 dependency
-        from .s3_storage import S3Source
+        from botocore.config import Config
+        from .s3_storage import S3Source, _LIST_SHARD_THREADS
         from .s3_producer import s3_event_producer
 
-        # This client does only the serial LIST (reconcile classify) + serial
-        # per-event single-file catalogs. The parallel range-GET extraction now runs
-        # in worker PROCESSES with their own clients (see reconcile.SourceSpec), so
-        # boto3's default connection pool is ample here — no explicit sizing needed.
-        source = S3Source(boto3.client("s3"), args.s3_bucket, args.s3_prefix)
+        # The sharded LIST (s3_storage.list_all) now pipelines up to
+        # _LIST_SHARD_THREADS concurrent per-shard paginations on this client,
+        # so its connection pool must be sized to match (+ slack for the
+        # serial per-event single-file catalogs sharing the same client) — the
+        # boto3 default (10) would otherwise serialize shards behind pool
+        # waits. The parallel range-GET extraction runs in worker PROCESSES
+        # with their own clients (see reconcile.SourceSpec), so this pool only
+        # needs to cover the LIST fan-out + serial per-event catalogs.
+        source = S3Source(
+            boto3.client("s3", config=Config(max_pool_connections=_LIST_SHARD_THREADS + 8)),
+            args.s3_bucket, args.s3_prefix,
+        )
 
         def start_producer() -> None:
             threading.Thread(

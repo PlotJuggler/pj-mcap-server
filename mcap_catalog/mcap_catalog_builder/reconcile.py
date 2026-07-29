@@ -8,6 +8,7 @@ the single writer thread like everything else.
 """
 
 import logging
+import multiprocessing
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from pathlib import Path
@@ -200,7 +201,7 @@ def full_reconcile(
         st = apply_extract(conn, caches, ex).status
         tally[st] += 1
         if progress is not None:
-            progress.file_done(st)
+            progress.file_done(st, getattr(ex, "summary_via", ""))
 
     # Read phase (parallel, network-bound, NO DB) -> apply phase (serial, DB writes
     # on this thread only). Each summary applies as soon as it lands while other
@@ -214,8 +215,24 @@ def full_reconcile(
         # THIS thread either way (per-file quarantine + count-check unchanged).
         n = min(workers, len(to_extract))
         if source_spec is not None:
+            # Explicit context, not the platform default: production runs Python
+            # 3.12 (CI runs 3.11 — same default), whose default start method is
+            # fork, and the daemon starts the sidecar heartbeat THREAD
+            # (status.StatusWriter.heartbeat_start) before this pool — a bare
+            # fork() would fork-after-threads, a known hazard (any lock held by
+            # a thread other than the forking one at fork time stays locked
+            # forever in the child, since only the forking thread survives the
+            # fork). forkserver forks from a clean, thread-free helper process
+            # instead, sidestepping the hazard entirely. Dev's 3.14 already
+            # defaults to forkserver, so this is a behavior change on 3.11/3.12
+            # only. Side effect: worker-process logging (targeted_summary.py's
+            # per-file DEBUG/WARNING lines) no longer inherits the parent's
+            # logging.basicConfig under forkserver the way it would under fork
+            # — the summary_* sidecar counters are parent-side (file_done runs
+            # on THIS thread) and are unaffected either way.
             pool = ProcessPoolExecutor(
-                max_workers=n, initializer=_init_worker, initargs=(source_spec,)
+                max_workers=n, initializer=_init_worker, initargs=(source_spec,),
+                mp_context=multiprocessing.get_context("forkserver"),
             )
             submit = lambda item: pool.submit(_extract_task, item)  # noqa: E731
         else:

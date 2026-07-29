@@ -13,6 +13,7 @@ from mcap_catalog_builder.builder import (
     synth_etag,
 )
 from mcap_catalog_builder.mcap_summary import ChannelInfo, FileSummary
+from mcap_catalog_builder.storage import LocalSource
 from mcap_catalog_builder.tests.fixtures import write_minimal_mcap, write_unsummarized_mcap
 from mcap_catalog_builder.varint import decode_counts_blob
 
@@ -137,7 +138,7 @@ def test_count_mismatch_guard_rolls_back(tmp_db, tmp_path, monkeypatch):
         chunk_count=1,
         channels=[ChannelInfo(1, "/a", "S", "ros2msg", 1)],
     )
-    monkeypatch.setattr(builder, "summary_from_stream", lambda _stream: bad)
+    monkeypatch.setattr(LocalSource, "read_summary", lambda self, k, s: (bad, "targeted"))
     assert catalog_file(conn, caches, dest, root).status == "failed"
     assert conn.execute("SELECT COUNT(*) FROM files").fetchone()[0] == 0
     assert conn.execute("SELECT COUNT(*) FROM catalog_failures").fetchone()[0] == 1
@@ -217,7 +218,7 @@ def test_broken_reupload_count_mismatch_quarantines_stale_row(tmp_db, tmp_path, 
     os.utime(dest, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000_000))  # etag changes
     bad = FileSummary(start_time_ns=1, end_time_ns=2, message_count=999, chunk_count=1,
                       channels=[ChannelInfo(1, "/a", "S", "ros2msg", 1)])  # sum=1 != 999
-    monkeypatch.setattr(builder, "summary_from_stream", lambda _s: bad)
+    monkeypatch.setattr(LocalSource, "read_summary", lambda self, k, s: (bad, "targeted"))
     assert catalog_file(conn, caches, dest, root).status == "failed"
     assert conn.execute("SELECT COUNT(*) FROM files").fetchone()[0] == 0
     assert conn.execute("SELECT COUNT(*) FROM catalog_failures").fetchone()[0] == 1
@@ -318,3 +319,51 @@ def test_update_tags_set_unset_mask(tmp_db, tmp_path):
     keys = {r["key"] for r in conn.execute(
         "SELECT key FROM tags_effective WHERE file_id=?", (fid,))}
     assert "mission" not in keys
+
+
+def test_extract_summary_uses_source_read_summary(tmp_path):
+    from mcap_catalog_builder.builder import extract_summary, resolve_key_dims
+    from mcap_catalog_builder.storage import LocalSource
+
+    key = "customer=c/customer_site=s/robot=r/source=ros-bags/date=2026-01-01/a.mcap"
+    p = tmp_path / key
+    write_minimal_mcap(str(p))
+    src = LocalSource(str(tmp_path))
+    calls = []
+    orig = src.read_summary
+    src.read_summary = lambda k, size: (calls.append(k), orig(k, size))[1]
+    st = src.stat(key)
+    dims, eff = resolve_key_dims(key, src)
+    ex = extract_summary(src, key, st, dims, eff)
+    assert ex.kind == "ready" and calls == [key] and ex.summary_via == "targeted"
+
+
+def test_extract_summary_vanish_never_carries_a_stamped_disposition():
+    # 2026-07-29 review FIX 1: a TOCTOU vanish (object gone between LIST and
+    # read) must not surface a summary_via disposition even when the racing
+    # read happened to hit the unexpected-fallback branch and got STAMPED
+    # before the object actually disappeared — a benign lifecycle deletion
+    # must never inflate fallback-unexpected (and trip the aggregate
+    # "bug suspected" WARNING on a long reconcile with normal deletions).
+    from mcap_catalog_builder.builder import extract_summary
+    from mcap_catalog_builder.storage import Stat
+
+    class _StampedThenGoneSource:
+        """A read that raced a delete: it hit the (unrelated) unexpected-
+        fallback branch and got stamped, but by the time extract_summary's
+        TOCTOU check runs, the object is confirmed gone."""
+
+        def read_summary(self, key, size):
+            exc = RuntimeError("boom mid-read")
+            exc.summary_via = "fallback-unexpected"
+            raise exc
+
+        def stat(self, key):
+            return None  # gone by the time extract_summary checks
+
+    key = "customer=c/customer_site=s/robot=r/source=ros-bags/date=2026-01-01/gone.mcap"
+    dims = {"customer": "c", "site": "s", "robot": "r", "source": "ros-bags",
+            "date": "2026-01-01", "filename": "gone.mcap"}
+    ex = extract_summary(_StampedThenGoneSource(), key, Stat(size=1, etag="e"), dims, key)
+    assert ex.kind == "vanished"
+    assert ex.summary_via == ""
