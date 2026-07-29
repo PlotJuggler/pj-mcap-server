@@ -265,15 +265,23 @@ def extract_summary(source, key: str, stat, dims: dict[str, str], eff_key: str) 
                 gone = source.stat(key) is None
             except Exception:  # noqa: BLE001
                 gone = False
-            # A failed streamed fallback stamps its disposition onto the exception
-            # (read_summary_with_fallback) so a quarantined file still counts.
-            via = getattr(e, "summary_via", "")
             if gone:
+                # A TOCTOU vanish is not a targeted-read outcome — leave summary_via
+                # empty (counts in no disposition bucket) even though the read that
+                # raced the delete may have picked up a stamped "fallback-*" via;
+                # otherwise a benign lifecycle deletion would inflate
+                # fallback-unexpected and trip the aggregate "bug suspected"
+                # WARNING (2026-07-29 review). Consistent with LocalSource, whose
+                # local vanish (FileNotFoundError, no read_summary_with_fallback
+                # stamp) already yields "".
                 logger.debug("object vanished before cataloging: %s", key)
                 return Extract(key, "vanished", dims=dims, eff_key=eff_key, stat=stat,
-                               summary_via=via)
+                               summary_via="")
+            # A failed streamed fallback stamps its disposition onto the exception
+            # (read_summary_with_fallback) so a quarantined file still counts.
             return Extract(key, "error", dims=dims, eff_key=eff_key, stat=stat,
-                           error=f"{type(e).__name__}: {e}", summary_via=via)
+                           error=f"{type(e).__name__}: {e}",
+                           summary_via=getattr(e, "summary_via", ""))
         return Extract(key, "ready", dims=dims, eff_key=eff_key, stat=stat, summary=summary,
                        summary_via=summary_via)
     except Exception as e:  # noqa: BLE001 - a worker must never crash the pool

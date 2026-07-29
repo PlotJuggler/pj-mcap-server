@@ -336,3 +336,34 @@ def test_extract_summary_uses_source_read_summary(tmp_path):
     dims, eff = resolve_key_dims(key, src)
     ex = extract_summary(src, key, st, dims, eff)
     assert ex.kind == "ready" and calls == [key] and ex.summary_via == "targeted"
+
+
+def test_extract_summary_vanish_never_carries_a_stamped_disposition():
+    # 2026-07-29 review FIX 1: a TOCTOU vanish (object gone between LIST and
+    # read) must not surface a summary_via disposition even when the racing
+    # read happened to hit the unexpected-fallback branch and got STAMPED
+    # before the object actually disappeared — a benign lifecycle deletion
+    # must never inflate fallback-unexpected (and trip the aggregate
+    # "bug suspected" WARNING on a long reconcile with normal deletions).
+    from mcap_catalog_builder.builder import extract_summary
+    from mcap_catalog_builder.storage import Stat
+
+    class _StampedThenGoneSource:
+        """A read that raced a delete: it hit the (unrelated) unexpected-
+        fallback branch and got stamped, but by the time extract_summary's
+        TOCTOU check runs, the object is confirmed gone."""
+
+        def read_summary(self, key, size):
+            exc = RuntimeError("boom mid-read")
+            exc.summary_via = "fallback-unexpected"
+            raise exc
+
+        def stat(self, key):
+            return None  # gone by the time extract_summary checks
+
+    key = "customer=c/customer_site=s/robot=r/source=ros-bags/date=2026-01-01/gone.mcap"
+    dims = {"customer": "c", "site": "s", "robot": "r", "source": "ros-bags",
+            "date": "2026-01-01", "filename": "gone.mcap"}
+    ex = extract_summary(_StampedThenGoneSource(), key, Stat(size=1, etag="e"), dims, key)
+    assert ex.kind == "vanished"
+    assert ex.summary_via == ""

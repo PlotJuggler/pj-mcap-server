@@ -118,8 +118,9 @@ merely unlikely:
   the embedded `rosbag2` metadata (which describes the whole multi-day bag).
 - **R2 / R4 cheap path.** Cataloging reads only the footer/summary — for object
   stores, a targeted read (`targeted_summary.py`) fetches just the footer tail +
-  Schema/Channel/Statistics groups via the summary-offset section (1–2 range
-  GETs, never streaming the ChunkIndex group), falling back to the streamed
+  Schema/Channel/Statistics groups via the summary-offset section (a bounded
+  speculative over-read: 1–2 range GETs; no computed range ever targets the
+  ChunkIndex group), falling back to the streamed
   `summary_from_stream` on ANY structural surprise — the fallback is the
   semantics authority for every quarantine verdict (sole carve-out: the
   `summary_start == 0` no-summary ValueError). The targeted path never reads

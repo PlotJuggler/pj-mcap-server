@@ -225,7 +225,11 @@ def full_reconcile(
             # fork). forkserver forks from a clean, thread-free helper process
             # instead, sidestepping the hazard entirely. Dev's 3.14 already
             # defaults to forkserver, so this is a behavior change on 3.11/3.12
-            # only.
+            # only. Side effect: worker-process logging (targeted_summary.py's
+            # per-file DEBUG/WARNING lines) no longer inherits the parent's
+            # logging.basicConfig under forkserver the way it would under fork
+            # — the summary_* sidecar counters are parent-side (file_done runs
+            # on THIS thread) and are unaffected either way.
             pool = ProcessPoolExecutor(
                 max_workers=n, initializer=_init_worker, initargs=(source_spec,),
                 mp_context=multiprocessing.get_context("forkserver"),

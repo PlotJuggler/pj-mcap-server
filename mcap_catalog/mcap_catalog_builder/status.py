@@ -175,7 +175,10 @@ class ReconcileProgress:
         self._last_log = None
         self._set_status(
             phase="extracting", extract_total=to_extract, extract_done=0,
-            skipped=skipped, failed=failed, force=True,
+            cataloged=0, skipped=skipped, failed=failed,
+            summary_targeted_ok=0, summary_fallbacks_unavailable=0,
+            summary_fallbacks_unexpected=0,
+            force=True,
         )
         logger.info(
             "reconcile: extracting %d files (%d unchanged skipped, %d unparseable)",

@@ -306,6 +306,55 @@ def test_reconcile_reports_summary_via_dispositions(tmp_db, tmp_path):
     assert progress.summary_via_counts["fallback-unexpected"] == 0
 
 
+class _VanishRaceSource(LocalSource):
+    """Simulates a TOCTOU vanish where the racing read happened to hit the
+    unexpected-fallback branch and got STAMPED before the object actually
+    disappeared: ``read_summary`` for ``bad_key`` always raises a
+    fallback-unexpected-stamped exception, and ``stat`` only starts reporting
+    the object gone AFTER that first raise (so ``list_all``'s own internal
+    ``stat`` call — which must see the file as present to list it at all —
+    is unaffected)."""
+
+    def __init__(self, root: str, bad_key: str) -> None:
+        super().__init__(root)
+        self._bad_key = bad_key
+        self._raised = False
+
+    def read_summary(self, key: str, size: int):
+        if key == self._bad_key:
+            self._raised = True
+            exc = RuntimeError("boom mid-read")
+            exc.summary_via = "fallback-unexpected"
+            raise exc
+        return super().read_summary(key, size)
+
+    def stat(self, key: str):
+        if key == self._bad_key and self._raised:
+            return None  # vanished right after the stamped failure
+        return super().stat(key)
+
+
+def test_reconcile_vanish_race_does_not_inflate_unexpected_disposition(tmp_db, tmp_path):
+    """2026-07-29 review FIX 1: a file that vanishes between LIST and the read
+    phase, where the racing read happens to be stamped fallback-unexpected
+    right before the object goes away, must NOT count toward
+    summary_fallbacks_unexpected — otherwise routine lifecycle deletions on a
+    long reconcile would poison the "nonzero means bug" aggregate signal."""
+    from mcap_catalog_builder.status import ReconcileProgress
+
+    conn, caches = tmp_db
+    root = str(tmp_path / "watch")
+    dest = _hive(root, filename="ghost.mcap")
+    key = os.path.relpath(dest, root)
+
+    progress = ReconcileProgress()
+    tally = full_reconcile(conn, caches, _VanishRaceSource(root, key), progress=progress)
+    assert tally["failed"] == 1  # vanish still tallies as "failed" (unchanged)
+    assert progress.summary_via_counts["fallback-unexpected"] == 0
+    assert progress.summary_via_counts["targeted"] == 0
+    assert progress.summary_via_counts["fallback-unavailable"] == 0
+
+
 def test_reconcile_deletes_removed(tmp_db, tmp_path):
     conn, caches = tmp_db
     root = str(tmp_path / "watch")

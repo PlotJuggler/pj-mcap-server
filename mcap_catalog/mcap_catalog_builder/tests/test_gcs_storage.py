@@ -175,3 +175,16 @@ def test_gcs_read_summary_parity(tmp_path):
     src = GCSSource(fake, "b")
     summary, via = src.read_summary("k.mcap", len(data))
     assert summary == summary_from_stream(io.BytesIO(data)) and via == "targeted"
+
+
+def test_gcs_read_summary_falls_back_on_garbage(tmp_path):
+    data = b"\x00" * 4096
+    fake = FakeGCS({"k.mcap": data})
+    src = GCSSource(fake, "b")
+    try:
+        src.read_summary("k.mcap", len(data))
+        raised = None
+    except Exception as e:  # noqa: BLE001
+        raised = e
+    assert raised is not None                      # streamed fallback's verdict
+    assert getattr(raised, "summary_via", "") == "fallback-unavailable"
