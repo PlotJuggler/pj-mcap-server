@@ -267,3 +267,67 @@ def test_fallback_failure_stamps_disposition(tmp_path):
         assert e.summary_via == "fallback-unavailable"
     else:
         pytest.fail("expected the fallback to raise on garbage bytes")
+
+
+# --- statistics count cross-check: directional (2026-07-29 census) ----------
+
+def _patch_stats_counts(data: bytes, *, schema_count=None, channel_count=None) -> bytes:
+    """Rewrite Statistics.schema_count/channel_count inside the stats group.
+
+    Payload layout: message_count u64, schema_count u16, channel_count u32, ...
+    """
+    import io as _io
+    from mcap.data_stream import ReadDataStream
+    from mcap.opcode import Opcode
+    from mcap.records import SummaryOffset
+
+    footer = data[-37:-8]
+    _summary_start, so_start, _crc = struct.unpack("<QQI", footer[9:29])
+    so_buf = data[so_start:len(data) - 37]
+    stats_start = None
+    stream = ReadDataStream(_io.BytesIO(so_buf))
+    while stream.count < len(so_buf):
+        op = stream.read1()
+        length = stream.read8()
+        if op == Opcode.SUMMARY_OFFSET:
+            rec = SummaryOffset.read(stream)
+            if rec.group_opcode == Opcode.STATISTICS:
+                stats_start = rec.group_start
+        else:
+            stream.read(length)
+    assert stats_start is not None
+    payload = stats_start + 9  # opcode(1) + length(8)
+    b = bytearray(data)
+    if schema_count is not None:
+        b[payload + 8:payload + 10] = struct.pack("<H", schema_count)
+    if channel_count is not None:
+        b[payload + 10:payload + 14] = struct.pack("<I", channel_count)
+    return bytes(b)
+
+
+def test_statistics_underreport_is_accepted_with_parity(tmp_path):
+    # Real-fleet writer bug (arri-86 census 2026-07-29, 941/25.5k files):
+    # Statistics claims FEWER schemas/channels than the summary groups hold.
+    # The streamed baseline ignores those counts and catalogs every summary
+    # record — the targeted path must do the same, not fall back.
+    chans = [(f"/t{i}", f"pkg/msg/T{i % 2}", "ros2msg", 2) for i in range(5)]
+    data = _mcap_bytes(tmp_path, channels=chans)
+    patched = _patch_stats_counts(data, schema_count=1, channel_count=2)
+    got = read_summary_targeted(PreadRecorder(patched), len(patched))
+    assert got == _baseline(patched)
+    assert len(got.channels) == 5
+
+
+def test_statistics_overreport_still_falls_back(tmp_path):
+    # The dangerous direction: parsing FEWER records than Statistics claims
+    # means a missing/truncated group — must stay TargetedUnavailable.
+    data = _mcap_bytes(tmp_path, channels=[("/a", "p/msg/A", "ros2msg", 1),
+                                           ("/b", "p/msg/B", "ros2msg", 1)])
+    with pytest.raises(TargetedUnavailable):
+        read_summary_targeted(
+            PreadRecorder(_patch_stats_counts(data, channel_count=7)),
+            len(data))
+    with pytest.raises(TargetedUnavailable):
+        read_summary_targeted(
+            PreadRecorder(_patch_stats_counts(data, schema_count=9)),
+            len(data))

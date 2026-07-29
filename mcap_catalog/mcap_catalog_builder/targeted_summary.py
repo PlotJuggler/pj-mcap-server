@@ -194,8 +194,14 @@ def read_summary_targeted(
                 stats = rec
     if stats is None:
         raise TargetedUnavailable("statistics record missing from its group")
-    if len(channels) != stats.channel_count or len(schemas) != stats.schema_count:
-        raise TargetedUnavailable("schema/channel count mismatch vs statistics")
+    # DIRECTIONAL guard: fewer parsed records than Statistics claims means a
+    # missing/truncated group — fall back. MORE than claimed is accepted: the
+    # streamed baseline ignores these counts and catalogs every summary-group
+    # record, and real fleet writers under-report them (arri-86 continuous
+    # bags, 941/25.5k files in the 2026-07-29 census — statistics said 34/51
+    # where the groups held 51/150; baseline-equivalent, so no fallback).
+    if len(channels) < stats.channel_count or len(schemas) < stats.schema_count:
+        raise TargetedUnavailable("schema/channel records missing vs statistics")
 
     counts = stats.channel_message_counts
     return FileSummary(
