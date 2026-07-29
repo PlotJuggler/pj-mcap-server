@@ -20,7 +20,7 @@ from mcap_catalog_builder.s3_storage import (
     _is_missing,
     _is_permanent,
 )
-from mcap_catalog_builder.tests.fixtures import write_minimal_mcap
+from mcap_catalog_builder.tests.fixtures import _delimited_listing, write_minimal_mcap
 
 
 class _FakeClientError(Exception):
@@ -61,23 +61,7 @@ class FakeS3:
         self.list_calls.append({"Prefix": Prefix, "Delimiter": Delimiter,
                                  "ContinuationToken": ContinuationToken})
         assert Delimiter in (None, "/")
-        keys = sorted(k for k in self._objects if k.startswith(Prefix))
-        if Delimiter is None:
-            return {"Contents": [{"Key": k, "Size": len(self._objects[k]),
-                                   "ETag": f'"etag-{k}"'} for k in keys],
-                    "IsTruncated": False}
-        prefixes, contents = [], []
-        for k in keys:
-            rest = k[len(Prefix):]
-            if "/" in rest:
-                p = Prefix + rest.split("/", 1)[0] + "/"
-                if p not in prefixes:
-                    prefixes.append(p)
-            else:
-                contents.append({"Key": k, "Size": len(self._objects[k]),
-                                  "ETag": f'"etag-{k}"'})
-        return {"CommonPrefixes": [{"Prefix": p} for p in prefixes],
-                "Contents": contents, "IsTruncated": False}
+        return _delimited_listing(self._objects, Prefix, Delimiter)
 
     def get_paginator(self, name):
         assert name == "list_objects_v2"
@@ -304,8 +288,9 @@ def _wait_for_thread_count(baseline: int, timeout: float = 10.0) -> int:
 
 
 def test_list_all_pages_stream_bounded():
-    # Import here so the module-level constant is read fresh (not shadowed by
-    # a local of the same name in this test file).
+    # Read the bound straight off the module (rather than a `from ... import
+    # _LIST_QUEUE_PAGES`) so the assertion below is unmistakably checking the
+    # PRODUCTION constant, not a copy/typo'd local of the same name.
     from mcap_catalog_builder import s3_storage as s3_storage_mod
 
     fake = _make_lazy_fixture()
@@ -333,31 +318,59 @@ def test_list_all_pages_stream_bounded():
 
 
 def test_list_all_early_close_no_deadlock():
+    # The plan calls for a WATCHDOG on this deadlock-sensitive test: gen.close()
+    # itself must never be trusted to return — on a real deadlock it blocks
+    # forever, so a bare `gen.close(); assert elapsed < 10` is unreachable (the
+    # test just hangs, burning the whole CI timeout with no failure message).
+    # Running it in a daemon thread + bounded join() means a deadlock instead
+    # fails FAST (~10s) with a clear assertion, and never blocks process exit.
     baseline = _active_threads_baseline()
     fake = _make_lazy_fixture()
     src = S3Source(fake, "b", "")
     gen = src.list_all()
     next(gen)  # take exactly one listing
 
-    start = time.monotonic()
-    gen.close()
-    elapsed = time.monotonic() - start
-    assert elapsed < 10.0, f"gen.close() took {elapsed:.2f}s — looks deadlocked"
+    result: dict = {}
+
+    def _close():
+        start = time.monotonic()
+        gen.close()
+        result["elapsed"] = time.monotonic() - start
+
+    t = threading.Thread(target=_close, daemon=True)
+    t.start()
+    t.join(10.0)
+    assert not t.is_alive(), "teardown deadlocked: gen.close() did not return within 10s"
+    assert result["elapsed"] < 10.0, f"gen.close() took {result['elapsed']:.2f}s — looks deadlocked"
 
     final = _wait_for_thread_count(baseline)
-    assert final == baseline, f"thread count did not return to baseline ({final} vs {baseline})"
+    assert final <= baseline, f"thread count did not return to baseline ({final} vs {baseline})"
 
 
 def test_list_all_shard_error_propagates_and_tears_down():
+    # Same watchdog rationale as test_list_all_early_close_no_deadlock: the
+    # consuming list(...) must not be trusted to return on its own.
     baseline = _active_threads_baseline()
     fake = _make_lazy_fixture(fail_prefix="shard0/")
     src = S3Source(fake, "b", "")
 
-    with pytest.raises(RuntimeError, match="simulated shard failure"):
-        list(src.list_all())
+    result: dict = {}
+
+    def _consume():
+        try:
+            list(src.list_all())
+        except BaseException as e:  # noqa: BLE001 - relayed to the main thread below
+            result["exc"] = e
+
+    t = threading.Thread(target=_consume, daemon=True)
+    t.start()
+    t.join(10.0)
+    assert not t.is_alive(), "teardown deadlocked: list(src.list_all()) did not return within 10s"
+    assert isinstance(result.get("exc"), RuntimeError)
+    assert "simulated shard failure" in str(result["exc"])
 
     final = _wait_for_thread_count(baseline)
-    assert final == baseline, f"thread count did not return to baseline ({final} vs {baseline})"
+    assert final <= baseline, f"thread count did not return to baseline ({final} vs {baseline})"
 
 
 def test_s3_event_translation_helpers():

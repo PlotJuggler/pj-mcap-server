@@ -192,10 +192,8 @@ class S3Source:
         )
 
     def list_all(self) -> Iterator[Listing]:
-        # S3 pagination is SERIAL within one prefix (continuation tokens), so a
-        # large listing is parallelized by sharding the key space on the first
-        # '/'-delimited level under the prefix and paginating shards
-        # concurrently. Yield order is NOT lexicographic — reconcile is
+        # See the _LIST_SHARD_THREADS/_LIST_QUEUE_PAGES comment above for why
+        # this shards at all. Yield order is NOT lexicographic — reconcile is
         # dict/set-keyed throughout, so this is safe.
         # Memory: the shard list + submitted futures are O(first-level
         # prefixes) (small: sites/customers), and BUFFERED LISTINGS are
@@ -234,6 +232,8 @@ class S3Source:
             return False
 
         def produce(prefix: str) -> None:
+            if cancel.is_set():
+                return  # teardown already started (e.g. an earlier shard's error) — don't even LIST
             try:
                 for page in self._c.get_paginator("list_objects_v2").paginate(
                         Bucket=self._bucket, Prefix=prefix):
@@ -260,10 +260,18 @@ class S3Source:
                         if o["Key"].endswith(".mcap"):
                             yield self._listing(o)
         finally:
+            # Teardown invariant: this runs on EVERY exit — normal completion,
+            # an `err` raise, or the consumer closing/abandoning the generator
+            # (GeneratorExit) — so no producer can outlive it blocked on a full
+            # queue.
             cancel.set()          # unblock any producer stuck in put_or_cancel
             while True:           # drain so in-flight puts find space
                 try:
                     q.get_nowait()
                 except _queue.Empty:
                     break
-            pool.shutdown(wait=True)  # producers exit promptly via cancel
+            # cancel_futures=True drops any shard not yet started (Python
+            # 3.9+); combined with the cancel-check at the top of produce()
+            # and put_or_cancel's own check, an already-running shard task
+            # still exits promptly instead of doing one more wasted LIST call.
+            pool.shutdown(wait=True, cancel_futures=True)
