@@ -210,3 +210,27 @@ def test_record_failure_upserts(conn):
         "SELECT error_text FROM catalog_failures WHERE s3_key='k1'"
     ).fetchall()
     assert len(rows) == 1 and rows[0][0] == "boom2"
+
+
+def test_dimension_indexes_exist_and_cover_facet_group_by(conn):
+    """The Go reader's GetVocabulary runs `SELECT <dim>, COUNT(*) FROM files
+    GROUP BY <dim>` for each dimension, and ListFiles filters dimensions with
+    keyset pagination (`<dim> = ? AND id > ? ORDER BY id`). Both need a plain
+    index per dimension FK column: without one, each facet count is a full-table
+    scan + temp b-tree and each filtered page pays a per-page sort (measured at
+    1M files: facets 460 ms -> 131 ms, one page 6.5 ms -> 0.2 ms)."""
+    indexes = {
+        r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='index'")
+    }
+    expected = {
+        "idx_files_customer", "idx_files_site", "idx_files_robot", "idx_files_source",
+    }
+    assert expected <= indexes, f"missing dimension indexes: {expected - indexes}"
+    for col in ("customer_id", "site_id", "robot_id", "source_id"):
+        plan = " ".join(
+            r[3] for r in conn.execute(
+                f"EXPLAIN QUERY PLAN SELECT {col}, COUNT(*) FROM files GROUP BY {col}"
+            )
+        )
+        assert "COVERING INDEX idx_files_" in plan, f"{col} facet not covered: {plan}"
+        assert "TEMP B-TREE" not in plan, f"{col} facet needs a temp b-tree: {plan}"

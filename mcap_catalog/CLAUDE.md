@@ -121,6 +121,12 @@ merely unlikely:
   read** (local etag = `local:{size}:{mtime}` so size/mtime changes re-catalog; S3 =
   the real ETag from the listing). A restart over a cataloged lake re-reads zero files.
 - **Read the summary OUTSIDE the transaction** (it's slow and can throw).
+- **Bounded extraction window.** The reconcile read phase must never submit-all
+  then `as_completed` — a list of every future pins every completed `Extract`
+  (whole `FileSummary` graph) until the pool closes: multi-GB at millions of
+  objects (the 2026-07-28 production kill). `_bounded_completions` keeps at most
+  `2×workers` futures in flight and drops each as its result is applied; pinned
+  by `test_reconcile_extraction_results_release_incrementally`.
 - **`topic_counts` blob ordering:** one varint per topic-set member, sorted by
   `topic_id` ASC, aligned with `topic_set_members`. Encode/decode must agree.
 - **Resolvers** use `INSERT OR IGNORE` then `SELECT id` (never `lastrowid` after

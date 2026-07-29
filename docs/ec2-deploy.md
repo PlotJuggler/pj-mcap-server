@@ -53,7 +53,7 @@ deploy success no longer depends on how long the first scan takes.
 | Setting | Recommendation | Why |
 |---|---|---|
 | AMI | Amazon Linux 2023 or Ubuntu 22.04 LTS | Docker-ready; systemd for the daemon. |
-| Instance type | `t3.medium` (2 vCPU / 4 GB) to start | The server is light. The builder's first scan parallelizes across CPU cores, so more vCPUs speed up a large cold catalog. |
+| Instance type | `t3.medium` (2 vCPU / 4 GB) to start | The server is light. The builder's first scan parallelizes across CPU cores, so more vCPUs speed up a large cold catalog. Memory: the extract phase is flat (bounded work window), but the reconcile's per-run bookkeeping is proportional to bucket size — budget roughly **2 GB of headroom per million objects** and size up from `t3.medium` past ~1M. RSS staying at its high-water mark between rescans is allocator behavior, not a leak. |
 | Storage | **EBS gp3**, ≥ 20 GB | The Docker named volume lives on the local EBS root — correct for `catalog-data`. |
 | Region | **Same region as your S3 bucket** | Deploy in-region: cross-region range-GETs are the extraction bottleneck. |
 | Security group | Inbound `22` (SSH, your IP) + `8080` (WS/health/dashboard, or restrict to your client CIDR). Outbound `443` to S3. | Don't expose the dashboard publicly without a password. |
