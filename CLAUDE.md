@@ -174,8 +174,9 @@ local codebases first. Do not guess SDK/plugin APIs — read the real headers.
 > `pj-official-plugins` are **NOT submodules of this repo** (removed in `82a8c2f`) —
 > they are managed as sibling checkouts under `~/ws_plotjuggler/` (e.g. `PJ4-cloud/`,
 > `plotjuggler_sdk-cloud/`). The connector plugin builds **standalone** at
-> `plugin/toolbox_mcap_cloud/` against the SDK Conan package (**0.11.0** — built on
-> this machine 2026-07-06 from `~/ws_plotjuggler/plotjuggler_sdk-cloud`). The ONLY
+> `plugin/toolbox_mcap_cloud/` against the SDK Conan package (**0.20.0** — built on
+> this machine 2026-07-29 from the `v0.20.0` tag via
+> `~/ws_plotjuggler/plotjuggler_sdk-cloud/.worktrees/v0.20.0`). The ONLY
 > directory `mcap_catalog/` is VENDORED (formerly the only submodule). Prose below that mentions `PJ4/` as a
 > submodule or SDK 0.8.1 is a stale reference-reading aid — the fork/vendoring history
 > lives in `docs/history.md`. Paths below were verified 2026-06-04 on the original
@@ -220,7 +221,7 @@ How real PJ4 plugins are shaped, built, and shipped. **Note: on this machine it 
 - `CLAUDE.md`, `PLUGIN_DEVELOPMENT.md`, `porting_guide.md` — plugin shapes
   (self-parsing vs delegating DataSource, MessageParser catalog pattern), data-write
   rules, mechanical-translation policy.
-- `SDK_VERSION` — single source of truth for the SDK pin (**currently `0.11.0`**;
+- `SDK_VERSION` — single source of truth for the SDK pin (**currently `0.20.0`**;
   this repo's copy is `plugin/SDK_VERSION`; the Conan package is `conan create`d
   from `~/ws_plotjuggler/plotjuggler_sdk-cloud` — the root `./build.sh` checks the
   cache and prints the command if absent); every plugin's `conanfile.py` reads it

@@ -7,11 +7,11 @@
 #   2. Otherwise clone the PUBLIC PlotJuggler/plotjuggler_sdk repo at tag
 #      v<SDK_VERSION> and `conan create` it (cold-CI path).
 #
-# Single source of truth for the version: plugin/SDK_VERSION (0.11.0 as of
-# 2026-07-26). Upstream tag v0.11.0 is the squash merge of the
-# feat/toolbox-parser-ingest-rangeslider-markers branch (PR #133) — verified
-# content-identical (whitespace-only diff) to the source the dev-box package
-# was built from, so CI and the dev box build the same SDK.
+# Single source of truth for the version: plugin/SDK_VERSION (0.20.0 as of
+# 2026-07-29). Upstream tag v0.20.0 is the squash merge of the descriptor-import
+# v1 ABI branch (SDK PR #160, commit 4e7e14d) — the dev-box package is conan
+# create'd from the same tag (plotjuggler_sdk-cloud worktree .worktrees/v0.20.0),
+# so CI and the dev box build the same SDK.
 #
 # Env overrides:
 #   PJ_SDK_GIT_URL — alternate SDK git URL (e.g. a fork).
