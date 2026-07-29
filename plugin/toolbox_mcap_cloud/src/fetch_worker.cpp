@@ -549,13 +549,52 @@ void FetchWorker::pullTopicsAsync(std::vector<std::string> sequence_names, std::
     finish_all();
     return;
   }
+  BackendConnection* session_backend = session_owned.get();
+
+  // Expose the session backend for requestCancel() BEFORE the blocking
+  // connect()/openSessionFresh() calls below — registering it only ahead of the
+  // download loop (the original placement) left the OpenSession wait
+  // uncancellable from the GUI, reintroducing the exact 120 s stall the
+  // sendAndWait wake predicate exists to fix (review-caught, both reviewers).
+  // Scope guard: cleared under cancel_mu_ on EVERY exit path, and declared
+  // after session_owned so it unwinds first — requestCancel() can never
+  // dereference the destroyed connection.
+  struct CancelHookGuard {
+    FetchWorker* worker;
+    ~CancelHookGuard() {
+      std::lock_guard<std::mutex> lock(worker->cancel_mu_);
+      worker->backend_session_for_cancel_ = nullptr;
+    }
+  } cancel_hook_guard{this};
+  {
+    std::lock_guard<std::mutex> lock(cancel_mu_);
+    backend_session_for_cancel_ = session_backend;
+  }
+  // A cancel latched BEFORE the hook was published could not reach the wire;
+  // honor it cooperatively before any blocking call. (After publication a
+  // cancel reaches cancelSession() directly, and BackendConnection latches it
+  // for the connection's lifetime — openSessionFresh deliberately does NOT
+  // reset the flag, so no arming-order race can swallow it.)
+  if (cancel_flag_.load(std::memory_order_relaxed)) {
+    finish_all_topics(false, "cancelled");
+    finish_all();
+    return;
+  }
+
   std::string connect_err;
   if (!session_owned->connect(&connect_err)) {
     finish_all_topics(false, connect_err.empty() ? std::string("session connect failed") : connect_err);
     finish_all();
     return;
   }
-  BackendConnection* session_backend = session_owned.get();
+  // connect()'s handshake wait does not wake on cancel — a cancel during it
+  // latched the backend flag but had nothing to interrupt; honor it now
+  // instead of opening a session that would only fail as "cancelled" later.
+  if (cancel_flag_.load(std::memory_order_relaxed)) {
+    finish_all_topics(false, "cancelled");
+    finish_all();
+    return;
+  }
 
   // Key-addressed OpenFresh (wire v2): the sequence names ARE the durable
   // s3_keys, so they go into the request verbatim — no list -> file_id
@@ -734,13 +773,8 @@ void FetchWorker::pullTopicsAsync(std::vector<std::string> sequence_names, std::
   std::chrono::steady_clock::time_point last_wire_emit{};
   const auto kProgressInterval = std::chrono::milliseconds(100);
 
-  // Expose the session backend so requestCancel() can fire a wire Cancel
-  // (guarded by cancel_mu_ — the pointer is cleared under the same lock before
-  // session_owned is destroyed, closing the UAF window).
-  {
-    std::lock_guard<std::mutex> lock(cancel_mu_);
-    backend_session_for_cancel_ = session_backend;
-  }
+  // (backend_session_for_cancel_ was published before connect/open above;
+  // CancelHookGuard clears it on every exit path.)
 
   // Surface "Resuming (attempt N/max)…" through the worker->dialog path on each
   // reconnect attempt during a mid-pull transport drop.
@@ -795,11 +829,6 @@ void FetchWorker::pullTopicsAsync(std::vector<std::string> sequence_names, std::
         }
         return true;
       });
-
-  {
-    std::lock_guard<std::mutex> lock(cancel_mu_);
-    backend_session_for_cancel_ = nullptr;
-  }
 
   if (mcap_writer) {
     // The import outcome (stats/topic ledger) is NEVER touched here: any

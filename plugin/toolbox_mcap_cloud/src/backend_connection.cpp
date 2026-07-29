@@ -315,8 +315,9 @@ bool BackendConnection::buildAndOpenSocket(std::string* error_out) {
   // Close events the callback above translates into socket_open_ /
   // socket_closed_ (with the underlying reason captured in socket_error_).
   // A reconnect MUST also clear stale pending_ RPC waiters + the session inbox
-  // and reset cancel_requested_ so a prior attempt's frames/false-closed flags
-  // can't corrupt this one.
+  // so a prior attempt's frames/false-closed flags can't corrupt this one.
+  // (cancel_requested_ is NOT cleared anywhere after cancelSession() — it is
+  // latched for the connection's lifetime; see openSessionFresh.)
   {
     std::lock_guard<std::mutex> lock(mu_);
     socket_open_ = false;
@@ -803,7 +804,14 @@ bool BackendConnection::openSessionFresh(const OpenSessionParams& params, Sessio
     session_active_ = true;
     session_subscription_id_ = 0;
     session_inbox_.clear();
-    cancel_requested_.store(false);
+    // cancel_requested_ is deliberately NOT reset here: cancelSession() latches
+    // the flag for the connection's LIFETIME. A connection is one-download-scoped
+    // (Slice 8: fresh BackendConnection per download), so there is no legitimate
+    // "stale cancel from a previous session" on this object — but there IS a real
+    // race the old reset lost: the caller arms its cancel hook, a cancel lands,
+    // and a reset here would swallow it right before the sendAndWait below, waiting
+    // out the full kOpenSessionTimeout. A latched cancel makes this open fail
+    // fast as "cancelled" instead.
     // Fresh session = start of a new download; zero the wire-byte accumulator so
     // it measures THIS download (resume legs deliberately keep accumulating).
     session_wire_bytes_.store(0, std::memory_order_relaxed);

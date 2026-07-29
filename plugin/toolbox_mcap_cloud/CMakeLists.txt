@@ -776,6 +776,39 @@ if(BUILD_TESTING)
   add_test(NAME McapCloudFetchWorkerExportContractTest
            COMMAND toolbox_mcap_cloud_fetch_worker_export_contract_test)
 
+  # Hermetic FetchWorker-level cancel wiring pin (review-caught): cancel during
+  # session establishment must reach the wire cancelSession(), not just the
+  # download loop. TIMEOUT 30 turns a wiring regression's 120 s OpenSession
+  # hang into a fast FAIL.
+  add_executable(toolbox_mcap_cloud_fetch_worker_cancel_test
+    tests/fetch_worker_cancel_test.cpp
+    tests/find_free_port.cpp
+    src/parser_ingest_driver.cpp
+    src/fetch_worker.cpp
+    src/backend_connection.cpp
+    src/wire_mapping.cpp
+    src/session_decode.cpp
+    src/session_mcap_writer.cpp
+    src/mcap_save_path.cpp
+    src/core/time_format.cpp
+    src/mcap_implementation.cpp
+    ${MCAP_CLOUD_PROTO_SRCS}
+  )
+  target_compile_features(toolbox_mcap_cloud_fetch_worker_cancel_test PRIVATE cxx_std_20)
+  target_include_directories(toolbox_mcap_cloud_fetch_worker_cancel_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/core
+    ${MCAP_CLOUD_PROTO_OUT_DIR}
+  )
+  target_link_libraries(toolbox_mcap_cloud_fetch_worker_cancel_test PRIVATE
+    plotjuggler_sdk::plugin_sdk
+    protobuf::libprotobuf ixwebsocket::ixwebsocket nlohmann_json::nlohmann_json
+    zstd::libzstd_static LZ4::lz4_static mcap::mcap GTest::gtest_main
+  )
+  add_test(NAME McapCloudFetchWorkerCancelTest
+           COMMAND toolbox_mcap_cloud_fetch_worker_cancel_test)
+  set_tests_properties(McapCloudFetchWorkerCancelTest PROPERTIES TIMEOUT 30)
+
   add_executable(toolbox_mcap_cloud_parser_ingest_live_test
     tests/parser_ingest_live_test.cpp
     src/parser_ingest_driver.cpp

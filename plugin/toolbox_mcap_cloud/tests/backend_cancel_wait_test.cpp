@@ -133,9 +133,10 @@ TEST(McapCloudBackendCancelWait, CancelUnblocksPendingOpenSession) {
       << "the error must mention the cancel, got: " << open_error;
 }
 
-// (ii) Scoping: a cancel latched OUTSIDE any session (the flag stays set until
-// the next fresh open resets it) must not wake browse RPCs — ListFiles still
-// waits for and returns its real response instead of coming back empty.
+// (ii) Scoping: a cancel latched OUTSIDE any session (the flag is latched for
+// the connection's LIFETIME — openSessionFresh deliberately does not reset it,
+// see the arming-order race note there) must not wake browse RPCs — ListFiles
+// still waits for and returns its real response instead of coming back empty.
 TEST(McapCloudBackendCancelWait, StaleCancelFlagDoesNotDisturbBrowseRpcs) {
   FakeSilentOpenServer server(/*answer_list_files=*/true);
   ASSERT_TRUE(server.ok());
@@ -153,4 +154,35 @@ TEST(McapCloudBackendCancelWait, StaleCancelFlagDoesNotDisturbBrowseRpcs) {
   ASSERT_EQ(sequences.size(), 1u)
       << "a stale cancel flag must not truncate a browse RPC to an empty result";
   EXPECT_EQ(sequences[0].name, FakeSilentOpenServer::kFakeSequenceName);
+}
+
+// (iii) Lifetime latch: a cancel that lands BEFORE openSessionFresh (the
+// arming-order race — caller publishes its cancel hook, cancel fires, THEN the
+// open runs) must make the open fail fast as "cancelled", never wait out the
+// 120 s timeout. Before the fix, openSessionFresh reset cancel_requested_ on
+// entry and swallowed exactly this cancel.
+TEST(McapCloudBackendCancelWait, CancelLatchedBeforeOpenFailsFast) {
+  FakeSilentOpenServer server(/*answer_list_files=*/false);
+  ASSERT_TRUE(server.ok());
+
+  mcap_cloud::BackendConnection conn(server.uri(), /*cert_path=*/"", /*api_key=*/"",
+                                     /*allow_insecure=*/false);
+  std::string error;
+  ASSERT_TRUE(conn.connect(&error)) << error;
+
+  conn.cancelSession();  // latched before the open — must survive it
+
+  mcap_cloud::OpenSessionParams params;
+  params.s3_keys = {"a.mcap"};
+  mcap_cloud::SessionInfo info;
+  std::string open_error;
+  const auto open_at = std::chrono::steady_clock::now();
+  const bool open_ok = conn.openSessionFresh(params, &info, &open_error);
+  const auto elapsed = std::chrono::steady_clock::now() - open_at;
+
+  EXPECT_FALSE(open_ok) << "an open on a cancelled connection must not succeed";
+  EXPECT_LT(elapsed, std::chrono::seconds(2))
+      << "a pre-latched cancel must fail the open fast, not after the 120s timeout";
+  EXPECT_NE(open_error.find("cancel"), std::string::npos)
+      << "the error must mention the cancel, got: " << open_error;
 }
