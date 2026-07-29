@@ -1,4 +1,4 @@
-# Canonical Cloud Layouts — Replay via Materializable Cached Files (design v3.4 / V3+B)
+# Canonical Cloud Layouts — Replay via Materializable Cached Files (design v3.5 / V3+B)
 
 **Status:** DRAFT v3.3 — the **V3+B variant is adopted** (user decision 2026-07-28 after a
 three-way V2 / V3.2 / V3+B comparison): cache-miss replay reuses the authoring dual path
@@ -371,30 +371,51 @@ family vtable**; the three semantic operations ride the SDK's existing extension
 each new struct `struct_size`-versioned, `PJ_string_view_t` + UTF-8 throughout, MINOR SDK
 release **0.20.0**, no `PJ_ABI_VERSION` / protocol-version bumps):
 
-- **Toolbox plugin extension `pj.descriptor_replay.v1`** (via the existing reverse-DNS
-  `get_plugin_extension` hook, `toolbox_protocol.h:161` — presence = capability, no new
-  capability bit): `PJ_descriptor_replay_provider_v1_t` with
+- **Plugin extension `pj.descriptor_replay.v1`** (via the existing reverse-DNS
+  `get_plugin_extension` hook — present on ALL plugin families (`data_source:462`,
+  `toolbox:161`, `message_parser:116`), so the extension struct lives in a
+  **family-neutral header** with `plugin_ctx` defined as the originating plugin-family
+  instance context; presence = capability, no new capability bit):
+  `PJ_descriptor_replay_provider_v1_t` with
   - `query_descriptor(descriptor_json) -> {trust: refused|needs_confirmation|trusted,
-    is_materialized, source_identity, local_path_utf8, message}` — sync, strictly bounded
-    (§6.3); **`source_identity` and `local_path` are ALWAYS returned** (hit or miss — the
-    host cannot compute a provider's canonical identity, and rewrite-then-classify needs
-    the planned path before any job starts);
-  - `start_replay(descriptor_json, callbacks, ctx) -> PJ_joinable_job_t` (fat-pointer job:
-    cancel non-blocking/idempotent, join returns after the terminal callback, destroy
-    cancels+joins). Callbacks are exactly TWO — `on_dataset` (zero-or-one, precedes any
-    publication/progress/adoption: the job↔dataset correlation #470 cannot provide) and
-    `on_terminal` (exactly-once, last: outcomes `SUCCEEDED_MATERIALIZED |
-    SUCCEEDED_UNMATERIALIZED | FAILED | CANCELLED`; the UNMATERIALIZED outcome is explicit
-    because "no adoption observed" is absence, not a terminal fact). **No `on_progress`** —
-    progress/publish/stop ride #470's existing dataset-scoped surface.
+    is_materialized, source_identity, local_path_utf8, message, estimated_bytes}` — sync,
+    strictly bounded (§6.3); **`source_identity` and `local_path` are ALWAYS returned**
+    (hit or miss — the host cannot compute a provider's canonical identity, and
+    rewrite-then-classify needs the planned path before any job starts);
+    **`estimated_bytes` (0 = unknown)** feeds §7 guard 3's confirmation display and
+    non-interactive byte-limit refusal at query time (from the descriptor's
+    authoring-time estimate or local metadata — never the network);
+  - `start_replay(request, callbacks, ctx) -> PJ_joinable_job_t` where **`request` is a
+    caller-sized `PJ_descriptor_replay_start_request_v1_t`** `{descriptor_json,
+    flags (v1 known-mask = 0; unknown bits rejected synchronously, fail-closed),
+    max_transfer_bytes (0 = no caller ceiling — the §7 guard-3 enforcement channel)}` —
+    a struct, not a naked flags parameter, so future *valued* runtime options
+    (force-refetch, prewarm/download-only, dry-run) are field-appends, never a v2
+    extension id. Runtime options deliberately do NOT ride the descriptor (it is the
+    persisted identity artifact). Job = fat pointer (cancel non-blocking/idempotent,
+    join returns after the terminal callback, destroy cancels+joins). Callbacks are
+    exactly TWO — `on_dataset` (zero-or-one, precedes any publication/progress/adoption:
+    the job↔dataset correlation #470 cannot provide; zero also covers future
+    prewarm/validate modes) and `on_terminal` (exactly-once, last: outcomes
+    `SUCCEEDED_MATERIALIZED | SUCCEEDED_UNMATERIALIZED | FAILED | CANCELLED`; the
+    UNMATERIALIZED outcome is explicit because "no adoption observed" is absence, not a
+    terminal fact). **No `on_progress`** — progress/publish/stop ride #470's existing
+    dataset-scoped surface.
+  - **Growth contract (all new structs, both directions):** the caller zero-initializes
+    its complete allocation then sets `struct_size`; the callee reads/writes only fields
+    wholly covered by that size — so field-appends to v1 structs are absent-as-zero on
+    older peers, and the side-by-side ID convention (`pj.<name>.v2`) remains the escape
+    hatch for semantic changes only.
 - **Host service `pj.materialized_source.v1`** (via the existing `bind()` service registry —
-  optional; absence = host without adoption support): `adopt(request, result_cb)` — async,
-  exactly-once result; request carries `{dataset, source_identity, local_path_utf8,
-  loader_plugin_id, loader_config_json, descriptor_json}` — the loader id + preset are
-  provider-supplied because a non-MCAP artifact (Mosaico's Arrow container + companion
-  loader) needs its OWN loader; the host re-checks dataset generation, drives the stock
-  `FileLoader` `replace_dataset_id` transaction, captures the loader's accepted config via
-  the normal completion path, and attaches `{provider manifest id, source_identity,
+  optional; absence = host without adoption support; **bound per plugin instance so the
+  host derives the authenticated provider manifest id itself — the plugin never supplies
+  it, so it cannot be spoofed**): `adopt(request, result_cb)` — async, exactly-once
+  result; request carries `{dataset, source_identity, local_path_utf8, loader_plugin_id,
+  loader_config_json, descriptor_json}` — the loader id + preset are provider-supplied
+  because a non-MCAP artifact (Mosaico's Arrow container + companion loader) needs its
+  OWN loader; the host re-checks dataset generation, drives the stock `FileLoader`
+  `replace_dataset_id` transaction, captures the loader's accepted config via the normal
+  completion path, and attaches `{provider manifest id, source_identity,
   descriptor_json}` before the callback.
 - **Co-batched in the same 0.20.0 bump** (closes the direct-ingest gap): a generic
   `createDatasetIngest()` C++ alias + `DatasetIngestHostView` exposing the
@@ -666,3 +687,28 @@ declarations (struct_size-versioned result/callback/job/request/service structs,
 lifetime + threading rules per slot, FORCE_INT32-pinned enums with fail-closed unknown
 values) are the stage-3 implementation reference — recover from the Codex session or the
 conversation record.
+
+**Fifth consult (fresh thread `019faca5-155d-73a0-8c39-27f02544a3dc`, 2026-07-28):
+future-proofing recalibration.** Owner directive: frequent SDK interface churn is worse
+than a slightly larger v1. An independent in-depth pass over the SDK mechanics
+(cross-family extension hook verified on all three plugin-family vtables; `pj.<name>.v<N>`
+side-by-side convention; Traits-based service lookup with min-version validation;
+back-to-back MINOR cadence in the CHANGELOG) produced a structural claim — only
+signature-frozen channels need v1 reservations — plus three deltas, cross-checked with
+Codex. Outcome: the claim was refuted *literally* (struct prefixes, callback
+cardinality/ordering, enum values, lifetimes, and descriptor canonicalization are also
+frozen; fat pointers never grow) but confirmed in priority. Amendments adopted into §8:
+`start_replay` takes a caller-sized **request struct** (not a naked flags param — absorbs
+future *valued* options; v1 flags mask = 0, unknown bits fail closed) carrying
+`max_transfer_bytes` (a CURRENT need — §7 guard 3 enforces against actual transferred
+bytes, and the caller ceiling must reach the provider); `estimated_bytes` added to the
+query result (§7 guard 3's confirmation display — the earlier "defer estimates" verdict
+contradicted our own spec); the zero-init + fields-wholly-covered growth contract
+generalized to every new struct on both sides; the extension struct moved to a
+family-neutral header (`plugin_ctx` = originating family instance); the adoption service
+bound per plugin instance (host-derived provider identity, unspoofable). Sweep verdict:
+after the request struct, NO other signature-frozen gaps against the 12-month feature
+list (ImportJob wraps the job handle; concurrency = appendable capability field, host
+serializes until advertised; Mosaico rides the adoption request; ETags = descriptor v2;
+server-hosted layouts = deliberately a separate extension id). on_dataset stays
+zero-or-one (fan-out = explicit v2 trigger).
