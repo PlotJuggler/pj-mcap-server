@@ -114,7 +114,7 @@ void saveCredentialsForUri(PJ::sdk::SettingsView view, CredentialStore& store, c
 // ORIGIN BINDING (spec docs/canonical-layout-replay.md §7 guard 2): the env
 // token is used IFF MCAP_CLOUD_URL is set AND its parsed origin equals the
 // target's (sameWsOrigin — strict, fail-closed). Without the binding, a
-// hostile layout/replay target of a DIFFERENT origin would silently receive
+// hostile layout/import target of a DIFFERENT origin would silently receive
 // the env bearer token. On a non-match the chain simply falls through to the
 // stored per-server token (unchanged).
 ServerCredentials resolveCredentials(PJ::sdk::SettingsView view, CredentialStore& store, const std::string& uri) {
@@ -2650,7 +2650,7 @@ void McapCloudDialog::onConnectFinished(bool ok, std::string uri, std::string st
     }
 
     // Spec §7 guard 1: a successful interactive Hello is the ONLY event that
-    // marks an origin trusted for auto-replay — recorded here, alongside the
+    // marks an origin trusted for auto-import — recorded here, alongside the
     // MRU write, about the server that actually answered.
     trustedOrigins().recordSuccessfulHello(uri);
 

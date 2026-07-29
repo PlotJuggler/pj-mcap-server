@@ -191,7 +191,7 @@ TEST(SessionMcapWriter, SinkOverloadRoundTrips) {
   EXPECT_EQ(payloads[1], "two");
 }
 
-// writeMetadata embeds a named MCAP Metadata record (the replay-descriptor
+// writeMetadata embeds a named MCAP Metadata record (the source-descriptor
 // provenance hook) that lands in the summary's metadata index and reads back
 // verbatim. mcap 2.1.1 has no readMetadata() convenience: the read path is
 // readSummary -> metadataIndexes() -> ReadRecord + ParseMetadata.
@@ -199,7 +199,7 @@ TEST(SessionMcapWriter, WriteMetadataAppearsInMetadataIndex) {
   TempMcap temp;
   mcap_cloud::SessionMcapWriter writer;
   std::string error;
-  const std::string kName = "mcap_cloud/replay_descriptor";
+  const std::string kName = "mcap_cloud/source_descriptor";
   const std::string kJson = "{\"v\":1}";
   ASSERT_TRUE(writer.open(temp.path, sessionInfo(), &error)) << error;
   ASSERT_TRUE(writer.writeMetadata(kName, kJson, &error)) << error;
@@ -241,7 +241,7 @@ TEST(SessionMcapWriter, WriteMetadataRejectedAfterFirstWriteAndBeforeOpen) {
   TempMcap temp;
   mcap_cloud::SessionMcapWriter writer;
   std::string error;
-  EXPECT_FALSE(writer.writeMetadata("mcap_cloud/replay_descriptor", "{}", &error));
+  EXPECT_FALSE(writer.writeMetadata("mcap_cloud/source_descriptor", "{}", &error));
   EXPECT_NE(error.find("not open"), std::string::npos) << error;
 
   ASSERT_TRUE(writer.open(temp.path, sessionInfo(), &error)) << error;
@@ -249,7 +249,7 @@ TEST(SessionMcapWriter, WriteMetadataRejectedAfterFirstWriteAndBeforeOpen) {
       {.topic_id = 11, .schema_id = 5, .log_time_ns = 100, .publish_time_ns = 90, .payload = "one-a"},
       &error))
       << error;
-  EXPECT_FALSE(writer.writeMetadata("mcap_cloud/replay_descriptor", "{}", &error));
+  EXPECT_FALSE(writer.writeMetadata("mcap_cloud/source_descriptor", "{}", &error));
   EXPECT_NE(error.find("first"), std::string::npos) << error;
   ASSERT_TRUE(writer.close(&error)) << error;
 }

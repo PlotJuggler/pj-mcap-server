@@ -1,5 +1,5 @@
 {
-  "comment": "Cross-repo contract: canonical serialization + identity vectors for the replay descriptor (docs/canonical-layout-replay.md §4). PJ4-side tests must consume this file byte-identically. Regenerating requires bumping the descriptor version.",
+  "comment": "Cross-repo contract: canonical serialization + identity vectors for the source descriptor (docs/canonical-layout-replay.md §4). PJ4-side tests must consume this file byte-identically. Regenerating requires bumping the descriptor version.",
   "cases": [
     { "name": "minimal-whole-range-all-topics",
       "descriptor": {"v":1,"kind":"mcap-cloud-session","server_uri":"ws://localhost:8080","s3_keys":["a.mcap"],"topics":[],"start_ns":"0","end_ns":"0","include_latched":true,"display_name":"A"},

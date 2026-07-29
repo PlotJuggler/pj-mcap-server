@@ -1,5 +1,12 @@
 # Layout-Replay Stage 1 — Plugin Foundations Implementation Plan
 
+> **Historical record — EXECUTED, not rewritten.** The vocabulary landed here
+> ("replay descriptor", `replay_descriptor.{hpp,cpp}`, `ReplayDescriptor`, ...) was
+> subsequently renamed to "source descriptor" (`source_descriptor.{hpp,cpp}`,
+> `SourceDescriptor`, ...) — see the "descriptor-import rename" plan and its
+> executing commit for the rationale. This document is left as-is; it describes
+> what was actually implemented under the names in effect at the time.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development
 > (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps
 > use checkbox (`- [ ]`) syntax for tracking.

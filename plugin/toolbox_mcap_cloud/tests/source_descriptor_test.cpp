@@ -1,12 +1,12 @@
 // Copyright 2026 Davide Faconti
 // SPDX-License-Identifier: MIT
 //
-// Replay descriptor (spec docs/canonical-layout-replay.md §4): parse/validate
+// Source descriptor (spec docs/canonical-layout-replay.md §4): parse/validate
 // round trip, canonical-serialization + identity conformance against the
 // CROSS-REPO vectors file (MCAP_CLOUD_VECTORS_JSON — the same bytes PJ4-side
 // tests consume), display_name identity invariance, and the strict rejection
 // matrix (allowlist, limits, URI hygiene, ns-string syntax, range order).
-#include "replay_descriptor.hpp"
+#include "source_descriptor.hpp"
 
 #include <gtest/gtest.h>
 
@@ -17,10 +17,10 @@
 
 namespace {
 
-using mcap_cloud::ReplayDescriptor;
+using mcap_cloud::SourceDescriptor;
 
-ReplayDescriptor fullDescriptor() {
-  ReplayDescriptor d;
+SourceDescriptor fullDescriptor() {
+  SourceDescriptor d;
   d.version = 1;
   d.kind = "mcap-cloud-session";
   d.server_uri = "wss://mcap.example.com";
@@ -51,7 +51,7 @@ nlohmann::json baseJson() {
 
 void expectReject(const std::string& json, const std::string& error_substr) {
   std::string error;
-  const auto d = mcap_cloud::parseReplayDescriptor(json, &error);
+  const auto d = mcap_cloud::parseSourceDescriptor(json, &error);
   EXPECT_FALSE(d.has_value()) << "accepted: " << json.substr(0, 200);
   EXPECT_NE(error.find(error_substr), std::string::npos)
       << "error \"" << error << "\" lacks substring \"" << error_substr << "\"";
@@ -67,10 +67,10 @@ std::string slurp(const char* path) {
 
 }  // namespace
 
-TEST(ReplayDescriptor, RoundTrip) {
-  const ReplayDescriptor d = fullDescriptor();
+TEST(SourceDescriptor, RoundTrip) {
+  const SourceDescriptor d = fullDescriptor();
   std::string error;
-  const auto parsed = mcap_cloud::parseReplayDescriptor(mcap_cloud::toReplayJson(d), &error);
+  const auto parsed = mcap_cloud::parseSourceDescriptor(mcap_cloud::toSourceDescriptorJson(d), &error);
   ASSERT_TRUE(parsed.has_value()) << error;
   EXPECT_EQ(parsed->version, d.version);
   EXPECT_EQ(parsed->kind, d.kind);
@@ -88,7 +88,7 @@ TEST(ReplayDescriptor, RoundTrip) {
 // file verbatim. The "display-name-does-not-change-identity" case is doubly
 // asserted: a twin differing ONLY in display_name yields the same canonical
 // bytes and the same identity (display_name is excluded from the digest).
-TEST(ReplayDescriptor, VectorConformance) {
+TEST(SourceDescriptor, VectorConformance) {
   const std::string raw = slurp(MCAP_CLOUD_VECTORS_JSON);
   const auto vectors = nlohmann::json::parse(raw, /*cb=*/nullptr, /*allow_exceptions=*/false);
   ASSERT_FALSE(vectors.is_discarded());
@@ -99,32 +99,32 @@ TEST(ReplayDescriptor, VectorConformance) {
     const std::string name = c["name"].get<std::string>();
     SCOPED_TRACE(name);
     std::string error;
-    const auto d = mcap_cloud::parseReplayDescriptor(c["descriptor"].dump(), &error);
+    const auto d = mcap_cloud::parseSourceDescriptor(c["descriptor"].dump(), &error);
     ASSERT_TRUE(d.has_value()) << error;
-    EXPECT_EQ(mcap_cloud::canonicalReplayJson(*d), c["canonical"].get<std::string>());
-    EXPECT_EQ(mcap_cloud::replayIdentity(*d), c["identity"].get<std::string>());
+    EXPECT_EQ(mcap_cloud::canonicalSourceDescriptorJson(*d), c["canonical"].get<std::string>());
+    EXPECT_EQ(mcap_cloud::descriptorIdentity(*d), c["identity"].get<std::string>());
 
     if (name == "display-name-does-not-change-identity") {
-      ReplayDescriptor twin = *d;
+      SourceDescriptor twin = *d;
       twin.display_name = "X";
-      EXPECT_EQ(mcap_cloud::canonicalReplayJson(twin), mcap_cloud::canonicalReplayJson(*d));
-      EXPECT_EQ(mcap_cloud::replayIdentity(twin), mcap_cloud::replayIdentity(*d));
+      EXPECT_EQ(mcap_cloud::canonicalSourceDescriptorJson(twin), mcap_cloud::canonicalSourceDescriptorJson(*d));
+      EXPECT_EQ(mcap_cloud::descriptorIdentity(twin), mcap_cloud::descriptorIdentity(*d));
     }
   }
 }
 
-TEST(ReplayDescriptor, IdentityInvariance) {
-  const ReplayDescriptor d = fullDescriptor();
-  ReplayDescriptor renamed = d;
+TEST(SourceDescriptor, IdentityInvariance) {
+  const SourceDescriptor d = fullDescriptor();
+  SourceDescriptor renamed = d;
   renamed.display_name = "RENAMED";
-  EXPECT_EQ(mcap_cloud::replayIdentity(renamed), mcap_cloud::replayIdentity(d));
+  EXPECT_EQ(mcap_cloud::descriptorIdentity(renamed), mcap_cloud::descriptorIdentity(d));
 
-  ReplayDescriptor changed = d;
+  SourceDescriptor changed = d;
   changed.include_latched = !d.include_latched;
-  EXPECT_NE(mcap_cloud::replayIdentity(changed), mcap_cloud::replayIdentity(d));
+  EXPECT_NE(mcap_cloud::descriptorIdentity(changed), mcap_cloud::descriptorIdentity(d));
 }
 
-TEST(ReplayDescriptor, RejectionMatrix) {
+TEST(SourceDescriptor, RejectionMatrix) {
   {  // Unsupported version.
     auto j = baseJson();
     j["v"] = 2;

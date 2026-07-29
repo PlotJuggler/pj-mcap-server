@@ -47,8 +47,8 @@ class SessionMcapWriter {
   /// the schema/channel dictionaries).
   [[nodiscard]] bool open(mcap::IWritable& sink, const SessionInfo& info, std::string* error);
   [[nodiscard]] bool write(const DecodedMessage& message, std::string* error);
-  /// Embed a named metadata record (e.g. the canonical replay descriptor,
-  /// name "mcap_cloud/replay_descriptor"). Call between open() and the first
+  /// Embed a named metadata record (e.g. the canonical source descriptor,
+  /// name "mcap_cloud/source_descriptor"). Call between open() and the first
   /// write() — the record participates in the summary's MetadataIndex; after
   /// the first write() it fails (a mid-stream Metadata record would split the
   /// open chunk).

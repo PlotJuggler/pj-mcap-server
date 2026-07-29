@@ -1,6 +1,6 @@
 // Copyright 2026 Davide Faconti
 // SPDX-License-Identifier: MIT
-#include "replay_descriptor.hpp"
+#include "source_descriptor.hpp"
 
 #include <limits>
 #include <nlohmann/json.hpp>
@@ -141,8 +141,8 @@ bool takeNs(const nlohmann::json& obj, const char* field, std::int64_t* out,
 
 }  // namespace
 
-std::optional<ReplayDescriptor> parseReplayDescriptor(std::string_view json,
-                                                      std::string* error) {
+std::optional<SourceDescriptor> parseSourceDescriptor(std::string_view json,
+                                                       std::string* error) {
   if (json.size() > kMaxDescriptorBytes) {
     fail(error, "descriptor exceeds the " + std::to_string(kMaxDescriptorBytes) +
                     "-byte limit");
@@ -175,7 +175,7 @@ std::optional<ReplayDescriptor> parseReplayDescriptor(std::string_view json,
     }
   }
 
-  ReplayDescriptor d;
+  SourceDescriptor d;
 
   const auto v_it = obj.find("v");
   if (v_it == obj.end()) {
@@ -242,7 +242,7 @@ std::optional<ReplayDescriptor> parseReplayDescriptor(std::string_view json,
   return d;
 }
 
-std::string canonicalReplayJson(const ReplayDescriptor& d) {
+std::string canonicalSourceDescriptorJson(const SourceDescriptor& d) {
   // ordered_json populated in ALPHABETICAL key order EXPLICITLY — the insert
   // order below IS the cross-repo contract (vectors file), never an artifact
   // of map ordering. display_name is deliberately absent (identity excludes
@@ -259,12 +259,12 @@ std::string canonicalReplayJson(const ReplayDescriptor& d) {
   return j.dump();
 }
 
-std::string replayIdentity(const ReplayDescriptor& d) {
+std::string descriptorIdentity(const SourceDescriptor& d) {
   // sha256/128 = the first 128 bits (16 bytes -> 32 lowercase hex chars).
-  return "mcap-cloud:v1:sha256/128:" + sha256HexPrefix(canonicalReplayJson(d), 16);
+  return "mcap-cloud:v1:sha256/128:" + sha256HexPrefix(canonicalSourceDescriptorJson(d), 16);
 }
 
-std::string toReplayJson(const ReplayDescriptor& d) {
+std::string toSourceDescriptorJson(const SourceDescriptor& d) {
   // Canonical fields + display_name, still in alphabetical insert order
   // ("display_name" sorts first).
   nlohmann::ordered_json j;

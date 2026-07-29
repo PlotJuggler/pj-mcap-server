@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT
 //
 // Trusted-origin ledger (spec docs/canonical-layout-replay.md §7 guard 1):
-// an origin is trusted for auto-replay iff it completed a SUCCESSFUL
+// an origin is trusted for auto-import iff it completed a SUCCESSFUL
 // interactive Hello on this machine. Deliberately NOT the credential store —
 // credentials may be saved before any successful connect, so the two must be
 // separate files with separate lifecycles.

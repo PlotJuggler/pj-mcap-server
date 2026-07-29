@@ -4,7 +4,7 @@
 // Session file cache core (spec docs/canonical-layout-replay.md §5), fully
 // hermetic: a private temp root is injected (never the real $XDG_CACHE_HOME),
 // and every valid fixture is a REAL MCAP built with SessionMcapWriter carrying
-// the canonical replay descriptor as embedded provenance — exactly what the
+// the canonical source descriptor as embedded provenance — exactly what the
 // stage-4 cache tee will produce.
 #include "session_file_cache.hpp"
 
@@ -18,7 +18,7 @@
 #include <string>
 #include <thread>
 
-#include "replay_descriptor.hpp"
+#include "source_descriptor.hpp"
 #include "session_mcap_writer.hpp"
 
 namespace {
@@ -40,8 +40,8 @@ struct TempRoot {
   fs::path path;
 };
 
-mcap_cloud::ReplayDescriptor descriptor(const std::string& key) {
-  mcap_cloud::ReplayDescriptor d;
+mcap_cloud::SourceDescriptor descriptor(const std::string& key) {
+  mcap_cloud::SourceDescriptor d;
   d.version = 1;
   d.kind = "mcap-cloud-session";
   d.server_uri = "ws://localhost:8080";
@@ -66,12 +66,12 @@ mcap_cloud::SessionInfo sessionInfo() {
 }
 
 // Write a valid, summarized session MCAP at `path` embedding
-// `embedded_canonical` as the replay-descriptor provenance record.
+// `embedded_canonical` as the source-descriptor provenance record.
 void writeSessionMcap(const fs::path& path, const std::string& embedded_canonical) {
   mcap_cloud::SessionMcapWriter writer;
   std::string error;
   ASSERT_TRUE(writer.open(path, sessionInfo(), &error)) << error;
-  ASSERT_TRUE(writer.writeMetadata("mcap_cloud/replay_descriptor", embedded_canonical, &error))
+  ASSERT_TRUE(writer.writeMetadata("mcap_cloud/source_descriptor", embedded_canonical, &error))
       << error;
   ASSERT_TRUE(writer.write(
       {.topic_id = 11, .schema_id = 5, .log_time_ns = 100, .publish_time_ns = 90,
@@ -83,15 +83,15 @@ void writeSessionMcap(const fs::path& path, const std::string& embedded_canonica
 
 // Materialize `d` into the cache through the real lock -> partial -> finalize
 // path; returns the finalized path.
-fs::path materialize(mcap_cloud::SessionFileCache& cache, const mcap_cloud::ReplayDescriptor& d) {
-  const std::string identity = mcap_cloud::replayIdentity(d);
+fs::path materialize(mcap_cloud::SessionFileCache& cache, const mcap_cloud::SourceDescriptor& d) {
+  const std::string identity = mcap_cloud::descriptorIdentity(d);
   std::string error;
   auto lock = cache.tryLockForMaterialize(identity, &error);
   EXPECT_TRUE(lock.has_value()) << error;
   if (!lock.has_value()) {
     return {};
   }
-  writeSessionMcap(cache.partialPathFor(*lock), mcap_cloud::canonicalReplayJson(d));
+  writeSessionMcap(cache.partialPathFor(*lock), mcap_cloud::canonicalSourceDescriptorJson(d));
   EXPECT_TRUE(cache.finalize(*lock, &error)) << error;
   return cache.pathFor(identity);
 }
@@ -111,7 +111,7 @@ TEST(SessionFileCache, PathForShapeAndIdentityValidation) {
 
   EXPECT_EQ(cache.pathFor(identityFor(kValidHexA)), root.path / (kValidHexA + ".mcap"));
   // The identity computed by the descriptor module is accepted as-is.
-  const std::string identity = mcap_cloud::replayIdentity(descriptor("a.mcap"));
+  const std::string identity = mcap_cloud::descriptorIdentity(descriptor("a.mcap"));
   EXPECT_FALSE(cache.pathFor(identity).empty());
 
   // Malformed identities never map to a path (and can never escape the root).
@@ -139,7 +139,7 @@ TEST(SessionFileCache, MaterializeFinalizeLookupRoundTrip) {
   TempRoot root("roundtrip");
   mcap_cloud::SessionFileCache cache(root.path);
   const auto d = descriptor("a.mcap");
-  const std::string identity = mcap_cloud::replayIdentity(d);
+  const std::string identity = mcap_cloud::descriptorIdentity(d);
 
   std::string error;
   auto lock = cache.tryLockForMaterialize(identity, &error);
@@ -149,7 +149,7 @@ TEST(SessionFileCache, MaterializeFinalizeLookupRoundTrip) {
   // Per-process partial: <hex>.mcap.partial.<pid>.
   EXPECT_NE(partial.filename().string().find(".mcap.partial."), std::string::npos);
 
-  writeSessionMcap(partial, mcap_cloud::canonicalReplayJson(d));
+  writeSessionMcap(partial, mcap_cloud::canonicalSourceDescriptorJson(d));
   ASSERT_TRUE(cache.finalize(*lock, &error)) << error;
   EXPECT_FALSE(fs::exists(partial));
 
@@ -174,7 +174,7 @@ TEST(SessionFileCache, MaterializeFinalizeLookupRoundTrip) {
 
   // A different identity is a miss; so is a corrupt file — which lookup does
   // NOT delete (deletion policy belongs to the provider flow, spec §5).
-  EXPECT_FALSE(cache.lookup(mcap_cloud::replayIdentity(descriptor("b.mcap")), &out));
+  EXPECT_FALSE(cache.lookup(mcap_cloud::descriptorIdentity(descriptor("b.mcap")), &out));
   {
     std::ofstream corrupt(final_path, std::ios::binary | std::ios::trunc);
     corrupt << "not an mcap";
@@ -188,16 +188,16 @@ TEST(SessionFileCache, FinalizeRejectsTruncatedFile) {
   mcap_cloud::SessionFileCache cache(root.path);
   const auto d = descriptor("a.mcap");
   std::string error;
-  auto lock = cache.tryLockForMaterialize(mcap_cloud::replayIdentity(d), &error);
+  auto lock = cache.tryLockForMaterialize(mcap_cloud::descriptorIdentity(d), &error);
   ASSERT_TRUE(lock.has_value()) << error;
   const fs::path partial = cache.partialPathFor(*lock);
-  writeSessionMcap(partial, mcap_cloud::canonicalReplayJson(d));
+  writeSessionMcap(partial, mcap_cloud::canonicalSourceDescriptorJson(d));
   fs::resize_file(partial, fs::file_size(partial) - 64);  // chop the footer
 
   EXPECT_FALSE(cache.finalize(*lock, &error));
   EXPECT_FALSE(error.empty());
   EXPECT_FALSE(fs::exists(partial));  // failed finalize removes the partial
-  EXPECT_FALSE(fs::exists(cache.pathFor(mcap_cloud::replayIdentity(d))));
+  EXPECT_FALSE(fs::exists(cache.pathFor(mcap_cloud::descriptorIdentity(d))));
 }
 
 TEST(SessionFileCache, FinalizeRejectsNonMcapJunk) {
@@ -259,10 +259,10 @@ TEST(SessionFileCache, FinalizeRejectsDescriptorIdentityMismatchAndAbsence) {
   // Embedded provenance for a DIFFERENT request -> wrong-file substitution
   // is detected from the file alone.
   {
-    auto lock = cache.tryLockForMaterialize(mcap_cloud::replayIdentity(d1), &error);
+    auto lock = cache.tryLockForMaterialize(mcap_cloud::descriptorIdentity(d1), &error);
     ASSERT_TRUE(lock.has_value()) << error;
     const fs::path partial = cache.partialPathFor(*lock);
-    writeSessionMcap(partial, mcap_cloud::canonicalReplayJson(d2));
+    writeSessionMcap(partial, mcap_cloud::canonicalSourceDescriptorJson(d2));
     EXPECT_FALSE(cache.finalize(*lock, &error));
     EXPECT_NE(error.find("identity"), std::string::npos) << error;
     EXPECT_FALSE(fs::exists(partial));
@@ -271,7 +271,7 @@ TEST(SessionFileCache, FinalizeRejectsDescriptorIdentityMismatchAndAbsence) {
   // No provenance at all: a cache file must self-describe (spec §5) — the
   // tee always embeds the descriptor, so absence at finalize is a defect.
   {
-    auto lock = cache.tryLockForMaterialize(mcap_cloud::replayIdentity(d1), &error);
+    auto lock = cache.tryLockForMaterialize(mcap_cloud::descriptorIdentity(d1), &error);
     ASSERT_TRUE(lock.has_value()) << error;
     const fs::path partial = cache.partialPathFor(*lock);
     mcap_cloud::SessionMcapWriter writer;
@@ -395,7 +395,7 @@ TEST(SessionFileCache, CleanupSkipsLockedVictims) {
   // The oldest entry's identity lock is held (stage-4 leases share this lock
   // file): eviction must skip it and take the next victim instead.
   std::string error;
-  auto held = cache.tryLockForMaterialize(mcap_cloud::replayIdentity(d_old), &error);
+  auto held = cache.tryLockForMaterialize(mcap_cloud::descriptorIdentity(d_old), &error);
   ASSERT_TRUE(held.has_value()) << error;
 
   mcap_cloud::SessionFileCache::Config cfg;

@@ -5,7 +5,7 @@
 // *trusted = origin recorded after a successful interactive Hello*. This is a
 // dedicated ledger, deliberately NOT the credential store — credentials can
 // exist before any successful connection, so "has a stored token" must never
-// imply "safe to auto-replay against".
+// imply "safe to auto-import against".
 //
 // Storage format: {"v":1,"origins":["wss://host:443","ws://host:8080", ...]}
 // where each serialized origin is scheme://host:port with the EFFECTIVE port
@@ -23,7 +23,7 @@ namespace mcap_cloud {
 
 // Ledger of origins that completed a successful interactive Hello on this
 // machine (file: <config_root>/trusted_origins.json, 0600, atomic replace).
-// This is the auto-replay trust source (spec §7 guard 1) — NOT the
+// This is the auto-import trust source (spec §7 guard 1) — NOT the
 // credential store: credentials may be saved before any successful connect.
 class TrustedOrigins {
  public:

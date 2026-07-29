@@ -29,7 +29,7 @@ constexpr std::string_view kIdentityPrefix = "mcap-cloud:v1:sha256/128:";
 constexpr std::size_t kDigestHexChars = 32;  // 128 bits, lowercase hex
 // The provenance record SessionMcapWriter::writeMetadata embeds (spec §5:
 // a cache file self-describes which request produced it).
-constexpr const char* kProvenanceName = "mcap_cloud/replay_descriptor";
+constexpr const char* kProvenanceName = "mcap_cloud/source_descriptor";
 
 // Extract the digest component from a full identity string; nullopt for
 // anything that is not EXACTLY "mcap-cloud:v1:sha256/128:<32 lowercase hex>".
@@ -93,8 +93,8 @@ void touchStamp(const fs::path& file) {
 //
 // The identity check hashes the embedded canonical-descriptor bytes directly:
 // the identity is DEFINED as sha256/128 over those exact bytes (see
-// replayIdentity), so byte-hashing detects wrong-file substitution and name
-// collisions from the file alone, without a JSON parse here.
+// descriptorIdentity), so byte-hashing detects wrong-file substitution and
+// name collisions from the file alone, without a JSON parse here.
 bool validateMcap(const fs::path& path, const std::string& hex, bool strict,
                   std::string* error) {
   mcap::McapReader reader;
@@ -118,7 +118,7 @@ bool validateMcap(const fs::path& path, const std::string& hex, bool strict,
   if (index == reader.metadataIndexes().end()) {
     reader.close();
     if (strict) {
-      *error = std::string("missing embedded replay descriptor (") + kProvenanceName + ")";
+      *error = std::string("missing embedded source descriptor (") + kProvenanceName + ")";
       return false;
     }
     return true;
@@ -254,7 +254,7 @@ std::optional<SessionFileCache::MaterializeLock> SessionFileCache::tryLockForMat
   const auto hex = identityHex(identity);
   if (!hex.has_value()) {
     if (error) {
-      *error = "invalid replay identity (want mcap-cloud:v1:sha256/128:<32 lowercase hex>)";
+      *error = "invalid descriptor identity (want mcap-cloud:v1:sha256/128:<32 lowercase hex>)";
     }
     return std::nullopt;
   }
