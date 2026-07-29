@@ -235,14 +235,17 @@ def read_summary_with_fallback(
     """
     try:
         return read_summary_targeted(pread, size, tail=tail), "targeted"
-    except _NoSummary:
+    except _NoSummary as e:
         # The carve-out: a well-framed footer already gave the baseline's
-        # exact verdict — propagate it verbatim, no fallback re-read needed.
+        # exact verdict — re-raise as a PLAIN ValueError (never the private
+        # subclass: quarantine rows persist ``type(e).__name__``, and the
+        # error_text must stay byte-identical to the streamed path's —
+        # A/B-gate-verified 2026-07-29). No fallback re-read needed.
         # Narrowly typed (not a bare ValueError) so a ValueError raised by a
         # buggy/adversarial ``pread`` transport does NOT take this shortcut —
         # it falls through to the generic handler below and gets a real
         # streamed-fallback verdict instead.
-        raise
+        raise ValueError(str(e)) from None
     except TargetedUnavailable as e:
         # Demoted to DEBUG (2026-07-29 review): at million-object scale a
         # per-file INFO line here is noise — the sidecar's aggregate
