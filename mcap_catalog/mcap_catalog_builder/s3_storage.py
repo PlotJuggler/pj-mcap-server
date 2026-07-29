@@ -18,6 +18,7 @@ from typing import Iterator
 
 from .retry import retry_with
 from .storage import Listing, Stat
+from .targeted_summary import read_summary_with_fallback
 
 # Error codes a HEAD/GET returns when an object is absent (duck-typed off the
 # botocore ClientError shape, so botocore need not be importable here).
@@ -156,6 +157,18 @@ class S3Source:
         return io.BufferedReader(
             S3RangeReader(self._c, self._bucket, key, size), buffer_size=1 << 20
         )
+
+    def read_summary(self, key: str, size: int):
+        def pread(lo: int, hi: int) -> bytes:
+            return retry_with(
+                lambda: self._c.get_object(
+                    Bucket=self._bucket, Key=key, Range=f"bytes={lo}-{hi}",
+                )["Body"].read(),
+                is_permanent=_is_permanent,
+            )
+
+        return read_summary_with_fallback(
+            pread, lambda: self.open_summary(key, size), key, size)
 
     def list_all(self) -> Iterator[Listing]:
         for page in self._c.get_paginator("list_objects_v2").paginate(

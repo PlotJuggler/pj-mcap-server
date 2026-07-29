@@ -77,6 +77,25 @@ near-miss key is never guessed into a wrong row.
 - **Removal** hard-deletes the `files` row (tags cascade); the append-only lookups,
   dictionaries, and `topic_sets` are left as harmless orphans (no GC).
 
+## Targeted summary read
+
+Every `Source.read_summary(key, size)` (all three backends) tries a **targeted**
+read first (`targeted_summary.py`): a bounded speculative over-read of the
+footer/summary-offset section that fetches only the Schema/Channel/Statistics
+groups — never the ChunkIndex group, which dominates a chunked recording's
+summary section. It falls back to the streamed `summary_from_stream` reader on
+*any* structural surprise (a short/corrupt footer, an out-of-bounds group, a
+count mismatch, …); **the streamed fallback is the sole authority for every
+quarantine verdict** — the targeted path can only shortcut to the *same*
+answer faster, never produce a different one. Per-file disposition
+(`"targeted"` / `"fallback-unavailable"` / `"fallback-unexpected"`) is tallied
+per-reconcile and published in the status sidecar as `summary_targeted_ok`,
+`summary_fallbacks_unavailable`, and `summary_fallbacks_unexpected` — the
+operator-facing signal that a systematic targeted-path bug would show up as a
+spike in `fallback-unexpected`, without needing per-file log lines at
+million-object scale. `--extract-workers 64` measured 1.28× on WAN cold scans
+(default unchanged pending in-region measurement).
+
 ## Architecture (single writer)
 
 The `watchdog` observer, the debounce `Timer`s, and the periodic-rescan thread are

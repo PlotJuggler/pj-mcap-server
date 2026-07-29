@@ -35,7 +35,7 @@ from .db import (
     resolve_topic_set,
 )
 from .keyparse import parse_hive_key, rebuild_hive_key, relpath_key
-from .mcap_summary import derive_tags, summary_from_stream
+from .mcap_summary import derive_tags
 from .storage import LocalSource, local_etag
 from .varint import encode_counts_blob
 
@@ -70,6 +70,7 @@ class Extract:
     eff_key: str | None = None
     summary: object = None
     error: str = ""
+    summary_via: str = ""  # targeted-read disposition (targeted_summary.py); "" if unset
 
 
 def compute_set_fingerprint(members: list[tuple[int, int]]) -> str:
@@ -216,9 +217,9 @@ def _write_file_row(conn, caches, dims, eff_key, ids, stat, summary) -> CatalogR
             # migration §4.4). v1 signals: an explicit error tag, OR an EMPTY
             # recording (0 messages) — a cataloged-but-suspect file an operator
             # wants to surface/skip. (An UNSUMMARIZED file never reaches here — it
-            # raises in summary_from_stream and is quarantined to catalog_failures,
-            # §4.6.) Distinct from catalog_failures (files that could not be
-            # cataloged at all).
+            # raises in source.read_summary (targeted or its summary_from_stream
+            # fallback) and is quarantined to catalog_failures, §4.6.) Distinct
+            # from catalog_failures (files that could not be cataloged at all).
             has_error = 1 if (
                 any(is_error_tag(k, v) for k, v in tags) or summary.message_count == 0
             ) else 0
@@ -253,8 +254,9 @@ def extract_summary(source, key: str, stat, dims: dict[str, str], eff_key: str) 
     try:
         try:
             # Only the footer + summary are fetched — never the message body (R2).
-            with source.open_summary(key, stat.size) as stream:
-                summary = summary_from_stream(stream)
+            # ``via`` is the targeted/fallback disposition (targeted_summary.py),
+            # fed to the reconcile telemetry counters.
+            summary, summary_via = source.read_summary(key, stat.size)
         except Exception as e:  # noqa: BLE001
             # Disambiguate a TOCTOU vanish (object deleted between LIST and read) from
             # a real parse error with ONE HEAD, taken only on the error path so the
@@ -263,17 +265,22 @@ def extract_summary(source, key: str, stat, dims: dict[str, str], eff_key: str) 
                 gone = source.stat(key) is None
             except Exception:  # noqa: BLE001
                 gone = False
+            # A failed streamed fallback stamps its disposition onto the exception
+            # (read_summary_with_fallback) so a quarantined file still counts.
+            via = getattr(e, "summary_via", "")
             if gone:
                 logger.debug("object vanished before cataloging: %s", key)
-                return Extract(key, "vanished", dims=dims, eff_key=eff_key, stat=stat)
+                return Extract(key, "vanished", dims=dims, eff_key=eff_key, stat=stat,
+                               summary_via=via)
             return Extract(key, "error", dims=dims, eff_key=eff_key, stat=stat,
-                           error=f"{type(e).__name__}: {e}")
-        return Extract(key, "ready", dims=dims, eff_key=eff_key, stat=stat, summary=summary)
+                           error=f"{type(e).__name__}: {e}", summary_via=via)
+        return Extract(key, "ready", dims=dims, eff_key=eff_key, stat=stat, summary=summary,
+                       summary_via=summary_via)
     except Exception as e:  # noqa: BLE001 - a worker must never crash the pool
         # Anything unexpected (e.g. a future edit adding a raise outside the inner
         # try) still comes back as a quarantinable Extract, not a pool-aborting raise.
         return Extract(key, "error", dims=dims, eff_key=eff_key, stat=stat,
-                       error=f"{type(e).__name__}: {e}")
+                       error=f"{type(e).__name__}: {e}", summary_via=getattr(e, "summary_via", ""))
 
 
 def apply_extract(conn: sqlite3.Connection, caches: Caches, ex: Extract) -> CatalogResult:
@@ -327,10 +334,12 @@ def catalog_object(
         return CatalogResult("skipped")
 
     # Read the summary OUTSIDE the transaction (slow / can throw). Only the
-    # footer + summary are fetched — never the message body (R2).
+    # footer + summary are fetched — never the message body (R2). This
+    # single-file event path deliberately drops the targeted/fallback `via`
+    # disposition — the reconcile counters (status sidecar) are the
+    # observability surface for that telemetry, not the watcher path.
     try:
-        with source.open_summary(key, stat.size) as stream:
-            summary = summary_from_stream(stream)
+        summary, _via = source.read_summary(key, stat.size)
     except Exception as e:  # noqa: BLE001
         # QUARANTINE: a file is NEVER simultaneously "cataloged" and "failed". If a
         # previously-healthy row exists for this key (a broken RE-UPLOAD: etag

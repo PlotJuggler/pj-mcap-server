@@ -18,6 +18,7 @@ from typing import Iterator
 
 from .retry import retry_with
 from .storage import Listing, Stat
+from .targeted_summary import read_summary_with_fallback
 
 # Permanent (non-retryable) HTTP codes: bad-request / auth / missing. The Go GCS
 # classifier (gcsreader.go) treats 400/403/404 as permanent, 429/5xx as transient;
@@ -112,6 +113,18 @@ class GCSSource:
         return io.BufferedReader(
             GCSRangeReader(self._c, self._bucket, key, size), buffer_size=1 << 16
         )
+
+    def read_summary(self, key: str, size: int):
+        blob = self._c.bucket(self._bucket).blob(key)
+
+        def pread(lo: int, hi: int) -> bytes:
+            return retry_with(
+                lambda: blob.download_as_bytes(start=lo, end=hi),
+                is_permanent=_is_permanent,
+            )
+
+        return read_summary_with_fallback(
+            pread, lambda: self.open_summary(key, size), key, size)
 
     def list_all(self) -> Iterator[Listing]:
         # list_blobs is lazy + paginates as it is iterated; materialize under retry

@@ -64,3 +64,13 @@ def test_local_wait_for_stable_true_for_static_file(tmp_path):
     write_minimal_mcap(str(tmp_path / "x.mcap"))
     src = LocalSource(str(tmp_path), stability_checks=2, stability_interval=0.0)
     assert src.wait_for_stable(str(tmp_path / "x.mcap")) is True
+
+
+def test_local_read_summary_parity(tmp_path):
+    p = tmp_path / "a.mcap"
+    write_minimal_mcap(str(p), channels=[("/x", "pkg/msg/X", "ros2msg", 3),
+                                         ("/y", "pkg/msg/Y", "ros2msg", 0)])
+    src = LocalSource(str(tmp_path))
+    st = src.stat("a.mcap")
+    summary, via = src.read_summary("a.mcap", st.size)
+    assert summary == read_file_summary(str(p)) and via == "targeted"

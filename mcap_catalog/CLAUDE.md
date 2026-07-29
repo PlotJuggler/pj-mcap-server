@@ -116,10 +116,17 @@ merely unlikely:
   `channel_message_counts`. The `.get(..., 0)` default is mandatory.
 - **Summary only.** Per-file stats come from the MCAP summary/Statistics, **never**
   the embedded `rosbag2` metadata (which describes the whole multi-day bag).
-- **R2 / R4 cheap path.** Cataloging reads only the footer/summary (a few KB — for S3,
-  1–2 range GETs, never the body), and an unchanged **`etag`** skips with **no body
-  read** (local etag = `local:{size}:{mtime}` so size/mtime changes re-catalog; S3 =
-  the real ETag from the listing). A restart over a cataloged lake re-reads zero files.
+- **R2 / R4 cheap path.** Cataloging reads only the footer/summary — for object
+  stores, a targeted read (`targeted_summary.py`) fetches just the footer tail +
+  Schema/Channel/Statistics groups via the summary-offset section (1–2 range
+  GETs, never streaming the ChunkIndex group), falling back to the streamed
+  `summary_from_stream` on ANY structural surprise — the fallback is the
+  semantics authority for every quarantine verdict (sole carve-out: the
+  `summary_start == 0` no-summary ValueError). The targeted path never reads
+  the leading magic on large files; integrity = trailing magic + record framing
+  + the count check. An unchanged **`etag`** skips with **no body read** (local
+  etag = `local:{size}:{mtime}`; S3 = the real ETag from the listing). A restart
+  over a cataloged lake re-reads zero files.
 - **Read the summary OUTSIDE the transaction** (it's slow and can throw).
 - **Bounded extraction window.** The reconcile read phase must never submit-all
   then `as_completed` — a list of every future pins every completed `Extract`

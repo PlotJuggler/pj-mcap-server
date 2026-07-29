@@ -11,6 +11,7 @@ from mcap.writer import CompressionType, Writer
 
 from mcap_catalog_builder.gcs_storage import GCSRangeReader, GCSSource, _is_permanent
 from mcap_catalog_builder.mcap_summary import read_file_summary, summary_from_stream
+from mcap_catalog_builder.tests.fixtures import write_minimal_mcap
 
 
 class _GcsError(Exception):
@@ -164,3 +165,13 @@ def test_open_summary_reads_real_mcap_without_downloading_body(tmp_path):
 
     assert got == read_file_summary(dest)  # identical to the local read
     assert client.fetched < 200_000        # only footer + summary fetched
+
+
+def test_gcs_read_summary_parity(tmp_path):
+    p = tmp_path / "a.mcap"
+    write_minimal_mcap(str(p))
+    data = p.read_bytes()
+    fake = FakeGCS({"k.mcap": data})
+    src = GCSSource(fake, "b")
+    summary, via = src.read_summary("k.mcap", len(data))
+    assert summary == summary_from_stream(io.BytesIO(data)) and via == "targeted"

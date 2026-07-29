@@ -154,6 +154,21 @@ def test_progress_drives_status_and_logs(tmp_path, caplog):
     assert "4/4" in caplog.text
 
 
+def test_progress_tracks_summary_via_dispositions_in_sidecar(tmp_path):
+    db = str(tmp_path / "catalog.db")
+    w = StatusWriter(db, min_interval=0.0)
+    p = ReconcileProgress(status=w, log_interval=0.0)
+    p.extract_start(to_extract=4, skipped=0, failed=0)
+    p.file_done("cataloged", via="targeted")
+    p.file_done("cataloged", via="targeted")
+    p.file_done("failed", via="fallback-unavailable")
+    p.file_done("cataloged", via="fallback-unexpected")
+    doc = _read_status(db)
+    assert doc["summary_targeted_ok"] == 2
+    assert doc["summary_fallbacks_unavailable"] == 1
+    assert doc["summary_fallbacks_unexpected"] == 1
+
+
 def test_progress_without_status_writer_only_logs(caplog):
     p = ReconcileProgress(status=None, log_interval=0.0)
     with caplog.at_level("INFO"):

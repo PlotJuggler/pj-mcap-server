@@ -185,3 +185,27 @@ def test_open_summary_reads_real_mcap_without_downloading_body(tmp_path):
 
     assert got == read_file_summary(dest)        # identical to the local read
     assert client.fetched < 200_000              # only footer + summary fetched
+
+
+def test_s3_read_summary_parity_and_single_get(tmp_path):
+    p = tmp_path / "a.mcap"
+    write_minimal_mcap(str(p))
+    data = p.read_bytes()
+    fake = FakeS3({"k.mcap": data})
+    src = S3Source(fake, "b")
+    summary, via = src.read_summary("k.mcap", len(data))
+    assert summary == summary_from_stream(io.BytesIO(data)) and via == "targeted"
+    assert len(fake.ranges) == 1  # small file: everything in the tail read
+
+
+def test_s3_read_summary_falls_back_on_garbage(tmp_path):
+    data = b"\x00" * 4096
+    fake = FakeS3({"k.mcap": data})
+    src = S3Source(fake, "b")
+    try:
+        src.read_summary("k.mcap", len(data))
+        raised = None
+    except Exception as e:  # noqa: BLE001
+        raised = e
+    assert raised is not None                      # streamed fallback's verdict
+    assert getattr(raised, "summary_via", "") == "fallback-unavailable"

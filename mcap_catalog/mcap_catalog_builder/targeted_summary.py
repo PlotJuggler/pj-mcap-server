@@ -244,8 +244,14 @@ def read_summary_with_fallback(
         # streamed-fallback verdict instead.
         raise
     except TargetedUnavailable as e:
-        logger.info("targeted summary read unavailable for %s (%s); using streamed read",
-                    key, e)
+        # Demoted to DEBUG (2026-07-29 review): at million-object scale a
+        # per-file INFO line here is noise — the sidecar's aggregate
+        # summary_fallbacks_unavailable counter (status.ReconcileProgress) is
+        # the operator-facing signal for this path. The fallback-unexpected
+        # WARNING below stays per-file: that path suggests an actual bug in
+        # the targeted reader, which deserves immediate visibility.
+        logger.debug("targeted summary read unavailable for %s (%s); using streamed read",
+                     key, e)
         via = "fallback-unavailable"
     except Exception as e:  # noqa: BLE001 — a targeted bug must never change verdicts
         logger.warning("targeted summary read failed for %s (%s: %s); using streamed read",

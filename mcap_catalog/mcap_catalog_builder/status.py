@@ -145,6 +145,11 @@ class ReconcileProgress:
         self._total = 0
         self._done = 0
         self._counts = {"cataloged": 0, "skipped": 0, "failed": 0}
+        # Per-file summary-read disposition tallies (targeted_summary.py's
+        # ``via``) — the aggregate observability surface for the targeted-read
+        # optimization: a systematic targeted-path bug must show up here, not
+        # just as a per-file DEBUG/WARNING line at million-object scale.
+        self._via_counts = {"targeted": 0, "fallback-unavailable": 0, "fallback-unexpected": 0}
 
     # -- milestones -------------------------------------------------------
 
@@ -165,6 +170,7 @@ class ReconcileProgress:
         self._total = to_extract
         self._done = 0
         self._counts = {"cataloged": 0, "skipped": skipped, "failed": failed}
+        self._via_counts = {"targeted": 0, "fallback-unavailable": 0, "fallback-unexpected": 0}
         self._t0 = self._clock()
         self._last_log = None
         self._set_status(
@@ -176,14 +182,19 @@ class ReconcileProgress:
             to_extract, skipped, failed,
         )
 
-    def file_done(self, status: str) -> None:
+    def file_done(self, status: str, via: str = "") -> None:
         self._done += 1
         self._counts[status] = self._counts.get(status, 0) + 1
+        if via in self._via_counts:  # empty/unknown via counts in no disposition bucket
+            self._via_counts[via] += 1
         self._set_status(
             extract_done=self._done,
             cataloged=self._counts["cataloged"],
             skipped=self._counts["skipped"],
             failed=self._counts["failed"],
+            summary_targeted_ok=self._via_counts["targeted"],
+            summary_fallbacks_unavailable=self._via_counts["fallback-unavailable"],
+            summary_fallbacks_unexpected=self._via_counts["fallback-unexpected"],
         )
         if self._log_due():
             elapsed = max(self._clock() - (self._t0 or self._clock()), 1e-9)
@@ -209,8 +220,27 @@ class ReconcileProgress:
             skipped=tally.get("skipped", 0),
             failed=tally.get("failed", 0),
             deleted=tally.get("deleted", 0),
+            summary_targeted_ok=self._via_counts["targeted"],
+            summary_fallbacks_unavailable=self._via_counts["fallback-unavailable"],
+            summary_fallbacks_unexpected=self._via_counts["fallback-unexpected"],
             force=True,
         )
+        if self._via_counts["fallback-unexpected"] > 0:
+            # ONE aggregate WARNING per reconcile (the per-file WARNING already
+            # fired in targeted_summary.py for each occurrence) — a summary a
+            # human skimming logs can't miss even if the per-file lines scrolled by.
+            logger.warning(
+                "reconcile: %d file(s) hit an UNEXPECTED targeted-summary-read "
+                "failure this build (see per-file WARNING lines above) — a "
+                "targeted-read bug is suspected",
+                self._via_counts["fallback-unexpected"],
+            )
+
+    @property
+    def summary_via_counts(self) -> dict:
+        """A snapshot of this reconcile's summary-read disposition tallies
+        (``targeted`` / ``fallback-unavailable`` / ``fallback-unexpected``)."""
+        return dict(self._via_counts)
 
     # -- helpers ----------------------------------------------------------
 
