@@ -769,6 +769,63 @@ void FetchWorker::pullTopicsAsync(std::vector<std::string> sequence_names, std::
     }
   }
 
+  // #470 progress surface (spec §13 stage 2): make the progressive import
+  // HOST-visible — title-bar strip, per-dataset ingest lifecycle, cooperative
+  // stop — through the dataset-ingest view over the already-bound context
+  // (SDK 0.20.0's wider facade on the same create_parser_ingest fat pointer).
+  // Best-effort by design: a host without the progress slots REFUSES
+  // progressStart, and on such a host progressUpdate's false return means
+  // "unsupported", never "user cancelled" — so the cancel interpretation in
+  // the pull loop below is gated on host_progress_active. Stream-thread
+  // tagged calls, driven from this worker thread like every other host call.
+  bool host_progress_active = false;
+  if (driver.hasDecodable()) {
+    host_progress_active =
+        driver.datasetIngest()
+            .progressStart("MCAP Cloud: " + group_name, session_info.approximate_messages,
+                           /*cancellable=*/true)
+            .has_value();
+  }
+  std::uint64_t transport_messages_seen = 0;
+
+  // Host-stop WATCHDOG (review-caught): the in-callback isStopRequested()
+  // check below only runs when messages flow — a stalled server or a
+  // reconnect backoff would ignore the host's Stop for the full frame-wait/
+  // backoff timeouts (minutes). This poller observes the [thread-safe] stop
+  // slot from its own thread and converts a stop into requestCancel(), whose
+  // wake machinery (cancel hook + sendAndWait/frame-wait/backoff predicates)
+  // already unblocks every waiting phase promptly. Scoped strictly to the
+  // download: joined before the terminal classification and finalize(), so
+  // the dataset-ingest view outlives it.
+  std::atomic<bool> download_done{false};
+  std::thread host_stop_watchdog;
+  // Exception-safe join (re-verify-caught): the download below invokes
+  // unrestricted std::function callbacks (pullProgress, ...) — if one throws,
+  // unwinding through a still-joinable std::thread is std::terminate. The
+  // guard signals + joins on EVERY exit; the manual join before the terminal
+  // boundary below then no-ops (joinable() false) and keeps its ordering role.
+  struct WatchdogJoinGuard {
+    std::atomic<bool>& done;
+    std::thread& thread;
+    ~WatchdogJoinGuard() {
+      done.store(true, std::memory_order_relaxed);
+      if (thread.joinable()) {
+        thread.join();
+      }
+    }
+  } watchdog_join_guard{download_done, host_stop_watchdog};
+  if (host_progress_active) {
+    host_stop_watchdog = std::thread([&]() {
+      while (!download_done.load(std::memory_order_relaxed)) {
+        if (driver.datasetIngest().isStopRequested()) {
+          requestCancel();
+          return;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+      }
+    });
+  }
+
   // Progress throttle: emit pullProgress at most ~10 Hz per topic.
   std::unordered_map<std::uint32_t, std::int64_t> bytes_by_id;
   std::unordered_map<std::uint32_t, std::chrono::steady_clock::time_point> last_emit;
@@ -777,6 +834,7 @@ void FetchWorker::pullTopicsAsync(std::vector<std::string> sequence_names, std::
   // otherwise it would re-emit the same value once per topic that trips its own
   // window (N GUI events/window instead of one).
   std::chrono::steady_clock::time_point last_wire_emit{};
+  std::chrono::steady_clock::time_point last_host_progress_emit{};
   const auto kProgressInterval = std::chrono::milliseconds(100);
 
   // (backend_session_for_cancel_ was published before connect/open above;
@@ -833,8 +891,36 @@ void FetchWorker::pullTopicsAsync(std::vector<std::string> sequence_names, std::
           last_wire_emit = now;
           pullWireBytes(static_cast<std::int64_t>(session_backend->sessionWireBytesReceived()));
         }
+        // Host progress tick (#470) — session-wide, own throttle stamp. The
+        // step unit is TRANSPORT messages (matches approximate_messages, the
+        // total announced to progressStart). A false progressUpdate return or
+        // a host stop request cancels cooperatively via the same return-false
+        // -> wire-Cancel path the dialog cancel uses; both signals are only
+        // honored when the host accepted progressStart (see above).
+        ++transport_messages_seen;
+        if (host_progress_active && now - last_host_progress_emit >= kProgressInterval) {
+          last_host_progress_emit = now;
+          if (!driver.datasetIngest().progressUpdate(transport_messages_seen) ||
+              driver.datasetIngest().isStopRequested()) {
+            return false;
+          }
+        }
         return true;
       });
+
+  download_done.store(true, std::memory_order_relaxed);
+  if (host_stop_watchdog.joinable()) {
+    host_stop_watchdog.join();
+  }
+
+  // ONE atomic terminal-outcome boundary (review-caught): sample cancel_flag_
+  // exactly ONCE, here, and derive every terminal decision from it — the
+  // export promotion gate, the progressFinish pairing, and the per-topic
+  // cancelled classification below. Three independent loads let a cancel
+  // racing in during (potentially long) MCAP finalization classify the SAME
+  // pull as completed on one surface and cancelled on another. A cancel
+  // arriving after this boundary is consistently ignored everywhere.
+  const bool cancelled_after_download = cancel_flag_.load(std::memory_order_relaxed);
 
   if (mcap_writer) {
     // The import outcome (stats/topic ledger) is NEVER touched here: any
@@ -849,8 +935,7 @@ void FetchWorker::pullTopicsAsync(std::vector<std::string> sequence_names, std::
       // readable MCAP. Remove it; report no path.
       discard_partial();
       result.path.clear();
-    } else if (stats.eos == SessionEos::Complete &&
-               !cancel_flag_.load(std::memory_order_relaxed)) {
+    } else if (stats.eos == SessionEos::Complete && !cancelled_after_download) {
       std::error_code rename_error;
       std::filesystem::rename(save_paths->partial_path, save_paths->final_path, rename_error);
       if (rename_error) {
@@ -866,15 +951,32 @@ void FetchWorker::pullTopicsAsync(std::vector<std::string> sequence_names, std::
       // its partials never survive (docs/canonical-layout-import.md §6.1) —
       // do not "align" the two when unifying the write path.
       result.status = McapSaveStatus::Partial;
-      result.error = !stats.error.empty()
-                         ? stats.error
-                         : (stats.eos == SessionEos::Cancelled ? "download cancelled"
-                                                               : "download ended before completion");
+      // Wording derives from the SAME terminal snapshot as every other
+      // surface (re-verify-caught): a Complete-but-cancelled-at-the-boundary
+      // pull must say "cancelled" here too, matching the progress/dialog
+      // classification.
+      result.error =
+          !stats.error.empty()
+              ? stats.error
+              : ((stats.eos == SessionEos::Cancelled || cancelled_after_download)
+                     ? "download cancelled"
+                     : "download ended before completion");
     }
     emit_save_result(std::move(result));
   }
 
-  // Seal the host-side parser writes (releaseParserIngest -> flushAll) while
+  // Pair the host progress sequence on the completed path: one final
+  // authoritative sample + progressFinish, on this same worker thread.
+  // Cancel/failure paths deliberately skip progressFinish — the
+  // releaseDatasetIngest inside driver.finalize() pairs the host's
+  // ingest-finished callback either way (#470 pairs release-without-finish),
+  // without painting an aborted pull as a completed progress sequence.
+  if (host_progress_active && stats.eos == SessionEos::Complete && !cancelled_after_download) {
+    (void)driver.datasetIngest().progressUpdate(transport_messages_seen);
+    driver.datasetIngest().progressFinish();
+  }
+
+  // Seal the host-side parser writes (releaseDatasetIngest -> flushAll) while
   // still inside the host-write critical section, so the GUI-thread
   // notifyDataChanged -> catalog rebuild that follows sees every row and
   // every object topic.
@@ -883,7 +985,7 @@ void FetchWorker::pullTopicsAsync(std::vector<std::string> sequence_names, std::
   // Final per-topic progress flush + per-topic completion.
   const auto counts = driver.decodedCounts();
   const auto errors = driver.errorCounts();
-  const bool cancelled = (stats.eos == SessionEos::Cancelled) || cancel_flag_.load(std::memory_order_relaxed);
+  const bool cancelled = (stats.eos == SessionEos::Cancelled) || cancelled_after_download;
   const bool session_failed = (stats.eos == SessionEos::Error || stats.eos == SessionEos::Unset);
 
   write_lock.unlock();  // release before invoking the GUI-thread callbacks
@@ -919,17 +1021,24 @@ void FetchWorker::pullTopicsAsync(std::vector<std::string> sequence_names, std::
     }
     bool ok = false;
     std::string error;
-    if (!tid_opt) {
+    if (cancelled) {
+      // The BATCH outcome wins (re-verify-caught): checked before the
+      // per-topic missing/undecodable reasons so a cancelled batch reports
+      // every topic "cancelled" — otherwise an all-bindings-failed batch
+      // that was then cancelled reported no "cancelled" topic at all, the
+      // dialog never latched, and it summarized "Fetch failed…" while the
+      // progress/export surfaces said cancelled. Per-topic bind-failure
+      // detail is not lost: the bell notification surfaced it at bind time.
+      // Treated as not-ok but the dialog tags it "Cancelled" (kept OUT of
+      // the failure tally).
+      error = "cancelled";
+    } else if (!tid_opt) {
       // Requested topic absent from the session dictionary: the server's plan
       // found no message for it in the selected files/time range (zero-message
       // catalog topics and windows that miss the data both land here).
       error = "no messages in the selected time range";
     } else if (decodable_by_id.count(*tid_opt) && !decodable_by_id.at(*tid_opt)) {
       error = skip_reason_by_id.count(*tid_opt) ? skip_reason_by_id.at(*tid_opt) : "no parser bound for topic";
-    } else if (cancelled) {
-      // Treated as not-ok but the dialog tags it "Cancelled" (kept OUT of the
-      // failure tally) when state_.cancelling is set.
-      error = "cancelled";
     } else if (session_failed) {
       error = stats.error.empty() ? "session ended without terminal Eos" : stats.error;
     } else {

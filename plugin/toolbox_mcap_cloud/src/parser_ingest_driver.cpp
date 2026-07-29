@@ -27,7 +27,7 @@ IngestBindResult ParserIngestDriver::bindSession(
     schema_by_id.emplace(s.schema_id, &s);
   }
 
-  auto ingest_or = runtime_.createParserIngest(ds.id);
+  auto ingest_or = runtime_.createDatasetIngest(ds.id);
   if (!ingest_or.has_value()) {
     // Older/unconfigured host: every topic carries the reason; no fallback.
     // Error format: "<topic> (<type>): <reason>" — type from schema_by_id when
@@ -138,8 +138,8 @@ void ParserIngestDriver::finalize() {
     return;
   }
   active_ = false;
-  ingest_ = PJ::ParserIngestHostView{};
-  (void)runtime_.releaseParserIngest(source_id_);
+  ingest_ = PJ::DatasetIngestHostView{};
+  (void)runtime_.releaseDatasetIngest(source_id_);
 }
 
 bool ParserIngestDriver::hasDecodable() const {

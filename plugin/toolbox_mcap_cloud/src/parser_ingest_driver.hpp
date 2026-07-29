@@ -9,6 +9,13 @@
 // classify/store object topics (tf, pointclouds, images, grids) with a
 // render-time parser registered — 3D-draggable AND renderable.
 //
+// Stage 2 (#470 progress surface): the driver acquires the context through
+// SDK 0.20.0's createDatasetIngest — the WIDER facade over the exact same
+// create_parser_ingest slot (identical error strings, pinned SDK-side) that
+// additionally exposes progress_start/update/finish + is_stop_requested, so
+// the pull loop can make the progressive import host-visible (title-bar
+// strip, per-dataset lifecycle) and honor a host-side stop cooperatively.
+//
 // On hosts without the tail slots every topic reports skip_reason
 // "host parser ingest unavailable: ..." — the plugin ships no fallback decoder.
 #pragma once
@@ -81,9 +88,16 @@ class ParserIngestDriver {
   [[nodiscard]] std::unordered_map<std::uint32_t, std::uint64_t> decodedCounts() const;
   [[nodiscard]] std::unordered_map<std::uint32_t, std::uint64_t> errorCounts() const;
 
+  // The dataset-ingest view over the bound context — the pull loop drives the
+  // #470 progress/stop surface through it (worker thread only, like decode()).
+  // Invalid (all calls no-op/fail-closed) before bindSession / after finalize.
+  [[nodiscard]] const PJ::DatasetIngestHostView& datasetIngest() const {
+    return ingest_;
+  }
+
  private:
   PJ::ToolboxRuntimeHostView runtime_{};
-  PJ::ParserIngestHostView ingest_{};
+  PJ::DatasetIngestHostView ingest_{};
   std::uint32_t source_id_ = 0;
   bool active_ = false;
   std::unordered_map<std::uint32_t, IngestTopic> topics_;

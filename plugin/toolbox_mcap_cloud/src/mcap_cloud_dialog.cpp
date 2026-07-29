@@ -2973,10 +2973,15 @@ void McapCloudDialog::onPullFinished(
     state_.imported_any = true;
     state_.topic_fetch_status[topic_name] = "Done";
   } else if (state_.cancelling || error == "cancelled") {
-    // Interrupted by the user's Cancel, not a real failure: label it
-    // "Cancelled" and keep it OUT of the error tally so a cancel doesn't
-    // raise spurious fetch-error notifications.
+    // Interrupted by a cancel, not a real failure: label it "Cancelled" and
+    // keep it OUT of the error tally so a cancel doesn't raise spurious
+    // fetch-error notifications. LATCH the batch as cancelling too: a cancel
+    // can originate OUTSIDE the dialog's own Cancel button (the host's #470
+    // stop, a wire-level cancel) — without the latch such a batch summarized
+    // as "Fetch failed: " with an empty reason instead of "Download
+    // cancelled" (review-caught).
     state_.topic_fetch_status[topic_name] = "Cancelled";
+    state_.cancelling = true;
   } else {
     ++state_.fetch_failed;
     state_.topic_fetch_status[topic_name] = "Failed";

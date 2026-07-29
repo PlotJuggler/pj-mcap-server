@@ -53,10 +53,31 @@ struct FakeIngestHost {
   // without recording the push (simulates a host-side push rejection).
   bool refuse_push = false;
 
+  // ── #470 progress surface: recording + knobs ──
+  struct ProgressStart {
+    std::string label;
+    uint64_t total = 0;
+    bool cancellable = false;
+  };
+  // Worker-thread owned (like bindings/pushes): a live test's other threads
+  // may read ONLY the atomics below, never these vectors, until after join.
+  std::vector<ProgressStart> progress_starts;
+  std::vector<uint64_t> progress_updates;
+  std::atomic<uint64_t> progress_update_events{0};
+  std::atomic<uint64_t> progress_finish_events{0};
+  // is_stop_requested return — the host-side stop button. Thread-safe toggle.
+  std::atomic<bool> stop_requested{false};
+  // progress_update return: false = host-side cancel (spec: NOT an error).
+  std::atomic<bool> progress_update_continue{true};
+
   PJ_data_source_runtime_host_vtable_t ds_vtable{};
   PJ_toolbox_runtime_host_vtable_t tb_vtable{};
 
-  FakeIngestHost() {
+  // with_progress_slots=false models a pre-#470 host: the four progress/stop
+  // pointers stay null, so the SDK view refuses progressStart and returns
+  // false from progressUpdate — the plugin must treat that as "unsupported",
+  // never as a cancel (regression pin for the host_progress_active gate).
+  explicit FakeIngestHost(bool with_progress_slots = true) {
     // The REAL host hands out 1 (DataSourceRuntimeHost.cpp:197 —
     // protocol_version comment: "= 1 for the v4-era runtime host"), not
     // PJ_DATA_SOURCE_PROTOCOL_VERSION (which is the plugin-side major = 4).
@@ -64,6 +85,12 @@ struct FakeIngestHost {
     ds_vtable.struct_size = sizeof(PJ_data_source_runtime_host_vtable_t);
     ds_vtable.ensure_parser_binding = &FakeIngestHost::ensureBinding;
     ds_vtable.push_message = &FakeIngestHost::pushMessage;
+    if (with_progress_slots) {
+      ds_vtable.progress_start = &FakeIngestHost::progressStart;
+      ds_vtable.progress_update = &FakeIngestHost::progressUpdate;
+      ds_vtable.progress_finish = &FakeIngestHost::progressFinish;
+      ds_vtable.is_stop_requested = &FakeIngestHost::isStopRequested;
+    }
     tb_vtable.protocol_version = PJ_TOOLBOX_PLUGIN_PROTOCOL_VERSION;
     tb_vtable.struct_size = sizeof(PJ_toolbox_runtime_host_vtable_t);
     tb_vtable.create_parser_ingest = &FakeIngestHost::createIngest;
@@ -103,6 +130,26 @@ struct FakeIngestHost {
   static bool releaseIngest(void* ctx, uint32_t id, PJ_error_t* /*err*/) noexcept {
     static_cast<FakeIngestHost*>(ctx)->released.push_back(id);
     return true;
+  }
+  static bool progressStart(
+      void* ctx, PJ_string_view_t label, uint64_t total, bool cancellable,
+      PJ_error_t* /*err*/) noexcept {
+    auto* self = static_cast<FakeIngestHost*>(ctx);
+    self->progress_starts.push_back({sv(label), total, cancellable});
+    return true;
+  }
+  static bool progressUpdate(void* ctx, uint64_t current) noexcept {
+    auto* self = static_cast<FakeIngestHost*>(ctx);
+    self->progress_updates.push_back(current);
+    self->progress_update_events.fetch_add(1, std::memory_order_relaxed);
+    return self->progress_update_continue.load(std::memory_order_relaxed);
+  }
+  static void progressFinish(void* ctx) noexcept {
+    static_cast<FakeIngestHost*>(ctx)->progress_finish_events.fetch_add(
+        1, std::memory_order_relaxed);
+  }
+  static bool isStopRequested(void* ctx) noexcept {
+    return static_cast<FakeIngestHost*>(ctx)->stop_requested.load(std::memory_order_relaxed);
   }
   static bool ensureBinding(
       void* ctx, const PJ_parser_binding_request_t* req, PJ_parser_binding_handle_t* out,
