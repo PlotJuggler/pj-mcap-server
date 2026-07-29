@@ -4,13 +4,13 @@
 
 **Status:** DRAFT v3.6 — the **V3+B variant is adopted** (user decision 2026-07-28 after a
 three-way V2 / V3.2 / V3+B comparison): cache-miss import reuses the authoring dual path
-(progressive eager ingest + cache tee → adoption), so **plots grow during every download,
+(progressive eager ingest + cache tee → promotion), so **plots grow during every download,
 in every mode**. Incorporates: the v3 Codex pass (21 findings), the ImportJob-timing
 consult (`LoadTicket` seam, §6.2/§8), and the PR #4 alignment (§9 — the save-MCAP write
 path is the tee's foundation; PR #4 merges first). **v3.6 (2026-07-29): vocabulary-only
-rename** — descriptor/layout "replay" → "import" throughout (§15); jumps 3.3→3.6 to stay
-clear of main's unmerged v3.4/v3.5 revisions to this same file (reconcile at merge).
-Awaiting spec re-review before the implementation plan.
+rename** — descriptor/layout "replay" → "import", "adoption" → "source promotion" (§15),
+reconciled at the PR #11 merge onto main's v3.4/v3.5 SDK-ABI revisions; the §8 SDK half
+shipped as SDK **0.20.0** the same day.
 **Date:** 2026-07-27
 **Repos touched:** this repo (plugin `toolbox_mcap_cloud`, docs) + PJ4 (host + SDK, upstreamed
 like prior cloud hooks) + `pj-official-plugins` (`data_load_mcap` version pinned in the matrix).
@@ -73,7 +73,7 @@ On layout load:
   on the load itself, **zero network**. Works even if the provider plugin is absent (§6.4).
 - **Cache miss** (V3+B) → identity-first resolution → trust gate → provider **import job** =
   the authoring dual path driven headlessly: progressive eager ingest (plots grow during the
-  download, #470 surface) + the cache tee, **adopted** into the cache file at completion.
+  download, #470 surface) + the cache tee, **promoted** onto the cache file at completion.
   One download path in the product — import-on-miss IS the Fetch path minus the dialog.
 
 The `<materialize>` element is a **provider-generic source record** — "how this dataset came to
@@ -88,7 +88,7 @@ be and how to re-obtain it" — not a cloud one-off:
 Persistence formats outlive code: the schema is where the unified model lives; host
 orchestration can converge later (§11).
 
-**Provider precondition (P)** — implicit in the adoption step, made explicit here as part of
+**Provider precondition (P)** — implicit in the promotion step, made explicit here as part of
 the provider contract: *a provider must be able to serialize its session into a single file
 that an installed `FileSource` loader ingests with semantics identical to the provider's eager
 path.* MCAP Cloud satisfies P natively (payload is MCAP; `data_load_mcap` exists; both paths
@@ -113,14 +113,14 @@ The loader need not pre-exist; it must merely share the eager path's ingest code
   verification vehicle. **Scope limit found in review:** its `on_ingest_finished(DatasetId)` is a
   lifecycle-pairing signal with *no outcome* — it fires on normal finish, on release-without-
   finish, and on host teardown (`ToolboxRuntimeHost.cpp:46-69, 243-261, 279-331` on the branch).
-  It is therefore **not** used as the success boundary; the adopt step (§6.1) is. The
+  It is therefore **not** used as the success boundary; the promotion step (§6.1) is. The
   lifecycle-tracking hoist from `MainWindow` into `SessionManager`/`AppSession` remains a
   follow-up in our series
   ([recorded on #470](https://github.com/PlotJuggler/PJ4/pull/470#issuecomment-5093599773)).
 - **PJ4 #464** (MERGED): transactional per-dataset Reload/Replace. An explicit
   `replace_dataset_id` target wins regardless of path (`FileLoader.cpp:1184`), the new source
   path commits only after success (`FileLoader.cpp:2132`), rollback leaves data/name/path
-  untouched. This is the engine of both the authoring adopt step and import-into-loaded-dataset.
+  untouched. This is the engine of both the authoring promotion step and import-into-loaded-dataset.
   `FileLoader::sameSourceIdentity` stays **string-typed and untouched** — provider identity is
   resolved against the host's source-record registry to a `DatasetId` first, then passed via
   `replace_dataset_id` (review finding: do not overload the two-string comparison).
@@ -132,7 +132,7 @@ The loader need not pre-exist; it must merely share the eager path's ingest code
   lazy too") collapses the parallel rail into the file rail. v2's descriptor/identity/trust work
   carries forward intact. v3.0 → v3.1: thirteen mandatory amendments from the second Codex pass
   (§15). v3.2 → v3.3: **V3+B adopted** — an independent three-way comparison (V2 / V3.2 / V3+B,
-  §15) confirmed V3's cache+adoption economics and memory model; the user chose to also keep
+  §15) confirmed V3's cache+promotion economics and memory model; the user chose to also keep
   V2's signature UX (progressive plots on cache-miss import) by pulling the growing-import
   curve binder into scope rather than gating it. V3+B = V3.2 ∪ (V2's binder); nothing from
   v3.2 is discarded.
@@ -210,7 +210,7 @@ identical.
 
 ## 6. Flows
 
-### 6.1 Authoring (interactive Fetch — dual-path with completion-time adoption)
+### 6.1 Authoring (interactive Fetch — dual-path with completion-time promotion)
 
 ```
 user: browse -> gate -> select files/window/topics -> Fetch
@@ -218,7 +218,8 @@ plugin: FetchWorker downloads
         ├─ eager streaming ingest (existing path, adopting the #470 progress surface)
         └─ tee: raw wire-decoded records -> cache partial (bounded async queue, §6.5)
 on complete (plugin-decided success: EOS reached, zero losses, writer finalized+validated):
-        adopt_materialized_source(dataset_id, cache_path, descriptor)   [runtime-host tail slot]
+        promote_to_file_source(request{dataset, cache_path, descriptor, ...}, result_cb)
+                                                        [pj.source_promotion.v1 host service]
 host:   queues a STOCK FileLoader load of cache_path with
           replace_dataset_id = dataset_id, expected loader = MCAP loader,
           preset config { filepath: cache_path, use_log_time: true, ... }, skip_dialog
@@ -230,18 +231,18 @@ host:   queues a STOCK FileLoader load of cache_path with
 user: arranges plots -> File -> Save Layout -> <fileInfo> + <materialize> emitted
 ```
 
-Why adoption instead of a bare `commit_source_record`: the review showed a two-argument commit
+Why promotion instead of a bare `commit_source_record`: the review showed a two-argument commit
 cannot mint what layout save requires — a `LoadedSource` only exists via the stock capture chain
 (`FileLoader.cpp:2154` config capture, `:2162` source-path install, `MainWindow.cpp:2665`
 recording), and the eager parser semantics differ from the loader's (log-time vs publish-time
-default, `"{}"` parser config vs the loader's array-limit/timestamp/schema settings) — adoption
+default, `"{}"` parser config vs the loader's array-limit/timestamp/schema settings) — promotion
 makes the saved dataset *identical* to what import will produce, closing both gaps in one move.
 
-Plot-while-downloading is preserved during the transfer (#470 surface); adoption happens once at
-the end. Partial/cancelled fetches adopt nothing and delete their partial. **In-memory
+Plot-while-downloading is preserved during the transfer (#470 surface); promotion happens once at
+the end. Partial/cancelled fetches promote nothing and delete their partial. **In-memory
 cache-hit** fetches whose disk file is missing cannot "re-tee from memory" (the in-memory
 `SessionCache` stores counts, not bytes — `session_cache.hpp:53`): the in-memory entry is
-evicted and a normal network fetch runs. A cache hit whose disk file exists re-adopts it.
+evicted and a normal network fetch runs. A cache hit whose disk file exists re-promotes it.
 
 **Foundation: PR #4 ("save downloads as MCAP") merges first.** It already ships the shared
 writer TU (`SessionMcapWriter` + `CheckedFileWriter` error-latching sink — a genuine fix for
@@ -292,7 +293,7 @@ rewrite the *document*, not just pick a path):
 6. rewrite the loader preset filepath (FileLoader rewrite_preset_filepath hint)
 7. classify: already-loaded (registry match by identity -> #464 replace_dataset_id if a refresh
    is wanted, else skip) / cache hit -> stock load / miss -> trust-gated PROVIDER IMPORT JOB
-   (dual path: progressive eager ingest + tee -> adoption), finalized as a stock-recorded
+   (dual path: progressive eager ingest + tee -> promotion), finalized as a stock-recorded
    file-backed dataset
 ```
 
@@ -329,7 +330,7 @@ authorized `materialize`.
   loader; the unknown `<materialize>` sibling is ignored by the existing reader (verified:
   `extractDataSource` walks `<dataset>` children and selects `<plugin>` by name,
   `LayoutXml.cpp:77`; out-of-tree cache paths stay absolute, `MainWindow.cpp:229, 6378`). This
-  is conditional on the adoption step having produced a real loader record (§6.1) — which it
+  is conditional on the promotion step having produced a real loader record (§6.1) — which it
   does by construction.
 - **Provider plugin absent on a new host:** if the hinted file exists and validates, the stock
   load proceeds anyway (don't regress the strongest degraded mode); the provider is required
@@ -371,21 +372,73 @@ root. Inherent to shareable layouts; a sharing-policy note, not a mechanism fix.
 
 ## 8. Host + SDK changes (PJ4)
 
-SDK / ABI (all `struct_size`-gated tail additions, no protocol bump):
+SDK / ABI (v3.4, per the 2026-07-28 SDK-minimization consult — **ZERO new slots on either
+family vtable**; the three semantic operations ride the SDK's existing extension mechanisms,
+each new struct `struct_size`-versioned, `PJ_string_view_t` + UTF-8 throughout, MINOR SDK
+release **0.20.0**, no `PJ_ABI_VERSION` / protocol-version bumps):
 
-- Capability flag `PJ_TOOLBOX_CAPABILITY_SOURCE_PROVIDER`.
-- Toolbox plugin vtable tail: `source_provider_query(descriptor) -> {trust, cached_path?}`
-  (strict §6.3 contract) and `source_provider_import(descriptor, callbacks) -> job` (async
-  **dual-path import**: progressive eager ingest into a new dataset + cache tee, adoption at
-  completion; fully specified lifetime/threading ABI). A P-failing provider (§2, e.g. Mosaico
-  before its companion loader exists) may implement import as eager-ingest-only without
-  adoption — V2-style behavior under the same schema; its datasets are then not re-saveable
-  as import sources until it satisfies P.
-- Toolbox runtime host vtable tail: `adopt_materialized_source(dataset_id, cache_path,
-  descriptor_json)` — GUI-marshalled; host re-checks dataset existence/generation, then drives
-  the stock `FileLoader` replace + descriptor attach as one ordered transaction whose result is
-  visible before any Save Layout can observe completion. (Replaces v3.0's underspecified
-  `commit_source_record`.)
+- **Plugin extension `pj.descriptor_import.v1`** (via the existing reverse-DNS
+  `get_plugin_extension` hook — present on ALL plugin families (`data_source:462`,
+  `toolbox:161`, `message_parser:116`), so the extension struct lives in a
+  **family-neutral header** with `plugin_ctx` defined as the originating plugin-family
+  instance context; presence = capability, no new capability bit):
+  `PJ_descriptor_import_provider_v1_t` with
+  - `query_descriptor(descriptor_json) -> {trust: refused|needs_confirmation|trusted,
+    is_materialized, source_identity, local_path_utf8, message, estimated_bytes}` — sync,
+    strictly bounded (§6.3); **`source_identity` and `local_path` are ALWAYS returned**
+    (hit or miss — the host cannot compute a provider's canonical identity, and
+    rewrite-then-classify needs the planned path before any job starts);
+    **`estimated_bytes` (0 = unknown)** feeds §7 guard 3's confirmation display and
+    non-interactive byte-limit refusal at query time (from the descriptor's
+    authoring-time estimate or local metadata — never the network);
+  - `start_import(request, callbacks, ctx) -> PJ_joinable_job_t` where **`request` is a
+    caller-sized `PJ_descriptor_import_start_request_v1_t`** `{descriptor_json,
+    flags (v1 known-mask = 0; unknown bits rejected synchronously, fail-closed),
+    max_transfer_bytes (0 = no caller ceiling — the §7 guard-3 enforcement channel)}` —
+    a struct, not a naked flags parameter, so future *valued* runtime options
+    (force-refetch, prewarm/download-only, dry-run) are field-appends, never a v2
+    extension id. Runtime options deliberately do NOT ride the descriptor (it is the
+    persisted identity artifact). Job = fat pointer (cancel non-blocking/idempotent,
+    join returns after the terminal callback, destroy cancels+joins). Callbacks are
+    exactly TWO — `on_dataset` (zero-or-one, precedes any publication/progress/promotion:
+    the job↔dataset correlation #470 cannot provide; zero also covers future
+    prewarm/validate modes) and `on_terminal` (exactly-once, last: outcomes
+    `SUCCEEDED_PROMOTED | SUCCEEDED_EAGER_ONLY | FAILED | CANCELLED`; the
+    EAGER_ONLY outcome is explicit because "no completed promotion observed" is absence,
+    not a terminal fact). **No `on_progress`** — progress/publish/stop ride #470's existing
+    dataset-scoped surface.
+  - **Growth contract (all new structs, both directions):** the caller zero-initializes
+    its complete allocation then sets `struct_size`; the callee reads/writes only fields
+    wholly covered by that size — so field-appends to v1 structs are absent-as-zero on
+    older peers, and the side-by-side ID convention (`pj.<name>.v2`) remains the escape
+    hatch for semantic changes only.
+- **Host service `pj.source_promotion.v1`** (via the existing `bind()` service registry —
+  optional; absence = host without promotion support; **bound per plugin instance so the
+  host derives the authenticated provider manifest id itself — the plugin never supplies
+  it, so it cannot be spoofed**): `promote_to_file_source(request, result_cb)` — async, exactly-once
+  result; request carries `{dataset, source_identity, local_path_utf8, loader_plugin_id,
+  loader_config_json, descriptor_json}` — the loader id + preset are provider-supplied
+  because a non-MCAP artifact (Mosaico's Arrow container + companion loader) needs its
+  OWN loader; the host re-checks dataset generation, drives the stock `FileLoader`
+  `replace_dataset_id` transaction, captures the loader's accepted config via the normal
+  completion path, and attaches `{provider manifest id, source_identity,
+  descriptor_json}` before the callback.
+- **Co-batched in the same 0.20.0 bump** (closes the direct-ingest gap): a generic
+  `createDatasetIngest()` C++ alias + `DatasetIngestHostView` exposing the
+  progress/start/finish/stop surface for BOTH delegated parsing and direct toolbox writes
+  (today's `ParserIngestHostView` hides it, `data_source_host_views.hpp:335`, and Mosaico's
+  Arrow path never reaches #470), with contract text making it the canonical dataset-scoped
+  lifecycle; `on_dataset`-before-`progress_start` required; stable manifest-ID selection in
+  `FileLoader`; ABI-layout + old-host/null-extension tests.
+- Deferred deliberately: capability bit, ABI-level job ids/phase/progress callbacks, the
+  global ImportJob envelope, concurrent provider imports.
+- A P-failing provider (§2, e.g. Mosaico before its companion loader exists) may implement
+  import as eager-ingest-only — it reports `SUCCEEDED_EAGER_ONLY` and its datasets are
+  not re-saveable as import sources until it satisfies P.
+- The full C declarations shipped in SDK **0.20.0**
+  (`pj_base/include/pj_base/descriptor_import_protocol.h` + the C++ wrappers in
+  `pj_base/sdk/descriptor_import.hpp`); the §15 fourth-consult record (Codex session
+  `019fa9d6-34dd-7232-9f41-a5bd71a32554`) retains the pre-rename draft.
 
 Host:
 
@@ -419,7 +472,7 @@ Explicitly **not** built (v2 components dissolved or #470-supplied): `<replay_so
 0. **PR #4 gates + follow-ups.** The 2026-07-28 four-agent + Codex merge-gate review split
    the findings; the five gates **landed in the PR itself** (`f775d9e`, 40/40 ctest):
    export-is-secondary (a tee open/write/finalize failure never aborts the download or the
-   import — also the prerequisite for the async cache tee and adoption semantics);
+   import — also the prerequisite for the async cache tee and promotion semantics);
    **exactly-one `McapSaveResult`** per export-requested pull on every exit path (new
    `Skipped` status; Codex's correction — never "at-most-one"); TOCTOU-closed exclusive
    name reservation; `<name>.mcap.partial` ordering; `mcap_cloud/export_*` keys with
@@ -451,7 +504,7 @@ Explicitly **not** built (v2 components dissolved or #470-supplied): `<replay_so
 6. **Fetch tee** — PR #4's in-loop write evolved to a bounded async queue with owned payload
    copies off the ingest hot path; explicit backpressure when full. **Uniform failure policy
    (supersedes the v3.1 wording): a writer/tee failure never aborts the import** — the eager
-   ingest completes for the user; the failure only prevents adoption (no cache file, no
+   ingest completes for the user; the failure only prevents promotion (no cache file, no
    source record) and is reported. Applies identically to the export save and the cache tee.
    (`SessionCache` stores `DatasetId`; missing-disk-file hits evict and refetch — §6.1.)
 7. **#470 progress-surface adoption** in `ParserIngestDriver`/`FetchWorker` — also #470's live
@@ -459,7 +512,7 @@ Explicitly **not** built (v2 components dissolved or #470-supplied): `<replay_so
 8. **Provider implementation** — headless bind mode (no auto-connect), `source_provider_query`,
    `source_provider_import` (the authoring dual path — FetchWorker progressive eager ingest +
    the PR #4 `SessionMcapWriter` tee — driven headlessly by descriptor; the shared-TU and
-   `MCAP_IMPLEMENTATION` concerns are already solved by PR #4), `adopt_materialized_source`
+   `MCAP_IMPLEMENTATION` concerns are already solved by PR #4), `promote_to_file_source`
    calls at fetch completion.
 
 ## 10. Semantics, failure behavior
@@ -475,7 +528,7 @@ Explicitly **not** built (v2 components dissolved or #470-supplied): `<replay_so
   wss://… — connect once in the MCAP Cloud toolbox or set MCAP_CLOUD_API_KEY + MCAP_CLOUD_URL").
 - **Cancel/exit:** materialize honors cancel with bounded waits; partials never survive; batch
   jobs are owned and joined by the batch at shutdown.
-- **Adoption failure** (stock load of the cache file fails after a successful download): the
+- **Promotion failure** (stock load of the cache file fails after a successful download): the
   transactional refill rolls back — the eager dataset stays, no source record is attached, the
   layout simply won't carry an import record for it; diagnostic emitted.
 
@@ -504,10 +557,10 @@ Explicitly **not** built (v2 components dissolved or #470-supplied): `<replay_so
   `LayoutImportBatch` is a stepping stone, not dead-end code: an ImportJob absorbs its
   child-operation plumbing; the document-transaction semantics remain the batch's either way.
 - **File-routed interactive Fetch** (download, then load — single path, no eager ingest) —
-  rejected: discards plot-while-downloading, the exact UX #470 exists to provide. The adoption
+  rejected: discards plot-while-downloading, the exact UX #470 exists to provide. The promotion
   step gets the same end state without the UX loss.
 - **Piggybacking commit on #470's `on_ingest_finished`** — rejected by review: that callback has
-  no success outcome (fires on abandon/teardown too). The plugin decides success; adoption is
+  no success outcome (fires on abandon/teardown too). The plugin decides success; promotion is
   the terminal transaction.
 - **Extending `sameSourceIdentity` with descriptor semantics** — rejected by review; identity
   resolves through the source-record registry to a `DatasetId`.
@@ -533,8 +586,8 @@ Explicitly **not** built (v2 components dissolved or #470-supplied): `<replay_so
   cancel-by-id, legacy `loadFile`/`queueDrained` callers unaffected);
   `LayoutImportBatch` tests (per-job failure isolation, non-interactive policy persistence,
   cancellation, drain — all via the ticket seam, never path-matching); a **fake source-provider test plugin** driving load-time integration
-  incl. non-interactive `--layout`; adoption tests (eager→file refill keeps ids; rollback on
-  failed adoption; **catalog equality** between an authored-and-adopted dataset and an
+  incl. non-interactive `--layout`; promotion tests (eager→file refill keeps ids; rollback on
+  failed promotion; **catalog equality** between an authored-and-promoted dataset and an
   import-loaded one — semantic equality, not just `mcapdiff`); stable-ID + name-fallback loader
   matching.
 - **Matrix pin:** `data_load_mcap` (and parser set) version pinned in the E2E matrix — import
@@ -547,21 +600,18 @@ Explicitly **not** built (v2 components dissolved or #470-supplied): `<replay_so
 1. **Plugin foundations** *(no host dependency, each shippable)* — descriptor module + vectors;
    cancel predicate; credential origin binding + trusted-origin ledger; cache manager
    (re-targeting the PR #4 writer via the §9.0 seams).
-   *(LANDED 2026-07-28, branch `feat/layout-replay-foundations`: sha256 `6954fdf`,
-   descriptor+vectors `2a7e7df`, cancel fix `18e4d0b`, origin binding `6ce0eda`,
-   trusted-origin ledger `a706fc9`, §9.0 writer seams `ecdfb47`, cache core `b3c02ad`;
-   the tee re-target consuming the cache stays stage 4.)*
 2. **Plugin adopts the #470 progress surface** (#470 is merged; this is its still-missing live
    verification) — progressive eager ingest becomes host-visible, the precondition for both
    authoring UX and import-job binding.
-3. **SDK ABI + host** — capability + three tail slots + fake-provider host tests;
+3. **SDK ABI + host** — the §8 extension + service routing (zero new vtable slots) +
+   fake-provider host tests;
    `LayoutImportBatch` + `LoadTicket`; **growing-import binder** (batch-scoped); source
    records + registry (incl. lifecycle hoist); layout rewrite-then-classify; stable-ID loader
-   matching. **Publish the new SDK package and bump the plugin's SDK pin** (currently
-   `plugin/SDK_VERSION` = 0.11.0 vs PJ4's SDK recipe 0.19.0 — the provider implementation
-   cannot compile before this step).
+   matching. **Publish the new SDK package and bump the plugin's SDK pin** (the SDK half
+   shipped as **0.20.0** on 2026-07-29; `plugin/SDK_VERSION` = 0.11.0 still needs the bump —
+   the provider implementation cannot compile before it).
 4. **Plugin dual-path + provider** — fetch tee re-target (content-addressed + delete-retention
-   + provenance); `SessionCache` DatasetId; headless bind mode; query/import/adopt
+   + provenance); `SessionCache` DatasetId; headless bind mode; query/import/promote
    implementations.
 5. **End-to-end + docs** — GUI flow, `--layout` flow (incl. progressive miss import), team-
    sharing runbook (metadata/path leakage note), pinned-loader matrix, live coverage.
@@ -623,16 +673,68 @@ are folded into §9.0. Verified empirically during that review: the PR's writer 
 chunked + summarized + carries Statistics (`mcap doctor` clean) — the adoption prerequisite —
 and `CheckedFileWriter` genuinely closes the vendored writer's swallowed-error hole.
 
+**Fourth consult (fresh thread `019fa9d6-34dd-7232-9f41-a5bd71a32554`, 2026-07-28): SDK
+minimization.** Governing principle from the owner: touch the SDK only when really needed,
+and only with future-proof general interfaces. Proposal attacked: 3 family-vtable tail
+slots + capability bit. Verdict: keep the three semantic operations (proven irreducible —
+`save_config`/dialog/`notify_data_changed`/`plugin_data_api` all fail as carriers by
+semantic abuse), but route them through the SDK's EXISTING extension mechanisms: the
+reverse-DNS toolbox `get_plugin_extension` hook (`toolbox_protocol.h:161`) for the
+plugin-side pair (extension `pj.descriptor_replay.v1`: `query_descriptor` + `start_replay`
+with the two-callback job), and the `bind()` service registry for the host-side adoption
+service (`pj.materialized_source.v1`: `adopt`) — **zero new slots on either family vtable,
+no capability bit** (presence = capability). Corrections adopted into §8: adoption request
+gains `loader_plugin_id` + `loader_config_json` + `source_identity` (generality — a
+non-MCAP artifact needs its own companion loader; the host cannot compute provider
+identity); `eager_only` became the explicit `SUCCEEDED_UNMATERIALIZED` outcome (absence of
+adoption is not a terminal fact); the two-callback minimization survives BUT the
+direct-ingest gap is real (Mosaico's Arrow path never reaches #470's surface —
+`data_source_host_views.hpp:335` hides progress/stop), closed by co-batching a generic
+`DatasetIngestHostView` in the same bump; SDK release = MINOR **0.20.0** (0.19.0 already
+recorded), no `PJ_ABI_VERSION`/protocol bumps. The consult's full recommended C
+declarations (struct_size-versioned result/callback/job/request/service structs,
+lifetime + threading rules per slot, FORCE_INT32-pinned enums with fail-closed unknown
+values) are the stage-3 implementation reference — recover from the Codex session or the
+conversation record.
+
+**Fifth consult (fresh thread `019faca5-155d-73a0-8c39-27f02544a3dc`, 2026-07-28):
+future-proofing recalibration.** Owner directive: frequent SDK interface churn is worse
+than a slightly larger v1. An independent in-depth pass over the SDK mechanics
+(cross-family extension hook verified on all three plugin-family vtables; `pj.<name>.v<N>`
+side-by-side convention; Traits-based service lookup with min-version validation;
+back-to-back MINOR cadence in the CHANGELOG) produced a structural claim — only
+signature-frozen channels need v1 reservations — plus three deltas, cross-checked with
+Codex. Outcome: the claim was refuted *literally* (struct prefixes, callback
+cardinality/ordering, enum values, lifetimes, and descriptor canonicalization are also
+frozen; fat pointers never grow) but confirmed in priority. Amendments adopted into §8:
+`start_replay` takes a caller-sized **request struct** (not a naked flags param — absorbs
+future *valued* options; v1 flags mask = 0, unknown bits fail closed) carrying
+`max_transfer_bytes` (a CURRENT need — §7 guard 3 enforces against actual transferred
+bytes, and the caller ceiling must reach the provider); `estimated_bytes` added to the
+query result (§7 guard 3's confirmation display — the earlier "defer estimates" verdict
+contradicted our own spec); the zero-init + fields-wholly-covered growth contract
+generalized to every new struct on both sides; the extension struct moved to a
+family-neutral header (`plugin_ctx` = originating family instance); the adoption service
+bound per plugin instance (host-derived provider identity, unspoofable). Sweep verdict:
+after the request struct, NO other signature-frozen gaps against the 12-month feature
+list (ImportJob wraps the job handle; concurrency = appendable capability field, host
+serializes until advertised; Mosaico rides the adoption request; ETags = descriptor v2;
+server-hosted layouts = deliberately a separate extension id). on_dataset stays
+zero-or-one (fan-out = explicit v2 trigger).
+
 **Vocabulary rename (2026-07-29, sixth consult, session
-`019fadae-c338-7b41-a1af-48a56c647516`):** descriptor replay → descriptor import; `adopt` →
-`promote_to_file_source`; service `pj.materialized_source.v1` → `pj.source_promotion.v1`;
-outcome tails `SUCCEEDED_EAGER_ONLY`/`SUCCEEDED_PROMOTED`; plugin descriptor module →
-`SourceDescriptor`. Rationale: "replay" implies already-downloaded data and rosbag-style
-paced playback; the descriptor is durable source identity. File renamed
-`canonical-layout-replay.md` → `canonical-layout-import.md`. This is a vocabulary-only
-revision (v3.3 → v3.6, skipping v3.4/v3.5 to stay clear of main's independent SDK-ABI
-revisions to this same file — reconcile at merge): no semantics, enum values, struct
-layouts, or canonical descriptor bytes/identity changed. Preserved verbatim as historical
-record: the rejected v2 `<replay_sources>`/`ReplayRecord`/`ReplayManager` naming above (§3,
-§8, §11, §15) and the branch name `feat/layout-replay-foundations` (§13) — these describe
+`019fadae-c338-7b41-a1af-48a56c647516`):** descriptor replay → descriptor import; adoption →
+source promotion (`adopt` → `promote_to_file_source`; service `pj.materialized_source.v1` →
+`pj.source_promotion.v1`); outcome tails `SUCCEEDED_EAGER_ONLY`/`SUCCEEDED_PROMOTED`
+(numeric values unchanged); plugin descriptor module → `SourceDescriptor`. Rationale:
+"replay" implies already-downloaded data and rosbag-style paced playback; the descriptor is
+durable source identity, not itself an import. File renamed `canonical-layout-replay.md` →
+`canonical-layout-import.md`. This is a vocabulary-only revision: no semantics, enum values,
+struct layouts, or canonical descriptor bytes/identity changed. The PR branch first carried
+it as v3.3 → v3.6 (skipping v3.4/v3.5 to stay clear of main's independent SDK-ABI revisions
+to this same file); this v3.6 text is the merge reconciliation — v3.5's content under the
+final vocabulary, matching the names that shipped in SDK **0.20.0** the same day. Preserved
+verbatim as historical record: the rejected v2 `<replay_sources>`/`ReplayRecord`/
+`ReplayManager` naming (§3, §8, §11, §15), the pre-rename names inside the earlier §15
+consult records above, and the branch name `feat/layout-replay-foundations` — these describe
 what was actually named at the time, not current vocabulary.
