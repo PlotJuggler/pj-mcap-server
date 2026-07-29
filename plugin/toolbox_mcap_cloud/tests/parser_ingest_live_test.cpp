@@ -208,4 +208,132 @@ TEST(McapCloudParserIngestLive, CancelMidPullReleasesContext) {
   }
 }
 
+// ── Stage 2: the #470 progress surface — live verification ──
+// These four cases are the "still-missing live verification" PJ4 #470 was
+// merged without: a REAL worker pull against the smoke server, with the fake
+// runtime host recording the plugin side of the progress contract.
+
+// The pull announces itself to the host: exactly one progress_start carrying
+// the session total (exact on MessageIndex-bearing fixtures) + cancellable,
+// monotonic updates ending in the final authoritative sample, exactly one
+// progress_finish on the completed path.
+TEST(McapCloudParserIngestLive, ProgressSurfaceReportsHostVisibleImport) {
+  const char* url = liveUrl();
+  if (url == nullptr || *url == '\0') {
+    GTEST_SKIP() << "MCAP_CLOUD_LIVE_URL not set — live ingest test skipped";
+  }
+
+  FakeToolboxHost host;
+  FakeIngestHost fake;
+  LiveWorker lw(host, fake);
+  ASSERT_TRUE(lw.connect(url)) << "connect failed: " << lw.lastError();
+
+  int failed = 0;
+  lw.worker().pullFinished = [&](std::string, std::string, bool ok, std::string) {
+    failed += ok ? 0 : 1;
+  };
+  lw.worker().resetCancel();
+  lw.worker().pullTopicsAsync({kSeq}, kSeq, allTopics(), 0, 0);  // synchronous
+  EXPECT_EQ(failed, 0);
+
+  ASSERT_EQ(fake.progress_starts.size(), 1u) << "the pull must announce exactly one progress sequence";
+  EXPECT_NE(fake.progress_starts[0].label.find("MCAP Cloud"), std::string::npos);
+  EXPECT_NE(fake.progress_starts[0].label.find(kSeq), std::string::npos)
+      << "label must carry the group name, got: " << fake.progress_starts[0].label;
+  EXPECT_EQ(fake.progress_starts[0].total, kTotalMessages)
+      << "total must be the session estimate (exact with MessageIndex)";
+  EXPECT_TRUE(fake.progress_starts[0].cancellable);
+
+  ASSERT_FALSE(fake.progress_updates.empty()) << "at least the final sample must fire";
+  for (std::size_t i = 1; i < fake.progress_updates.size(); ++i) {
+    EXPECT_GE(fake.progress_updates[i], fake.progress_updates[i - 1]) << "updates must be monotonic";
+  }
+  EXPECT_EQ(fake.progress_updates.back(), kTotalMessages)
+      << "the completed path must end with the final authoritative sample";
+  EXPECT_EQ(fake.progress_finish_events.load(), 1u);
+}
+
+// A host stop request (the strip's stop button) cancels the pull
+// cooperatively. Pre-latched so the FIRST throttled tick observes it
+// deterministically (the throttle stamp starts at epoch — the first message
+// always ticks), independent of how fast a localhost pull completes.
+TEST(McapCloudParserIngestLive, HostStopRequestCancelsPull) {
+  const char* url = liveUrl();
+  if (url == nullptr || *url == '\0') {
+    GTEST_SKIP() << "MCAP_CLOUD_LIVE_URL not set — live ingest test skipped";
+  }
+
+  FakeToolboxHost host;
+  FakeIngestHost fake;
+  fake.stop_requested.store(true);
+  LiveWorker lw(host, fake);
+  ASSERT_TRUE(lw.connect(url)) << "connect failed: " << lw.lastError();
+
+  bool all_complete = false;
+  lw.worker().allFetchesComplete = [&](std::string) { all_complete = true; };
+  lw.worker().resetCancel();
+  lw.worker().pullTopicsAsync({kSeq}, kSeq, allTopics(), 0, 0);  // synchronous
+
+  EXPECT_TRUE(all_complete);
+  ASSERT_EQ(fake.created.size(), 1u);
+  EXPECT_EQ(fake.released.size(), 1u) << "host-stop path did not release the ingest context";
+  EXPECT_LT(fake.pushes.size(), kTotalMessages)
+      << "a pre-latched host stop must cancel on the first tick, not run to completion";
+  EXPECT_EQ(fake.progress_finish_events.load(), 0u)
+      << "an aborted pull must not paint a completed progress sequence";
+}
+
+// progress_update returning false is the host's OTHER cancel channel (spec:
+// user cancelled, not an error) — same cooperative-cancel outcome.
+TEST(McapCloudParserIngestLive, ProgressUpdateFalseCancelsPull) {
+  const char* url = liveUrl();
+  if (url == nullptr || *url == '\0') {
+    GTEST_SKIP() << "MCAP_CLOUD_LIVE_URL not set — live ingest test skipped";
+  }
+
+  FakeToolboxHost host;
+  FakeIngestHost fake;
+  fake.progress_update_continue.store(false);
+  LiveWorker lw(host, fake);
+  ASSERT_TRUE(lw.connect(url)) << "connect failed: " << lw.lastError();
+
+  lw.worker().resetCancel();
+  lw.worker().pullTopicsAsync({kSeq}, kSeq, allTopics(), 0, 0);  // synchronous
+
+  ASSERT_EQ(fake.created.size(), 1u);
+  EXPECT_EQ(fake.released.size(), 1u);
+  EXPECT_LT(fake.pushes.size(), kTotalMessages);
+  EXPECT_EQ(fake.progress_finish_events.load(), 0u);
+}
+
+// Pre-#470 host (no progress slots): progressStart is refused, and the
+// plugin must treat every subsequent false progressUpdate return as
+// "unsupported" — NEVER as a cancel. The pull completes in full. This is the
+// regression pin for the host_progress_active gate: without it, every
+// download on an old host would instantly self-cancel.
+TEST(McapCloudParserIngestLive, PreProgressHostCompletesWithoutSpuriousCancel) {
+  const char* url = liveUrl();
+  if (url == nullptr || *url == '\0') {
+    GTEST_SKIP() << "MCAP_CLOUD_LIVE_URL not set — live ingest test skipped";
+  }
+
+  FakeToolboxHost host;
+  FakeIngestHost fake(/*with_progress_slots=*/false);
+  LiveWorker lw(host, fake);
+  ASSERT_TRUE(lw.connect(url)) << "connect failed: " << lw.lastError();
+
+  int failed = 0;
+  lw.worker().pullFinished = [&](std::string, std::string, bool ok, std::string) {
+    failed += ok ? 0 : 1;
+  };
+  lw.worker().resetCancel();
+  lw.worker().pullTopicsAsync({kSeq}, kSeq, allTopics(), 0, 0);  // synchronous
+
+  EXPECT_EQ(failed, 0) << "an old host without progress slots must not fail the pull";
+  EXPECT_EQ(fake.pushes.size(), kTotalMessages)
+      << "the pull must run to completion — no spurious cancel from the refused surface";
+  EXPECT_TRUE(fake.progress_starts.empty());
+  EXPECT_EQ(fake.progress_finish_events.load(), 0u);
+}
+
 }  // namespace

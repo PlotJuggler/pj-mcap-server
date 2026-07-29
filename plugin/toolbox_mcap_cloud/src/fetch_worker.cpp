@@ -769,6 +769,25 @@ void FetchWorker::pullTopicsAsync(std::vector<std::string> sequence_names, std::
     }
   }
 
+  // #470 progress surface (spec §13 stage 2): make the progressive import
+  // HOST-visible — title-bar strip, per-dataset ingest lifecycle, cooperative
+  // stop — through the dataset-ingest view over the already-bound context
+  // (SDK 0.20.0's wider facade on the same create_parser_ingest fat pointer).
+  // Best-effort by design: a host without the progress slots REFUSES
+  // progressStart, and on such a host progressUpdate's false return means
+  // "unsupported", never "user cancelled" — so the cancel interpretation in
+  // the pull loop below is gated on host_progress_active. Stream-thread
+  // tagged calls, driven from this worker thread like every other host call.
+  bool host_progress_active = false;
+  if (driver.hasDecodable()) {
+    host_progress_active =
+        driver.datasetIngest()
+            .progressStart("MCAP Cloud: " + group_name, session_info.approximate_messages,
+                           /*cancellable=*/true)
+            .has_value();
+  }
+  std::uint64_t transport_messages_seen = 0;
+
   // Progress throttle: emit pullProgress at most ~10 Hz per topic.
   std::unordered_map<std::uint32_t, std::int64_t> bytes_by_id;
   std::unordered_map<std::uint32_t, std::chrono::steady_clock::time_point> last_emit;
@@ -777,6 +796,7 @@ void FetchWorker::pullTopicsAsync(std::vector<std::string> sequence_names, std::
   // otherwise it would re-emit the same value once per topic that trips its own
   // window (N GUI events/window instead of one).
   std::chrono::steady_clock::time_point last_wire_emit{};
+  std::chrono::steady_clock::time_point last_host_progress_emit{};
   const auto kProgressInterval = std::chrono::milliseconds(100);
 
   // (backend_session_for_cancel_ was published before connect/open above;
@@ -833,6 +853,20 @@ void FetchWorker::pullTopicsAsync(std::vector<std::string> sequence_names, std::
           last_wire_emit = now;
           pullWireBytes(static_cast<std::int64_t>(session_backend->sessionWireBytesReceived()));
         }
+        // Host progress tick (#470) — session-wide, own throttle stamp. The
+        // step unit is TRANSPORT messages (matches approximate_messages, the
+        // total announced to progressStart). A false progressUpdate return or
+        // a host stop request cancels cooperatively via the same return-false
+        // -> wire-Cancel path the dialog cancel uses; both signals are only
+        // honored when the host accepted progressStart (see above).
+        ++transport_messages_seen;
+        if (host_progress_active && now - last_host_progress_emit >= kProgressInterval) {
+          last_host_progress_emit = now;
+          if (!driver.datasetIngest().progressUpdate(transport_messages_seen) ||
+              driver.datasetIngest().isStopRequested()) {
+            return false;
+          }
+        }
         return true;
       });
 
@@ -874,7 +908,18 @@ void FetchWorker::pullTopicsAsync(std::vector<std::string> sequence_names, std::
     emit_save_result(std::move(result));
   }
 
-  // Seal the host-side parser writes (releaseParserIngest -> flushAll) while
+  // Pair the host progress sequence on the completed path: one final
+  // authoritative sample + progressFinish, on this same worker thread.
+  // Cancel/failure paths deliberately skip progressFinish — the
+  // releaseDatasetIngest inside driver.finalize() pairs the host's
+  // ingest-finished callback either way (#470 pairs release-without-finish),
+  // without painting an aborted pull as a completed progress sequence.
+  if (host_progress_active && stats.eos == SessionEos::Complete) {
+    (void)driver.datasetIngest().progressUpdate(transport_messages_seen);
+    driver.datasetIngest().progressFinish();
+  }
+
+  // Seal the host-side parser writes (releaseDatasetIngest -> flushAll) while
   // still inside the host-write critical section, so the GUI-thread
   // notifyDataChanged -> catalog rebuild that follows sees every row and
   // every object topic.

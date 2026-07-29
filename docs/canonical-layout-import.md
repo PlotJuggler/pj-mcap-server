@@ -601,9 +601,13 @@ Explicitly **not** built (v2 components dissolved or #470-supplied): `<replay_so
 1. **Plugin foundations** *(no host dependency, each shippable)* — descriptor module + vectors;
    cancel predicate; credential origin binding + trusted-origin ledger; cache manager
    (re-targeting the PR #4 writer via the §9.0 seams).
-2. **Plugin adopts the #470 progress surface** (#470 is merged; this is its still-missing live
-   verification) — progressive eager ingest becomes host-visible, the precondition for both
-   authoring UX and import-job binding.
+2. **Plugin adopts the #470 progress surface** (DONE 2026-07-29 — driver switched to
+   the 0.20.0 `createDatasetIngest` wider facade; the pull loop announces
+   `progressStart(total=approximate_messages)`, ticks throttled `progressUpdate`s, honors
+   host stop / update-false as cooperative cancel gated on the host accepting the
+   surface, and pairs `progressFinish` on the completed path only; four live gtests are
+   #470's previously-missing live verification) — progressive eager ingest is
+   host-visible, the precondition for both authoring UX and import-job binding.
 3. **SDK ABI + host** — the §8 extension + service routing (zero new vtable slots) +
    fake-provider host tests;
    `LayoutImportBatch` + `LoadTicket`; **growing-import binder** (batch-scoped); source
