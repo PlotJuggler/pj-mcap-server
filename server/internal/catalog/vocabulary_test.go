@@ -2,8 +2,10 @@ package catalog
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"path/filepath"
+	"reflect"
 	"testing"
 )
 
@@ -277,5 +279,73 @@ func TestAurynFilterFiles_DimensionPredicates(t *testing.T) {
 	got, _, _ = FilterFiles(ctx, st, FilterArgs{CustomerID: u(1), SourceID: u(2)})
 	if len(got) != 0 {
 		t.Fatalf("CustomerID=1 + SourceID=2 => %d files, want 0", len(got))
+	}
+}
+
+// TestTagFacets_EquivalentToEffectiveView pins the 3-query facet decomposition
+// to the tags_effective VIEW's own GROUP BY (the previous implementation and
+// the semantic ground truth), across every merge edge: an override REPLACES its
+// embedded value, a NULL override MASKS it (a fully-masked value must vanish),
+// an override value that coexists with surviving embedded rows SUMS into one
+// group, and an override-only key (no embedded row) still appears.
+func TestTagFacets_EquivalentToEffectiveView(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "cat.db")
+	buildVocabDB(t, path, 0)
+	db, err := sql.Open("sqlite",
+		fmt.Sprintf("file:%s?_pragma=journal_mode(WAL)&_pragma=foreign_keys(ON)", path))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+	seeds := []string{
+		`INSERT INTO tags_embedded(file_id,key,value) VALUES (1,'quality','good'),(2,'quality','good'),(4,'quality','bad')`,
+		// f1: override REPLACES good -> bad; bad then SUMS with f4's embedded bad.
+		`INSERT INTO tags_override(file_id,key,value,updated_at) VALUES (1,'quality','bad',1)`,
+		// f4: NULL override MASKS its only 'session' tag -> s9 must vanish entirely.
+		`INSERT INTO tags_embedded(file_id,key,value) VALUES (4,'session','s9')`,
+		`INSERT INTO tags_override(file_id,key,value,updated_at) VALUES (4,'session',NULL,1)`,
+		// f5: override-only key, no embedded row at all.
+		`INSERT INTO tags_override(file_id,key,value,updated_at) VALUES (5,'reviewed','yes',1)`,
+	}
+	for _, s := range seeds {
+		if _, err := db.Exec(s); err != nil {
+			t.Fatalf("seed %q: %v", s, err)
+		}
+	}
+
+	got, err := tagFacets(context.Background(), db)
+	if err != nil {
+		t.Fatalf("tagFacets: %v", err)
+	}
+
+	// Ground truth: the view's GROUP BY, shaped exactly like the pre-rewrite code.
+	var want []VocabFacet
+	byKey := map[string][]VocabFacetValue{}
+	var keyOrder []string
+	if err := queryRows(context.Background(), db,
+		`SELECT key, value, COUNT(*) FROM tags_effective GROUP BY key, value ORDER BY key, value`,
+		func(scan func(...any) error) error {
+			var key, value string
+			var n uint64
+			if err := scan(&key, &value, &n); err != nil {
+				return err
+			}
+			if _, seen := byKey[key]; !seen {
+				keyOrder = append(keyOrder, key)
+			}
+			byKey[key] = append(byKey[key], VocabFacetValue{Value: value, FileCount: n})
+			return nil
+		}); err != nil {
+		t.Fatalf("view ground truth: %v", err)
+	}
+	for _, key := range keyOrder {
+		if len(byKey[key]) > TagFacetCap {
+			continue
+		}
+		want = append(want, VocabFacet{Key: key, Values: byKey[key]})
+	}
+
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("facet decomposition diverged from tags_effective view:\n got: %+v\nwant: %+v", got, want)
 	}
 }
