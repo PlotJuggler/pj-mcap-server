@@ -365,14 +365,21 @@ bool BackendConnection::connect(std::string* error_out) {
   }
 
   // Hello handshake. Empty api_key is allowed (dev anonymous).
+  // wake_on_cancel: session establishment must be promptly cancellable END TO
+  // END — a cancelSession() while a silent server sits on the Hello (initial
+  // session connect OR a resume reconnect) returns immediately instead of
+  // waiting out kRequestTimeout (review-caught residual of the OpenSession
+  // wake fix). Harmless for browse connections: nothing ever cancels them, so
+  // their flag is never set.
   pj_cloud::v1::ClientMessage request;
   fillHello(request.mutable_hello());
 
   pj_cloud::v1::ServerMessage response;
-  if (!sendAndWait(request, &response)) {
+  if (!sendAndWait(request, &response, kRequestTimeout, /*wake_on_cancel=*/true)) {
     socket_->stop();
     socket_.reset();
-    set_error("no response to handshake from " + buildWsUrl(uri_));
+    set_error(cancel_requested_.load() ? "cancelled"
+                                       : "no response to handshake from " + buildWsUrl(uri_));
     return false;
   }
 
@@ -1133,8 +1140,9 @@ bool BackendConnection::openSessionResume(std::uint64_t subscription_id, std::ui
   // Do NOT clear cancel_requested_ here: a cancel that arrived during the
   // reconnect (after the resume loop's pre-reconnect checks) must SURVIVE into
   // the resumed frame loop and stop it — clearing it would let a cancelled
-  // download silently continue. (openSessionFresh clears it because a fresh
-  // download legitimately starts a new cancel scope; a resume does not.)
+  // download silently continue. (Nothing resets the flag anywhere — it is
+  // latched for the connection's lifetime; openSessionFresh deliberately does
+  // not clear it either, see the arming-order race note there.)
   {
     std::lock_guard<std::mutex> lock(mu_);
     session_active_ = true;

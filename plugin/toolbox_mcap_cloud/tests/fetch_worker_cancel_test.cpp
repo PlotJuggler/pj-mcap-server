@@ -19,6 +19,7 @@
 
 #include "find_free_port.hpp"
 
+#include <atomic>
 #include <chrono>
 #include <string>
 #include <thread>
@@ -36,12 +37,17 @@ using mcap_cloud_test::findFreePort;
 
 // Same shape as backend_cancel_wait_test.cpp's fake: answers Hello so
 // connect() succeeds, swallows OpenSession so the session RPC wait genuinely
-// blocks server-side.
+// blocks server-side. openSessionSeen() lets the test synchronize on the
+// worker actually REACHING the pending-OpenSession window before cancelling —
+// a blind sleep could otherwise let a descheduled worker take the cooperative
+// pre-connect exit and pass without exercising the hook wiring at all
+// (review-caught spurious-pass hole).
 class FakeSilentOpenServer {
  public:
   FakeSilentOpenServer() : port_(findFreePort()), server_(port_, "127.0.0.1") {
-    server_.setOnClientMessageCallback([](std::shared_ptr<ix::ConnectionState>, ix::WebSocket& ws,
-                                          const ix::WebSocketMessagePtr& msg) {
+    server_.setOnClientMessageCallback([this](std::shared_ptr<ix::ConnectionState>,
+                                              ix::WebSocket& ws,
+                                              const ix::WebSocketMessagePtr& msg) {
       if (msg->type != ix::WebSocketMessageType::Message) {
         return;
       }
@@ -56,6 +62,8 @@ class FakeSilentOpenServer {
         std::string payload;
         response.SerializeToString(&payload);
         ws.sendBinary(payload);
+      } else if (request.has_open_session()) {
+        open_session_seen_.store(true);
       }
       // OpenSession (and anything else): deliberately no reply.
     });
@@ -70,11 +78,13 @@ class FakeSilentOpenServer {
 
   [[nodiscard]] bool ok() const { return ok_; }
   [[nodiscard]] std::string uri() const { return "ws://127.0.0.1:" + std::to_string(port_); }
+  [[nodiscard]] bool openSessionSeen() const { return open_session_seen_.load(); }
 
  private:
   int port_;
   ix::WebSocketServer server_;
   bool ok_ = false;
+  std::atomic<bool> open_session_seen_{false};
 };
 
 }  // namespace
@@ -106,12 +116,17 @@ TEST(McapCloudFetchWorkerCancel, CancelDuringSessionEstablishmentUnblocksPull) {
     worker.pullTopicsAsync({"a.mcap"}, "a.mcap", {"/topic"}, 0, 0, /*save_directory=*/{});
   });
 
-  // Let the pull reach session establishment: fresh connection + Hello are
-  // local round-trips; OpenSession is then swallowed by the fake, so "past the
-  // send" is all the settle time needs to cover (same tolerance as the
-  // BackendConnection-level test). A cancel landing EARLIER is also a valid —
-  // and still asserted — outcome: every stage must honor it promptly.
-  std::this_thread::sleep_for(std::chrono::milliseconds(500));
+  // Synchronize on the worker actually REACHING the pending-OpenSession wait:
+  // cancel only once the fake has SEEN the OpenSession request, so this test
+  // deterministically exercises the published-hook wake path (a blind sleep
+  // could let a descheduled worker take the cooperative pre-connect exit and
+  // pass without the hook — review-caught spurious-pass hole).
+  const auto seen_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  while (!server.openSessionSeen() && std::chrono::steady_clock::now() < seen_deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  ASSERT_TRUE(server.openSessionSeen())
+      << "the pull never sent OpenSession — the test precondition did not establish";
 
   const auto cancel_at = std::chrono::steady_clock::now();
   worker.requestCancel();

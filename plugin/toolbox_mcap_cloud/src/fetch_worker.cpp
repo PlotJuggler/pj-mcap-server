@@ -583,7 +583,13 @@ void FetchWorker::pullTopicsAsync(std::vector<std::string> sequence_names, std::
 
   std::string connect_err;
   if (!session_owned->connect(&connect_err)) {
-    finish_all_topics(false, connect_err.empty() ? std::string("session connect failed") : connect_err);
+    // A cancel is the CAUSE, not a symptom: report it as such instead of the
+    // transport's view of the aborted handshake ("no response…"/socket text).
+    const bool was_cancelled = cancel_flag_.load(std::memory_order_relaxed);
+    finish_all_topics(false, was_cancelled
+                                 ? std::string("cancelled")
+                                 : (connect_err.empty() ? std::string("session connect failed")
+                                                        : connect_err));
     finish_all();
     return;
   }

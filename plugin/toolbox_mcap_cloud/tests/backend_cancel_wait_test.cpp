@@ -44,11 +44,11 @@ using mcap_cloud_test::findFreePort;
 // tests is an RPC wait that never completes server-side.
 class FakeSilentOpenServer {
  public:
-  explicit FakeSilentOpenServer(bool answer_list_files)
+  explicit FakeSilentOpenServer(bool answer_list_files, bool answer_hello = true)
       : port_(findFreePort()), server_(port_, "127.0.0.1") {
     server_.setOnClientMessageCallback(
-        [answer_list_files](std::shared_ptr<ix::ConnectionState>, ix::WebSocket& ws,
-                            const ix::WebSocketMessagePtr& msg) {
+        [answer_list_files, answer_hello](std::shared_ptr<ix::ConnectionState>, ix::WebSocket& ws,
+                                          const ix::WebSocketMessagePtr& msg) {
           if (msg->type != ix::WebSocketMessageType::Message) {
             return;
           }
@@ -56,7 +56,7 @@ class FakeSilentOpenServer {
           if (!request.ParseFromString(msg->str)) {
             return;
           }
-          if (request.has_hello()) {
+          if (request.has_hello() && answer_hello) {
             pj_cloud::v1::ServerMessage response;
             response.set_request_id(request.request_id());
             response.mutable_hello_response()->set_server_version("test-fake-1.0");
@@ -185,4 +185,35 @@ TEST(McapCloudBackendCancelWait, CancelLatchedBeforeOpenFailsFast) {
       << "a pre-latched cancel must fail the open fast, not after the 120s timeout";
   EXPECT_NE(open_error.find("cancel"), std::string::npos)
       << "the error must mention the cancel, got: " << open_error;
+}
+
+// (iv) Session establishment is promptly cancellable END TO END: a cancel
+// while a server accepts the WebSocket but never answers Hello must wake the
+// handshake wait inside connect() (wake_on_cancel on the Hello sendAndWait)
+// and report "cancelled" — not sit out kRequestTimeout with a misleading
+// "no response to handshake" (review-caught residual of the OpenSession fix).
+TEST(McapCloudBackendCancelWait, CancelUnblocksPendingHello) {
+  FakeSilentOpenServer server(/*answer_list_files=*/false, /*answer_hello=*/false);
+  ASSERT_TRUE(server.ok());
+
+  mcap_cloud::BackendConnection conn(server.uri(), /*cert_path=*/"", /*api_key=*/"",
+                                     /*allow_insecure=*/false);
+  std::string connect_error;
+  bool connect_ok = true;
+  std::thread worker([&] { connect_ok = conn.connect(&connect_error); });
+
+  // Let the worker get past the WS open and into the Hello RPC wait (the fake
+  // accepts the socket but never replies, so "past the send" is enough).
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+  const auto cancel_at = std::chrono::steady_clock::now();
+  conn.cancelSession();
+  worker.join();  // ctest TIMEOUT 30 converts a regression's stall into a fast FAIL
+  const auto elapsed = std::chrono::steady_clock::now() - cancel_at;
+
+  EXPECT_FALSE(connect_ok) << "a cancelled handshake must not report success";
+  EXPECT_LT(elapsed, std::chrono::seconds(2))
+      << "cancel must wake the Hello wait promptly, not after kRequestTimeout";
+  EXPECT_NE(connect_error.find("cancel"), std::string::npos)
+      << "the error must mention the cancel, got: " << connect_error;
 }
