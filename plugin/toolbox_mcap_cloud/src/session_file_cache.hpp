@@ -58,22 +58,43 @@ class SessionFileCache {
   /// Returns an empty path for anything malformed — a bad identity can never
   /// name a file outside the root.
   [[nodiscard]] std::filesystem::path pathFor(std::string_view identity) const;
-  /// Existing + structurally valid (footer magic + summary readable +
-  /// embedded descriptor identity matches when present). Touches the LRU
-  /// stamp on hit. NO network, bounded I/O (footer + summary only). A failed
-  /// check is a plain miss — the file is NOT deleted here; re-materialization
-  /// atomically renames over it (deletion policy is the provider flow's).
+  /// Existing + structurally valid: footer magic + summary readable +
+  /// Statistics present + embedded descriptor provenance PRESENT and matching
+  /// the identity. The provenance requirement is deliberate (review-caught):
+  /// every legitimately finalized cache file carries it, so requiring it here
+  /// has zero false negatives — and without it any unrelated valid MCAP
+  /// dropped at <digest>.mcap (e.g. under an overridden MCAP_CLOUD_CACHE_DIR)
+  /// would classify as a hit for that request. Touches the LRU stamp on hit.
+  /// NO network, bounded I/O (footer + summary only). A failed check is a
+  /// plain miss — the file is NOT deleted here; re-materialization atomically
+  /// renames over it (deletion policy is the provider flow's).
   [[nodiscard]] bool lookup(std::string_view identity, std::filesystem::path* out);
 
   [[nodiscard]] std::optional<MaterializeLock> tryLockForMaterialize(
       std::string_view identity, std::string* error);
   /// The partial path this process must write under `lock`.
   [[nodiscard]] std::filesystem::path partialPathFor(const MaterializeLock& lock) const;
-  /// Validate the finished partial (reader: footer, summary, statistics,
-  /// embedded descriptor == identity), fsync file, atomic rename to
-  /// pathFor(identity), fsync directory (POSIX). On any failure: remove the
-  /// partial, return false with the reason.
-  [[nodiscard]] bool finalize(const MaterializeLock& lock, std::string* error);
+
+  /// Semantic-completeness pin for finalize: the counts the PRODUCER knows the
+  /// finished session must contain (the tee's EOS message total and the
+  /// session's channel count). Statistics in the file must match exactly —
+  /// a cleanly-closed writer over a PREFIX of a stream produces a structurally
+  /// valid MCAP that only this check can reject (review-caught).
+  struct ExpectedContent {
+    std::uint64_t message_count = 0;
+    std::uint64_t channel_count = 0;
+  };
+
+  /// Validate the finished partial (reader: footer, summary, Statistics,
+  /// embedded descriptor == identity, and — when `expected` is provided —
+  /// Statistics matching the expected message/channel counts), fsync file,
+  /// atomic rename to pathFor(identity), fsync directory (POSIX). On any
+  /// failure: remove the partial, return false with the reason.
+  /// Pass `expected` whenever the producer knows the counts (the stage-4 tee
+  /// always does — its EOS carries them); std::nullopt skips ONLY the
+  /// semantic-completeness comparison, never the structural/identity checks.
+  [[nodiscard]] bool finalize(const MaterializeLock& lock,
+                              const std::optional<ExpectedContent>& expected, std::string* error);
 
   /// Startup/maintenance: remove orphaned partials older than
   /// orphan_partial_age whose lock is free; then LRU-evict unlocked files

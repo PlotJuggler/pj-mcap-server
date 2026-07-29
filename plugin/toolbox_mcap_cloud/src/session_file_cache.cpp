@@ -86,16 +86,22 @@ void touchStamp(const fs::path& file) {
 }
 
 // Reader-validate `path` against the identity digest (spec §5). Bounded I/O:
-// footer + summary section only, never a message scan. `strict` is the
-// finalize gate (Statistics AND the embedded descriptor are REQUIRED there —
-// the tee always embeds it, so absence is a defect); lookup's cheap check
-// tolerates an absent descriptor but still rejects a mismatching one.
+// footer + summary section only, never a message scan. Statistics AND the
+// embedded descriptor are REQUIRED unconditionally — every legitimately
+// finalized cache file carries both (the tee always embeds the descriptor),
+// so absence is either a truncated write or a foreign file, and both must be
+// a miss/rejection (review-caught: a lenient lookup classified any unrelated
+// valid MCAP dropped at <digest>.mcap as a hit for that request).
+// `expected`, when provided (the finalize gate with producer-known counts),
+// additionally pins Statistics against the session's expected message/channel
+// counts — the only check that catches a cleanly-closed PREFIX of a stream.
 //
 // The identity check hashes the embedded canonical-descriptor bytes directly:
 // the identity is DEFINED as sha256/128 over those exact bytes (see
 // descriptorIdentity), so byte-hashing detects wrong-file substitution and
 // name collisions from the file alone, without a JSON parse here.
-bool validateMcap(const fs::path& path, const std::string& hex, bool strict,
+bool validateMcap(const fs::path& path, const std::string& hex,
+                  const std::optional<SessionFileCache::ExpectedContent>& expected,
                   std::string* error) {
   mcap::McapReader reader;
   mcap::Status status = reader.open(path.string());
@@ -109,19 +115,29 @@ bool validateMcap(const fs::path& path, const std::string& hex, bool strict,
     *error = "summary unreadable: " + status.message;
     return false;
   }
-  if (strict && !reader.statistics().has_value()) {
+  if (!reader.statistics().has_value()) {
     reader.close();
     *error = "missing Statistics record";
     return false;
   }
+  if (expected.has_value()) {
+    const auto& stats = *reader.statistics();
+    if (stats.messageCount != expected->message_count ||
+        static_cast<std::uint64_t>(stats.channelCount) != expected->channel_count) {
+      reader.close();
+      *error = "Statistics mismatch: file has " + std::to_string(stats.messageCount) +
+               " message(s) / " + std::to_string(stats.channelCount) + " channel(s), expected " +
+               std::to_string(expected->message_count) + " / " +
+               std::to_string(expected->channel_count) +
+               " (incomplete or foreign session content)";
+      return false;
+    }
+  }
   const auto index = reader.metadataIndexes().find(kProvenanceName);
   if (index == reader.metadataIndexes().end()) {
     reader.close();
-    if (strict) {
-      *error = std::string("missing embedded source descriptor (") + kProvenanceName + ")";
-      return false;
-    }
-    return true;
+    *error = std::string("missing embedded source descriptor (") + kProvenanceName + ")";
+    return false;
   }
   mcap::Record record;
   status = mcap::McapReader::ReadRecord(*reader.dataSource(), index->second.offset, &record);
@@ -239,7 +255,7 @@ bool SessionFileCache::lookup(std::string_view identity, fs::path* out) {
     return false;
   }
   std::string error;
-  if (!validateMcap(file, *hex, /*strict=*/false, &error)) {
+  if (!validateMcap(file, *hex, /*expected=*/std::nullopt, &error)) {
     return false;
   }
   touchStamp(file);
@@ -286,7 +302,9 @@ fs::path SessionFileCache::partialPathFor(const MaterializeLock& lock) const {
   return lock.partial_;
 }
 
-bool SessionFileCache::finalize(const MaterializeLock& lock, std::string* error) {
+bool SessionFileCache::finalize(const MaterializeLock& lock,
+                                const std::optional<ExpectedContent>& expected,
+                                std::string* error) {
   const fs::path& partial = lock.partial_;
   const fs::path final_path = root_ / (lock.hex_ + ".mcap");
   const auto fail = [&](const std::string& reason) {
@@ -298,7 +316,7 @@ bool SessionFileCache::finalize(const MaterializeLock& lock, std::string* error)
     return false;
   };
   std::string reason;
-  if (!validateMcap(partial, lock.hex_, /*strict=*/true, &reason)) {
+  if (!validateMcap(partial, lock.hex_, expected, &reason)) {
     return fail("cache finalize rejected " + partial.filename().string() + ": " + reason);
   }
   chmod0600(partial);

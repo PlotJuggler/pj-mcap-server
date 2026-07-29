@@ -92,7 +92,10 @@ fs::path materialize(mcap_cloud::SessionFileCache& cache, const mcap_cloud::Sour
     return {};
   }
   writeSessionMcap(cache.partialPathFor(*lock), mcap_cloud::canonicalSourceDescriptorJson(d));
-  EXPECT_TRUE(cache.finalize(*lock, &error)) << error;
+  EXPECT_TRUE(cache.finalize(
+      *lock, mcap_cloud::SessionFileCache::ExpectedContent{.message_count = 1, .channel_count = 1},
+      &error))
+      << error;
   return cache.pathFor(identity);
 }
 
@@ -150,7 +153,10 @@ TEST(SessionFileCache, MaterializeFinalizeLookupRoundTrip) {
   EXPECT_NE(partial.filename().string().find(".mcap.partial."), std::string::npos);
 
   writeSessionMcap(partial, mcap_cloud::canonicalSourceDescriptorJson(d));
-  ASSERT_TRUE(cache.finalize(*lock, &error)) << error;
+  ASSERT_TRUE(cache.finalize(
+      *lock, mcap_cloud::SessionFileCache::ExpectedContent{.message_count = 1, .channel_count = 1},
+      &error))
+      << error;
   EXPECT_FALSE(fs::exists(partial));
 
   const fs::path final_path = cache.pathFor(identity);
@@ -194,7 +200,7 @@ TEST(SessionFileCache, FinalizeRejectsTruncatedFile) {
   writeSessionMcap(partial, mcap_cloud::canonicalSourceDescriptorJson(d));
   fs::resize_file(partial, fs::file_size(partial) - 64);  // chop the footer
 
-  EXPECT_FALSE(cache.finalize(*lock, &error));
+  EXPECT_FALSE(cache.finalize(*lock, std::nullopt, &error));
   EXPECT_FALSE(error.empty());
   EXPECT_FALSE(fs::exists(partial));  // failed finalize removes the partial
   EXPECT_FALSE(fs::exists(cache.pathFor(mcap_cloud::descriptorIdentity(d))));
@@ -211,7 +217,7 @@ TEST(SessionFileCache, FinalizeRejectsNonMcapJunk) {
     std::ofstream out(partial, std::ios::binary);
     out << "definitely not an mcap";
   }
-  EXPECT_FALSE(cache.finalize(*lock, &error));
+  EXPECT_FALSE(cache.finalize(*lock, std::nullopt, &error));
   EXPECT_FALSE(fs::exists(partial));
 }
 
@@ -245,7 +251,7 @@ TEST(SessionFileCache, FinalizeRejectsMissingSummary) {
     ASSERT_TRUE(raw.write(message).ok());
     raw.close();
   }
-  EXPECT_FALSE(cache.finalize(*lock, &error));
+  EXPECT_FALSE(cache.finalize(*lock, std::nullopt, &error));
   EXPECT_FALSE(fs::exists(partial));
 }
 
@@ -263,7 +269,7 @@ TEST(SessionFileCache, FinalizeRejectsDescriptorIdentityMismatchAndAbsence) {
     ASSERT_TRUE(lock.has_value()) << error;
     const fs::path partial = cache.partialPathFor(*lock);
     writeSessionMcap(partial, mcap_cloud::canonicalSourceDescriptorJson(d2));
-    EXPECT_FALSE(cache.finalize(*lock, &error));
+    EXPECT_FALSE(cache.finalize(*lock, std::nullopt, &error));
     EXPECT_NE(error.find("identity"), std::string::npos) << error;
     EXPECT_FALSE(fs::exists(partial));
   }
@@ -282,9 +288,60 @@ TEST(SessionFileCache, FinalizeRejectsDescriptorIdentityMismatchAndAbsence) {
         &error))
         << error;
     ASSERT_TRUE(writer.close(&error)) << error;
-    EXPECT_FALSE(cache.finalize(*lock, &error));
+    EXPECT_FALSE(cache.finalize(*lock, std::nullopt, &error));
     EXPECT_FALSE(fs::exists(partial));
   }
+}
+
+// Semantic completeness (review-caught): a cleanly-closed writer over a PREFIX
+// of a stream is a structurally valid, summarized MCAP with matching
+// provenance — only the expected-count comparison can reject it.
+TEST(SessionFileCache, FinalizeRejectsStatisticsCountMismatch) {
+  TempRoot root("countmismatch");
+  mcap_cloud::SessionFileCache cache(root.path);
+  const auto d = descriptor("a.mcap");
+  std::string error;
+  auto lock = cache.tryLockForMaterialize(mcap_cloud::descriptorIdentity(d), &error);
+  ASSERT_TRUE(lock.has_value()) << error;
+  const fs::path partial = cache.partialPathFor(*lock);
+  writeSessionMcap(partial, mcap_cloud::canonicalSourceDescriptorJson(d));  // 1 msg / 1 channel
+
+  EXPECT_FALSE(cache.finalize(
+      *lock, mcap_cloud::SessionFileCache::ExpectedContent{.message_count = 2, .channel_count = 1},
+      &error));
+  EXPECT_NE(error.find("Statistics mismatch"), std::string::npos) << error;
+  EXPECT_FALSE(fs::exists(partial));  // failed finalize removes the partial
+  EXPECT_FALSE(fs::exists(cache.pathFor(mcap_cloud::descriptorIdentity(d))));
+}
+
+// Lookup fail-closed (review-caught): a valid summarized MCAP WITHOUT the
+// embedded source-descriptor provenance dropped at <digest>.mcap (e.g. under
+// an overridden MCAP_CLOUD_CACHE_DIR) must be a MISS, not a hit — every
+// legitimately finalized cache file carries the provenance record.
+TEST(SessionFileCache, LookupRejectsForeignFileWithoutProvenance) {
+  TempRoot root("foreignfile");
+  mcap_cloud::SessionFileCache cache(root.path);
+  const auto d = descriptor("a.mcap");
+  const std::string identity = mcap_cloud::descriptorIdentity(d);
+
+  // A real, summarized session MCAP — just no provenance record.
+  const fs::path file = cache.pathFor(identity);
+  {
+    mcap_cloud::SessionMcapWriter writer;
+    std::string error;
+    ASSERT_TRUE(writer.open(file, sessionInfo(), &error)) << error;
+    ASSERT_TRUE(writer.write(
+        {.topic_id = 11, .schema_id = 5, .log_time_ns = 100, .publish_time_ns = 90,
+         .payload = "one"},
+        &error))
+        << error;
+    ASSERT_TRUE(writer.close(&error)) << error;
+  }
+  ASSERT_TRUE(fs::exists(file));
+
+  fs::path out;
+  EXPECT_FALSE(cache.lookup(identity, &out))
+      << "a provenance-less MCAP at the digest path must be a miss";
 }
 
 TEST(SessionFileCache, SecondMaterializeLockOnSameIdentityFailsWhileHeld) {
