@@ -509,11 +509,12 @@ Explicitly **not** built (v2 components dissolved or #470-supplied): `<replay_so
    (`SessionCache` stores `DatasetId`; missing-disk-file hits evict and refetch — §6.1.)
 7. **#470 progress-surface adoption** in `ParserIngestDriver`/`FetchWorker` — also #470's live
    verification.
-8. **Provider implementation** — headless bind mode (no auto-connect), `source_provider_query`,
-   `source_provider_import` (the authoring dual path — FetchWorker progressive eager ingest +
+8. **Provider implementation** — headless bind mode (no auto-connect), the
+   `pj.descriptor_import.v1` extension as shipped in SDK 0.20.0: `query_descriptor` and
+   `start_import` (the authoring dual path — FetchWorker progressive eager ingest +
    the PR #4 `SessionMcapWriter` tee — driven headlessly by descriptor; the shared-TU and
    `MCAP_IMPLEMENTATION` concerns are already solved by PR #4), `promote_to_file_source`
-   calls at fetch completion.
+   calls (via `pj.source_promotion.v1`) at fetch completion.
 
 ## 10. Semantics, failure behavior
 
