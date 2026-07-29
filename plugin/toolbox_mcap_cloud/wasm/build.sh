@@ -12,7 +12,8 @@
 #
 # It compiles the PURE protocol/decode core (src/session_key.hpp,
 # src/session_cache.hpp, src/hierarchy_prefix.h, src/stitch_select.h,
-# tools/cli_url_resolve.hpp) plus the official single-file zstd 1.5.7 DECODER
+# tools/cli_url_resolve.hpp + its std-only src/origin_match.cpp dependency —
+# the token origin-binding guard) plus the official single-file zstd 1.5.7 DECODER
 # amalgamation (third_party/zstd/) into one .wasm, then runs it under node and
 # checks for the "WASM SMOKE PASS" line.
 #
@@ -130,6 +131,7 @@ em++ -std=c++20 -O2 -Wall -Wextra -Werror \
   -s ENVIRONMENT=node \
   -s ALLOW_MEMORY_GROWTH=1 \
   "${HERE}/wasm_smoke_main.cpp" \
+  "${SRC_DIR}/origin_match.cpp" \
   "${BUILD_DIR}/zstddeclib.o" \
   -o "${WASM_OUT}" \
   || fail "decode-core smoke -> wasm"

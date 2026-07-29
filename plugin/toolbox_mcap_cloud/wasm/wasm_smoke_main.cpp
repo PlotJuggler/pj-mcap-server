@@ -167,8 +167,20 @@ void testCliUrl() {
         "cli_url explicit-wins");
   check(resolveCliUrl(std::nullopt, std::string("ws://env")) == "ws://env", "cli_url env-fallback");
   check(resolveCliUrl(std::nullopt, std::nullopt) == kDefaultCliUrl, "cli_url default");
-  check(resolveCliToken(std::string(""), std::string("envtok")) == "", "cli_token explicit-empty-wins");
-  check(resolveCliToken(std::nullopt, std::string("envtok")) == "envtok", "cli_token env-fallback");
+  // Token resolution is origin-bound (spec §7 guard 2): the env token applies
+  // only when the effective URL's origin matches MCAP_CLOUD_URL's.
+  check(resolveCliToken(std::string(""), std::string("envtok"), "ws://env-host:9999",
+                        std::string("ws://env-host:9999")) == "",
+        "cli_token explicit-empty-wins");
+  check(resolveCliToken(std::nullopt, std::string("envtok"), "ws://env-host:9999",
+                        std::string("ws://env-host:9999")) == "envtok",
+        "cli_token env-fallback");
+  check(resolveCliToken(std::nullopt, std::string("envtok"), "ws://other-host:1234",
+                        std::string("ws://env-host:9999")) == "",
+        "cli_token cross-origin-refused");
+  check(resolveCliToken(std::nullopt, std::string("envtok"), std::string(kDefaultCliUrl),
+                        std::nullopt) == "",
+        "cli_token unbound-env-ignored");
 }
 
 void testZstdDecode() {
