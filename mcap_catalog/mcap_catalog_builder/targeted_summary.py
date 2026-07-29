@@ -49,12 +49,20 @@ MAGIC = b"\x89MCAP0\r\n"
 DEFAULT_TAIL = 64 * 1024   # 42% of the staging corpus resolves in ONE read
 _FOOTER_LEN = 37           # op(1) + len(8) + payload(20) + trailing magic(8)
 _FOOTER_PAYLOAD = 20
-_COALESCE_GAP = 4096       # merge needed groups separated by less than this
+_COALESCE_GAP = 4096       # merge needed groups separated by AT MOST this much
 _MAX_OFFSETS_LEN = 64 * 1024  # sanity cap: ~7 SummaryOffset records expected
+
+_READERS = {Opcode.SCHEMA: Schema.read, Opcode.CHANNEL: Channel.read,
+            Opcode.STATISTICS: Statistics.read,
+            Opcode.SUMMARY_OFFSET: SummaryOffset.read}
 
 
 class TargetedUnavailable(Exception):
     """The targeted path cannot serve this file — use the streamed fallback."""
+
+
+class _NoSummary(ValueError):
+    """Well-framed footer with summary_start == 0 (the baseline's verdict)."""
 
 
 def _iter_records(buf: bytes):
@@ -65,9 +73,6 @@ def _iter_records(buf: bytes):
     """
     stream = ReadDataStream(io.BytesIO(buf))
     end = len(buf)
-    readers = {Opcode.SCHEMA: Schema.read, Opcode.CHANNEL: Channel.read,
-               Opcode.STATISTICS: Statistics.read,
-               Opcode.SUMMARY_OFFSET: SummaryOffset.read}
     while stream.count < end:
         if stream.count + 9 > end:
             raise TargetedUnavailable("truncated record framing")
@@ -76,7 +81,7 @@ def _iter_records(buf: bytes):
         payload_start = stream.count
         if payload_start + length > end:
             raise TargetedUnavailable("record overruns fetched range")
-        reader = readers.get(opcode)
+        reader = _READERS.get(opcode)
         if reader is None:
             stream.read(length)
             yield opcode, None
@@ -96,6 +101,15 @@ def _iter_records(buf: bytes):
 def read_summary_targeted(
     pread: Callable[[int, int], bytes], size: int, tail: int = DEFAULT_TAIL
 ) -> FileSummary:
+    """Read ``FileSummary`` via footer + summary-offset section only.
+
+    ``pread(lo, hi)`` must return the INCLUSIVE byte range ``[lo, hi]`` (i.e.
+    ``hi`` is the last byte returned, not one-past-the-end). Raises
+    ``TargetedUnavailable`` for any structural surprise (the caller should
+    fall back to the streamed reader), or the carve-out ``_NoSummary``
+    (a ``ValueError`` subclass) when a well-framed footer already gives the
+    baseline's own "no summary/statistics in MCAP" verdict.
+    """
     if size < _FOOTER_LEN:
         raise TargetedUnavailable("too small for an MCAP footer")
     tail_start = max(0, size - tail)
@@ -116,9 +130,12 @@ def read_summary_targeted(
     if summary_start == 0:
         # A well-framed footer that plainly says "no summary" — this IS the
         # baseline's exact verdict, not a targeted-path limitation, so raise
-        # it directly (ValueError, not TargetedUnavailable): no need to pay
-        # for a second, streamed read just to get the same answer.
-        raise ValueError("no summary/statistics in MCAP")
+        # it directly (a typed ValueError subclass, not TargetedUnavailable):
+        # no need to pay for a second, streamed read just to get the same
+        # answer. Typed (rather than a bare ValueError) so the wrapper can
+        # narrowly distinguish this carve-out from an unrelated ValueError
+        # a buggy/adversarial ``pread`` transport might raise.
+        raise _NoSummary("no summary/statistics in MCAP")
     if summary_offset_start == 0:
         raise TargetedUnavailable("no summary-offset section")
 
@@ -130,6 +147,8 @@ def read_summary_targeted(
     if summary_offset_start >= tail_start:
         so_buf = buf_tail[summary_offset_start - tail_start:footer_pos - tail_start]
     else:
+        # Live only for a shrunk (non-default) ``tail`` — DEFAULT_TAIL covers
+        # the offsets section on its own in every default-tail test.
         so_buf = pread(summary_offset_start, footer_pos - 1)
         if len(so_buf) != footer_pos - summary_offset_start:
             raise TargetedUnavailable("short summary-offset read")
@@ -216,9 +235,13 @@ def read_summary_with_fallback(
     """
     try:
         return read_summary_targeted(pread, size, tail=tail), "targeted"
-    except ValueError:
+    except _NoSummary:
         # The carve-out: a well-framed footer already gave the baseline's
         # exact verdict — propagate it verbatim, no fallback re-read needed.
+        # Narrowly typed (not a bare ValueError) so a ValueError raised by a
+        # buggy/adversarial ``pread`` transport does NOT take this shortcut —
+        # it falls through to the generic handler below and gets a real
+        # streamed-fallback verdict instead.
         raise
     except TargetedUnavailable as e:
         logger.info("targeted summary read unavailable for %s (%s); using streamed read",

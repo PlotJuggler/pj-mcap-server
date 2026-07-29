@@ -128,6 +128,52 @@ def test_corrupt_footer_is_unavailable(tmp_path, mutate):
         read_summary_targeted(PreadRecorder(data), len(data))
 
 
+def _corrupt_group_start_below_summary(data: bytearray, target_opcodes=(0x03, 0x04)):
+    """Scan the summary-offset section for a SCHEMA(0x03)/CHANNEL(0x04) group
+    and rewrite its ``group_start`` to point at byte 8 (just past the leading
+    magic — squarely in the header/data section, below ``summary_start``),
+    keeping ``group_length`` as-is (a plausible length, just relocated).
+    Records here are framed op(1) + len u64(8) + payload; a SummaryOffset
+    payload is group_opcode u8(1) + group_start u64(8) + group_length u64(8).
+    Returns ``(summary_start, summary_offset_start)`` for the caller.
+    """
+    footer = bytes(data[-37:-8])
+    summary_start, summary_offset_start, _crc = struct.unpack("<QQI", footer[9:29])
+    footer_pos = len(data) - 37
+    pos = summary_offset_start
+    while pos < footer_pos:
+        op = data[pos]
+        (length,) = struct.unpack_from("<Q", data, pos + 1)
+        payload_off = pos + 9
+        if op == 0x0E and data[payload_off] in target_opcodes:  # SUMMARY_OFFSET
+            struct.pack_into("<Q", data, payload_off + 1, 8)  # group_start := 8
+            return summary_start, summary_offset_start
+        pos = payload_off + length
+    raise AssertionError("no SCHEMA/CHANNEL SummaryOffset record found to corrupt")
+
+
+def test_corrupt_group_start_below_summary_never_reads_body(tmp_path):
+    # Pins BOUNDEDNESS ITSELF (not just this guard's specific message): a
+    # SummaryOffset record whose group_start is corrupted to point below
+    # summary_start (into the header/data section) must be rejected WITHOUT
+    # ever issuing a fetch for that out-of-bounds range — removing the
+    # "summary group outside summary section" guard must make this test fail
+    # via the boundedness assertion even if some other check happens to still
+    # raise TargetedUnavailable.
+    chans = [(f"/topic{i}", f"pkg/msg/T{i}", "ros2msg", 2) for i in range(30)]
+    data = bytearray(_mcap_bytes(tmp_path, channels=chans))
+    tail = 2048
+    assert len(data) > tail
+    summary_start, _summary_offset_start = _corrupt_group_start_below_summary(data)
+    data = bytes(data)
+
+    pread = PreadRecorder(data)
+    with pytest.raises(TargetedUnavailable):
+        read_summary_targeted(pread, len(data), tail=tail)
+    for lo, _hi in pread.calls[1:]:  # calls[0] is the initial tail read (exempt)
+        assert lo >= summary_start
+
+
 def test_corrupt_leading_magic_small_file_unavailable(tmp_path):
     # File fits in the tail -> offset 0 is visible -> leading magic IS checked.
     data = _mcap_bytes(tmp_path)
@@ -178,6 +224,24 @@ def test_fallback_dispositions(tmp_path, caplog):
     with caplog.at_level(logging.WARNING):
         got, via = read_summary_with_fallback(boom, lambda: _open(good), "k", len(good))
     assert via == "fallback-unexpected" and got == _baseline(good)
+
+
+def test_transport_valueerror_does_not_take_carveout_shortcut(tmp_path):
+    # A ValueError raised by the PREAD TRANSPORT ITSELF (not the well-framed
+    # summary_start==0 carve-out) must NOT be mistaken for that carve-out: it
+    # has to fall through to the generic handler and get a real
+    # streamed-fallback verdict, not propagate verbatim past the fallback and
+    # past the .summary_via stamping (which would silently mis-quarantine a
+    # perfectly healthy file on a transient/buggy transport error).
+    good = _mcap_bytes(tmp_path)
+
+    def bad_pread(lo, hi):
+        raise ValueError("transport bug")
+
+    got, via = read_summary_with_fallback(
+        bad_pread, lambda: _open(good), "k", len(good))
+    assert via == "fallback-unexpected"
+    assert got == _baseline(good)
 
 
 def test_garbage_fallback_error_parity(tmp_path):
