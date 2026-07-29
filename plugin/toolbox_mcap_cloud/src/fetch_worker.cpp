@@ -788,6 +788,29 @@ void FetchWorker::pullTopicsAsync(std::vector<std::string> sequence_names, std::
   }
   std::uint64_t transport_messages_seen = 0;
 
+  // Host-stop WATCHDOG (review-caught): the in-callback isStopRequested()
+  // check below only runs when messages flow — a stalled server or a
+  // reconnect backoff would ignore the host's Stop for the full frame-wait/
+  // backoff timeouts (minutes). This poller observes the [thread-safe] stop
+  // slot from its own thread and converts a stop into requestCancel(), whose
+  // wake machinery (cancel hook + sendAndWait/frame-wait/backoff predicates)
+  // already unblocks every waiting phase promptly. Scoped strictly to the
+  // download: joined before the terminal classification and finalize(), so
+  // the dataset-ingest view outlives it.
+  std::atomic<bool> download_done{false};
+  std::thread host_stop_watchdog;
+  if (host_progress_active) {
+    host_stop_watchdog = std::thread([&]() {
+      while (!download_done.load(std::memory_order_relaxed)) {
+        if (driver.datasetIngest().isStopRequested()) {
+          requestCancel();
+          return;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+      }
+    });
+  }
+
   // Progress throttle: emit pullProgress at most ~10 Hz per topic.
   std::unordered_map<std::uint32_t, std::int64_t> bytes_by_id;
   std::unordered_map<std::uint32_t, std::chrono::steady_clock::time_point> last_emit;
@@ -870,6 +893,20 @@ void FetchWorker::pullTopicsAsync(std::vector<std::string> sequence_names, std::
         return true;
       });
 
+  download_done.store(true, std::memory_order_relaxed);
+  if (host_stop_watchdog.joinable()) {
+    host_stop_watchdog.join();
+  }
+
+  // ONE atomic terminal-outcome boundary (review-caught): sample cancel_flag_
+  // exactly ONCE, here, and derive every terminal decision from it — the
+  // export promotion gate, the progressFinish pairing, and the per-topic
+  // cancelled classification below. Three independent loads let a cancel
+  // racing in during (potentially long) MCAP finalization classify the SAME
+  // pull as completed on one surface and cancelled on another. A cancel
+  // arriving after this boundary is consistently ignored everywhere.
+  const bool cancelled_after_download = cancel_flag_.load(std::memory_order_relaxed);
+
   if (mcap_writer) {
     // The import outcome (stats/topic ledger) is NEVER touched here: any
     // export/finalize failure is a purely local problem — the mcap_save_failed
@@ -883,8 +920,7 @@ void FetchWorker::pullTopicsAsync(std::vector<std::string> sequence_names, std::
       // readable MCAP. Remove it; report no path.
       discard_partial();
       result.path.clear();
-    } else if (stats.eos == SessionEos::Complete &&
-               !cancel_flag_.load(std::memory_order_relaxed)) {
+    } else if (stats.eos == SessionEos::Complete && !cancelled_after_download) {
       std::error_code rename_error;
       std::filesystem::rename(save_paths->partial_path, save_paths->final_path, rename_error);
       if (rename_error) {
@@ -914,7 +950,7 @@ void FetchWorker::pullTopicsAsync(std::vector<std::string> sequence_names, std::
   // releaseDatasetIngest inside driver.finalize() pairs the host's
   // ingest-finished callback either way (#470 pairs release-without-finish),
   // without painting an aborted pull as a completed progress sequence.
-  if (host_progress_active && stats.eos == SessionEos::Complete) {
+  if (host_progress_active && stats.eos == SessionEos::Complete && !cancelled_after_download) {
     (void)driver.datasetIngest().progressUpdate(transport_messages_seen);
     driver.datasetIngest().progressFinish();
   }
@@ -928,7 +964,7 @@ void FetchWorker::pullTopicsAsync(std::vector<std::string> sequence_names, std::
   // Final per-topic progress flush + per-topic completion.
   const auto counts = driver.decodedCounts();
   const auto errors = driver.errorCounts();
-  const bool cancelled = (stats.eos == SessionEos::Cancelled) || cancel_flag_.load(std::memory_order_relaxed);
+  const bool cancelled = (stats.eos == SessionEos::Cancelled) || cancelled_after_download;
   const bool session_failed = (stats.eos == SessionEos::Error || stats.eos == SessionEos::Unset);
 
   write_lock.unlock();  // release before invoking the GUI-thread callbacks
