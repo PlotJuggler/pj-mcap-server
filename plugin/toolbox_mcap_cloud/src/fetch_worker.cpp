@@ -799,6 +799,21 @@ void FetchWorker::pullTopicsAsync(std::vector<std::string> sequence_names, std::
   // the dataset-ingest view outlives it.
   std::atomic<bool> download_done{false};
   std::thread host_stop_watchdog;
+  // Exception-safe join (re-verify-caught): the download below invokes
+  // unrestricted std::function callbacks (pullProgress, ...) — if one throws,
+  // unwinding through a still-joinable std::thread is std::terminate. The
+  // guard signals + joins on EVERY exit; the manual join before the terminal
+  // boundary below then no-ops (joinable() false) and keeps its ordering role.
+  struct WatchdogJoinGuard {
+    std::atomic<bool>& done;
+    std::thread& thread;
+    ~WatchdogJoinGuard() {
+      done.store(true, std::memory_order_relaxed);
+      if (thread.joinable()) {
+        thread.join();
+      }
+    }
+  } watchdog_join_guard{download_done, host_stop_watchdog};
   if (host_progress_active) {
     host_stop_watchdog = std::thread([&]() {
       while (!download_done.load(std::memory_order_relaxed)) {
@@ -936,10 +951,16 @@ void FetchWorker::pullTopicsAsync(std::vector<std::string> sequence_names, std::
       // its partials never survive (docs/canonical-layout-import.md §6.1) —
       // do not "align" the two when unifying the write path.
       result.status = McapSaveStatus::Partial;
-      result.error = !stats.error.empty()
-                         ? stats.error
-                         : (stats.eos == SessionEos::Cancelled ? "download cancelled"
-                                                               : "download ended before completion");
+      // Wording derives from the SAME terminal snapshot as every other
+      // surface (re-verify-caught): a Complete-but-cancelled-at-the-boundary
+      // pull must say "cancelled" here too, matching the progress/dialog
+      // classification.
+      result.error =
+          !stats.error.empty()
+              ? stats.error
+              : ((stats.eos == SessionEos::Cancelled || cancelled_after_download)
+                     ? "download cancelled"
+                     : "download ended before completion");
     }
     emit_save_result(std::move(result));
   }
@@ -1000,17 +1021,24 @@ void FetchWorker::pullTopicsAsync(std::vector<std::string> sequence_names, std::
     }
     bool ok = false;
     std::string error;
-    if (!tid_opt) {
+    if (cancelled) {
+      // The BATCH outcome wins (re-verify-caught): checked before the
+      // per-topic missing/undecodable reasons so a cancelled batch reports
+      // every topic "cancelled" — otherwise an all-bindings-failed batch
+      // that was then cancelled reported no "cancelled" topic at all, the
+      // dialog never latched, and it summarized "Fetch failed…" while the
+      // progress/export surfaces said cancelled. Per-topic bind-failure
+      // detail is not lost: the bell notification surfaced it at bind time.
+      // Treated as not-ok but the dialog tags it "Cancelled" (kept OUT of
+      // the failure tally).
+      error = "cancelled";
+    } else if (!tid_opt) {
       // Requested topic absent from the session dictionary: the server's plan
       // found no message for it in the selected files/time range (zero-message
       // catalog topics and windows that miss the data both land here).
       error = "no messages in the selected time range";
     } else if (decodable_by_id.count(*tid_opt) && !decodable_by_id.at(*tid_opt)) {
       error = skip_reason_by_id.count(*tid_opt) ? skip_reason_by_id.at(*tid_opt) : "no parser bound for topic";
-    } else if (cancelled) {
-      // Treated as not-ok but the dialog tags it "Cancelled" (kept OUT of the
-      // failure tally) when state_.cancelling is set.
-      error = "cancelled";
     } else if (session_failed) {
       error = stats.error.empty() ? "session ended without terminal Eos" : stats.error;
     } else {
