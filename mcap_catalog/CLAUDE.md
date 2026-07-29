@@ -156,3 +156,8 @@ merely unlikely:
   back the *planned* async metric-extraction pass (REQUIREMENTS R11–R13, for
   numeric-threshold queries like *velocity > X*); the current catalog builder writes to
   neither. `open_db` creates them, but don't expect rows until that pass exists.
+- **Catalogs are not byte-reproducible across runs** — topic/schema dictionary
+  ids assign in file-completion order, so `topic_sets.fingerprint` and
+  `topic_counts` blobs differ between two builds of the same bucket. Only
+  `scripts/catalog-semantic-diff.py` (id-dictionary-decoded comparison) is a
+  valid equivalence check between catalogs.
