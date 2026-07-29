@@ -75,7 +75,25 @@ func GetVocabulary(ctx context.Context, s *Store) (*Vocabulary, error) {
 // the ws layer pins ONE Snapshot so the vocabulary rows and the generation
 // token stamped on the response are guaranteed to describe the same generation
 // (the dimension ids are only meaningful together with that token).
+//
+// The lease pins the served FILE's identity, NOT a WAL read snapshot — the
+// builder commits per file, so the ~8 queries here must additionally share ONE
+// read transaction or a mid-vocabulary commit skews them against each other
+// (customer count 1 beside a child site count 2; pinned by the
+// concurrent-writer test). The tx is read-only in effect (mode=ro DSN) and
+// always rolled back.
 func GetVocabularyDB(ctx context.Context, db *sql.DB) (*Vocabulary, error) {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	return vocabularyFromSnapshot(ctx, tx)
+}
+
+// vocabularyFromSnapshot assembles the vocabulary over one already-pinned WAL
+// snapshot (the GetVocabularyDB transaction).
+func vocabularyFromSnapshot(ctx context.Context, db querier) (*Vocabulary, error) {
 	custCount, err := groupCount(ctx, db, "customer_id")
 	if err != nil {
 		return nil, err
@@ -169,8 +187,8 @@ func GetVocabularyDB(ctx context.Context, db *sql.DB) (*Vocabulary, error) {
 }
 
 // groupCount returns file counts grouped by a dimension FK column on files.
-// Takes an already-pinned db (B1) — see GetVocabulary.
-func groupCount(ctx context.Context, db *sql.DB, col string) (map[uint64]uint64, error) {
+// Takes the vocabulary's single-snapshot querier — see GetVocabularyDB.
+func groupCount(ctx context.Context, db querier, col string) (map[uint64]uint64, error) {
 	out := map[uint64]uint64{}
 	// col is an internal constant (never user input) — safe to interpolate.
 	q := fmt.Sprintf(`SELECT %s, COUNT(*) FROM files GROUP BY %s`, col, col)
@@ -202,18 +220,13 @@ func groupCount(ctx context.Context, db *sql.DB, col string) (map[uint64]uint64,
 //	                       (driven from tags_override: O(overrides) PK probes)
 //	                     + non-NULL overrides                 -- idx_tags_override_kv order
 //
-// The three legs run inside ONE read transaction so a concurrent tag edit
-// (the builder's IPC commits between queries otherwise) cannot skew the merge.
-func tagFacets(ctx context.Context, db *sql.DB) ([]VocabFacet, error) {
-	tx, err := db.BeginTx(ctx, nil)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = tx.Rollback() }() // read-only: always rollback
-
+// The three legs share the caller's single-snapshot querier (the
+// GetVocabularyDB transaction) so a concurrent tag edit cannot skew the merge —
+// nor skew the facets against the dimension counts.
+func tagFacets(ctx context.Context, db querier) ([]VocabFacet, error) {
 	counts := map[string]map[string]int64{} // key -> value -> effective count
 	add := func(q string, sign int64) error {
-		return queryRows(ctx, tx, q, func(scan func(...any) error) error {
+		return queryRows(ctx, db, q, func(scan func(...any) error) error {
 			var key, value string
 			var n int64
 			if err := scan(&key, &value, &n); err != nil {

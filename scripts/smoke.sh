@@ -399,17 +399,9 @@ EOF
 # SMOKE_BUILDER_PID. Runs from mcap_catalog/ (the package root) with S3
 # endpoint/creds passed as plain AWS env vars — boto3 (>=1.26 / botocore
 # >=1.29) honors AWS_ENDPOINT_URL for a Minio-compatible endpoint override with
-# NO code change to the builder needed.
-#
-# --extract-workers 1 (here AND in run_builder_once_rebuild) is DELIBERATE:
-# catalog rowids are assigned in APPLY order, which with a parallel pool is
-# completion order — nondeterministic under load. Step i's precondition (the
-# lexically-first extra fixture must RENUMBER the target across a rebuild)
-# only holds when apply order == listing order, i.e. workers=1; a loaded
-# machine flaked it twice on 2026-07-29 (the extra fixture is a copy of the
-# BIGGEST file, so its extraction can finish last -> no renumbering). The
-# parallel process-pool path keeps coverage in the builder pytest suite
-# (process-mode-matches-thread-mode, extraction-retention) + ci-integration.
+# NO code change to the builder needed. The daemon keeps DEFAULT (parallel)
+# extract workers on purpose — it is smoke's only process-pool coverage; the
+# determinism pin lives ONLY in run_builder_once_rebuild (see there).
 start_builder_daemon() {
   local logfile="$1"
   : > "${logfile}"
@@ -420,7 +412,6 @@ start_builder_daemon() {
       AWS_REGION="${SMOKE_S3_REGION}" AWS_DEFAULT_REGION="${SMOKE_S3_REGION}" \
       "${VENV_PY}" -m mcap_catalog_builder --source s3 --s3-bucket "${SMOKE_BUCKET}" --no-watch \
       --tag-socket "${TAG_SOCKET}" --db "${SMOKE_DB}" --rescan-interval "${RESCAN_INTERVAL}" \
-      --extract-workers 1 \
       --log-level INFO >>"${logfile}" 2>&1 ) &
   SMOKE_BUILDER_PID=$!
 }
@@ -434,6 +425,16 @@ start_builder_daemon() {
 # rebuild fails fast with clear diagnostics instead of hanging the whole
 # harness indefinitely; the caller's existing `|| { cat logfile; fail ...}`
 # picks up the extra TIMED OUT line appended below.
+#
+# --extract-workers 1 is DELIBERATE and load-bearing: rebuild rowids are
+# assigned in APPLY order, which with a parallel pool is completion order —
+# nondeterministic under load. Step i's precondition (the lexically-first
+# extra fixture must RENUMBER the target across THIS rebuild; its baseline
+# id comes from step h's earlier call to this same helper) only holds when
+# apply order == listing order, i.e. workers=1; a loaded machine flaked it
+# twice on 2026-07-29 (the extra fixture copies the BIGGEST file, so its
+# extraction can finish last -> no renumbering). The daemon keeps parallel
+# workers, so smoke retains its process-pool leg.
 run_builder_once_rebuild() {
   local logfile="$1" rc=0
   ( cd "${MCAP_CATALOG_DIR}" && env \
