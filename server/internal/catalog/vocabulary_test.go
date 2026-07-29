@@ -2,8 +2,10 @@ package catalog
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"path/filepath"
+	"reflect"
 	"testing"
 )
 
@@ -277,5 +279,204 @@ func TestAurynFilterFiles_DimensionPredicates(t *testing.T) {
 	got, _, _ = FilterFiles(ctx, st, FilterArgs{CustomerID: u(1), SourceID: u(2)})
 	if len(got) != 0 {
 		t.Fatalf("CustomerID=1 + SourceID=2 => %d files, want 0", len(got))
+	}
+}
+
+// TestTagFacets_EquivalentToEffectiveView pins the 3-query facet decomposition
+// to the tags_effective VIEW's own GROUP BY (the previous implementation and
+// the semantic ground truth), across every merge edge: an override REPLACES its
+// embedded value, a NULL override MASKS it (a fully-masked value must vanish),
+// an override value that coexists with surviving embedded rows SUMS into one
+// group, and an override-only key (no embedded row) still appears.
+func TestTagFacets_EquivalentToEffectiveView(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "cat.db")
+	buildVocabDB(t, path, 0)
+	db, err := sql.Open("sqlite",
+		fmt.Sprintf("file:%s?_pragma=journal_mode(WAL)&_pragma=foreign_keys(ON)", path))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+	seeds := []string{
+		`INSERT INTO tags_embedded(file_id,key,value) VALUES (1,'quality','good'),(2,'quality','good'),(4,'quality','bad')`,
+		// f1: override REPLACES good -> bad; bad then SUMS with f4's embedded bad.
+		`INSERT INTO tags_override(file_id,key,value,updated_at) VALUES (1,'quality','bad',1)`,
+		// f4: NULL override MASKS its only 'session' tag -> s9 must vanish entirely.
+		`INSERT INTO tags_embedded(file_id,key,value) VALUES (4,'session','s9')`,
+		`INSERT INTO tags_override(file_id,key,value,updated_at) VALUES (4,'session',NULL,1)`,
+		// f5: override-only key, no embedded row at all.
+		`INSERT INTO tags_override(file_id,key,value,updated_at) VALUES (5,'reviewed','yes',1)`,
+	}
+	for _, s := range seeds {
+		if _, err := db.Exec(s); err != nil {
+			t.Fatalf("seed %q: %v", s, err)
+		}
+	}
+
+	got, err := tagFacets(context.Background(), db)
+	if err != nil {
+		t.Fatalf("tagFacets: %v", err)
+	}
+
+	// Ground truth: the view's GROUP BY, shaped exactly like the pre-rewrite code.
+	var want []VocabFacet
+	byKey := map[string][]VocabFacetValue{}
+	var keyOrder []string
+	if err := queryRows(context.Background(), db,
+		`SELECT key, value, COUNT(*) FROM tags_effective GROUP BY key, value ORDER BY key, value`,
+		func(scan func(...any) error) error {
+			var key, value string
+			var n uint64
+			if err := scan(&key, &value, &n); err != nil {
+				return err
+			}
+			if _, seen := byKey[key]; !seen {
+				keyOrder = append(keyOrder, key)
+			}
+			byKey[key] = append(byKey[key], VocabFacetValue{Value: value, FileCount: n})
+			return nil
+		}); err != nil {
+		t.Fatalf("view ground truth: %v", err)
+	}
+	for _, key := range keyOrder {
+		if len(byKey[key]) > TagFacetCap {
+			continue
+		}
+		want = append(want, VocabFacet{Key: key, Values: byKey[key]})
+	}
+
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("facet decomposition diverged from tags_effective view:\n got: %+v\nwant: %+v", got, want)
+	}
+}
+
+// TestGetVocabularyDB_SingleSnapshotUnderConcurrentWriter pins the documented
+// same-snapshot invariant (Codex review of PR #12): the store lease pins the
+// served FILE's generation, not a WAL read snapshot — the builder commits per
+// file, so unless GetVocabularyDB wraps its ~8 queries in ONE read
+// transaction they can straddle commits and return a customer count that
+// disagrees with the sum of its sites' counts (or tag facets newer than both).
+// Seed: every file carries exactly one 'quality' tag, so on EVERY read three
+// cross-checks must hold: sum(site counts) == customer count, sum(robot
+// counts) == site count, and sum(quality facet counts) == total files.
+func TestGetVocabularyDB_SingleSnapshotUnderConcurrentWriter(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "cat.db")
+	w := openAurynTestDB(t, path)
+	defer w.Close()
+	seeds := []string{
+		`INSERT INTO customers(id,name) VALUES (1,'alpha')`,
+		`INSERT INTO sites(id,customer_id,name) VALUES (1,1,'s1')`,
+		`INSERT INTO robots(id,site_id,name) VALUES (1,1,'r1'),(2,1,'r2')`,
+		`INSERT INTO sources(id,name) VALUES (1,'ros-bags')`,
+		`INSERT INTO topic_names(id,name) VALUES (1,'/a')`,
+		`INSERT INTO schemas(id,name,encoding) VALUES (1,'S','ros2msg')`,
+		`INSERT INTO topic_sets(id,fingerprint) VALUES (1,'fp1')`,
+		`INSERT INTO topic_set_members(set_id,topic_id,schema_id) VALUES (1,1,1)`,
+	}
+	for _, s := range seeds {
+		if _, err := w.Exec(s); err != nil {
+			t.Fatalf("seed %q: %v", s, err)
+		}
+	}
+	insertFile := func(id int) error {
+		tx, err := w.Begin()
+		if err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`INSERT INTO files
+			(id,filename,etag,size_bytes,customer_id,site_id,robot_id,source_id,date,start_time_ns,end_time_ns,chunk_count,topic_set_id,topic_counts)
+			VALUES (?,?,?,?,1,1,?,1,'2026-06-01',1000,2000,1,1,?)`,
+			id, fmt.Sprintf("f%d.mcap", id), "e", 1, id%2+1, encodeCounts(1)); err != nil {
+			_ = tx.Rollback()
+			return err
+		}
+		if _, err := tx.Exec(
+			`INSERT INTO tags_embedded(file_id,key,value) VALUES (?,'quality',?)`,
+			id, fmt.Sprintf("q%d", id%3)); err != nil {
+			_ = tx.Rollback()
+			return err
+		}
+		return tx.Commit()
+	}
+	if err := insertFile(1); err != nil { // never-empty catalog for OpenReadOnly
+		t.Fatalf("first insert: %v", err)
+	}
+
+	st, err := OpenReadOnly(context.Background(), path)
+	if err != nil {
+		t.Fatalf("OpenReadOnly: %v", err)
+	}
+	defer st.Close()
+
+	done := make(chan error, 1)
+	go func() {
+		for i := 2; i <= 300; i++ {
+			if err := insertFile(i); err != nil {
+				done <- err
+				return
+			}
+		}
+		done <- nil
+	}()
+
+	check := func(v *Vocabulary) error {
+		var total uint64
+		for _, c := range v.Customers {
+			var siteSum uint64
+			for _, s := range c.Sites {
+				var robotSum uint64
+				for _, r := range s.Robots {
+					robotSum += r.FileCount
+				}
+				if robotSum != s.FileCount {
+					return fmt.Errorf("site %s: robots sum %d != site count %d", s.Name, robotSum, s.FileCount)
+				}
+				siteSum += s.FileCount
+			}
+			if siteSum != c.FileCount {
+				return fmt.Errorf("customer %s: sites sum %d != customer count %d", c.Name, siteSum, c.FileCount)
+			}
+			total += c.FileCount
+		}
+		var facetTotal uint64
+		for _, f := range v.Tags {
+			if f.Key != "quality" {
+				continue
+			}
+			for _, val := range f.Values {
+				facetTotal += val.FileCount
+			}
+		}
+		if facetTotal != total {
+			return fmt.Errorf("quality facet total %d != file total %d (facets from a different snapshot)", facetTotal, total)
+		}
+		return nil
+	}
+
+	writerDone := false
+	for !writerDone {
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("writer: %v", err)
+			}
+			writerDone = true
+		default:
+			v, err := GetVocabulary(context.Background(), st)
+			if err != nil {
+				t.Fatalf("GetVocabulary: %v", err)
+			}
+			if err := check(v); err != nil {
+				t.Fatalf("cross-snapshot inconsistency: %v", err)
+			}
+		}
+	}
+	// One final read with the writer quiescent must also be consistent.
+	v, err := GetVocabulary(context.Background(), st)
+	if err != nil {
+		t.Fatalf("final GetVocabulary: %v", err)
+	}
+	if err := check(v); err != nil {
+		t.Fatalf("final: %v", err)
 	}
 }

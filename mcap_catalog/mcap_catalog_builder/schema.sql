@@ -85,6 +85,17 @@ CREATE INDEX IF NOT EXISTS idx_files_error ON files(id) WHERE has_error = 1;
 -- customers' errors for a scoped query (measured: 8.8 ms -> 0.066 ms at 1M files).
 CREATE INDEX IF NOT EXISTS idx_files_cust_err ON files(customer_id, site_id, id) WHERE has_error = 1;
 CREATE INDEX IF NOT EXISTS idx_files_set   ON files(topic_set_id, id);
+-- Per-dimension indexes: the reader's vocabulary facets (`SELECT <dim>, COUNT(*)
+-- FROM files GROUP BY <dim>`) and dimension-filtered ListFiles pages
+-- (`<dim> = ? AND id > ? ORDER BY id` — a single-column index is implicitly
+-- (dim, rowid), so keyset pagination rides it with no per-page sort). Only
+-- customer_id has a usable prefix in the UNIQUE composite; the rest were
+-- full scans + temp b-trees (measured at 1M files: the 4 facet GROUP BYs
+-- 460 ms -> 131 ms; one cust+site page 6.5 ms -> 0.2 ms; build cost 0.9 s).
+CREATE INDEX IF NOT EXISTS idx_files_customer ON files(customer_id);
+CREATE INDEX IF NOT EXISTS idx_files_site     ON files(site_id);
+CREATE INDEX IF NOT EXISTS idx_files_robot    ON files(robot_id);
+CREATE INDEX IF NOT EXISTS idx_files_source   ON files(source_id);
 
 -- Dimension lookups (hierarchical: site→customer, robot→site; sources flat).
 CREATE TABLE IF NOT EXISTS customers (
