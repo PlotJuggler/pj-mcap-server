@@ -435,6 +435,16 @@ start_builder_daemon() {
 # twice on 2026-07-29 (the extra fixture copies the BIGGEST file, so its
 # extraction can finish last -> no renumbering). The daemon keeps parallel
 # workers, so smoke retains its process-pool leg.
+#
+# PR3 (sharded S3 LIST) adds a SECOND ordering hazard on top of the above:
+# listing order itself is only deterministic WITHIN one customer= shard (a
+# single-shard bucket is paginated by one thread, same as before sharding);
+# across shards it's an intentional race (non-lexicographic yield, review-
+# verified — reconcile is dict/set-keyed and order-independent). Step i's
+# extra fixture must therefore stay under the SAME customer= prefix as the
+# corpus (today: exactly one, "${HIVE_CUSTOMER}") to keep this a single-shard
+# listing — see step_key_addressed_open's comment for the 2026-07-29 flake
+# this fixes (a `customer=aaa/...` extra key raced a second shard and lost).
 run_builder_once_rebuild() {
   local logfile="$1" rc=0
   ( cd "${MCAP_CATALOG_DIR}" && env \
@@ -1221,26 +1231,38 @@ PY
 }
 
 # ── step i: key-addressed OpenFresh (wire v2) survives a rowid-SHIFTING
-# rebuild. Seed ONE extra fixture whose Hive key sorts lexically FIRST, run a
-# full `--once --rebuild` (renumbers rowids, CATALOG_CONTRACT.md §7 — the extra
-# file takes the low rowid and SHIFTS every other file's id), wait for the Go
-# server's reopen, then download the ORIGINAL target BY KEY and mcapdiff it
-# against the local original. Under the old id-addressed wire this exact race
-# could stream the WRONG file (the new occupant of a stale rowid); the
-# key-addressed open must resolve the key in the server's CURRENT generation. ──
+# rebuild. Seed ONE extra fixture whose Hive key sorts lexically BEFORE the
+# target's WITHIN THE SAME customer= SHARD, run a full `--once --rebuild`
+# (renumbers rowids, CATALOG_CONTRACT.md §7 — the extra file takes the low
+# rowid and SHIFTS every other file's id), wait for the Go server's reopen,
+# then download the ORIGINAL target BY KEY and mcapdiff it against the local
+# original. Under the old id-addressed wire this exact race could stream the
+# WRONG file (the new occupant of a stale rowid); the key-addressed open must
+# resolve the key in the server's CURRENT generation.
+#
+# The extra fixture MUST stay under the same top-level customer=${HIVE_CUSTOMER}
+# prefix as the target (PR3 sharded LIST): the corpus has exactly one
+# customer= value, so today this is a single shard listed by a single thread
+# — fully deterministic, lexicographic order, same as pre-sharding. A
+# DIFFERENT top-level customer= prefix would create a SECOND shard that races
+# the first concurrently (yield order across shards is explicitly NOT
+# lexicographic by design), making "the extra file gets the lowest rowid"
+# a coin flip instead of a guarantee — this is exactly what flaked once
+# during PR3 development (2026-07-29) with a `customer=aaa/...` extra key. ──
 step_key_addressed_open() {
   log "step i: key-addressed open survives a rowid-shifting rebuild (wire v2)"
   local probe="${SERVER_DIR}/bin/devprobe"
   local mcapdiff="${SERVER_DIR}/bin/mcapdiff"
   local sdk_cli="${CTEST_DIR}/bin/mcap-cloud-cli"
-  local extra_key="customer=aaa/customer_site=lab/robot=r1/source=synthetic/date=2026-06-22/aaa_shift.mcap"
+  local extra_key="customer=${HIVE_CUSTOMER}/customer_site=aaa/robot=r0/source=synthetic/date=2000-01-01/aaa_shift.mcap"
 
   local id_before
   id_before="$(db_query "${SMOKE_DB}" "SELECT id FROM files WHERE filename='${TARGET_FILE}'")" \
     || fail "keyaddr: could not read the target's pre-rebuild rowid"
 
-  # Seed the lexically-first extra fixture (a copy of the target original —
-  # content is irrelevant, only its KEY position in the scan order matters).
+  # Seed the lexically-first (within-shard) extra fixture (a copy of the
+  # target original — content is irrelevant, only its KEY position in the
+  # scan order matters).
   local extra_dir
   extra_dir="$(mktemp -d)" || fail "keyaddr: mktemp -d failed"
   mkdir -p "${extra_dir}/$(dirname "${extra_key}")"
@@ -1272,7 +1294,7 @@ step_key_addressed_open() {
   id_after="$(db_query "${SMOKE_DB}" "SELECT id FROM files WHERE filename='${TARGET_FILE}'")" \
     || fail "keyaddr: could not read the target's post-rebuild rowid"
   [[ "${id_before}" != "${id_after}" ]] \
-    || fail "keyaddr: target rowid did NOT shift (${id_before} -> ${id_after}); the lexically-first extra fixture did not renumber the scan"
+    || fail "keyaddr: target rowid did NOT shift (${id_before} -> ${id_after}); the within-shard lexically-first extra fixture did not renumber the scan"
   log "step i: target rowid shifted ${id_before} -> ${id_after} (extra key ${extra_key})"
 
   # Wait (<=40s, the 30s freshness tick + slack) for the server to serve the

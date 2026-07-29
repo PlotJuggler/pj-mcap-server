@@ -23,6 +23,30 @@ class _S3ClientError(Exception):
         self.response = {"Error": {"Code": code}}
 
 
+def _delimited_listing(objects: dict[str, bytes], Prefix: str, Delimiter) -> dict:
+    """Shared ``list_objects_v2`` response shape: delimiter-aware (single
+    first-level ``CommonPrefixes`` split) or flat, mirroring real S3 closely
+    enough for the sharded-LIST tests. Used by both ``InMemoryS3Client`` and
+    ``FakeS3`` (test_s3_storage.py) — factored here to avoid duplicating the
+    CommonPrefixes-splitting logic."""
+    keys = sorted(k for k in objects if k.startswith(Prefix))
+    if Delimiter is None:
+        return {"Contents": [{"Key": k, "Size": len(objects[k]),
+                               "ETag": f'"etag-{k}"'} for k in keys],
+                "IsTruncated": False}
+    prefixes, contents = [], []
+    for k in keys:
+        rest = k[len(Prefix):]
+        if "/" in rest:
+            p = Prefix + rest.split("/", 1)[0] + "/"
+            if p not in prefixes:
+                prefixes.append(p)
+        else:
+            contents.append({"Key": k, "Size": len(objects[k]), "ETag": f'"etag-{k}"'})
+    return {"CommonPrefixes": [{"Prefix": p} for p in prefixes],
+            "Contents": contents, "IsTruncated": False}
+
+
 class InMemoryS3Client:
     """A minimal in-memory S3 client (head / ranged get / list) for tests.
 
@@ -44,6 +68,9 @@ class InMemoryS3Client:
         chunk = self._objects[Key][int(start_s):int(end_s) + 1]
         self.fetched += len(chunk)
         return {"Body": io.BytesIO(chunk)}
+
+    def list_objects_v2(self, Bucket, Prefix="", Delimiter=None, ContinuationToken=None):
+        return _delimited_listing(self._objects, Prefix, Delimiter)
 
     def get_paginator(self, name):
         assert name == "list_objects_v2"

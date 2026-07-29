@@ -112,6 +112,9 @@ class _EmptyS3Client:
     """Fake boto3 S3 client whose bucket listing is always empty — enough
     for a real ``full_reconcile`` to run cheaply with no network access."""
 
+    def list_objects_v2(self, **_kwargs):
+        return {"Contents": [], "IsTruncated": False}
+
     def get_paginator(self, _name):
         class _Paginator:
             def paginate(self, **_kwargs):
@@ -135,6 +138,16 @@ def test_main_s3_daemon_no_watch_skips_sqs_requirement(tmp_path, monkeypatch):
     # the connection pool); the fake must tolerate it.
     fake_boto3.client = lambda name, **kw: _EmptyS3Client() if name == "s3" else object()
     monkeypatch.setitem(sys.modules, "boto3", fake_boto3)
+
+    # __main__'s s3 branch also does `from botocore.config import Config` (to size
+    # the client's connection pool) — neither boto3 nor botocore is installed in
+    # this CI environment, so both fakes must be injected together.
+    fake_botocore = types.ModuleType("botocore")
+    fake_botocore_config = types.ModuleType("botocore.config")
+    fake_botocore_config.Config = lambda **kw: None
+    fake_botocore.config = fake_botocore_config
+    monkeypatch.setitem(sys.modules, "botocore", fake_botocore)
+    monkeypatch.setitem(sys.modules, "botocore.config", fake_botocore_config)
 
     producer_calls = []
     monkeypatch.setattr(

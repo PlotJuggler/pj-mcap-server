@@ -37,6 +37,13 @@ _PERMANENT_CODES = _MISSING_CODES | {"403", "AccessDenied", "Forbidden", "400", 
 # (clamped to the object size). 64 KiB is ample for magic + Header record.
 _HEADER_WINDOW = 1 << 16
 
+# S3 pagination is SERIAL within one prefix (continuation tokens chain one GET
+# after another), so a large listing (measured: 8.6s for 25.6k objects) is
+# parallelized by sharding the key space on the first '/'-delimited level
+# beneath the configured prefix and paginating each shard concurrently.
+_LIST_SHARD_THREADS = 16
+_LIST_QUEUE_PAGES = 32  # max buffered pages (~32k listings) — bounds listing memory
+
 
 def _err_code(exc: Exception):
     resp = getattr(exc, "response", None)
@@ -170,21 +177,93 @@ class S3Source:
         return read_summary_with_fallback(
             pread, lambda: self.open_summary(key, size), key, size)
 
+    def _listing(self, o) -> Listing:
+        # ETag + Size + LastModified all come from the LIST itself — R4's
+        # "fingerprint from the listing", zero GETs. Carrying mtime lets the
+        # reconcile catalog a file straight from the listing Stat, with no
+        # per-file HEAD (see builder.extract).
+        return Listing(
+            key=o["Key"],
+            stat=Stat(
+                size=o["Size"],
+                etag=o["ETag"].strip('"'),
+                mtime_ns=_last_modified_ns(o.get("LastModified")),
+            ),
+        )
+
     def list_all(self) -> Iterator[Listing]:
-        for page in self._c.get_paginator("list_objects_v2").paginate(
-            Bucket=self._bucket, Prefix=self._prefix
-        ):
-            for o in page.get("Contents", []):
+        # S3 pagination is SERIAL within one prefix (continuation tokens), so a
+        # large listing is parallelized by sharding the key space on the first
+        # '/'-delimited level under the prefix and paginating shards
+        # concurrently. Yield order is NOT lexicographic — reconcile is
+        # dict/set-keyed throughout, so this is safe.
+        # Memory: the shard list + submitted futures are O(first-level
+        # prefixes) (small: sites/customers), and BUFFERED LISTINGS are
+        # bounded by the queue (_LIST_QUEUE_PAGES pages) — the full-bucket
+        # O(objects) accumulation lives (as before) in the reconcile caller,
+        # not here.
+        shards: list[str] = []
+        kw: dict = {"Bucket": self._bucket, "Prefix": self._prefix, "Delimiter": "/"}
+        while True:
+            resp = self._c.list_objects_v2(**kw)
+            shards += [p["Prefix"] for p in resp.get("CommonPrefixes", [])]
+            for o in resp.get("Contents", []):  # keys at the prefix root itself
                 if o["Key"].endswith(".mcap"):
-                    # ETag + Size + LastModified all come from the LIST itself —
-                    # R4's "fingerprint from the listing", zero GETs. Carrying
-                    # mtime lets the reconcile catalog a file straight from the
-                    # listing Stat, with no per-file HEAD (see builder.extract).
-                    yield Listing(
-                        key=o["Key"],
-                        stat=Stat(
-                            size=o["Size"],
-                            etag=o["ETag"].strip('"'),
-                            mtime_ns=_last_modified_ns(o.get("LastModified")),
-                        ),
-                    )
+                    yield self._listing(o)
+            if not resp.get("IsTruncated"):
+                break
+            kw["ContinuationToken"] = resp["NextContinuationToken"]
+        if not shards:
+            return
+
+        import queue as _queue
+        import threading
+        from concurrent.futures import ThreadPoolExecutor
+
+        q: "_queue.Queue" = _queue.Queue(maxsize=_LIST_QUEUE_PAGES)
+        cancel = threading.Event()
+
+        def put_or_cancel(item) -> bool:
+            """Cancel-aware put: never blocks past teardown."""
+            while not cancel.is_set():
+                try:
+                    q.put(item, timeout=0.25)
+                    return True
+                except _queue.Full:
+                    continue
+            return False
+
+        def produce(prefix: str) -> None:
+            try:
+                for page in self._c.get_paginator("list_objects_v2").paginate(
+                        Bucket=self._bucket, Prefix=prefix):
+                    if not put_or_cancel(("page", page.get("Contents", []))):
+                        return  # consumer is gone — stop paginating
+            except Exception as e:  # noqa: BLE001 — surfaced on the consumer side
+                put_or_cancel(("err", e))
+            else:
+                put_or_cancel(("done", None))
+
+        pool = ThreadPoolExecutor(max_workers=min(_LIST_SHARD_THREADS, len(shards)))
+        try:
+            for prefix in shards:
+                pool.submit(produce, prefix)
+            finished = 0
+            while finished < len(shards):
+                kind, payload = q.get()
+                if kind == "done":
+                    finished += 1
+                elif kind == "err":
+                    raise payload  # abort-the-reconcile, same as the old paginator
+                else:
+                    for o in payload:
+                        if o["Key"].endswith(".mcap"):
+                            yield self._listing(o)
+        finally:
+            cancel.set()          # unblock any producer stuck in put_or_cancel
+            while True:           # drain so in-flight puts find space
+                try:
+                    q.get_nowait()
+                except _queue.Empty:
+                    break
+            pool.shutdown(wait=True)  # producers exit promptly via cancel
