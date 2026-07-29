@@ -547,7 +547,7 @@ if(BUILD_TESTING)
   )
   add_test(NAME McapCloudSha256Test COMMAND toolbox_mcap_cloud_sha256_test)
 
-  # Canonical source descriptor (spec docs/canonical-layout-replay.md §4):
+  # Canonical source descriptor (spec docs/canonical-layout-import.md §4):
   # allowlisted parse/validate -> canonical serialization -> sha256/128
   # identity. The canonicalization vectors are a CROSS-REPO contract
   # (repo-root docs/source-descriptor-vectors.json; PJ4-side tests consume
@@ -588,7 +588,7 @@ if(BUILD_TESTING)
   add_test(NAME McapCloudSessionMcapWriterTest COMMAND toolbox_mcap_cloud_session_mcap_writer_test)
 
   # Request-addressed session file cache core (spec docs/canonical-layout-
-  # replay.md §5, HERMETIC): identity validation + path mapping, per-identity
+  # import.md §5, HERMETIC): identity validation + path mapping, per-identity
   # exclusive materialize lock (sidecar <hex>.mcap.lock via flock/LockFileEx),
   # validated finalization (reader: footer/summary/Statistics + embedded
   # source-descriptor identity, then fsync -> atomic rename -> dir fsync),
@@ -988,7 +988,7 @@ if(BUILD_TESTING)
   add_test(NAME McapCloudTrustedOriginsTest COMMAND toolbox_mcap_cloud_trusted_origins_test)
 
   # Strict ws/wss origin parse + compare (HERMETIC, std-only): the credential
-  # origin-binding guard (spec docs/canonical-layout-replay.md §7 guard 2) —
+  # origin-binding guard (spec docs/canonical-layout-import.md §7 guard 2) —
   # MCAP_CLOUD_API_KEY applies only when MCAP_CLOUD_URL's origin equals the
   # target's. Rejected shapes (userinfo/query/fragment/bad scheme/empty host/
   # junk port) parse to nullopt and never match, not even themselves.

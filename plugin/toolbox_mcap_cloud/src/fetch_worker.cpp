@@ -828,7 +828,7 @@ void FetchWorker::pullTopicsAsync(std::vector<std::string> sequence_names, std::
       // DELIBERATE retention: a user-requested export KEEPS the readable
       // partial after a cancellation/transport drop (close() above finalized
       // footer + summary). The future replay-cache tee does the OPPOSITE —
-      // its partials never survive (docs/canonical-layout-replay.md §6.1) —
+      // its partials never survive (docs/canonical-layout-import.md §6.1) —
       // do not "align" the two when unifying the write path.
       result.status = McapSaveStatus::Partial;
       result.error = !stats.error.empty()

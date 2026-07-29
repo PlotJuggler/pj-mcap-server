@@ -111,7 +111,7 @@ void saveCredentialsForUri(PJ::sdk::SettingsView view, CredentialStore& store, c
 // then dev-anonymous empty. Mirrors cli_url_resolve's resolveCliToken chain
 // (extended with the STORED tier via resolveStoredToken).
 //
-// ORIGIN BINDING (spec docs/canonical-layout-replay.md §7 guard 2): the env
+// ORIGIN BINDING (spec docs/canonical-layout-import.md §7 guard 2): the env
 // token is used IFF MCAP_CLOUD_URL is set AND its parsed origin equals the
 // target's (sameWsOrigin — strict, fail-closed). Without the binding, a
 // hostile layout/import target of a DIFFERENT origin would silently receive

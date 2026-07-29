@@ -4,7 +4,7 @@
 // Minimal RAII advisory file lock over a dedicated sidecar lock file (POSIX
 // flock / Windows LockFileEx), non-blocking try-acquire only. EXCLUSIVE mode
 // is the whole surface today; SHARED leases (live cache-backed datasets
-// pinning their file against eviction, spec docs/canonical-layout-replay.md
+// pinning their file against eviction, spec docs/canonical-layout-import.md
 // §5) are stage-4 scope and slot in as a second try-acquire entry point
 // without changing existing callers.
 #pragma once

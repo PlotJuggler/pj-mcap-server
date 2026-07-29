@@ -1,7 +1,7 @@
 // Copyright 2026 Davide Faconti
 // SPDX-License-Identifier: MIT
 //
-// Session file cache core (spec docs/canonical-layout-replay.md §5), fully
+// Session file cache core (spec docs/canonical-layout-import.md §5), fully
 // hermetic: a private temp root is injected (never the real $XDG_CACHE_HOME),
 // and every valid fixture is a REAL MCAP built with SessionMcapWriter carrying
 // the canonical source descriptor as embedded provenance — exactly what the

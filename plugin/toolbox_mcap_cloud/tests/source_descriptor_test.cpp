@@ -1,7 +1,7 @@
 // Copyright 2026 Davide Faconti
 // SPDX-License-Identifier: MIT
 //
-// Source descriptor (spec docs/canonical-layout-replay.md §4): parse/validate
+// Source descriptor (spec docs/canonical-layout-import.md §4): parse/validate
 // round trip, canonical-serialization + identity conformance against the
 // CROSS-REPO vectors file (MCAP_CLOUD_VECTORS_JSON — the same bytes PJ4-side
 // tests consume), display_name identity invariance, and the strict rejection

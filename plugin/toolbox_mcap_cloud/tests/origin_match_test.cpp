@@ -3,7 +3,7 @@
 //
 // HERMETIC tests for the strict ws/wss origin parser + comparator
 // (src/origin_match.hpp) backing credential origin binding (spec
-// docs/canonical-layout-replay.md §7 guard 2): MCAP_CLOUD_API_KEY may only
+// docs/canonical-layout-import.md §7 guard 2): MCAP_CLOUD_API_KEY may only
 // apply when MCAP_CLOUD_URL's parsed origin equals the target's. The parser is
 // deliberately STRICT — anything that could smuggle credentials or ambiguity
 // through an origin comparison (userinfo, query, fragment, non-ws scheme,

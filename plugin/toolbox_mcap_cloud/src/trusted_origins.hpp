@@ -1,7 +1,7 @@
 // Copyright 2026 Davide Faconti
 // SPDX-License-Identifier: MIT
 //
-// Trusted-origin ledger (spec docs/canonical-layout-replay.md §7 guard 1):
+// Trusted-origin ledger (spec docs/canonical-layout-import.md §7 guard 1):
 // *trusted = origin recorded after a successful interactive Hello*. This is a
 // dedicated ledger, deliberately NOT the credential store — credentials can
 // exist before any successful connection, so "has a stored token" must never

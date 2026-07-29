@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT
 //
 // Request-addressed session file cache core (spec
-// docs/canonical-layout-replay.md §5): identity->path mapping, cross-process
+// docs/canonical-layout-import.md §5): identity->path mapping, cross-process
 // exclusive materialization locking, validated atomic finalization, and
 // orphan/LRU maintenance. Deliberately consumer-free in stage 1 — the fetch
 // tee re-target and the host adoption flow (stage 4) plug into exactly this
@@ -19,7 +19,7 @@
 
 namespace mcap_cloud {
 
-/// Request-addressed session cache (spec docs/canonical-layout-replay.md §5).
+/// Request-addressed session cache (spec docs/canonical-layout-import.md §5).
 /// Files: <root>/<128-bit-hex>.mcap; partials: <name>.mcap.partial.<pid>;
 /// sidecars: <name>.mcap.lock (materialize/evict mutual exclusion, and the
 /// stage-4 lease point) and <name>.mcap.touch (LRU stamp — atime is

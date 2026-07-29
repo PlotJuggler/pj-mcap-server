@@ -4,7 +4,7 @@
 // D12 env-var fallback unit test (HERMETIC): pins the mcap-cloud-cli URL/token
 // precedence — explicit --url/--token > environment (MCAP_CLOUD_URL /
 // MCAP_CLOUD_API_KEY) > built-in default — plus the credential ORIGIN BINDING
-// (spec docs/canonical-layout-replay.md §7 guard 2): the env token applies
+// (spec docs/canonical-layout-import.md §7 guard 2): the env token applies
 // only when the effective URL's origin equals MCAP_CLOUD_URL's. Pure:
 // tools/cli_url_resolve.hpp takes the (flag, env) values directly, so no
 // process env / argv is needed and the rule is exercised in isolation. Mirrors
@@ -51,7 +51,7 @@ TEST(CliUrlResolve, UrlEmptyEnvFallsThroughToDefault) {
 // --- token -------------------------------------------------------------------
 //
 // The env token is ORIGIN-BOUND to MCAP_CLOUD_URL (spec
-// docs/canonical-layout-replay.md §7 guard 2): it applies only when the
+// docs/canonical-layout-import.md §7 guard 2): it applies only when the
 // effective URL's origin equals the env URL's. The no---url case is a
 // self-match (the effective URL IS the env URL), so the pre-binding tests
 // below pass the same URL as both.

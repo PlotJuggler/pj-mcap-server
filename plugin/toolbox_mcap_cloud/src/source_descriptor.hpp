@@ -1,7 +1,7 @@
 // Copyright 2026 Davide Faconti
 // SPDX-License-Identifier: MIT
 //
-// The canonical source descriptor (spec docs/canonical-layout-replay.md §4):
+// The canonical source descriptor (spec docs/canonical-layout-import.md §4):
 // the PUBLIC, allowlisted, versioned description of a fetch request that a
 // layout may embed and a provider may import. Deliberately distinct from the
 // process-local FNV SessionKey (src/session_key.hpp), which never crosses a
@@ -19,7 +19,7 @@
 
 namespace mcap_cloud {
 
-/// Spec docs/canonical-layout-replay.md §4. Timestamps are decimal strings on
+/// Spec docs/canonical-layout-import.md §4. Timestamps are decimal strings on
 /// the wire; parsed to int64 here. topics empty = all. "0"/"0" = whole range.
 struct SourceDescriptor {
   int version = 1;                   // "v"

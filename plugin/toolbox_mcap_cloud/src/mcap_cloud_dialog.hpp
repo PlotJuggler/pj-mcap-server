@@ -317,7 +317,7 @@ struct DialogState {
   bool cancelling = false;
   // Optional raw-session EXPORT (persisted as mcap_cloud/export_*). Default
   // OFF: an involuntary full-session file per fetch is not a sane default,
-  // and the future replay cache (docs/canonical-layout-replay.md) is a
+  // and the future replay cache (docs/canonical-layout-import.md) is a
   // separate, capped store — this toggle governs only the user-owned export
   // copy. The path is a directory because the plugin stays Qt-free and
   // generates collision-safe filenames itself.

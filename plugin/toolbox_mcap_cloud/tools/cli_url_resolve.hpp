@@ -41,7 +41,7 @@ inline std::string resolveCliUrl(const std::optional<std::string>& cli_url,
 // meaningful sources are a present --token (any value, incl. empty) and a present
 // non-empty env value.
 //
-// ORIGIN BINDING (spec docs/canonical-layout-replay.md §7 guard 2): the env
+// ORIGIN BINDING (spec docs/canonical-layout-import.md §7 guard 2): the env
 // token is bound to MCAP_CLOUD_URL's origin — it applies only when env_url is
 // set AND its parsed origin equals the EFFECTIVE URL's (sameWsOrigin, strict
 // fail-closed). A --url naming a different origin therefore never receives the

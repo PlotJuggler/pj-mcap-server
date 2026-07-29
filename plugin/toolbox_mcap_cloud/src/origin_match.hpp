@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT
 //
 // Strict ws/wss origin parsing + comparison for credential origin binding
-// (spec docs/canonical-layout-replay.md §7 guard 2): the MCAP_CLOUD_API_KEY
+// (spec docs/canonical-layout-import.md §7 guard 2): the MCAP_CLOUD_API_KEY
 // env token may only apply to a target whose origin equals MCAP_CLOUD_URL's.
 // Deliberately NOT normalizeServerKey() — that is a storage key (lossy,
 // collision-tolerant), not an origin parser; a credential-release decision

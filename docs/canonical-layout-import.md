@@ -1,12 +1,16 @@
-# Canonical Cloud Layouts — Replay via Materializable Cached Files (design v3.3 / V3+B)
+# Canonical Layout Import (design v3.6 / V3+B)
 
-**Status:** DRAFT v3.3 — the **V3+B variant is adopted** (user decision 2026-07-28 after a
-three-way V2 / V3.2 / V3+B comparison): cache-miss replay reuses the authoring dual path
+*Descriptor-backed layout import via materializable cached files.*
+
+**Status:** DRAFT v3.6 — the **V3+B variant is adopted** (user decision 2026-07-28 after a
+three-way V2 / V3.2 / V3+B comparison): cache-miss import reuses the authoring dual path
 (progressive eager ingest + cache tee → adoption), so **plots grow during every download,
 in every mode**. Incorporates: the v3 Codex pass (21 findings), the ImportJob-timing
 consult (`LoadTicket` seam, §6.2/§8), and the PR #4 alignment (§9 — the save-MCAP write
-path is the tee's foundation; PR #4 merges first). Awaiting spec re-review before the
-implementation plan.
+path is the tee's foundation; PR #4 merges first). **v3.6 (2026-07-29): vocabulary-only
+rename** — descriptor/layout "replay" → "import" throughout (§15); jumps 3.3→3.6 to stay
+clear of main's unmerged v3.4/v3.5 revisions to this same file (reconcile at merge).
+Awaiting spec re-review before the implementation plan.
 **Date:** 2026-07-27
 **Repos touched:** this repo (plugin `toolbox_mcap_cloud`, docs) + PJ4 (host + SDK, upstreamed
 like prior cloud hooks) + `pj-official-plugins` (`data_load_mcap` version pinned in the matrix).
@@ -29,7 +33,7 @@ what the user does manually in the plugin dialog. Locked requirements:
 ## 2. Core idea
 
 > A cloud session doesn't need to *pretend* to be a file (v1's fatal mistake) — we **make it
-> one**, and we make the authored dataset and the replayed dataset **the same kind of thing**.
+> one**, and we make the authored dataset and the imported dataset **the same kind of thing**.
 
 Every fetch materializes into a **request-addressed** local cache file:
 
@@ -43,7 +47,7 @@ dataset is transactionally replaced by a stock `FileLoader` load of that cache f
 failure). From that moment the dataset *is* an ordinary `data_load_mcap`-loaded file: real loader
 record captured by the stock path (`FileLoader` `saveConfig()` capture + source-path install +
 `onFileLoaded` `LoadedSource` recording), lazy cold-chunk storage, and byte-identical semantics
-between authoring and replay. The layout then records a **normal `<fileInfo>`** plus one new
+between authoring and import. The layout then records a **normal `<fileInfo>`** plus one new
 provider-generic child:
 
 ```xml
@@ -59,7 +63,7 @@ provider-generic child:
 
 (The `<plugin>` ID above is whatever the stock capture emits — today `FileLoader` writes the
 loader's display name and matches `expected_plugin_id` against `candidate->name`
-(`FileLoader.cpp:1135`, `:2154`); the loader's manifest id is `mcap-loader`. The replay series
+(`FileLoader.cpp:1135`, `:2154`); the loader's manifest id is `mcap-loader`. The import series
 moves this to stable manifest-ID semantics with a name-based compat fallback for existing
 layouts. The provider id is the toolbox's stable manifest id `mcap-cloud`.)
 
@@ -67,10 +71,10 @@ On layout load:
 
 - **Cache hit** (file present, structurally valid) → the stock reload path runs. Zero new code
   on the load itself, **zero network**. Works even if the provider plugin is absent (§6.4).
-- **Cache miss** (V3+B) → identity-first resolution → trust gate → provider **replay job** =
+- **Cache miss** (V3+B) → identity-first resolution → trust gate → provider **import job** =
   the authoring dual path driven headlessly: progressive eager ingest (plots grow during the
   download, #470 surface) + the cache tee, **adopted** into the cache file at completion.
-  One download path in the product — replay-on-miss IS the Fetch path minus the dialog.
+  One download path in the product — import-on-miss IS the Fetch path minus the dialog.
 
 The `<materialize>` element is a **provider-generic source record** — "how this dataset came to
 be and how to re-obtain it" — not a cloud one-off:
@@ -116,7 +120,7 @@ The loader need not pre-exist; it must merely share the eager path's ingest code
 - **PJ4 #464** (MERGED): transactional per-dataset Reload/Replace. An explicit
   `replace_dataset_id` target wins regardless of path (`FileLoader.cpp:1184`), the new source
   path commits only after success (`FileLoader.cpp:2132`), rollback leaves data/name/path
-  untouched. This is the engine of both the authoring adopt step and replay-into-loaded-dataset.
+  untouched. This is the engine of both the authoring adopt step and import-into-loaded-dataset.
   `FileLoader::sameSourceIdentity` stays **string-typed and untouched** — provider identity is
   resolved against the host's source-record registry to a `DatasetId` first, then passed via
   `replace_dataset_id` (review finding: do not overload the two-string comparison).
@@ -129,7 +133,7 @@ The loader need not pre-exist; it must merely share the eager path's ingest code
   carries forward intact. v3.0 → v3.1: thirteen mandatory amendments from the second Codex pass
   (§15). v3.2 → v3.3: **V3+B adopted** — an independent three-way comparison (V2 / V3.2 / V3+B,
   §15) confirmed V3's cache+adoption economics and memory model; the user chose to also keep
-  V2's signature UX (progressive plots on cache-miss replay) by pulling the growing-import
+  V2's signature UX (progressive plots on cache-miss import) by pulling the growing-import
   curve binder into scope rather than gating it. V3+B = V3.2 ∪ (V2's binder); nothing from
   v3.2 is discarded.
 
@@ -159,11 +163,12 @@ The loader need not pre-exist; it must merely share the eager path's ingest code
   (`CATALOG_CONTRACT.md` discipline). Unknown `v`/`kind` → provider refuses with a diagnostic.
 - **Size/complexity limits** are part of validation (§7): maximum descriptor/CDATA size, key and
   topic counts, string lengths.
-- **Exact-replay caveat (explicit):** the digest names the *request*, not the content. Exact
-  byte replay is guaranteed only under the deployment prerequisite that bucket objects are
-  immutable (our stated convention). Embedding per-key server object versions/ETags in the
-  descriptor is specified as the v2-of-descriptor upgrade path; until then the spec claims
-  request-replay, not content-replay.
+- **Exact-reimport caveat (explicit):** the digest names the *request*, not the content. Exact
+  byte reproduction across imports is guaranteed only under the deployment prerequisite that
+  bucket objects are immutable (our stated convention). Embedding per-key server object
+  versions/ETags in the descriptor is specified as the v2-of-descriptor upgrade path; until
+  then the spec claims request-level reproducibility on import, not content-level
+  reproducibility.
 
 Dedup and cache lookups compare digest as a fast path and confirm with a full
 canonical-descriptor comparison (excluding `display_name`) before treating two sessions as
@@ -230,7 +235,7 @@ cannot mint what layout save requires — a `LoadedSource` only exists via the s
 (`FileLoader.cpp:2154` config capture, `:2162` source-path install, `MainWindow.cpp:2665`
 recording), and the eager parser semantics differ from the loader's (log-time vs publish-time
 default, `"{}"` parser config vs the loader's array-limit/timestamp/schema settings) — adoption
-makes the saved dataset *identical* to what replay will produce, closing both gaps in one move.
+makes the saved dataset *identical* to what import will produce, closing both gaps in one move.
 
 Plot-while-downloading is preserved during the transfer (#470 surface); adoption happens once at
 the end. Partial/cancelled fetches adopt nothing and delete their partial. **In-memory
@@ -247,7 +252,7 @@ provenance record) — **one write path, two policies**; the user-facing export 
 and the cache must never become two writers. Stage-1 follow-ups hardening PR #4's path for
 tee duty are enumerated in §9.0.
 
-### 6.2 Replay (Load Layout / `--layout`) — rewrite first, then classify
+### 6.2 Import (Load Layout / `--layout`) — rewrite first, then classify
 
 A small host coordinator — **`LayoutImportBatch`** — owns the restore transaction. It exists
 because a cache miss materializes *before* `FileLoader` is busy, and today's state machine has
@@ -286,19 +291,19 @@ rewrite the *document*, not just pick a path):
    LayoutXml.cpp:546)
 6. rewrite the loader preset filepath (FileLoader rewrite_preset_filepath hint)
 7. classify: already-loaded (registry match by identity -> #464 replace_dataset_id if a refresh
-   is wanted, else skip) / cache hit -> stock load / miss -> trust-gated PROVIDER REPLAY JOB
+   is wanted, else skip) / cache hit -> stock load / miss -> trust-gated PROVIDER IMPORT JOB
    (dual path: progressive eager ingest + tee -> adoption), finalized as a stock-recorded
    file-backed dataset
 ```
 
 Widgets restore immediately. Curve binding is progressive on **both** load kinds: cache-hit
-loads bind via the stock busy-restore path, and replay jobs bind via the **growing-import
+loads bind via the stock busy-restore path, and import jobs bind via the **growing-import
 binder** — the existing `CatalogModel::itemsAdded` binder generalized to run while a
 batch-owned toolbox import grows (#470's publish ticks provide the growth events; the batch,
 not `FileLoader::queueDrained`, provides the drain signal for these jobs — the `LoadTicket`
 seam already decouples that). This is V2's binder work, pulled into scope by the V3+B
 decision; it is batch-scoped and does not touch the ordinary non-cloud layout-load path.
-Failures are per-job (§10). Replay jobs are sequential in v1 of the feature.
+Failures are per-job (§10). Import jobs are sequential in v1 of the feature.
 
 ### 6.3 Provider query — strict contract
 
@@ -307,7 +312,7 @@ Runs synchronously on the GUI thread (the settings backend owns one unsynchroniz
 parse/validation, in-memory trust lookup, cheap file stat + structural/identity check — **no
 network, no lock waits, no full-file scan, no credential resolution** (a cache-hit answer must
 not touch credentials at all). One provider instance is bound once per batch and queried for all
-descriptors. The async `replay` ABI specifies: exactly-once completion, callback thread,
+descriptors. The async `import` ABI specifies: exactly-once completion, callback thread,
 descriptor/callback lifetimes, provider DSO lifetime, cancel-and-join semantics, the
 cancellation-vs-successful-rename race, and shutdown ordering (batch jobs are owned by the batch
 — #470's shutdown only joins `FileLoader` and panel ingest hosts).
@@ -370,12 +375,12 @@ SDK / ABI (all `struct_size`-gated tail additions, no protocol bump):
 
 - Capability flag `PJ_TOOLBOX_CAPABILITY_SOURCE_PROVIDER`.
 - Toolbox plugin vtable tail: `source_provider_query(descriptor) -> {trust, cached_path?}`
-  (strict §6.3 contract) and `source_provider_replay(descriptor, callbacks) -> job` (async
-  **dual-path replay**: progressive eager ingest into a new dataset + cache tee, adoption at
+  (strict §6.3 contract) and `source_provider_import(descriptor, callbacks) -> job` (async
+  **dual-path import**: progressive eager ingest into a new dataset + cache tee, adoption at
   completion; fully specified lifetime/threading ABI). A P-failing provider (§2, e.g. Mosaico
-  before its companion loader exists) may implement replay as eager-ingest-only without
+  before its companion loader exists) may implement import as eager-ingest-only without
   adoption — V2-style behavior under the same schema; its datasets are then not re-saveable
-  as replay sources until it satisfies P.
+  as import sources until it satisfies P.
 - Toolbox runtime host vtable tail: `adopt_materialized_source(dataset_id, cache_path,
   descriptor_json)` — GUI-marshalled; host re-checks dataset existence/generation, then drives
   the stock `FileLoader` replace + descriptor attach as one ordered transaction whose result is
@@ -401,8 +406,8 @@ Host:
   `sameSourceIdentity` **unchanged**.
 
 - **Growing-import binder** (V3+B): the batch-scoped generalization of the progressive
-  curve binder to bind against a toolbox import growing under a replay job (#470 publish
-  ticks as growth events; batch drain instead of `queueDrained`). Scoped so ordinary
+  curve binder to bind against a toolbox import growing under a layout-import job (#470
+  publish ticks as growth events; batch drain instead of `queueDrained`). Scoped so ordinary
   non-cloud layout loads never traverse new code.
 
 Explicitly **not** built (v2 components dissolved or #470-supplied): `<replay_sources>`,
@@ -452,7 +457,7 @@ Explicitly **not** built (v2 components dissolved or #470-supplied): `<replay_so
 7. **#470 progress-surface adoption** in `ParserIngestDriver`/`FetchWorker` — also #470's live
    verification.
 8. **Provider implementation** — headless bind mode (no auto-connect), `source_provider_query`,
-   `source_provider_replay` (the authoring dual path — FetchWorker progressive eager ingest +
+   `source_provider_import` (the authoring dual path — FetchWorker progressive eager ingest +
    the PR #4 `SessionMcapWriter` tee — driven headlessly by descriptor; the shared-TU and
    `MCAP_IMPLEMENTATION` concerns are already solved by PR #4), `adopt_materialized_source`
    calls at fetch completion.
@@ -472,7 +477,7 @@ Explicitly **not** built (v2 components dissolved or #470-supplied): `<replay_so
   jobs are owned and joined by the batch at shutdown.
 - **Adoption failure** (stock load of the cache file fails after a successful download): the
   transactional refill rolls back — the eager dataset stays, no source record is attached, the
-  layout simply won't carry a replay record for it; diagnostic emitted.
+  layout simply won't carry an import record for it; diagnostic emitted.
 
 ## 11. Considered and rejected
 
@@ -507,7 +512,7 @@ Explicitly **not** built (v2 components dissolved or #470-supplied): `<replay_so
 - **Extending `sameSourceIdentity` with descriptor semantics** — rejected by review; identity
   resolves through the source-record registry to a `DatasetId`.
 - **Content-addressed cache via server ETags** — not rejected, staged: descriptor v2 upgrade
-  path (§4) once exact content replay is required.
+  path (§4) once exact content-level reproduction on import is required.
 - **Sidecar descriptor file / server-side layouts** — out of scope (single-file decision);
   server-hosted layouts remain a possible later milestone over the same descriptor.
 
@@ -529,10 +534,10 @@ Explicitly **not** built (v2 components dissolved or #470-supplied): `<replay_so
   `LayoutImportBatch` tests (per-job failure isolation, non-interactive policy persistence,
   cancellation, drain — all via the ticket seam, never path-matching); a **fake source-provider test plugin** driving load-time integration
   incl. non-interactive `--layout`; adoption tests (eager→file refill keeps ids; rollback on
-  failed adoption; **catalog equality** between an authored-and-adopted dataset and a
-  replay-loaded one — semantic equality, not just `mcapdiff`); stable-ID + name-fallback loader
+  failed adoption; **catalog equality** between an authored-and-adopted dataset and an
+  import-loaded one — semantic equality, not just `mcapdiff`); stable-ID + name-fallback loader
   matching.
-- **Matrix pin:** `data_load_mcap` (and parser set) version pinned in the E2E matrix — replay
+- **Matrix pin:** `data_load_mcap` (and parser set) version pinned in the E2E matrix — import
   has a runtime dependency on a compatible loader.
 
 ## 13. Build order (cross-repo hazards resolved)
@@ -548,7 +553,7 @@ Explicitly **not** built (v2 components dissolved or #470-supplied): `<replay_so
    the tee re-target consuming the cache stays stage 4.)*
 2. **Plugin adopts the #470 progress surface** (#470 is merged; this is its still-missing live
    verification) — progressive eager ingest becomes host-visible, the precondition for both
-   authoring UX and replay-job binding.
+   authoring UX and import-job binding.
 3. **SDK ABI + host** — capability + three tail slots + fake-provider host tests;
    `LayoutImportBatch` + `LoadTicket`; **growing-import binder** (batch-scoped); source
    records + registry (incl. lifecycle hoist); layout rewrite-then-classify; stable-ID loader
@@ -556,9 +561,9 @@ Explicitly **not** built (v2 components dissolved or #470-supplied): `<replay_so
    `plugin/SDK_VERSION` = 0.11.0 vs PJ4's SDK recipe 0.19.0 — the provider implementation
    cannot compile before this step).
 4. **Plugin dual-path + provider** — fetch tee re-target (content-addressed + delete-retention
-   + provenance); `SessionCache` DatasetId; headless bind mode; query/replay/adopt
+   + provenance); `SessionCache` DatasetId; headless bind mode; query/import/adopt
    implementations.
-5. **End-to-end + docs** — GUI flow, `--layout` flow (incl. progressive miss replay), team-
+5. **End-to-end + docs** — GUI flow, `--layout` flow (incl. progressive miss import), team-
    sharing runbook (metadata/path leakage note), pinned-loader matrix, live coverage.
 
 ## 14. References
@@ -617,3 +622,17 @@ four specialist agents (code / silent-failure / tests / comments); the merge-rel
 are folded into §9.0. Verified empirically during that review: the PR's writer output is
 chunked + summarized + carries Statistics (`mcap doctor` clean) — the adoption prerequisite —
 and `CheckedFileWriter` genuinely closes the vendored writer's swallowed-error hole.
+
+**Vocabulary rename (2026-07-29, sixth consult, session
+`019fadae-c338-7b41-a1af-48a56c647516`):** descriptor replay → descriptor import; `adopt` →
+`promote_to_file_source`; service `pj.materialized_source.v1` → `pj.source_promotion.v1`;
+outcome tails `SUCCEEDED_EAGER_ONLY`/`SUCCEEDED_PROMOTED`; plugin descriptor module →
+`SourceDescriptor`. Rationale: "replay" implies already-downloaded data and rosbag-style
+paced playback; the descriptor is durable source identity. File renamed
+`canonical-layout-replay.md` → `canonical-layout-import.md`. This is a vocabulary-only
+revision (v3.3 → v3.6, skipping v3.4/v3.5 to stay clear of main's independent SDK-ABI
+revisions to this same file — reconcile at merge): no semantics, enum values, struct
+layouts, or canonical descriptor bytes/identity changed. Preserved verbatim as historical
+record: the rejected v2 `<replay_sources>`/`ReplayRecord`/`ReplayManager` naming above (§3,
+§8, §11, §15) and the branch name `feat/layout-replay-foundations` (§13) — these describe
+what was actually named at the time, not current vocabulary.

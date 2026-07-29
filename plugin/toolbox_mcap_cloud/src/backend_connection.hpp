@@ -324,7 +324,7 @@ class BackendConnection {
   // wake_on_cancel joins cancel_requested_ into the wait predicate so a
   // cancelSession() during the (up to 120 s) OpenSession/OpenResume wait
   // returns immediately instead of stranding the worker for the full timeout
-  // (spec docs/canonical-layout-replay.md §9 item 2; cancelSession() already
+  // (spec docs/canonical-layout-import.md §9 item 2; cancelSession() already
   // notify_all()s this cv). SESSION request path ONLY: browse RPCs (Hello/
   // ListFiles/GetVocabulary/...) keep the default false so a cancel latched
   // outside a session (the flag persists until the next fresh open resets it)

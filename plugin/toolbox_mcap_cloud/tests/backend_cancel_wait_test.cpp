@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT
 //
 // HERMETIC cancel-responsiveness tests for the SESSION RPC wait
-// (docs/canonical-layout-replay.md §9 item 2). Before the fix, cancelSession()
+// (docs/canonical-layout-import.md §9 item 2). Before the fix, cancelSession()
 // woke only the FRAME wait (waitSessionFrame) — a cancel arriving while
 // openSessionFresh was still blocked in sendAndWait on the OpenSession
 // response stranded the worker for the full 120 s kOpenSessionTimeout. These
