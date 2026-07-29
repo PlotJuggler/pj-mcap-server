@@ -608,9 +608,9 @@ Explicitly **not** built (v2 components dissolved or #470-supplied): `<replay_so
    fake-provider host tests;
    `LayoutImportBatch` + `LoadTicket`; **growing-import binder** (batch-scoped); source
    records + registry (incl. lifecycle hoist); layout rewrite-then-classify; stable-ID loader
-   matching. **Publish the new SDK package and bump the plugin's SDK pin** (the SDK half
-   shipped as **0.20.0** on 2026-07-29; `plugin/SDK_VERSION` = 0.11.0 still needs the bump —
-   the provider implementation cannot compile before it).
+   matching. **Publish the new SDK package and bump the plugin's SDK pin** (DONE
+   2026-07-29: the SDK half shipped as **0.20.0** and `plugin/SDK_VERSION` is bumped —
+   the provider implementation can now compile).
 4. **Plugin dual-path + provider** — fetch tee re-target (content-addressed + delete-retention
    + provenance); `SessionCache` DatasetId; headless bind mode; query/import/promote
    implementations.
