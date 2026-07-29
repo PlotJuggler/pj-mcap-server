@@ -25,6 +25,7 @@
 #include "backend_types.hpp"  // mcap_cloud::SequenceInfo / TopicInfo / TimeRange
 #include "core/types.h"
 #include "credential_store.hpp"  // mcap_cloud::CredentialStore (D6 token store)
+#include "trusted_origins.hpp"   // mcap_cloud::TrustedOrigins (spec §7 guard 1 ledger)
 #include "fetch_worker.hpp"      // mcap_cloud::FetchWorker::GateListResult (onGateListFinished's param type)
 #include "vocab_select.hpp"      // mcap_cloud::GatePhase / resolveGateFilter / autoSelectCustomer / siteNamesFor
 
@@ -316,7 +317,7 @@ struct DialogState {
   bool cancelling = false;
   // Optional raw-session EXPORT (persisted as mcap_cloud/export_*). Default
   // OFF: an involuntary full-session file per fetch is not a sane default,
-  // and the future replay cache (docs/canonical-layout-replay.md) is a
+  // and the future replay cache (docs/canonical-layout-import.md) is a
   // separate, capped store — this toggle governs only the user-owned export
   // copy. The path is a directory because the plugin stays Qt-free and
   // generates collision-safe filenames itself.
@@ -620,6 +621,12 @@ class McapCloudDialog : public PJ::DialogPluginTyped {
   // first credential access so a unit-load without setSettings() still works.
   std::unique_ptr<CredentialStore> credentials_;
   CredentialStore& credentialStore();
+  // Trusted-origin ledger (spec §7 guard 1): origins that completed a
+  // successful interactive Hello — the future auto-replay trust source.
+  // Deliberately separate from credentials_ (a stored token must never imply
+  // replay trust). Lazily constructed like credentials_ above.
+  std::unique_ptr<TrustedOrigins> trusted_origins_;
+  TrustedOrigins& trustedOrigins();
   // Toolbox runtime host provider (notifyDataChanged after import + the
   // reportMessage notification bell). Set by the toolbox during bind(); unset
   // for a dialog-only smoke load (notify() then no-ops).

@@ -320,9 +320,11 @@ class FetchWorker {
 
   // The session BackendConnection in flight during a pull, exposed for
   // requestCancel() to signal a wire CancelSession. Guarded by cancel_mu_: the
-  // worker sets it before the download and CLEARS it (under the lock) before the
-  // owning unique_ptr is destroyed, so a concurrent requestCancel() from the GUI
-  // thread can never dereference a freed object.
+  // worker publishes it BEFORE the blocking connect()/openSessionFresh() calls
+  // (so a cancel during session establishment wakes the OpenSession wait, not
+  // just the download loop) and clears it via an RAII guard (under the lock) on
+  // every exit path before the owning unique_ptr is destroyed, so a concurrent
+  // requestCancel() from the GUI thread can never dereference a freed object.
   std::mutex cancel_mu_;
   BackendConnection* backend_session_for_cancel_{nullptr};
 

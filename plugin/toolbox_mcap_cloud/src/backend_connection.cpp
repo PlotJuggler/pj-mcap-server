@@ -193,7 +193,7 @@ void BackendConnection::onBinaryFrame(const std::string& bytes) {
 }
 
 bool BackendConnection::sendAndWait(pj_cloud::v1::ClientMessage& request, pj_cloud::v1::ServerMessage* response_out,
-                                    std::chrono::seconds timeout) {
+                                    std::chrono::seconds timeout, bool wake_on_cancel) {
   if (!socket_) {
     return false;
   }
@@ -223,9 +223,15 @@ bool BackendConnection::sendAndWait(pj_cloud::v1::ClientMessage& request, pj_clo
   std::shared_ptr<pj_cloud::v1::ServerMessage> reply;
   {
     std::unique_lock<std::mutex> lock(mu_);
+    // wake_on_cancel (session opens only): cancel_requested_ joins the wake
+    // predicate — cancelSession() stores the flag then notify_all()s this cv
+    // under mu_, so the wake can't be lost. A response that already landed
+    // still wins (the ready check below consumes it); a bare cancel wake
+    // leaves reply null -> the false return the caller maps to "cancelled".
     const bool got = cv_.wait_for(lock, timeout, [&] {
       auto it = pending_.find(request_id);
-      return socket_closed_ || (it != pending_.end() && it->second.ready);
+      return socket_closed_ || (wake_on_cancel && cancel_requested_.load()) ||
+             (it != pending_.end() && it->second.ready);
     });
     auto it = pending_.find(request_id);
     if (got && it != pending_.end() && it->second.ready) {
@@ -235,7 +241,7 @@ bool BackendConnection::sendAndWait(pj_cloud::v1::ClientMessage& request, pj_clo
   }
 
   if (!reply) {
-    return false;  // timeout or socket closed before the reply arrived
+    return false;  // timeout, socket closed, or session cancel before the reply arrived
   }
   if (response_out != nullptr) {
     *response_out = std::move(*reply);
@@ -309,8 +315,9 @@ bool BackendConnection::buildAndOpenSocket(std::string* error_out) {
   // Close events the callback above translates into socket_open_ /
   // socket_closed_ (with the underlying reason captured in socket_error_).
   // A reconnect MUST also clear stale pending_ RPC waiters + the session inbox
-  // and reset cancel_requested_ so a prior attempt's frames/false-closed flags
-  // can't corrupt this one.
+  // so a prior attempt's frames/false-closed flags can't corrupt this one.
+  // (cancel_requested_ is NOT cleared anywhere after cancelSession() — it is
+  // latched for the connection's lifetime; see openSessionFresh.)
   {
     std::lock_guard<std::mutex> lock(mu_);
     socket_open_ = false;
@@ -358,14 +365,21 @@ bool BackendConnection::connect(std::string* error_out) {
   }
 
   // Hello handshake. Empty api_key is allowed (dev anonymous).
+  // wake_on_cancel: session establishment must be promptly cancellable END TO
+  // END — a cancelSession() while a silent server sits on the Hello (initial
+  // session connect OR a resume reconnect) returns immediately instead of
+  // waiting out kRequestTimeout (review-caught residual of the OpenSession
+  // wake fix). Harmless for browse connections: nothing ever cancels them, so
+  // their flag is never set.
   pj_cloud::v1::ClientMessage request;
   fillHello(request.mutable_hello());
 
   pj_cloud::v1::ServerMessage response;
-  if (!sendAndWait(request, &response)) {
+  if (!sendAndWait(request, &response, kRequestTimeout, /*wake_on_cancel=*/true)) {
     socket_->stop();
     socket_.reset();
-    set_error("no response to handshake from " + buildWsUrl(uri_));
+    set_error(cancel_requested_.load() ? "cancelled"
+                                       : "no response to handshake from " + buildWsUrl(uri_));
     return false;
   }
 
@@ -797,18 +811,28 @@ bool BackendConnection::openSessionFresh(const OpenSessionParams& params, Sessio
     session_active_ = true;
     session_subscription_id_ = 0;
     session_inbox_.clear();
-    cancel_requested_.store(false);
+    // cancel_requested_ is deliberately NOT reset here: cancelSession() latches
+    // the flag for the connection's LIFETIME. A connection is one-download-scoped
+    // (Slice 8: fresh BackendConnection per download), so there is no legitimate
+    // "stale cancel from a previous session" on this object — but there IS a real
+    // race the old reset lost: the caller arms its cancel hook, a cancel lands,
+    // and a reset here would swallow it right before the sendAndWait below, waiting
+    // out the full kOpenSessionTimeout. A latched cancel makes this open fail
+    // fast as "cancelled" instead.
     // Fresh session = start of a new download; zero the wire-byte accumulator so
     // it measures THIS download (resume legs deliberately keep accumulating).
     session_wire_bytes_.store(0, std::memory_order_relaxed);
   }
 
   pj_cloud::v1::ServerMessage response;
-  if (!sendAndWait(request, &response, kOpenSessionTimeout)) {
+  if (!sendAndWait(request, &response, kOpenSessionTimeout, /*wake_on_cancel=*/true)) {
     std::lock_guard<std::mutex> lock(mu_);
     session_active_ = false;
     session_inbox_.clear();
-    set_error("no response to OpenSession (timeout or socket closed)");
+    // Distinct "cancelled" (vs the timeout/closed text) keeps callers'
+    // closed-vs-error handling intact while naming the actual cause.
+    set_error(cancel_requested_.load() ? "cancelled"
+                                       : "no response to OpenSession (timeout or socket closed)");
     return false;
   }
 
@@ -1116,8 +1140,9 @@ bool BackendConnection::openSessionResume(std::uint64_t subscription_id, std::ui
   // Do NOT clear cancel_requested_ here: a cancel that arrived during the
   // reconnect (after the resume loop's pre-reconnect checks) must SURVIVE into
   // the resumed frame loop and stop it — clearing it would let a cancelled
-  // download silently continue. (openSessionFresh clears it because a fresh
-  // download legitimately starts a new cancel scope; a resume does not.)
+  // download silently continue. (Nothing resets the flag anywhere — it is
+  // latched for the connection's lifetime; openSessionFresh deliberately does
+  // not clear it either, see the arming-order race note there.)
   {
     std::lock_guard<std::mutex> lock(mu_);
     session_active_ = true;
@@ -1136,11 +1161,15 @@ bool BackendConnection::openSessionResume(std::uint64_t subscription_id, std::ui
   }
 
   pj_cloud::v1::ServerMessage response;
-  if (!sendAndWait(request, &response, kOpenSessionTimeout)) {
+  if (!sendAndWait(request, &response, kOpenSessionTimeout, /*wake_on_cancel=*/true)) {
     std::lock_guard<std::mutex> lock(mu_);
     session_active_ = false;
     session_inbox_.clear();
-    set_error("no response to OpenResume (timeout or socket closed)");
+    // A cancel during the resume wait surfaces as "cancelled" (not rejected):
+    // the caller's retry loop observes cancel_requested_ and finalizes as
+    // Cancelled instead of burning further reconnect attempts.
+    set_error(cancel_requested_.load() ? "cancelled"
+                                       : "no response to OpenResume (timeout or socket closed)");
     return false;
   }
   if (response.has_error()) {

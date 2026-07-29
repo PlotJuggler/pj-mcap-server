@@ -1,5 +1,14 @@
 # SDK 0.20.0 — Descriptor-Replay v1 ABI Implementation Plan
 
+> **Historical record — EXECUTED, not rewritten.** The vocabulary planned here
+> ("descriptor replay", `pj.descriptor_replay.v1`, `pj.materialized_source.v1`,
+> `adopt`, `SUCCEEDED_(UN)MATERIALIZED`, spec file `canonical-layout-replay.md`)
+> was renamed BEFORE the PR merged: SDK 0.20.0 shipped as `pj.descriptor_import.v1`
+> / `pj.source_promotion.v1` / `promote_to_file_source` /
+> `SUCCEEDED_EAGER_ONLY|PROMOTED`, and the spec is now
+> `docs/canonical-layout-import.md` (§15 vocabulary-rename entry). This document
+> is left as-is; it describes the plan under the names in effect at the time.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Ship the v3.5 descriptor-replay ABI (spec: `docs/canonical-layout-replay.md` §8 in the mcap_server repo) as PlotJuggler SDK **0.20.0** — the plugin extension `pj.descriptor_replay.v1`, the host service `pj.materialized_source.v1`, and the generic `DatasetIngestHostView` lifecycle facade — with **zero new vtable slots**, and open the PR against `PlotJuggler/plotjuggler_sdk` main.

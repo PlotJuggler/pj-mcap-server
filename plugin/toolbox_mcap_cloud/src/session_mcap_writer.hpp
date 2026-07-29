@@ -10,6 +10,10 @@
 #include "backend_types.hpp"
 #include "decoded_message.hpp"
 
+namespace mcap {
+class IWritable;
+}  // namespace mcap
+
 namespace mcap_cloud {
 
 /// Transport-independent reconstruction of a SessionInfo + DecodedMessage
@@ -36,7 +40,20 @@ class SessionMcapWriter {
   SessionMcapWriter& operator=(const SessionMcapWriter&) = delete;
 
   [[nodiscard]] bool open(const std::filesystem::path& path, const SessionInfo& info, std::string* error);
+  /// Open over a caller-owned sink (the caller owns file creation policy —
+  /// exclusive create, permissions, fsync — and MUST keep `sink` alive until
+  /// after close()). Used by the future cache tee; the path overload remains
+  /// the convenience for export/CLI (it delegates here — one init path for
+  /// the schema/channel dictionaries).
+  [[nodiscard]] bool open(mcap::IWritable& sink, const SessionInfo& info, std::string* error);
   [[nodiscard]] bool write(const DecodedMessage& message, std::string* error);
+  /// Embed a named metadata record (e.g. the canonical source descriptor,
+  /// name "mcap_cloud/source_descriptor"). Call between open() and the first
+  /// write() — the record participates in the summary's MetadataIndex; after
+  /// the first write() it fails (a mid-stream Metadata record would split the
+  /// open chunk).
+  [[nodiscard]] bool writeMetadata(const std::string& name,
+                                   const std::string& value_json, std::string* error);
   [[nodiscard]] bool close(std::string* error);
 
   /// Messages skipped because their topic_id was absent from the session

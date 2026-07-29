@@ -320,8 +320,19 @@ class BackendConnection {
   // kOpenSessionTimeout because the server builds the per-file chunk plan over
   // object storage BEFORE replying (over WAN that is real seconds, scaling
   // with the stitched file count).
+  //
+  // wake_on_cancel joins cancel_requested_ into the wait predicate so a
+  // cancelSession() during the (up to 120 s) OpenSession/OpenResume wait — or
+  // during the connect() Hello handshake (session establishment is promptly
+  // cancellable end to end) — returns immediately instead of stranding the
+  // worker for the full timeout (spec docs/canonical-layout-import.md §9
+  // item 2; cancelSession() already notify_all()s this cv). Browse RPCs
+  // (ListFiles/GetVocabulary/...) keep the default false so a cancel latched
+  // outside a session (the flag is latched for the connection's LIFETIME —
+  // nothing ever resets it; connections are one-download-scoped) can never
+  // wake them spuriously into an empty/failed result.
   bool sendAndWait(pj_cloud::v1::ClientMessage& request, pj_cloud::v1::ServerMessage* response_out,
-                   std::chrono::seconds timeout = kRequestTimeout);
+                   std::chrono::seconds timeout = kRequestTimeout, bool wake_on_cancel = false);
 
   // Serialize + send a ClientMessage as-is (no request_id assignment, no wait).
   // Used for fire-and-forget session frames (SessionAck, CancelSession). Returns

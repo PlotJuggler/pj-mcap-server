@@ -899,9 +899,13 @@ int main(int argc, char** argv) {
 
   // Resolve URL/token precedence: explicit flag > environment > default. An
   // absent --url falls back to MCAP_CLOUD_URL (then ws://localhost:8080); an
-  // absent --token falls back to MCAP_CLOUD_API_KEY (then empty = dev anonymous).
-  const std::string url = mcap_cloud::resolveCliUrl(url_flag, envOpt("MCAP_CLOUD_URL"));
-  const std::string token = mcap_cloud::resolveCliToken(token_flag, envOpt("MCAP_CLOUD_API_KEY"));
+  // absent --token falls back to MCAP_CLOUD_API_KEY (then empty = dev
+  // anonymous) — but the env token is ORIGIN-BOUND to MCAP_CLOUD_URL: a --url
+  // naming a different origin never receives it (spec §7 guard 2).
+  const std::optional<std::string> env_url = envOpt("MCAP_CLOUD_URL");
+  const std::string url = mcap_cloud::resolveCliUrl(url_flag, env_url);
+  const std::string token =
+      mcap_cloud::resolveCliToken(token_flag, envOpt("MCAP_CLOUD_API_KEY"), url, env_url);
   // Empty = auto-detect the system CA bundle inside BackendConnection; only a
   // private/corporate CA needs --cert or MCAP_CLOUD_CACERT.
   const std::string cert = mcap_cloud::resolveCliCert(cert_flag, envOpt("MCAP_CLOUD_CACERT"));

@@ -118,11 +118,16 @@ set(MCAP_CLOUD_SOURCES
   src/wire_mapping.cpp
   src/session_decode.cpp
   src/session_mcap_writer.cpp
+  src/session_file_cache.cpp
   src/mcap_save_path.cpp
   src/mcap_implementation.cpp
   src/settings_store.cpp
   src/credential_store.cpp
+  src/origin_match.cpp
+  src/trusted_origins.cpp
   src/server_history.cpp
+  src/core/file_lock.cpp
+  src/core/sha256.cpp
   src/core/time_format.cpp
 )
 
@@ -201,6 +206,7 @@ add_executable(mcap-cloud-cli
   src/backend_connection.cpp
   src/wire_mapping.cpp
   src/session_decode.cpp
+  src/origin_match.cpp
   src/core/time_format.cpp
   ${MCAP_CLOUD_PROTO_SRCS}
 )
@@ -524,6 +530,46 @@ if(BUILD_TESTING)
   )
   add_test(NAME McapCloudMcapSavePathTest COMMAND toolbox_mcap_cloud_mcap_save_path_test)
 
+  # Vendored FIPS 180-4 SHA-256 (hermetic, std-only): the source-descriptor
+  # digest foundation. Pinned to the NIST vectors incl. the one-million-'a'
+  # block-boundary case; no crypto dependency (mbedtls is only a transitive
+  # detail of ixwebsocket and deliberately NOT linked).
+  add_executable(toolbox_mcap_cloud_sha256_test
+    tests/sha256_test.cpp
+    src/core/sha256.cpp
+  )
+  target_compile_features(toolbox_mcap_cloud_sha256_test PRIVATE cxx_std_20)
+  target_include_directories(toolbox_mcap_cloud_sha256_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+  )
+  target_link_libraries(toolbox_mcap_cloud_sha256_test PRIVATE
+    GTest::gtest_main
+  )
+  add_test(NAME McapCloudSha256Test COMMAND toolbox_mcap_cloud_sha256_test)
+
+  # Canonical source descriptor (spec docs/canonical-layout-import.md §4):
+  # allowlisted parse/validate -> canonical serialization -> sha256/128
+  # identity. The canonicalization vectors are a CROSS-REPO contract
+  # (repo-root docs/source-descriptor-vectors.json; PJ4-side tests consume
+  # the same file byte-identically — CATALOG_CONTRACT discipline), so the
+  # test reads them from the source tree via a compile definition.
+  add_executable(toolbox_mcap_cloud_source_descriptor_test
+    tests/source_descriptor_test.cpp
+    src/source_descriptor.cpp
+    src/core/sha256.cpp
+  )
+  target_compile_features(toolbox_mcap_cloud_source_descriptor_test PRIVATE cxx_std_20)
+  target_include_directories(toolbox_mcap_cloud_source_descriptor_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+  )
+  target_compile_definitions(toolbox_mcap_cloud_source_descriptor_test PRIVATE
+    MCAP_CLOUD_VECTORS_JSON="${CMAKE_CURRENT_SOURCE_DIR}/../../docs/source-descriptor-vectors.json"
+  )
+  target_link_libraries(toolbox_mcap_cloud_source_descriptor_test PRIVATE
+    nlohmann_json::nlohmann_json GTest::gtest_main
+  )
+  add_test(NAME McapCloudSourceDescriptorTest COMMAND toolbox_mcap_cloud_source_descriptor_test)
+
   # Shared GUI/CLI MCAP writer round trip (hermetic): schemas, channels,
   # timestamps, payloads, per-channel sequence, chunking and Zstd. Uses the
   # test-only reader+writer implementation TU (product targets are writer-only).
@@ -540,6 +586,33 @@ if(BUILD_TESTING)
     mcap::mcap zstd::libzstd_static LZ4::lz4_static GTest::gtest_main
   )
   add_test(NAME McapCloudSessionMcapWriterTest COMMAND toolbox_mcap_cloud_session_mcap_writer_test)
+
+  # Request-addressed session file cache core (spec docs/canonical-layout-
+  # import.md §5, HERMETIC): identity validation + path mapping, per-identity
+  # exclusive materialize lock (sidecar <hex>.mcap.lock via flock/LockFileEx),
+  # validated finalization (reader: footer/summary/Statistics + embedded
+  # source-descriptor identity, then fsync -> atomic rename -> dir fsync),
+  # touch-file LRU eviction and orphan-partial cleanup. Injects a private temp
+  # root; fixtures are REAL MCAPs built with SessionMcapWriter (+ embedded
+  # provenance); uses the test-only reader+writer implementation TU.
+  add_executable(toolbox_mcap_cloud_session_file_cache_test
+    tests/session_file_cache_test.cpp
+    src/session_file_cache.cpp
+    src/core/file_lock.cpp
+    src/session_mcap_writer.cpp
+    src/source_descriptor.cpp
+    src/core/sha256.cpp
+    tests/mcap_roundtrip_implementation.cpp
+  )
+  target_compile_features(toolbox_mcap_cloud_session_file_cache_test PRIVATE cxx_std_20)
+  target_include_directories(toolbox_mcap_cloud_session_file_cache_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+  )
+  target_link_libraries(toolbox_mcap_cloud_session_file_cache_test PRIVATE
+    plotjuggler_sdk::plugin_sdk nlohmann_json::nlohmann_json
+    mcap::mcap zstd::libzstd_static LZ4::lz4_static GTest::gtest_main
+  )
+  add_test(NAME McapCloudSessionFileCacheTest COMMAND toolbox_mcap_cloud_session_file_cache_test)
 
   # D6 CredentialStore seam + file-backed fallback (HERMETIC): per-server token
   # round-trip, key normalization/collision, isolation, overwrite, erase,
@@ -703,6 +776,39 @@ if(BUILD_TESTING)
   add_test(NAME McapCloudFetchWorkerExportContractTest
            COMMAND toolbox_mcap_cloud_fetch_worker_export_contract_test)
 
+  # Hermetic FetchWorker-level cancel wiring pin (review-caught): cancel during
+  # session establishment must reach the wire cancelSession(), not just the
+  # download loop. TIMEOUT 30 turns a wiring regression's 120 s OpenSession
+  # hang into a fast FAIL.
+  add_executable(toolbox_mcap_cloud_fetch_worker_cancel_test
+    tests/fetch_worker_cancel_test.cpp
+    tests/find_free_port.cpp
+    src/parser_ingest_driver.cpp
+    src/fetch_worker.cpp
+    src/backend_connection.cpp
+    src/wire_mapping.cpp
+    src/session_decode.cpp
+    src/session_mcap_writer.cpp
+    src/mcap_save_path.cpp
+    src/core/time_format.cpp
+    src/mcap_implementation.cpp
+    ${MCAP_CLOUD_PROTO_SRCS}
+  )
+  target_compile_features(toolbox_mcap_cloud_fetch_worker_cancel_test PRIVATE cxx_std_20)
+  target_include_directories(toolbox_mcap_cloud_fetch_worker_cancel_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/core
+    ${MCAP_CLOUD_PROTO_OUT_DIR}
+  )
+  target_link_libraries(toolbox_mcap_cloud_fetch_worker_cancel_test PRIVATE
+    plotjuggler_sdk::plugin_sdk
+    protobuf::libprotobuf ixwebsocket::ixwebsocket nlohmann_json::nlohmann_json
+    zstd::libzstd_static LZ4::lz4_static mcap::mcap GTest::gtest_main
+  )
+  add_test(NAME McapCloudFetchWorkerCancelTest
+           COMMAND toolbox_mcap_cloud_fetch_worker_cancel_test)
+  set_tests_properties(McapCloudFetchWorkerCancelTest PROPERTIES TIMEOUT 30)
+
   add_executable(toolbox_mcap_cloud_parser_ingest_live_test
     tests/parser_ingest_live_test.cpp
     src/parser_ingest_driver.cpp
@@ -842,6 +948,31 @@ if(BUILD_TESTING)
   )
   add_test(NAME McapCloudListErrorSurfaceTest COMMAND toolbox_mcap_cloud_list_error_surface_test)
 
+  # Cancel-responsiveness of the SESSION RPC wait (HERMETIC): cancelSession()
+  # during a pending OpenSession must wake sendAndWait promptly ("cancelled"),
+  # never strand the worker for the full 120 s kOpenSessionTimeout — and the
+  # wake is SCOPED to the session request path (a stale cancel flag must not
+  # disturb browse RPCs like ListFiles). In-process fake WS server that answers
+  # Hello (+ListFiles) but deliberately never OpenSession. TIMEOUT 30 so a
+  # predicate regression fails fast instead of hanging CI on the 120 s wait.
+  add_executable(toolbox_mcap_cloud_backend_cancel_wait_test
+    tests/backend_cancel_wait_test.cpp
+    tests/find_free_port.cpp
+    src/backend_connection.cpp
+    src/wire_mapping.cpp
+    src/session_decode.cpp
+    ${MCAP_CLOUD_PROTO_SRCS}
+  )
+  target_include_directories(toolbox_mcap_cloud_backend_cancel_wait_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${MCAP_CLOUD_PROTO_OUT_DIR}
+  )
+  target_link_libraries(toolbox_mcap_cloud_backend_cancel_wait_test PRIVATE
+    protobuf::libprotobuf ixwebsocket::ixwebsocket zstd::libzstd_static LZ4::lz4_static GTest::gtest_main
+  )
+  add_test(NAME McapCloudBackendCancelWaitTest COMMAND toolbox_mcap_cloud_backend_cancel_wait_test)
+  set_tests_properties(McapCloudBackendCancelWaitTest PROPERTIES TIMEOUT 30)
+
   add_executable(toolbox_mcap_cloud_server_caps_test
     tests/server_caps_test.cpp
     tests/find_free_port.cpp
@@ -865,15 +996,58 @@ if(BUILD_TESTING)
   )
   add_test(NAME McapCloudServerCapsTest COMMAND toolbox_mcap_cloud_server_caps_test)
 
+  # Trusted-origin ledger (HERMETIC): spec §7 guard 1 — trusted = origin
+  # recorded after a SUCCESSFUL interactive Hello. Deliberately NOT the
+  # credential store (credentials can exist before any successful connect).
+  # Same conventions as the credential store: injectable config root, 0600
+  # file / 0700 dir, atomic replace, corrupt-file-reads-as-empty. Rooted at a
+  # private temp dir so it never touches the real $XDG_CONFIG_HOME. Links
+  # credential_store.cpp for defaultConfigRoot() (TrustedOrigins::standard())
+  # and origin_match.cpp for the strict origin parse.
+  add_executable(toolbox_mcap_cloud_trusted_origins_test
+    tests/trusted_origins_test.cpp
+    src/trusted_origins.cpp
+    src/origin_match.cpp
+    src/credential_store.cpp
+    src/server_history.cpp
+  )
+  target_compile_features(toolbox_mcap_cloud_trusted_origins_test PRIVATE cxx_std_20)
+  target_include_directories(toolbox_mcap_cloud_trusted_origins_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+  )
+  target_link_libraries(toolbox_mcap_cloud_trusted_origins_test PRIVATE
+    plotjuggler_sdk::plugin_sdk nlohmann_json::nlohmann_json GTest::gtest_main
+  )
+  add_test(NAME McapCloudTrustedOriginsTest COMMAND toolbox_mcap_cloud_trusted_origins_test)
+
+  # Strict ws/wss origin parse + compare (HERMETIC, std-only): the credential
+  # origin-binding guard (spec docs/canonical-layout-import.md §7 guard 2) —
+  # MCAP_CLOUD_API_KEY applies only when MCAP_CLOUD_URL's origin equals the
+  # target's. Rejected shapes (userinfo/query/fragment/bad scheme/empty host/
+  # junk port) parse to nullopt and never match, not even themselves.
+  add_executable(toolbox_mcap_cloud_origin_match_test
+    tests/origin_match_test.cpp
+    src/origin_match.cpp
+  )
+  target_compile_features(toolbox_mcap_cloud_origin_match_test PRIVATE cxx_std_20)
+  target_include_directories(toolbox_mcap_cloud_origin_match_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+  )
+  target_link_libraries(toolbox_mcap_cloud_origin_match_test PRIVATE GTest::gtest_main)
+  add_test(NAME McapCloudOriginMatchTest COMMAND toolbox_mcap_cloud_origin_match_test)
+
   # D12 env-var fallback (HERMETIC): the CLI URL/token precedence rule
   # (explicit --url/--token > env MCAP_CLOUD_URL/MCAP_CLOUD_API_KEY >
-  # default). Pure header (tools/cli_url_resolve.hpp), std only — no socket.
+  # default) + the env token's origin binding to MCAP_CLOUD_URL. Pure header
+  # (tools/cli_url_resolve.hpp) over origin_match — std only, no socket.
   add_executable(toolbox_mcap_cloud_cli_url_resolve_test
     tests/cli_url_resolve_test.cpp
+    src/origin_match.cpp
   )
   target_link_libraries(toolbox_mcap_cloud_cli_url_resolve_test PRIVATE GTest::gtest_main)
   target_include_directories(toolbox_mcap_cloud_cli_url_resolve_test PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/tools
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
   )
   add_test(NAME McapCloudCliUrlResolveTest COMMAND toolbox_mcap_cloud_cli_url_resolve_test)
 
