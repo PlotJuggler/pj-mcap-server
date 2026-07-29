@@ -186,12 +186,15 @@ std::optional<SourceDescriptor> parseSourceDescriptor(std::string_view json,
     fail(error, "field \"v\" must be an integer");
     return std::nullopt;
   }
-  d.version = v_it->get<int>();
-  if (d.version != 1) {
-    fail(error, "unsupported descriptor version " + std::to_string(d.version) +
-                    " (expected 1)");
+  // Exact-value comparison, never get<int>() — nlohmann's get<> is an
+  // unchecked narrowing cast, so e.g. v=4294967297 (2^32+1) would narrow to 1
+  // and alias a genuine v1 descriptor (review-caught; fail-closed versioning).
+  // json::operator== compares integer values exactly across int/uint width.
+  if (*v_it != 1) {
+    fail(error, "unsupported descriptor version " + v_it->dump() + " (expected 1)");
     return std::nullopt;
   }
+  d.version = 1;
 
   if (!takeString(obj, "kind", &d.kind, error)) {
     return std::nullopt;

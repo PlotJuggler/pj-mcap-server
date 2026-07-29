@@ -130,6 +130,22 @@ TEST(SourceDescriptor, RejectionMatrix) {
     j["v"] = 2;
     expectReject(j.dump(), "version");
   }
+  {  // Version narrowing (review-caught): 2^32+1 must NOT alias v1 through an
+     // unchecked get<int>() cast — exact-value rejection, fail-closed.
+    auto j = baseJson();
+    j["v"] = 4294967297ull;
+    expectReject(j.dump(), "version");
+  }
+  {  // Negative wraparound sibling of the same bug class.
+    auto j = baseJson();
+    j["v"] = -4294967295ll;
+    expectReject(j.dump(), "version");
+  }
+  {  // uint64 max — the extreme unsigned magnitude also rejects exactly.
+    auto j = baseJson();
+    j["v"] = 18446744073709551615ull;
+    expectReject(j.dump(), "version");
+  }
   {  // Missing required field.
     auto j = baseJson();
     j.erase("kind");
