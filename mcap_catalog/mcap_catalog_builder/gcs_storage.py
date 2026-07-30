@@ -14,6 +14,7 @@ the SDK on the injected client (the fake-gcs leg), so this module is unaware of 
 
 import calendar
 import io
+import threading
 from typing import Iterator
 
 from .retry import retry_with
@@ -126,12 +127,45 @@ class GCSSource:
         return read_summary_with_fallback(
             pread, lambda: self.open_summary(key, size), key, size)
 
-    def list_all(self) -> Iterator[Listing]:
-        # list_blobs is lazy + paginates as it is iterated; materialize under retry
-        # so a transient mid-list error re-lists rather than aborting the reconcile.
-        for blob in retry_with(
-            lambda: list(self._c.list_blobs(self._bucket, prefix=self._prefix)),
-            is_permanent=_is_permanent,
-        ):
+    def list_all(
+        self, stop_event: threading.Event | None = None
+    ) -> Iterator[Listing]:
+        # list_blobs is lazy + paginated. Keep the existing whole-list retry
+        # semantics, but inspect the cancellation signal between SDK pages.
+        def collect() -> list:
+            if stop_event is not None and stop_event.is_set():
+                return []
+            iterator = self._c.list_blobs(self._bucket, prefix=self._prefix)
+            pages = getattr(iterator, "pages", None)
+            page_iter = pages if pages is not None else (iterator,)
+            blobs = []
+            page_iter = iter(page_iter)
+            while True:
+                if stop_event is not None and stop_event.is_set():
+                    break
+                try:
+                    page = next(page_iter)
+                except StopIteration:
+                    break
+                if stop_event is not None and stop_event.is_set():
+                    break
+                blobs.extend(page)
+                if stop_event is not None and stop_event.is_set():
+                    break
+            return blobs
+
+        if stop_event is None:
+            blobs = retry_with(collect, is_permanent=_is_permanent)
+        else:
+            blobs = retry_with(
+                collect,
+                is_permanent=_is_permanent,
+                should_stop=stop_event.is_set,
+                sleep=stop_event.wait,
+            )
+
+        for blob in blobs:
+            if stop_event is not None and stop_event.is_set():
+                return
             if blob.name.endswith(".mcap"):
                 yield Listing(key=blob.name, stat=_stat_from_blob(blob))

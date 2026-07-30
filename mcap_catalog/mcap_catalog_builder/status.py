@@ -77,6 +77,20 @@ class StatusWriter:
         """Record a fatal failure (``phase="error"``) immediately."""
         self.update(phase="error", last_error=str(message)[:_MAX_ERROR_LEN], force=True)
 
+    def full_audit_finished(self, outcome: str, duration: float) -> None:
+        """Record the last terminal full-audit result.
+
+        These fields are additive advisory telemetry; existing sidecar readers
+        continue to key only on ``phase``/``updated_at``.
+        """
+        wall = time.time()
+        self.update(
+            full_audit_last=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(wall)),
+            full_audit_outcome=outcome,
+            full_audit_duration=max(0.0, duration),
+            force=True,
+        )
+
     def heartbeat_start(self, stop_event: threading.Event, interval: float = 10.0) -> None:
         """Refresh ``updated_at`` every ``interval`` seconds on a daemon thread,
         so sidecar freshness means "the builder process is alive" even during
@@ -238,6 +252,11 @@ class ReconcileProgress:
                 "targeted-read bug is suspected",
                 self._via_counts["fallback-unexpected"],
             )
+
+    def audit_finished(self, outcome: str, duration: float) -> None:
+        """Publish the result returned by the worker to the audit coordinator."""
+        if self._status is not None:
+            self._status.full_audit_finished(outcome, duration)
 
     @property
     def summary_via_counts(self) -> dict:

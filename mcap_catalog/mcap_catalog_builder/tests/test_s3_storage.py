@@ -373,6 +373,23 @@ def test_list_all_shard_error_propagates_and_tears_down():
     assert final <= baseline, f"thread count did not return to baseline ({final} vs {baseline})"
 
 
+def test_list_all_stop_between_shard_pages_is_prompt():
+    baseline = _active_threads_baseline()
+    fake = _make_lazy_fixture()
+    stop = threading.Event()
+    gen = S3Source(fake, "b", "").list_all(stop_event=stop)
+    next(gen)
+
+    started = time.monotonic()
+    stop.set()
+    assert list(gen) == []
+    assert time.monotonic() - started < 1.0
+    assert fake.pages_yielded < _NUM_SHARDS * _PAGES_PER_SHARD
+
+    final = _wait_for_thread_count(baseline)
+    assert final <= baseline, f"thread count did not return to baseline ({final} vs {baseline})"
+
+
 def test_s3_event_translation_helpers():
     src = S3Source(FakeS3({}), "bucket")
     assert src.event_key("customer=a/.../x.mcap") == "customer=a/.../x.mcap"  # key is the key

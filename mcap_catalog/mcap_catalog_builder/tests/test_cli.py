@@ -1,9 +1,11 @@
 """Tests for the CLI parser and the single-writer worker loop."""
 
+import json
 import os
 import queue
 import signal
 import sys
+import threading
 import types
 
 from mcap_catalog_builder.__main__ import build_parser, main, worker_loop
@@ -161,6 +163,127 @@ def test_main_s3_daemon_no_watch_skips_sqs_requirement(tmp_path, monkeypatch):
     assert rc == 0  # passes validation without --sqs-url
     assert os.path.exists(db)  # reconcile+publish actually completed
     assert producer_calls == []  # SQS long-poll producer never started
+
+
+def test_existing_db_starts_producer_and_tag_ipc_before_startup_audit(
+    tmp_path, monkeypatch
+):
+    import mcap_catalog_builder.__main__ as m
+    from mcap_catalog_builder.db import open_db
+
+    root = str(tmp_path / "watch")
+    os.makedirs(root)
+    db = str(tmp_path / "catalog.db")
+    open_db(db).close()  # clean existing served DB => non-blocking startup path
+
+    producer_started = threading.Event()
+    tag_bound = threading.Event()
+    audit_started = threading.Event()
+
+    class Observer:
+        def stop(self):
+            pass
+
+        def join(self):
+            pass
+
+    def start_observer(_root, _handler):
+        producer_started.set()
+        return Observer()
+
+    class TagServer:
+        def __init__(self, _path, _work_q):
+            tag_bound.set()  # the real server binds in its constructor
+
+        def serve_forever(self):
+            pass
+
+        def shutdown(self):
+            pass
+
+        def server_close(self):
+            pass
+
+    def startup_audit(*_args, stop_event=None, **_kwargs):
+        # A synchronous pre-service reconcile would fail these assertions.
+        assert stop_event is not None
+        assert producer_started.is_set()
+        assert tag_bound.is_set()
+        audit_started.set()
+        stop_event.set()
+        return {"cataloged": 0, "skipped": 0, "failed": 0, "deleted": 0}
+
+    monkeypatch.setattr(m, "start_observer", start_observer)
+    monkeypatch.setattr(m, "TagEditServer", TagServer)
+    monkeypatch.setattr(m, "full_reconcile", startup_audit)
+
+    rc = _run_daemon_main(
+        [
+            root,
+            "--db",
+            db,
+            "--tag-socket",
+            str(tmp_path / "tags.sock"),
+            "--rescan-interval",
+            "60",
+        ]
+    )
+    assert rc == 0
+    assert audit_started.is_set()
+    with open(db + ".status.json") as f:
+        status = json.load(f)
+    assert status["full_audit_outcome"] == "ok"
+    assert status["full_audit_duration"] >= 0.0
+
+
+def test_daemon_rebuild_remains_blocking_before_producer(tmp_path, monkeypatch):
+    import mcap_catalog_builder.__main__ as m
+    from mcap_catalog_builder.db import open_db
+    from mcap_catalog_builder.reconcile import full_reconcile as real_full_reconcile
+
+    root = str(tmp_path / "watch")
+    os.makedirs(root)
+    db = str(tmp_path / "catalog.db")
+    open_db(db).close()
+
+    producer_started = threading.Event()
+    producer_state_during_reconcile = []
+
+    class Observer:
+        def stop(self):
+            pass
+
+        def join(self):
+            pass
+
+    def start_observer(_root, _handler):
+        producer_started.set()
+        return Observer()
+
+    def spy_reconcile(*args, **kwargs):
+        producer_state_during_reconcile.append(producer_started.is_set())
+        return real_full_reconcile(*args, **kwargs)
+
+    def stop_worker(*_args, **kwargs):
+        kwargs["stop_event"].set()
+
+    monkeypatch.setattr(m, "start_observer", start_observer)
+    monkeypatch.setattr(m, "full_reconcile", spy_reconcile)
+    monkeypatch.setattr(m, "worker_loop", stop_worker)
+
+    rc = _run_daemon_main(
+        [
+            "--rebuild",
+            root,
+            "--db",
+            db,
+            "--rescan-interval",
+            "60",
+        ]
+    )
+    assert rc == 0
+    assert producer_state_during_reconcile == [False]
+    assert producer_started.is_set()
 
 
 def test_parser_once_flag():
