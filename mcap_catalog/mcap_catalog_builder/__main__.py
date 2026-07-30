@@ -273,7 +273,9 @@ def build_parser() -> argparse.ArgumentParser:
                         "exist yet. Valid with --once (the primary use) or in daemon "
                         "mode (rebuilds first, then watches the published path in place).")
     p.add_argument("--rescan-interval", type=float, default=300.0,
-                   help="seconds between safety re-scans (default: 300)")
+                   help="seconds between full audits, completion-relative: the next audit "
+                        "is scheduled this long after the previous one finished; "
+                        "failures retry with capped exponential backoff (default: 300)")
     p.add_argument("--no-watch", action="store_true",
                    help="daemon mode: start no live event producer at all — no "
                         "local watchdog/inotify observer, no S3 SQS long-poll "

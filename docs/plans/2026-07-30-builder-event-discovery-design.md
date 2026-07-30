@@ -1,6 +1,8 @@
 # Builder discovery at scale: event-primary + hybrid audit (design)
 
-**Date:** 2026-07-30 · **Status:** PROPOSED, v2 (design/spec — implementation plan to follow)
+**Date:** 2026-07-30 · **Status:** v2 — Phases 0–2 IMPLEMENTED (branch
+`builder-event-discovery`, 2026-07-30); Phases 3–6 are ops toggles per
+`server/deploy/README.md`, Phase 7 gated on §5.4's streaming prerequisite
 **Scope:** `mcap_catalog/` builder discovery + `server/deploy/` wiring. No Go-server,
 wire-protocol, or catalog-schema changes.
 **Revision:** v2 incorporates the 2026-07-30 Codex adversarial review (19 findings —

@@ -29,7 +29,7 @@ python3 -m mcap_catalog_builder --source s3 --s3-bucket B --sqs-url U  # S3
 | `--rebuild` | off | build into a temp DB and publish it atomically (implied when `--db` doesn't exist yet); valid with `--once` or in daemon mode |
 | `--db` | `/tmp/pj-cloud-catalog.db` | catalog SQLite file |
 | `--tag-socket` | off | path for the tag-edit IPC unix socket (daemon mode only; see [Tag-edit IPC](#tag-edit-ipc)) |
-| `--rescan-interval` | `300.0` | seconds between safety re-scans |
+| `--rescan-interval` | `300.0` | seconds between full-audit re-scans — **completion-relative**: the next audit is scheduled this long after the previous one *finished* (never fixed-rate); a failed audit retries with exponential backoff capped at this interval |
 | `--no-watch` | off | daemon mode: start **no** live event producer (no local watchdog/inotify observer, no S3 SQS long-poll thread) — discovery is then rescan-only, driven purely by `--rescan-interval`. With `--source s3`, also drops the `--sqs-url` requirement. No-op for `--source gcs` (already rescan-only) and for `--once` |
 | `--extract-workers` | `2×CPU, max 32` | concurrency for the full-reconcile read phase (fetch+parse summaries). For a remote bucket (`--source s3`) these are worker **processes** — each with its own client and its own GIL, so the GIL-bound pure-Python MCAP parse scales across cores; for a local watch root (or `--source gcs`) they are threads. The DB apply stays serial either way. Read-phase memory is bounded by a sliding submission window of `2×workers` in-flight results — it does **not** grow with bucket size, so raising workers costs memory O(workers), never O(objects). Rarely needs tuning |
 | `--debounce` | `2.0` | [local] seconds to debounce file events |
@@ -37,14 +37,21 @@ python3 -m mcap_catalog_builder --source s3 --s3-bucket B --sqs-url U  # S3
 | `--stability-interval` | `0.5` | [local] seconds between stability polls |
 | `--log-level` | `INFO` | `DEBUG`/`INFO`/`WARNING`/`ERROR` |
 
-On startup it runs a full **reconcile** (catalog missing objects, hard-delete vanished
-rows), then watches for changes — via `watchdog` (inotify) for `local`, or by draining
-**S3→SQS** notifications for `s3` — plus a periodic safety re-scan.
+Discovery has two tiers (design: `docs/plans/2026-07-30-builder-event-discovery-design.md`):
+live events — `watchdog` (inotify) for `local`, or the ack-hardened **S3→SQS**
+drain for `s3` — plus periodic full **reconciles** (catalog missing objects,
+hard-delete vanished rows) scheduled by the **audit coordinator**: at most one
+audit queued or running (due ticks coalesce), completion-relative timing, capped
+exponential backoff on failure, and SIGTERM interrupts a running audit promptly
+(a partial audit stamps no `build_metadata`). Startup: with an **existing** served
+DB the worker, live producer, and tag-edit IPC start immediately and the startup
+audit is scheduled like any other; a missing DB (or `--rebuild`) still does the
+blocking build-and-publish first.
 
 **`--no-watch` (rescan-only daemon).** Pass `--no-watch` to skip starting any live
 event producer at all: no `watchdog`/inotify observer for `local`, no SQS long-poll
-thread for `s3`. The startup reconcile, the periodic `--rescan-interval` re-scan
-thread, the worker loop, and the tag-edit IPC server (`--tag-socket`) all still run
+thread for `s3`. The scheduled audits (startup + periodic, via the audit
+coordinator), the worker loop, and the tag-edit IPC server (`--tag-socket`) all still run
 exactly as without the flag — only file *discovery* changes, to purely
 rescan-driven. This is for hosts where inotify is unavailable (e.g. exhausted
 `fs.inotify.max_user_instances`) or where SQS isn't wired up yet; `--source gcs` is
@@ -130,8 +137,15 @@ event-translation helpers), never to `os`/`open` directly. Two backends implemen
   HTTP range GETs** (footer → summary offset → summary), uses the **S3 ETag** as the
   R4 fingerprint, and lists via paginated `list_objects_v2`. The message body is
   never downloaded.
-- `s3_producer.py` — `s3_event_producer`: drains **S3→SQS** notifications into the
-  same `WatchEvent` queue the inotify handler feeds (the cloud-native inotify).
+- `s3_producer.py` — `s3_event_producer`: the ack-hardened **S3→SQS** drain (the
+  cloud-native inotify). The full body is validated *before* anything is enqueued
+  (malformed messages are left unacked for DLQ redrive); each message's records
+  share one `SqsBatch` and the message is deleted only after the *last* record's
+  DB outcome **commits**; lifecycle expirations (`LifecycleExpiration:*`) are
+  first-class delete events; delete events are **HEAD-guarded** (a live object —
+  stale delete after re-upload — re-catalogs instead of deleting the row); the
+  loop is self-supervising (bounded backoff, record-count backpressure, and an
+  `IntakeGate` that pauses intake while an audit runs).
 
 `builder.catalog_object` / `delete_by_key` are the unified core; `catalog_file` /
 `delete_by_path` remain as thin local wrappers. These S3 modules **never import

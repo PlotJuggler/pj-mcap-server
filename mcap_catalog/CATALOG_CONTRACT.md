@@ -625,7 +625,12 @@ that is not "the finished catalog".
   (float seconds — the freshness field consumers compare against), and the
   reconcile counters `listed_total`, `extract_total`, `extract_done`,
   `cataloged`, `skipped`, `failed`, `deleted`, plus `last_error` (set with
-  `phase="error"`).
+  `phase="error"`). Additive advisory fields (2026-07-30 event-discovery
+  design): `full_audit_last`/`full_audit_outcome`/`full_audit_duration` (last
+  terminal full-audit result), `producer_last_poll_ok_at`/
+  `producer_last_ack_at` (SQS intake liveness — distinguishes a dead intake
+  thread from a quiet bucket), and the event-tier counters `events_applied`/
+  `events_acked`/`events_unknown_name`.
 - **Phases**: `listing` → `extracting` → `idle` (build + publish complete;
   daemon steady state between rescans, or a finished `--once`), and `error`
   (fatal failure — the exception that killed the run, truncated, in

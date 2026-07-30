@@ -77,7 +77,8 @@ Module layering (each does one job):
   local wrappers (path→key via `LocalSource`) kept for the watcher path + tests.
 - `reconcile.py` — `full_reconcile(conn, caches, source)`: `source.list_all()` →
   catalog all → deletion sweep of rows with no object. **Authoritative** for removals;
-  runs on startup and each `--rescan-interval`. Accepts a `str` as shorthand for a
+  scheduled by `__main__`'s `AuditCoordinator` (startup + completion-relative
+  `--rescan-interval`, coalesced; cancellable via `stop_event` → `ReconcileCancelled`). Accepts a `str` as shorthand for a
   local root. `scan_disk` is retained for its test.
 - `db.py` — connection (WAL/FK/busy_timeout set per-connection, **not** in
   schema.sql), in-memory id `Caches`, and `resolve_*` helpers.
