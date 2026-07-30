@@ -151,3 +151,39 @@ def test_pending_unstarted_audit_is_dropped_on_stop():
 
     assert item.start() is False
     assert not coordinator.queued_or_running
+
+
+def test_intake_gate_pauses_and_drains_before_audit_then_resumes():
+    """§3.5 handshake: pause intake -> wait for received batches to ack ->
+    only then enqueue the audit; resume on completion."""
+    from mcap_catalog_builder.s3_producer import IntakeGate
+
+    work_q = queue.Queue()
+    stop = threading.Event()
+    gate = IntakeGate()
+    gate.batch_received(2)  # a message was received and is still un-acked
+
+    coordinator = AuditCoordinator(
+        work_q, stop, 0.05, backoff_initial=0.02, intake_gate=gate
+    )
+    coordinator.start(immediate=True)
+    try:
+        time.sleep(0.3)
+        assert gate.paused  # intake paused for the due audit...
+        assert work_q.empty()  # ...but the audit waits for the drain
+
+        gate.batch_acked()  # the producer acked the outstanding batch
+        item = work_q.get(timeout=1.0)
+        assert isinstance(item, AuditItem)
+        assert gate.paused  # still paused while the audit runs
+        assert item.start()
+        item.finish(AuditResult("ok", 0.01))
+
+        deadline = time.monotonic() + 1.0
+        while gate.paused and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert not gate.paused  # resumed after the audit completed
+    finally:
+        stop.set()
+        coordinator.join()
+    assert not gate.paused  # resume also holds on the stop path

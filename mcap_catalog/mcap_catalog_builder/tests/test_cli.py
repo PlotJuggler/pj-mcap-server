@@ -9,6 +9,8 @@ import threading
 import types
 
 from mcap_catalog_builder.__main__ import build_parser, main, worker_loop
+from mcap_catalog_builder.s3_producer import EventRecord, SqsBatch
+from mcap_catalog_builder.storage import Stat
 from mcap_catalog_builder.tests.fixtures import write_minimal_mcap
 from mcap_catalog_builder.watcher import WatchEvent
 
@@ -400,3 +402,106 @@ def test_worker_loop_delete_dispatches_by_key(tmp_db, monkeypatch):
     q.put(WatchEvent("stop"))
     worker_loop(conn, caches, _FakeSource(), q)
     assert deleted == ["/w/a.mcap"]
+
+
+# --------------------------------------------------------------------------
+# EventRecord handling (design §3.3/§3.4): terminal-after-commit ack + HEAD-guard
+# --------------------------------------------------------------------------
+
+class _StatSource(_FakeSource):
+    """A Source stub whose ``stat`` is scripted, counting calls (HEAD-guard)."""
+
+    def __init__(self, stat_result=None) -> None:
+        super().__init__()
+        self._stat_result = stat_result
+        self.stat_calls: list[str] = []
+
+    def stat(self, key: str):
+        self.stat_calls.append(key)
+        return self._stat_result
+
+
+def _event_record(kind, key):
+    ack_q: queue.Queue = queue.Queue()
+    batch = SqsBatch("rh-worker", 1, ack_q)
+    return EventRecord(kind, key, batch), ack_q
+
+
+def test_worker_event_record_catalog_acks_after_commit(tmp_db, monkeypatch):
+    conn, caches = tmp_db
+    import mcap_catalog_builder.__main__ as m
+
+    cataloged: list[str] = []
+    monkeypatch.setattr(
+        m, "catalog_object", lambda c, ca, k, s, stat=None: cataloged.append(k))
+
+    rec, ack_q = _event_record("catalog", "customer=a/x.mcap")
+    q: queue.Queue = queue.Queue()
+    q.put(rec)
+    q.put(WatchEvent("stop"))
+    worker_loop(conn, caches, _StatSource(), q)
+    assert cataloged == ["customer=a/x.mcap"]
+    assert ack_q.get_nowait() is rec.batch  # terminal AFTER the commit
+
+
+def test_worker_event_record_exception_leaves_batch_unacked(tmp_db, monkeypatch):
+    conn, caches = tmp_db
+    import mcap_catalog_builder.__main__ as m
+
+    def _boom(c, ca, k, s, stat=None):
+        raise RuntimeError("transient DB failure")
+
+    monkeypatch.setattr(m, "catalog_object", _boom)
+    rec, ack_q = _event_record("catalog", "customer=a/x.mcap")
+    later: list[str] = []
+    monkeypatch.setattr(m, "delete_by_key", lambda c, ca, k: later.append(k))
+
+    q: queue.Queue = queue.Queue()
+    q.put(rec)
+    q.put(WatchEvent("delete", "/w/next.mcap"))  # the worker must survive
+    q.put(WatchEvent("stop"))
+    worker_loop(conn, caches, _StatSource(), q)
+    assert ack_q.empty()  # NOT terminal: SQS will redeliver
+    assert later == ["/w/next.mcap"]  # worker kept processing
+
+
+def test_worker_delete_event_head_guard_recatalogs_live_object(tmp_db, monkeypatch):
+    conn, caches = tmp_db
+    import mcap_catalog_builder.__main__ as m
+
+    live = Stat(size=10, etag="e1", mtime_ns=1)
+    src = _StatSource(stat_result=live)
+    calls: list[tuple] = []
+    monkeypatch.setattr(
+        m, "catalog_object", lambda c, ca, k, s, stat=None: calls.append((k, stat)))
+    deleted: list[str] = []
+    monkeypatch.setattr(m, "delete_by_key", lambda c, ca, k: deleted.append(k))
+
+    rec, ack_q = _event_record("delete", "customer=a/x.mcap")
+    q: queue.Queue = queue.Queue()
+    q.put(rec)
+    q.put(WatchEvent("stop"))
+    worker_loop(conn, caches, src, q)
+    # Out-of-order delete for a live object: re-catalog with the HEAD's Stat
+    # passed through (exactly one stat call), never a row delete.
+    assert deleted == []
+    assert calls == [("customer=a/x.mcap", live)]
+    assert src.stat_calls == ["customer=a/x.mcap"]
+    assert ack_q.get_nowait() is rec.batch
+
+
+def test_worker_delete_event_head_guard_deletes_vanished_object(tmp_db, monkeypatch):
+    conn, caches = tmp_db
+    import mcap_catalog_builder.__main__ as m
+
+    src = _StatSource(stat_result=None)  # 404: object really gone
+    deleted: list[str] = []
+    monkeypatch.setattr(m, "delete_by_key", lambda c, ca, k: deleted.append(k))
+
+    rec, ack_q = _event_record("delete", "customer=a/x.mcap")
+    q: queue.Queue = queue.Queue()
+    q.put(rec)
+    q.put(WatchEvent("stop"))
+    worker_loop(conn, caches, src, q)
+    assert deleted == ["customer=a/x.mcap"]
+    assert ack_q.get_nowait() is rec.batch

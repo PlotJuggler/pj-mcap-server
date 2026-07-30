@@ -49,9 +49,10 @@ For ad-hoc inspection of `.mcap` files, use the official CLI at
 ## Architecture
 
 **Single-writer, producer/consumer** (`__main__.py`). The producers — for `local`:
-the `watchdog` observer + per-path debounce `Timer`s; for `s3`: the SQS event
-drainer; plus the periodic rescan thread — *only* `queue.put(WatchEvent)` and never
-touch the DB. One `worker_loop` on the main thread is the **sole consumer and the
+the `watchdog` observer + per-path debounce `Timer`s (`WatchEvent`); for `s3`: the
+ack-hardened SQS drainer (`EventRecord`, acked only after the DB outcome commits);
+plus the `AuditCoordinator` (one coalesced, result-bearing `AuditItem` at a time,
+completion-relative) — all *only* enqueue and never touch the DB. One `worker_loop` on the main thread is the **sole consumer and the
 only DB writer**, and is **backend-agnostic** (driven by a `Source`). SQLite runs in
 **WAL** mode so external readers query concurrently. The worker wraps every event
 in try/except so it can never die.
@@ -68,7 +69,8 @@ Module layering (each does one job):
   the `wait_for_stable` size-poll function.
 - `storage.py` — the `Source` protocol + `LocalSource` (local FS backend).
 - `s3_storage.py` — `S3Source` + `S3RangeReader` (footer-only range GETs, ETag
-  fingerprint, paginated LIST). `s3_producer.py` — `s3_event_producer` (S3→SQS).
+  fingerprint, paginated LIST). `s3_producer.py` — ack-hardened S3→SQS intake
+  (`SqsBatch`/`EventRecord`/`IntakeGate`; design 2026-07-30 §3).
 - `builder.py` — `catalog_object(conn, caches, key, source)` is the backend-agnostic
   core: resolve dims, **etag**-skip unchanged, then the per-file `with conn:`
   transaction. `delete_by_key` likewise. `catalog_file` / `delete_by_path` are thin

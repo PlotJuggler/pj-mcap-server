@@ -21,6 +21,7 @@ from .db import Caches, load_caches, open_db
 from .builder import catalog_object, delete_by_key
 from .publish import build_and_publish
 from .reconcile import ReconcileCancelled, SourceSpec, full_reconcile
+from .s3_producer import EventRecord, IntakeGate
 from .status import ReconcileProgress, StatusWriter
 from .storage import LocalSource
 from .tag_ipc import TagEditItem, TagEditServer, handle_tag_edit
@@ -115,11 +116,15 @@ class AuditCoordinator:
         interval: float,
         *,
         backoff_initial: float = _AUDIT_BACKOFF_INITIAL,
+        intake_gate=None,
     ) -> None:
         self._work_q = work_q
         self._stop_event = stop_event
         self._interval = max(0.0, interval)
         self._backoff_initial = max(0.0, backoff_initial)
+        # §3.5 handshake: pause SQS intake and wait until every received batch
+        # is terminal AND acked before an audit runs (None = no event tier).
+        self._gate = intake_gate
         self._lock = threading.Lock()
         self._queued_or_running = False
         self._current: AuditItem | None = None
@@ -177,39 +182,52 @@ class AuditCoordinator:
         delay = initial_delay
         failures = 0
         while not self._stop_event.wait(delay):
-            item = self._enqueue_if_idle()
-            if item is None:
-                # A due tick while an audit is queued/running is deliberately
-                # coalesced. If another caller requested the active audit, this
-                # scheduler observes that same result instead of creating work.
-                with self._lock:
-                    item = self._current
-                if item is None:
-                    return  # stop raced the due tick
-            result: AuditResult | None = None
             try:
-                result = item.wait(self._stop_event)
-                if result is None or result.outcome == "cancelled":
-                    return
-                if result.outcome == "ok":
-                    failures = 0
-                    delay = self._interval
-                else:
-                    failures += 1
-                    delay = min(
-                        self._interval,
-                        self._backoff_initial * (2 ** (failures - 1)),
-                    )
-                    logger.warning(
-                        "full audit failed; retrying in %.1fs (failure %d): %s",
-                        delay,
-                        failures,
-                        result.error or "unknown error",
-                    )
+                if self._gate is not None:
+                    # Pause intake BEFORE enqueueing the audit, then wait for
+                    # every already-received batch to be committed and acked —
+                    # a message must never sit un-acked behind a long audit
+                    # blowing its visibility timeout (§3.5). resume() runs in
+                    # the outer finally on every exit path.
+                    self._gate.pause()
+                    if not self._gate.wait_drained(self._stop_event):
+                        return  # stop arrived during the drain
+                item = self._enqueue_if_idle()
+                if item is None:
+                    # A due tick while an audit is queued/running is deliberately
+                    # coalesced. If another caller requested the active audit, this
+                    # scheduler observes that same result instead of creating work.
+                    with self._lock:
+                        item = self._current
+                    if item is None:
+                        return  # stop raced the due tick
+                result: AuditResult | None = None
+                try:
+                    result = item.wait(self._stop_event)
+                    if result is None or result.outcome == "cancelled":
+                        return
+                    if result.outcome == "ok":
+                        failures = 0
+                        delay = self._interval
+                    else:
+                        failures += 1
+                        delay = min(
+                            self._interval,
+                            self._backoff_initial * (2 ** (failures - 1)),
+                        )
+                        logger.warning(
+                            "full audit failed; retrying in %.1fs (failure %d): %s",
+                            delay,
+                            failures,
+                            result.error or "unknown error",
+                        )
+                finally:
+                    # Never leave the arbiter stuck after failure, cancellation,
+                    # or an unexpected result-handling exception.
+                    self._clear_active(item)
             finally:
-                # Never leave the arbiter stuck after failure, cancellation, or
-                # an unexpected result-handling exception.
-                self._clear_active(item)
+                if self._gate is not None:
+                    self._gate.resume()
 
         # Stop may arrive while the first/due timer is waiting. If an external
         # due request queued an item, make it a dropped terminal item.
@@ -316,6 +334,8 @@ def worker_loop(
         if stop_event is not None and stop_event.is_set():
             if isinstance(ev, AuditItem):
                 ev.cancel_if_pending()
+            # An EventRecord in hand is simply dropped un-terminal: the SQS
+            # message stays unacked and redelivers after restart (§3.3).
             break
 
         if isinstance(ev, AuditItem):
@@ -353,6 +373,40 @@ def worker_loop(
                     ev.finish(result)
             continue
 
+        if isinstance(ev, EventRecord):
+            # SQS event tier (§3.3/§3.4). ``terminal`` = the DB outcome
+            # COMMITTED (cataloged / ETag-skipped / committed quarantine /
+            # confirmed delete / safe no-op). A raised exception is NOT
+            # terminal: the message stays unacked and SQS redelivers it.
+            terminal = False
+            try:
+                if ev.kind == "catalog":
+                    catalog_object(conn, caches, ev.key, source)
+                    terminal = True
+                elif ev.kind == "delete":
+                    # HEAD-guard (§3.4): a stale/out-of-order delete for a
+                    # re-uploaded object re-catalogs from the live Stat (passed
+                    # through — no second HEAD) instead of deleting the row.
+                    st = source.stat(ev.key)
+                    if st is not None:
+                        catalog_object(conn, caches, ev.key, source, stat=st)
+                    else:
+                        delete_by_key(conn, caches, ev.key)
+                    terminal = True
+                else:
+                    logger.warning("unknown event record kind: %r", ev.kind)
+                    terminal = True  # redelivery cannot help an unknown kind
+            except Exception:  # noqa: BLE001 - the worker must never die
+                logger.exception(
+                    "event record failed; left unacked for redelivery: %s", ev.key
+                )
+            finally:
+                if terminal:
+                    ev.batch.record_terminal()
+                    if progress is not None:
+                        progress.event_applied()
+            continue
+
         try:
             if isinstance(ev, TagEditItem):
                 handle_tag_edit(conn, caches, ev)
@@ -386,6 +440,7 @@ def main(argv: list[str] | None = None) -> int:
     handler = None
     tag_server = None
     start_producer = None  # deferred until the served DB is ready
+    intake_gate = None  # §3.5 audit handshake; set only for the SQS event tier
 
     # --- build + validate the source (producers are started later) -----------
     if args.source == "s3":
@@ -420,11 +475,18 @@ def main(argv: list[str] | None = None) -> int:
             args.s3_bucket, args.s3_prefix,
         )
 
+        if args.sqs_url and not args.once and not args.no_watch:
+            intake_gate = IntakeGate()
+
         def start_producer() -> None:
+            # `status` is main()'s StatusWriter, assigned after the writer lock
+            # and before _locked_main ever calls this closure (late binding).
             threading.Thread(
                 target=s3_event_producer,
                 args=(boto3.client("sqs"), args.sqs_url, work_q, stop_event),
+                kwargs={"gate": intake_gate, "status": status},
                 daemon=True,
+                name="sqs-intake",
             ).start()
             logger.info("watching s3://%s/%s via %s", args.s3_bucket, args.s3_prefix, args.sqs_url)
     elif args.source == "gcs":
@@ -476,7 +538,7 @@ def main(argv: list[str] | None = None) -> int:
     status.heartbeat_start(stop_event)
     try:
         return _locked_main(args, source, start_producer, work_q, stop_event,
-                            lambda: observer, lambda: handler, status)
+                            lambda: observer, lambda: handler, status, intake_gate)
     except Exception as e:
         # Funnel any fatal error (missing credentials surfacing at the first
         # LIST, a failed publish, ...) into the sidecar so "unhealthy" comes
@@ -490,7 +552,7 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _locked_main(args, source, start_producer, work_q, stop_event,
-                 get_observer, get_handler, status) -> int:
+                 get_observer, get_handler, status, intake_gate=None) -> int:
     """The post-lock body of main(): everything that reads or writes the served
     DB / binds the tag socket runs under the single-writer lock. The observer/
     handler are read through GETTERS because the local-source start_producer
@@ -588,7 +650,7 @@ def _locked_main(args, source, start_producer, work_q, stop_event,
             start_producer()
 
         audit_coordinator = AuditCoordinator(
-            work_q, stop_event, args.rescan_interval
+            work_q, stop_event, args.rescan_interval, intake_gate=intake_gate
         )
         audit_coordinator.start(immediate=startup_audit)
 

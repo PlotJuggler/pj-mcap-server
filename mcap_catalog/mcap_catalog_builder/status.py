@@ -34,6 +34,10 @@ STATUS_SUFFIX = ".status.json"
 _MAX_ERROR_LEN = 2000
 
 
+def _utc_iso(wall: float | None = None) -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() if wall is None else wall))
+
+
 class StatusWriter:
     """Atomically maintains ``<db>.status.json`` (thread-safe, throttled)."""
 
@@ -51,6 +55,12 @@ class StatusWriter:
         self._clock = clock
         self._last_write: float | None = None
         self._hb_thread: threading.Thread | None = None
+        # Event-tier counters (§6, additive advisory fields): guarded by their
+        # own lock — increments come from both producer and worker threads.
+        self._counters_lock = threading.Lock()
+        self._events_applied = 0
+        self._events_unknown = 0
+        self._events_acked = 0
 
     def update(self, *, force: bool = False, **fields) -> None:
         """Merge ``fields`` into the state and write, subject to throttling.
@@ -77,15 +87,40 @@ class StatusWriter:
         """Record a fatal failure (``phase="error"``) immediately."""
         self.update(phase="error", last_error=str(message)[:_MAX_ERROR_LEN], force=True)
 
+    def producer_poll_ok(self) -> None:
+        """Record a successful SQS poll (§3.5: distinguishes a dead producer
+        from a quiet bucket — ``last_event_at`` alone cannot). Throttled by the
+        normal ``min_interval`` coalescing; polls recur every ~20 s anyway."""
+        self.update(producer_last_poll_ok_at=_utc_iso())
+
+    def producer_acked(self) -> None:
+        with self._counters_lock:
+            self._events_acked += 1
+            n = self._events_acked
+        self.update(producer_last_ack_at=_utc_iso(), events_acked=n)
+
+    def event_unknown(self, name: str) -> None:
+        """Count an S3 event name the translator does not support (§3.2) — a
+        visible counter, never a silently acked-and-dropped message."""
+        with self._counters_lock:
+            self._events_unknown += 1
+            n = self._events_unknown
+        self.update(events_unknown_name=n)
+
+    def event_applied(self) -> None:
+        with self._counters_lock:
+            self._events_applied += 1
+            n = self._events_applied
+        self.update(events_applied=n)
+
     def full_audit_finished(self, outcome: str, duration: float) -> None:
         """Record the last terminal full-audit result.
 
         These fields are additive advisory telemetry; existing sidecar readers
         continue to key only on ``phase``/``updated_at``.
         """
-        wall = time.time()
         self.update(
-            full_audit_last=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(wall)),
+            full_audit_last=_utc_iso(),
             full_audit_outcome=outcome,
             full_audit_duration=max(0.0, duration),
             force=True,
@@ -257,6 +292,11 @@ class ReconcileProgress:
         """Publish the result returned by the worker to the audit coordinator."""
         if self._status is not None:
             self._status.full_audit_finished(outcome, duration)
+
+    def event_applied(self) -> None:
+        """Count one committed event-tier record (create/delete via SQS)."""
+        if self._status is not None:
+            self._status.event_applied()
 
     @property
     def summary_via_counts(self) -> dict:
