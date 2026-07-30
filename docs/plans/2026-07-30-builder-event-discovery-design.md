@@ -411,6 +411,39 @@ ahead of need (first report takes up to 48 h).
 | False deletion cascading `tags_override` | — | **made structurally impossible**: live-LIST authority, per-prefix coverage, or HEAD-confirmed 404 | none (fail-closed) |
 | Builder crash mid-audit | no `record_build` stamp | next scheduled audit | one cadence |
 
+### 7.1 Reader-side fallback during the deletion-staleness window (verified 2026-07-30)
+
+The design tolerates a window where the catalog lists an object that no longer
+exists (minutes via delete events; up to ~one tier-3 cadence if a delete event
+is lost). The Go server's behavior in that window was verified against the code
+— it fails safe on every surface:
+
+- **Browse** (`ListFiles`/`GetVocabulary`): pure catalog reads, no object
+  access — the stale row is listed. Staleness is visible, never harmful.
+- **Session open** (`OpenFresh`): plan-build loads chunk indexes from the
+  object; a vanished object surfaces `NoSuchKey` → `storage.ErrPermanent`
+  (`storage/s3.go classify`) → a **request-scoped**
+  `ERROR_S3_UNAVAILABLE` with a diagnosable message
+  (`ws/handlers_session.go` plan-build error path). The connection and other
+  sessions are unaffected. The chunk-index cache stores only successful loads,
+  keyed by `(key|etag)` — a 404 is never negatively cached.
+- **Mid-stream**: every chunk read is `GetRangeVersioned`
+  (`session/codec_io.go`) — pinned to the catalog's ETag/generation. Deleted
+  object → permanent error → session `Error` frame ("stream failed" + detail);
+  **replaced** object → `PreconditionFailed` → clean "object changed
+  mid-session" failure. The pin makes serving mixed or wrong bytes under stale
+  catalog metadata **structurally impossible** — the worst outcome of the
+  staleness window is an explicit failed request, never silent corruption.
+- **Client**: the plugin opens a fresh `BackendConnection` per download and
+  fails that download on `Error`; `RESUME_NOT_POSSIBLE` fails verbatim with the
+  partial kept (both pinned decisions).
+
+Optional refinement (nicety, not safety): plan-build currently reports a
+vanished object as `ERROR_S3_UNAVAILABLE`, indistinguishable from a bucket
+outage. Mapping the `ErrPermanent`/`NoSuchKey` case to `ERROR_NOT_FOUND` would
+let the UI say "recording was deleted — refresh the list" instead of implying a
+retryable outage. Candidate for the implementation plan's server-side touch.
+
 ## 8. Rollout phases (reordered per review: burn in events *before* loosening the safety net)
 
 | Phase | Content | Type |
