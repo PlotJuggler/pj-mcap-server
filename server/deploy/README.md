@@ -193,18 +193,30 @@ aws sqs create-queue --queue-name pj-cloud-catalog-events --attributes '{
   "VisibilityTimeout": "300",
   "RedrivePolicy": "{\"deadLetterTargetArn\":\"'"$DLQ_ARN"'\",\"maxReceiveCount\":\"5\"}"
 }'
-# 2. Allow S3 to send (queue policy), then wire the bucket notification with
-#    a .mcap suffix filter (and your key prefix). Include lifecycle events —
-#    they have their OWN event names, ObjectRemoved does not cover them.
+# 2. Queue policy: allow THIS bucket's S3 notifications to send.
+cat > /tmp/queue-policy.json <<'POLICY'
+{"Policy": "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":{\"Service\":\"s3.amazonaws.com\"},\"Action\":\"sqs:SendMessage\",\"Resource\":\"<queue-arn>\",\"Condition\":{\"ArnLike\":{\"aws:SourceArn\":\"arn:aws:s3:::<bucket>\"}}}]}"}
+POLICY
+aws sqs set-queue-attributes --queue-url <queue-url> \
+    --attributes file:///tmp/queue-policy.json
+# 3. Wire the bucket notification with a .mcap suffix filter (and your key
+#    prefix). Include lifecycle events — they have their OWN event names,
+#    ObjectRemoved does not cover them.
 aws s3api put-bucket-notification-configuration --bucket <bucket> \
   --notification-configuration '{"QueueConfigurations": [{
     "QueueArn": "<queue-arn>",
     "Events": ["s3:ObjectCreated:*", "s3:ObjectRemoved:*",
                "s3:LifecycleExpiration:*"],
     "Filter": {"Key": {"FilterRules": [{"Name": "suffix", "Value": ".mcap"}]}}}]}'
-# 3. Builder IAM: sqs:ReceiveMessage, sqs:DeleteMessage,
-#    sqs:ChangeMessageVisibility, sqs:GetQueueAttributes on the queue ARN.
+# 4. Builder IAM: sqs:ReceiveMessage, sqs:DeleteMessage,
+#    sqs:ChangeMessageVisibility, sqs:GetQueueAttributes on the queue ARN
+#    (on EC2: add these to the instance role from docs/ec2-deploy.md).
 ```
+
+Steps 1–3 are safe to do **early**, well before enabling the consumer: only
+objects uploaded *after* the notification config exists generate events, and
+the queue simply accumulates them durably (4-day retention) until Phase 4
+drains it.
 
 Enable the consumer (Phase 4): replace `--no-watch` with
 `--sqs-url <queue-url>` in the compose file / `BUILDER_ARGS` — keep the 6 h

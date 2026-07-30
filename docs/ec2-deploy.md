@@ -74,6 +74,11 @@ keys are ever stored. Minimal policy:
 }
 ```
 
+> **SQS event tier (optional, later):** enabling event-driven discovery
+> (`server/deploy/README.md` § "S3 event notifications") requires adding
+> `sqs:ReceiveMessage`, `sqs:DeleteMessage`, `sqs:ChangeMessageVisibility`,
+> and `sqs:GetQueueAttributes` on the events-queue ARN to **this same role**.
+
 > **CONTAINER + IMDS GOTCHA (do not skip):** a container reaching the instance
 > role is **one extra network hop**, so IMDSv2's default hop limit of 1 blocks
 > it and the containers get *no* credentials. Raise it to 2:
