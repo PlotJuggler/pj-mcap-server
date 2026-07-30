@@ -174,6 +174,45 @@ argument convention (`BUILDER_ARGS` in `/etc/pj-cloud/builder.env`) are
 documented in each unit file's header comments — read `pj-cloud-builder.service`
 first, since the server unit depends on it having run at least once.
 
+## S3 event notifications (SQS) — enabling event-driven discovery
+
+Design: `docs/plans/2026-07-30-builder-event-discovery-design.md` (§3, §8).
+The builder code ships ack-hardened SQS intake, but every deploy shape above
+still runs `--no-watch` (rescan-only). Enablement is a phased ops change —
+create the infra (Phase 2-3), burn in the consumer (Phase 4), and only then
+loosen the audit interval (Phase 6):
+
+```bash
+# 1. Queue + DLQ (retention >= 4 days on both; redrive after 5 receives).
+aws sqs create-queue --queue-name pj-cloud-catalog-dlq \
+    --attributes MessageRetentionPeriod=1209600
+DLQ_ARN=$(aws sqs get-queue-attributes --queue-url <dlq-url> \
+    --attribute-names QueueArn --query Attributes.QueueArn --output text)
+aws sqs create-queue --queue-name pj-cloud-catalog-events --attributes '{
+  "MessageRetentionPeriod": "345600",
+  "VisibilityTimeout": "300",
+  "RedrivePolicy": "{\"deadLetterTargetArn\":\"'"$DLQ_ARN"'\",\"maxReceiveCount\":\"5\"}"
+}'
+# 2. Allow S3 to send (queue policy), then wire the bucket notification with
+#    a .mcap suffix filter (and your key prefix). Include lifecycle events —
+#    they have their OWN event names, ObjectRemoved does not cover them.
+aws s3api put-bucket-notification-configuration --bucket <bucket> \
+  --notification-configuration '{"QueueConfigurations": [{
+    "QueueArn": "<queue-arn>",
+    "Events": ["s3:ObjectCreated:*", "s3:ObjectRemoved:*",
+               "s3:LifecycleExpiration:*"],
+    "Filter": {"Key": {"FilterRules": [{"Name": "suffix", "Value": ".mcap"}]}}}]}'
+# 3. Builder IAM: sqs:ReceiveMessage, sqs:DeleteMessage,
+#    sqs:ChangeMessageVisibility, sqs:GetQueueAttributes on the queue ARN.
+```
+
+Enable the consumer (Phase 4): replace `--no-watch` with
+`--sqs-url <queue-url>` in the compose file / `BUILDER_ARGS` — keep the 6 h
+`--rescan-interval` until the burn-in drills pass (see the design doc), then
+move it to nightly. Alarm on SQS `ApproximateAgeOfOldestMessage` and DLQ
+depth > 0; the sidecar's `producer_last_poll_ok_at` distinguishes a dead
+intake thread from a quiet bucket.
+
 ## TLS
 
 Both the compose and systemd paths run the Go server in plaintext by default.

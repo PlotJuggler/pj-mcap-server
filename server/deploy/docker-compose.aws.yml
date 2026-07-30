@@ -60,7 +60,9 @@ services:
       - "--no-watch"
       - "--tag-socket=/var/lib/pj-cloud/tag.sock"
       - "--db=/var/lib/pj-cloud/catalog.db"
-      - "--rescan-interval=300"
+      # 6 h full-audit interval (design 2026-07-30 Phase 0) — see
+      # docker-compose.yml for the rationale; nightly after Phase 6.
+      - "--rescan-interval=21600"
       - "--log-level=INFO"
     # "Alive, progressing, not fatally failed" — from the <db>.status.json
     # sidecar (atomic, heartbeat-refreshed every 10s; CATALOG_CONTRACT.md §12).

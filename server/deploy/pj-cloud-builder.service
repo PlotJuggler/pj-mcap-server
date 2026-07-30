@@ -63,11 +63,14 @@ EnvironmentFile=/etc/pj-cloud/builder.env
 # default for a bare-metal box; drop it if you want live S3 SQS / local
 # inotify event-driven discovery instead of pure periodic rescans.
 # BUILDER_ARGS (source/bucket/prefix) comes from the EnvironmentFile above.
+# --rescan-interval 21600: 6 h full-audit interval (design 2026-07-30
+# Phase 0) — a 300 s full-bucket LIST treadmill saturates at millions of
+# objects; SQS events (Phase 4) carry freshness, the rescan is the safety net.
 ExecStart=/opt/pj-cloud-builder/venv/bin/python3 -m mcap_catalog_builder \
     --no-watch \
     --tag-socket /var/lib/pj-cloud/tag.sock \
     --db /var/lib/pj-cloud/catalog.db \
-    --rescan-interval 300 \
+    --rescan-interval 21600 \
     --log-level INFO \
     $BUILDER_ARGS
 Restart=on-failure
