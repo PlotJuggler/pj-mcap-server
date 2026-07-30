@@ -85,9 +85,68 @@ unchanged at `LayoutXml.cpp:77/:546`.
   return, `MainWindow.cpp:5095-5101`, so it cannot govern late jobs) and passes a
   `MissingCurvePolicy` into the drain path instead of the current implicit prompt.
 
+## Consult verdict (2026-07-30, Codex session `019fb1c1-29f5-7f71-84c9-2de32e1a70aa`) — AMENDMENTS LOCKED
+
+- **D1 amended:** the authoritative registry is a DATASET-KEYED map
+  `DatasetId → SourceRecord{provider_id, source_identity, descriptor_json}` —
+  NOT extended `LoadedSource` (path-level, dedup-by-path; one file fans out to many
+  datasets). Resolver order: exact-id-with-all-qualifiers (incl. record) → unique
+  (provider, identity, FULL canonical descriptor) record match → path tier → name
+  tier. Merge handling lives inside `SessionManager::mergeDatasets` (not
+  DatasetMergeActions); a destructive merge invalidates ALL contributing records
+  including the anchor.
+- **D2 locked** with compat tiers: manifest-id exact → display-name exact → no
+  `<plugin>` child keeps legacy first-extension-match → named-but-unmatched =
+  per-source failure (no unique-extension fallback). Schema: keep
+  `<plugin ID="display name" manifest_id="stable-id">` (old readers keep working).
+  Also fix `hint_eligible` (compares `expected_plugin_id == source_name` — breaks
+  under manifest-id selection, FileLoader.cpp:1318) and add a strict
+  no-dialog/config-required hint (a rejected preset currently falls back to a
+  dialog) + suppress per-source warning dialogs under a batch.
+- **D3 NOT locked as first written — five invariants added:** (1) an accepted
+  ticket never terminalizes before the enqueue call returns (synchronous
+  reuse/failure paths!); (2) ticket and generation state independent, associated
+  via a transient `requestStarted(ticket, generation)`; (3) cross-thread cancel
+  marshals to the GUI thread; (4) terminal-flag-and-erase BEFORE emitting; (5) one
+  centralized terminalization covering every exit incl. `joinForShutdown`. PLUS:
+  a strict-replacement flag (`replace_dataset_id` today silently degrades to a
+  fresh load when the target vanished — promotion must FAIL instead); plural
+  `produced_dataset_ids` (fan-out) with a primary convenience; and a
+  **pre-catalog commit seam** — source records must install BEFORE
+  `CatalogModel` rebuild/`itemsAdded` (today `finishLoadOnGui` rebuilds the
+  catalog before even installing the source path, so the terminal signal is too
+  late for the spec's atomic-publication guarantee).
+- **D4 locked (pj_app)** with wider binding: the promotion service registers for
+  BOTH interactive toolbox instances (launchToolbox) AND batch-owned headless
+  provider instances. "Validate dataset generation" is not literally implementable
+  (no generation token exists) — validate the target is live AND belongs to the
+  bound provider's ingest, combined with strict replacement. Teardown rule:
+  accepted promotion callbacks finish or are failed while the plugin
+  instance/DSO is still alive.
+- **D5 locked (construction-time capture)** + policy amendment: add an explicit
+  non-interactive `MissingCurvePolicy` mode — never prompts, never opens dialogs,
+  emits diagnostics, and RETAINS unresolved curve/scene intents for later binding
+  (the current drain path clears the binder after the conditional prompt).
+- **NEW T0 (prerequisite):** bump PJ4's `plotjuggler_sdk` submodule gitlink to
+  v0.20.0 — main still builds an in-tree 0.19.0-era SDK; nothing here compiles
+  against the new ABI without it.
+- **NEW T5b (PR-B):** `HeadlessDescriptorProviderSession` — find the provider by
+  stable manifest id, create + bind ONE headless plugin instance per batch,
+  resolve `pj.descriptor_import.v1`, register the per-instance promotion service,
+  pin the DSO + callback state through all jobs, tear down only after cancel/join.
+- **T6 additions:** provider-absent/cache-path stock fallback (§6.4),
+  `estimated_bytes`/`max_transfer_bytes` guard-3 policy, re-entrant provider
+  callback handling.
+- **PR-A must freeze the seams PR-B needs:** T1's strict-replacement + plural ids +
+  commit seam; T2's lifecycle begin/progress/end signals for T7 (MainWindow keeps
+  only strip presentation + stop routing); T3/T4 share the `<plugin>`/`<fileInfo>`
+  schema — design together, commit separately.
+
 ## Tasks (each = TDD; test conventions per pj_app: standalone gtest for
 ## Widgets-free logic, `add_pj_app_gui_test` + `friend class …TestPeer` for
 ## MainWindow-coupled scenarios)
+
+- [x] **T0 — SDK submodule bump to v0.20.0** (consult-caught prerequisite).
 
 - [ ] **T1 — FileLoader `LoadTicket`** (additive, D3). Mint ids at enqueue; terminal
   exactly-once signal incl. cancel/failure paths + effective path + DatasetId;
