@@ -470,6 +470,15 @@ estimates (`estimated_chunk_bytes`, `approximate_messages`).
 
 ## Working conventions
 
+- **A PR is NOT ready until the documentation audit passes**: before declaring any
+  branch/PR done, double-check that every document and instruction it touches the
+  truth of is up to date — the affected `README.md`s, the `CLAUDE.md`s (root +
+  `mcap_catalog/`), `CATALOG_CONTRACT.md` (BOTH byte-identical copies — verify with
+  `cmp`), the deploy runbooks (`server/deploy/`, `docs/ec2-deploy.md`,
+  `docs/gce-deploy-smoke.md`), CLI `--help` texts, and any design doc whose Status
+  header the PR advances. Grep the docs for the behavior you changed (flag names,
+  intervals, event/ack semantics, file paths) rather than trusting memory — the
+  2026-07-30 event-discovery PR found seven stale spots this way.
 - The plans are written **for agentic execution**: each starts with a required
   sub-skill (`superpowers:subagent-driven-development` or `superpowers:executing-plans`) and
   uses `- [ ]` checkboxes for task tracking. Follow that workflow when implementing them, and
