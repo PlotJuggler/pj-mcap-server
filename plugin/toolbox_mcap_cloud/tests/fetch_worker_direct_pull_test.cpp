@@ -383,3 +383,25 @@ TEST(McapCloudDirectPull, WatchdogSpawnFailureIsNonfatal) {
       << "watchdog spawn failure must be nonfatal: " << result.error;
   EXPECT_EQ(result.tee_outcome, mcap_cloud::TeeOutcome::kFinalized) << result.tee_error;
 }
+
+// Adversarial F12: the transfer-DURATION ceiling — same distinct-FAILED
+// semantics as bytes (the flood pull reliably takes >> 50 ms).
+TEST(McapCloudDirectPull, DurationCeilingFailsWithTheDurationCause) {
+  FakeStreamingServer server(FakeStreamingServer::Mode::kCompleteWithProgressFlood);
+  ASSERT_TRUE(server.ok());
+  TempRoot cache_root("duration-cache");
+  TempRoot config_root("duration-config");
+  mcap_cloud::ImportRuntime rt(mcap_cloud::SessionFileCache(cache_root.path),
+                               mcap_cloud::TrustedOrigins(config_root.path));
+
+  PullHarness h;
+  mcap_cloud::PullRequest request = h.request(rt, server.uri());
+  request.max_transfer_duration = std::chrono::milliseconds(50);
+  const auto result = h.worker.pull(std::move(request));
+
+  EXPECT_EQ(result.terminal, mcap_cloud::PullTerminal::kFailed) << result.error;
+  EXPECT_TRUE(result.duration_ceiling_exceeded);
+  EXPECT_NE(result.error.find("duration"), std::string::npos) << result.error;
+  fs::path unused;
+  EXPECT_FALSE(rt.fileCache().lookup(identityFor(server.uri()), &unused));
+}

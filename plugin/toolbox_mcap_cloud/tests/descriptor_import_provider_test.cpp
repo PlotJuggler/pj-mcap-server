@@ -964,3 +964,88 @@ TEST(McapCloudProviderJob, ControlOnlyCeilingOverageFails) {
   EXPECT_NE(recorder.terminal(0).second.find("byte"), std::string::npos)
       << recorder.terminal(0).second;
 }
+
+// Adversarial F9: ANOTHER PROCESS holding the identity's materialize lock
+// (a second SessionFileCache instance — flock treats each descriptor as an
+// independent holder, the two-process equivalent) must make the job WAIT,
+// then materialize normally once the lock frees — never classify the
+// contention as an ordinary tee failure and stream tee-less.
+TEST(McapCloudProviderJob, WaitsOutCrossProcessLockThenMaterializes) {
+  FakeStreamingServer server(FakeStreamingServer::Mode::kComplete);
+  ASSERT_TRUE(server.ok());
+  ProviderHarness h("job-xproclock");
+  h.provider.setLockWaitForTest(std::chrono::milliseconds(20), std::chrono::seconds(10));
+  const std::string identity = identityFor(server.uri());
+
+  mcap_cloud::SessionFileCache other_process(h.cache_root.path);
+  std::string err;
+  auto held = other_process.tryLockForMaterialize(identity, &err);
+  ASSERT_TRUE(held.has_value()) << err;
+
+  JobRecorder recorder;
+  ScopedJob job;
+  ASSERT_TRUE(h.start(queryJson(server.uri()), recorder, job));
+  std::this_thread::sleep_for(std::chrono::milliseconds(150));  // the job is waiting
+  EXPECT_EQ(recorder.terminalCount(), 0u) << "the job must WAIT, not fail tee-less";
+  held.reset();  // the other process finishes (without publishing a file)
+  ASSERT_TRUE(recorder.waitTerminal(std::chrono::seconds(20)));
+  job.job.vtable->join(job.job.ctx);
+
+  ASSERT_EQ(recorder.terminalCount(), 1u);
+  EXPECT_EQ(recorder.terminal(0).first, PJ_DESCRIPTOR_IMPORT_SUCCEEDED_EAGER_ONLY)
+      << recorder.terminal(0).second;
+  fs::path cache_file;
+  EXPECT_TRUE(h.rt.fileCache().lookup(identity, &cache_file))
+      << "after waiting out the lock the job must still MATERIALIZE (F9) — a tee-less "
+         "stream would leave no cache file";
+}
+
+// Adversarial F9: an EXHAUSTED cross-process wait fails actionably.
+TEST(McapCloudProviderJob, CrossProcessLockTimeoutFailsActionably) {
+  FakeStreamingServer server(FakeStreamingServer::Mode::kComplete);
+  ASSERT_TRUE(server.ok());
+  ProviderHarness h("job-xproctimeout");
+  h.provider.setLockWaitForTest(std::chrono::milliseconds(20), std::chrono::milliseconds(200));
+  const std::string identity = identityFor(server.uri());
+
+  mcap_cloud::SessionFileCache other_process(h.cache_root.path);
+  std::string err;
+  auto held = other_process.tryLockForMaterialize(identity, &err);
+  ASSERT_TRUE(held.has_value()) << err;
+
+  JobRecorder recorder;
+  ScopedJob job;
+  ASSERT_TRUE(h.start(queryJson(server.uri()), recorder, job));
+  ASSERT_TRUE(recorder.waitTerminal(std::chrono::seconds(10)));
+  job.job.vtable->join(job.job.ctx);
+
+  ASSERT_EQ(recorder.terminalCount(), 1u);
+  EXPECT_EQ(recorder.terminal(0).first, PJ_DESCRIPTOR_IMPORT_FAILED);
+  EXPECT_NE(recorder.terminal(0).second.find("another process"), std::string::npos)
+      << recorder.terminal(0).second;
+}
+
+// Adversarial F12: the provider's per-machine byte cap applies even when the
+// CALLER imposes no ceiling (env-overridable; effective = min-nonzero).
+TEST(McapCloudProviderJob, ProviderEnvByteCapAppliesWithoutCallerCeiling) {
+  FakeStreamingServer server(FakeStreamingServer::Mode::kCompleteEmpty);
+  ASSERT_TRUE(server.ok());
+  ProviderHarness h("job-envcap");
+  const std::optional<std::string> saved =
+      mcap_cloud_test::HermeticEnv::capture("MCAP_CLOUD_IMPORT_MAX_BYTES");
+  ::setenv("MCAP_CLOUD_IMPORT_MAX_BYTES", "1", 1);
+
+  JobRecorder recorder;
+  ScopedJob job;
+  const bool started = h.start(queryJson(server.uri()), recorder, job, /*max_transfer_bytes=*/0);
+  ASSERT_TRUE(started);
+  ASSERT_TRUE(recorder.waitTerminal(std::chrono::seconds(20)));
+  job.job.vtable->join(job.job.ctx);
+  mcap_cloud_test::HermeticEnv::restore("MCAP_CLOUD_IMPORT_MAX_BYTES", saved);
+
+  ASSERT_EQ(recorder.terminalCount(), 1u);
+  EXPECT_EQ(recorder.terminal(0).first, PJ_DESCRIPTOR_IMPORT_FAILED)
+      << recorder.terminal(0).second;
+  EXPECT_NE(recorder.terminal(0).second.find("byte"), std::string::npos)
+      << recorder.terminal(0).second;
+}

@@ -1653,13 +1653,27 @@ PullResult FetchWorker::pull(PullRequest request) {
   } tee_cancel_hook_guard{this};
   {
     std::string begin_error;
-    if (!tee->begin(request.identity, &begin_error, std::move(request.ticket))) {
+    if (!tee->begin(request.identity, &begin_error, std::move(request.ticket),
+                    std::move(request.lock))) {
       tee.reset();
       result.tee_outcome = TeeOutcome::kFailed;
       result.tee_error = begin_error;
     } else {
       setTeeForCancel(tee.get());
     }
+  }
+
+  // FAIR admission (adversarial F10): same gate as the interactive pull —
+  // ONE pull at a time, FIFO, acquired BEFORE any session/connection
+  // resources exist (a queued job holds no remote session or inbox), held
+  // (RAII) for the whole pull including the on_dataset host-lock release
+  // window so the other producer cannot steal the turn.
+  std::optional<ImportRuntime::AdmissionTicket> admission = rt->acquireAdmission(
+      [this]() { return cancel_flag_.load(std::memory_order_relaxed); },
+      std::chrono::milliseconds(50));
+  if (!admission.has_value()) {
+    finish_cancelled();
+    return result;  // the tee's RAII cleanup deletes the partial
   }
 
   // ---- ONE session connection owned by the pull, published for cancel
@@ -1826,6 +1840,8 @@ PullResult FetchWorker::pull(PullRequest request) {
   std::chrono::steady_clock::time_point last_host_progress_emit{};
   const auto kProgressInterval = std::chrono::milliseconds(100);
   bool byte_ceiling_exceeded = false;
+  bool duration_ceiling_exceeded = false;
+  const auto download_start = std::chrono::steady_clock::now();
 
   SessionStats stats = session_backend->downloadSessionResumable(
       session_info, [&](const DecodedMessage& m) -> bool {
@@ -1839,6 +1855,12 @@ PullResult FetchWorker::pull(PullRequest request) {
         if (request.max_transfer_bytes > 0 &&
             session_backend->sessionWireBytesReceived() > request.max_transfer_bytes) {
           byte_ceiling_exceeded = true;
+          return false;
+        }
+        // F12: the transfer-duration ceiling, same distinct-FAILED shape.
+        if (request.max_transfer_duration.count() > 0 &&
+            std::chrono::steady_clock::now() - download_start > request.max_transfer_duration) {
+          duration_ceiling_exceeded = true;
           return false;
         }
         // Cache tee: the shared §9.6 discipline (teeEnqueueFailed) — a tee
@@ -1884,13 +1906,18 @@ PullResult FetchWorker::pull(PullRequest request) {
       stats.wire_bytes_received > request.max_transfer_bytes) {
     byte_ceiling_exceeded = true;
   }
+  if (request.max_transfer_duration.count() > 0 && !duration_ceiling_exceeded &&
+      std::chrono::steady_clock::now() - download_start > request.max_transfer_duration) {
+    duration_ceiling_exceeded = true;  // F12: same final-boundary rule as bytes
+  }
 
   if (tee != nullptr) {
     // No export on the direct pull: nullopt save_paths, inert helpers. A
     // final ceiling overage must never finalize (F6) — it rides the same
     // not-complete input as a cancel.
     const TeeTerminalOutcome terminal = finishCacheTee(
-        *tee, stats, cancelled_after_download || byte_ceiling_exceeded, std::nullopt,
+        *tee, stats, cancelled_after_download || byte_ceiling_exceeded || duration_ceiling_exceeded,
+        std::nullopt,
         [](McapSaveResult) {}, []() {},
         [](const std::filesystem::path&) {},
         [](const std::filesystem::path&, std::string*) { return true; });
@@ -1901,7 +1928,7 @@ PullResult FetchWorker::pull(PullRequest request) {
   }
 
   if (host_progress_active && stats.eos == SessionEos::Complete && !cancelled_after_download &&
-      !byte_ceiling_exceeded) {
+      !byte_ceiling_exceeded && !duration_ceiling_exceeded) {
     (void)driver.datasetIngest().progressUpdate(transport_messages_seen);
     driver.datasetIngest().progressFinish();
   }
@@ -1934,13 +1961,15 @@ PullResult FetchWorker::pull(PullRequest request) {
       driver.hasDecodable() && (decoded_rows > 0 || stats.messages_received == 0);
   result.decode_errors = total_decode_errors;
   result.byte_ceiling_exceeded = byte_ceiling_exceeded;
+  result.duration_ceiling_exceeded = duration_ceiling_exceeded;
 
   // Terminal precedence (documented, pinned by the ABI adversarial tests):
   // CANCEL WINS over the byte ceiling when both latched — an explicit caller
   // cancel outranks the resource classification (the partial is deleted
   // either way, and a retried import reports the ceiling uncontaminated);
   // the ceiling then wins over every other failure cause.
-  if (cancelled_after_download || (stats.eos == SessionEos::Cancelled && !byte_ceiling_exceeded)) {
+  if (cancelled_after_download ||
+      (stats.eos == SessionEos::Cancelled && !byte_ceiling_exceeded && !duration_ceiling_exceeded)) {
     finish_cancelled();
     result.error = "download cancelled";
   } else if (byte_ceiling_exceeded) {
@@ -1948,6 +1977,10 @@ PullResult FetchWorker::pull(PullRequest request) {
     result.error = "transfer byte ceiling exceeded: " + std::to_string(stats.wire_bytes_received) +
                    " wire bytes received > " + std::to_string(request.max_transfer_bytes) +
                    " byte limit";
+  } else if (duration_ceiling_exceeded) {
+    result.terminal = PullTerminal::kFailed;
+    result.error = "transfer duration ceiling exceeded (limit " +
+                   std::to_string(request.max_transfer_duration.count()) + " ms)";
   } else if (stats.eos == SessionEos::Complete) {
     result.terminal = PullTerminal::kComplete;
     result.error.clear();

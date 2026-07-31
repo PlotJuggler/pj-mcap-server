@@ -3,6 +3,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <functional>
@@ -56,6 +57,10 @@ struct PullRequest {
   /// kCancelled (a sink-false classifies as SessionEos::Cancelled on the
   /// wire; the pull must not leak that as a cancel).
   std::uint64_t max_transfer_bytes = 0;
+  /// Transfer-duration ceiling (adversarial F12; measured from download
+  /// start, checked per message and at the final boundary). 0 = off. Same
+  /// distinct-FAILED semantics as the byte ceiling.
+  std::chrono::milliseconds max_transfer_duration{0};
   /// REQUIRED: the shared per-toolbox ImportRuntime. The cache tee is
   /// ALWAYS-ON for direct pulls (the single-encoder rule); a tee failure
   /// never aborts the ingest (spec §9.6) — it is reported via
@@ -75,6 +80,9 @@ struct PullRequest {
   /// job's own ticket would self-contend with the tee's begin(). Must have
   /// been acquired for the SAME identity.
   std::optional<ImportRuntime::MaterializeTicket> ticket;
+  /// Same handoff for the CROSS-PROCESS materialize lock (adversarial F9):
+  /// the job's bounded cancelable wait acquires it before the pull.
+  std::optional<SessionFileCache::MaterializeLock> lock;
   /// Optional per-message transport progress (cumulative transport messages).
   /// Unthrottled; test observability — the provider job leaves it unset.
   std::function<void(std::uint64_t transport_messages)> onProgress;
@@ -85,6 +93,7 @@ struct PullResult {
   PullTerminal terminal = PullTerminal::kFailed;
   std::string error;                        // non-empty unless kComplete
   bool byte_ceiling_exceeded = false;       // the DISTINCT kFailed byte cause
+  bool duration_ceiling_exceeded = false;   // the DISTINCT kFailed duration cause (F12)
   TeeOutcome tee_outcome = TeeOutcome::kNone;
   std::string tee_error;
   std::optional<PJ::sdk::DataSourceHandle> dataset;  // the eager dataset, when created

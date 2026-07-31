@@ -122,19 +122,44 @@ PJ::SourcePromotionRequest ImportRuntime::makePromotionRequest(
 std::shared_ptr<PromotionResult> ImportRuntime::promoteToFileSource(
     const PJ::SourcePromotionRequest& request, const SessionKey* cache_key) {
   auto result = std::make_shared<PromotionResult>();
+  // F11: promotion begins with an atomic CAS on the CURRENT entry — only for
+  // this dataset, only from a non-pending state — and every settle must
+  // match {key, dataset id, generation} exactly, so a late result for an
+  // evicted/recreated entry (or a racing second promotion) can never mutate
+  // the wrong entry. kNoEntry (store-suppressed sessions) proceeds without
+  // entry tracking; kAlreadyPending / kDatasetMismatch REFUSE without ever
+  // calling the host (the double-fire guard).
+  const std::optional<SessionKey> key =
+      cache_key != nullptr ? std::optional<SessionKey>(*cache_key) : std::nullopt;
+  const std::uint32_t dataset_id = static_cast<std::uint32_t>(request.dataset);
+  bool tracked = false;
+  std::uint64_t generation = 0;
+  if (key.has_value()) {
+    switch (session_cache_->beginPromotion(*key, dataset_id, &generation)) {
+      case SessionCache::PromotionBegin::kBegun:
+        tracked = true;
+        break;
+      case SessionCache::PromotionBegin::kNoEntry:
+        break;  // proceed untracked
+      case SessionCache::PromotionBegin::kAlreadyPending:
+        result->settle(false, "a promotion for this session is already pending");
+        return result;
+      case SessionCache::PromotionBegin::kDatasetMismatch:
+        result->settle(false, "the cached session now belongs to a different dataset");
+        return result;
+    }
+  }
   // The callback closure captures ONLY shared/weak state: the settle-once
   // result and a weak SessionCache handle. It may run re-entrantly (before
   // promoteToFileSource returns), on any host thread, or after this runtime
   // is gone — none of those can touch freed plugin state.
-  const std::optional<SessionKey> key =
-      cache_key != nullptr ? std::optional<SessionKey>(*cache_key) : std::nullopt;
   std::weak_ptr<SessionCache> weak_cache = session_cache_;
-  auto update_entry = [weak_cache, key](PromotionState state) {
-    if (!key.has_value()) {
+  auto settle_entry = [weak_cache, key, dataset_id, generation, tracked](PromotionState state) {
+    if (!tracked || !key.has_value()) {
       return;
     }
     if (auto cache = weak_cache.lock()) {
-      cache->updatePromotionState(*key, state);
+      cache->settlePromotion(*key, dataset_id, generation, state);
     }
   };
 
@@ -145,31 +170,28 @@ std::shared_ptr<PromotionResult> ImportRuntime::promoteToFileSource(
   }
   if (!view.has_value() || !view->valid()) {
     // Absent service: every completed materialize is EAGER_ONLY-equivalent.
-    update_entry(PromotionState::kEagerOnly);
+    settle_entry(PromotionState::kEagerOnly);
     result->settle(false, "source promotion service not available (host without promotion support)");
     return result;
   }
 
-  // Mark pending BEFORE the call: a re-entrant on_result then simply
-  // overwrites kPending with the terminal state. The outstanding counter
-  // (F7 diagnostics) increments before the call and decrements exactly once
-  // when on_result settles (or on synchronous rejection, where it never
-  // runs); the closure holds SHARED ownership of the counter so a settle
-  // after runtime teardown stays safe.
-  update_entry(PromotionState::kPending);
+  // The outstanding counter (F7 diagnostics) increments before the call and
+  // decrements exactly once when on_result settles (or on synchronous
+  // rejection, where it never runs); the closure holds SHARED ownership of
+  // the counter so a settle after runtime teardown stays safe.
   std::shared_ptr<std::atomic<int>> outstanding = promotions_outstanding_;
   outstanding->fetch_add(1);
   const PJ::Status status = view->promoteToFileSource(
-      request, [result, update_entry, outstanding](bool ok, std::string message) {
+      request, [result, settle_entry, outstanding](bool ok, std::string message) {
         // [host-callback-thread] — never assume the GUI thread here.
-        update_entry(ok ? PromotionState::kPromoted : PromotionState::kEagerOnly);
+        settle_entry(ok ? PromotionState::kPromoted : PromotionState::kEagerOnly);
         outstanding->fetch_sub(1);
         result->settle(ok, std::move(message));
       });
   if (!status) {
     // Synchronous rejection: on_result will never run.
     outstanding->fetch_sub(1);
-    update_entry(PromotionState::kEagerOnly);
+    settle_entry(PromotionState::kEagerOnly);
     result->settle(false, status.error());
   }
   return result;

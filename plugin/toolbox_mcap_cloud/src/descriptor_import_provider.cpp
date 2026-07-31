@@ -10,10 +10,13 @@
 #include <filesystem>
 #include <optional>
 #include <semaphore>
+#include <string>
 #include <string_view>
 #include <system_error>
 #include <thread>
 #include <utility>
+
+#include <pj_base/sdk/platform.hpp>
 
 #include "credential_resolve.hpp"
 #include "credential_store.hpp"
@@ -26,6 +29,36 @@ namespace {
 
 std::string_view toView(PJ_string_view_t sv) {
   return std::string_view(sv.data == nullptr ? "" : sv.data, sv.data == nullptr ? 0 : sv.size);
+}
+
+// Per-machine provider hard limits (adversarial F12): a trusted server must
+// not be able to stream indefinitely just because the CALLER passed no
+// ceiling. Generous defaults, env-overridable, 0 = explicitly off.
+constexpr std::uint64_t kDefaultImportMaxBytes = 32ull * 1024 * 1024 * 1024;  // 32 GiB
+constexpr std::uint64_t kDefaultImportMaxSeconds = 3600;                      // 1 h
+
+std::uint64_t envLimit(const char* name, std::uint64_t fallback) {
+  const std::optional<std::string> raw = PJ::sdk::getEnv(name);
+  if (!raw.has_value() || raw->empty()) {
+    return fallback;
+  }
+  try {
+    return static_cast<std::uint64_t>(std::stoull(*raw));
+  } catch (...) {
+    return fallback;  // unparsable -> the safe default, never off
+  }
+}
+
+// min-nonzero merge: the effective ceiling is the tighter of the caller's and
+// the provider's; 0 on either side means "that side imposes none".
+std::uint64_t minNonzero(std::uint64_t a, std::uint64_t b) {
+  if (a == 0) {
+    return b;
+  }
+  if (b == 0) {
+    return a;
+  }
+  return a < b ? a : b;
 }
 
 }  // namespace
@@ -46,6 +79,7 @@ struct DescriptorImportProvider::JobState {
   std::string display_json;
   std::string identity;
   std::uint64_t max_transfer_bytes = 0;
+  std::chrono::milliseconds max_transfer_duration{0};  // F12 (env-provided)
   std::chrono::milliseconds lock_poll{50};
   std::chrono::milliseconds lock_timeout{60000};
   std::function<void()> pre_terminal_hook;  // test seam
@@ -183,6 +217,55 @@ PJ_descriptor_import_outcome_t DescriptorImportProvider::JobState::runToTerminal
     // It failed or was cancelled: proceed with a fresh download on our slot.
   }
 
+  // ---- the CROSS-PROCESS materialization gate (adversarial F9) -------------
+  // The same bounded cancelable wait + revalidate, now around the OS lock:
+  // process B must never classify process A's live materialization as an
+  // ordinary tee failure and open a duplicate network stream. Our own
+  // runtime-retained read lease (F2) would block this exclusive try —
+  // release it first (begin() would do the same; re-materialization is
+  // rename-over safe). A NON-contended failure (OS/writer error) proceeds
+  // lock-less: the tee's begin() surfaces the same failure through the §9.6
+  // nonfatal path.
+  runtime.releaseRetainedLease(identity);
+  std::optional<SessionFileCache::MaterializeLock> os_lock;
+  {
+    bool waited = false;
+    const auto os_deadline = std::chrono::steady_clock::now() + lock_timeout;
+    for (;;) {
+      std::string lock_error;
+      bool contended = false;
+      os_lock = runtime.fileCache().tryLockForMaterialize(identity, &lock_error, &contended);
+      if (os_lock.has_value() || !contended) {
+        break;
+      }
+      waited = true;
+      if (isCancelled()) {
+        *message = "import cancelled";
+        return PJ_DESCRIPTOR_IMPORT_CANCELLED;
+      }
+      if (std::chrono::steady_clock::now() >= os_deadline) {
+        *message =
+            "another process is materializing this session — retry when it completes";
+        return PJ_DESCRIPTOR_IMPORT_FAILED;
+      }
+      std::this_thread::sleep_for(lock_poll);
+    }
+    if (os_lock.has_value() && waited) {
+      // Contended-then-acquired across processes: revalidate, exactly like
+      // the in-process race (the same LOCKED v1 decision applies — zero
+      // on_dataset ran here, so only retry-classification is truthful).
+      std::filesystem::path disk;
+      if (runtime.fileCache().lookup(identity, &disk)) {
+        os_lock.reset();
+        ticket.reset();
+        *message =
+            "session was materialized concurrently by another process — reload to classify it "
+            "as a cache hit";
+        return PJ_DESCRIPTOR_IMPORT_FAILED;
+      }
+    }
+  }
+
   // ---- the direct cancellable pull (cache-tee mode, ticket adopted) --------
   // Defensive empty-selection guard (adversarial F3): the parser rejects
   // empty s3_keys, so this is unreachable via the ABI — but the .front()
@@ -207,6 +290,8 @@ PJ_descriptor_import_outcome_t DescriptorImportProvider::JobState::runToTerminal
   request.descriptor_json = display_json;
   request.identity = identity;
   request.ticket = std::move(ticket);
+  request.lock = std::move(os_lock);
+  request.max_transfer_duration = max_transfer_duration;
   // on_dataset: zero-or-one, from the pull's dataset creation, strictly
   // before any publication/progress/promotion — the pull fires this hook at
   // exactly that point, on this job-callback thread (serialized trivially).
@@ -241,8 +326,8 @@ PJ_descriptor_import_outcome_t DescriptorImportProvider::JobState::runToTerminal
     *message = "import cancelled";
     return PJ_DESCRIPTOR_IMPORT_CANCELLED;  // the tee already deleted the partial
   }
-  if (res.byte_ceiling_exceeded) {
-    *message = res.error;
+  if (res.byte_ceiling_exceeded || res.duration_ceiling_exceeded) {
+    *message = res.error;  // the distinct byte/duration ceiling cause (F6/F12)
     return PJ_DESCRIPTOR_IMPORT_FAILED;
   }
   if (res.terminal == PullTerminal::kFailed) {
@@ -547,11 +632,18 @@ bool DescriptorImportProvider::startImport(const PJ_descriptor_import_start_requ
     state->canonical_json = canonicalSourceDescriptorJson(*d);
     state->display_json = toSourceDescriptorJson(*d);
     state->identity = descriptorIdentity(*d);
-    state->max_transfer_bytes =
+    const std::uint64_t caller_bytes =
         req_covered(offsetof(PJ_descriptor_import_start_request_v1_t, max_transfer_bytes),
                     sizeof(request->max_transfer_bytes))
             ? request->max_transfer_bytes
             : 0;
+    // F12: the provider's per-machine hard limits apply even when the caller
+    // imposes none — effective = min-nonzero(caller, provider). Read on the
+    // main thread (getEnv), like every other start-time resolution.
+    state->max_transfer_bytes =
+        minNonzero(caller_bytes, envLimit("MCAP_CLOUD_IMPORT_MAX_BYTES", kDefaultImportMaxBytes));
+    state->max_transfer_duration = std::chrono::milliseconds(
+        envLimit("MCAP_CLOUD_IMPORT_MAX_SECONDS", kDefaultImportMaxSeconds) * 1000);
     state->lock_poll = lock_poll_;
     state->lock_timeout = lock_timeout_;
     state->pre_terminal_hook = pre_terminal_hook_;

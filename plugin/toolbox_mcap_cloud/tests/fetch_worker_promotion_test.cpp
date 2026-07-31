@@ -359,3 +359,62 @@ TEST(McapCloudPromotion, OutstandingPromotionCounterTracksTheDeferredSettle) {
   promo.joinWorker();
   EXPECT_EQ(rt.outstandingPromotions(), 0) << "settled";
 }
+
+// Adversarial F11: a second promotion while one is PENDING is refused — the
+// begin-CAS never double-fires the host.
+TEST(McapCloudPromotion, PendingPromotionRefusesADoubleFire) {
+  FakeStreamingServer server(FakeStreamingServer::Mode::kComplete);
+  ASSERT_TRUE(server.ok());
+  TempRoot cache_root("doublefire-cache");
+  TempRoot config_root("doublefire-config");
+  mcap_cloud::ImportRuntime rt(mcap_cloud::SessionFileCache(cache_root.path),
+                               mcap_cloud::TrustedOrigins(config_root.path));
+  DeferredPromotionHost promo;  // accepted, never settles until release()
+  rt.setPromotionHost(PJ::SourcePromotionHostView(promo.view()));
+
+  Harness h;
+  h.worker.setImportRuntime(&rt);
+  h.worker.setDatasetExistsForTest([](const mcap_cloud::CachedSession&) { return true; });
+  bool connected = false;
+  h.worker.connectFinished = [&](bool ok, std::string, std::string, std::string) { connected = ok; };
+  h.worker.connectAsync(server.uri(), "", "", false);
+  ASSERT_TRUE(connected);
+  h.worker.pullTopicsAsync({"a.mcap"}, "a.mcap", {"/one"}, 0, 0);  // promotion pending
+
+  // A memory hit while the promotion is still PENDING must NOT re-promote.
+  h.worker.pullTopicsAsync({"a.mcap"}, "a.mcap", {"/one"}, 0, 0);
+  EXPECT_EQ(server.openSessions(), 1) << "second pull must be a memory hit";
+  EXPECT_EQ(promo.stored_cb != nullptr, true);
+  promo.release();
+  promo.joinWorker();
+  EXPECT_EQ(entryPromotionState(rt, server.uri()), mcap_cloud::PromotionState::kPromoted);
+}
+
+// Adversarial F11: a LATE settle for an evicted-and-recreated entry must not
+// mutate the replacement (full {key, dataset, generation} match required).
+TEST(McapCloudPromotion, LateSettleNeverMutatesAReplacementEntry) {
+  mcap_cloud::SessionCache cache;
+  const PJ::cloud::SessionKey key =
+      PJ::cloud::computeSessionKey("ws://x:1", {"a.mcap"}, {"/one"}, {0, 0}, true);
+  mcap_cloud::CachedSession first;
+  first.display_name = "a";
+  first.dataset_id = 1;
+  cache.store(key, first);
+  std::uint64_t generation = 0;
+  ASSERT_EQ(cache.beginPromotion(key, 1, &generation),
+            mcap_cloud::SessionCache::PromotionBegin::kBegun);
+
+  // The entry is evicted and RECREATED for a new dataset before P1 settles.
+  cache.evict(key);
+  mcap_cloud::CachedSession replacement;
+  replacement.display_name = "a";
+  replacement.dataset_id = 2;
+  cache.store(key, replacement);
+
+  cache.settlePromotion(key, 1, generation, mcap_cloud::PromotionState::kPromoted);
+  auto entry = cache.lookup(key, [](const mcap_cloud::CachedSession&) { return true; });
+  ASSERT_TRUE(entry.has_value());
+  EXPECT_EQ(entry->promotion_state, mcap_cloud::PromotionState::kNone)
+      << "a late settle for the OLD generation must not touch the replacement (F11)";
+  EXPECT_EQ(entry->dataset_id, 2u);
+}

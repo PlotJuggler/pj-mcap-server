@@ -105,6 +105,11 @@ struct CachedSession {
   TeeOutcome tee_outcome = TeeOutcome::kNone;
   MemoryHitCase last_hit_case = MemoryHitCase::kNone;
   PromotionState promotion_state = PromotionState::kNone;  // D6 promotion transaction state
+  // Monotonic per-store token (adversarial F11): assigned by store(); a late
+  // promotion settle must match {key, dataset_id, generation} exactly, so a
+  // result for an evicted-and-recreated entry can never mutate its
+  // replacement.
+  std::uint64_t generation = 0;
 };
 
 // LRU-by-entry-count cache keyed on SessionKey.hash with full-key equality to
@@ -169,8 +174,10 @@ class SessionCache {
   // Store (or refresh) the COMPLETE-session entry for `key`. Callers MUST only
   // call this on a COMPLETE download (cancel/error -> no entry). Re-storing the
   // same key updates the value and promotes it to MRU. Over budget -> evict LRU.
+  // Every store assigns a FRESH generation token (F11).
   void store(const SessionKey& key, CachedSession value) {
     std::lock_guard<std::mutex> lock(mu_);
+    value.generation = ++next_generation_;
     auto map_it = index_.find(key.hash);
     if (map_it != index_.end()) {
       for (auto bit = map_it->second.begin(); bit != map_it->second.end(); ++bit) {
@@ -203,6 +210,53 @@ class SessionCache {
         return;
       }
     }
+  }
+
+  // ---- F11 promotion CAS ----------------------------------------------------
+  // Atomically BEGIN a promotion for the CURRENT entry: succeeds only when an
+  // entry exists for `key`, it belongs to `dataset_id`, and no promotion is
+  // already pending — then flips the state to kPending and returns the
+  // entry's generation (the settle token). The tri-state failure lets the
+  // caller distinguish "no entry to track" (proceed untracked) from
+  // "already pending" / "entry now belongs to another dataset" (REFUSE —
+  // the double-fire / stale-request guards).
+  enum class PromotionBegin { kNoEntry, kAlreadyPending, kDatasetMismatch, kBegun };
+  [[nodiscard]] PromotionBegin beginPromotion(const SessionKey& key, std::uint32_t dataset_id,
+                                              std::uint64_t* generation_out) {
+    std::lock_guard<std::mutex> lock(mu_);
+    EntryIter entry_it;
+    if (!findLocked(key, &entry_it)) {
+      return PromotionBegin::kNoEntry;
+    }
+    if (entry_it->value.dataset_id != dataset_id) {
+      return PromotionBegin::kDatasetMismatch;
+    }
+    if (entry_it->value.promotion_state == PromotionState::kPending) {
+      return PromotionBegin::kAlreadyPending;
+    }
+    entry_it->value.promotion_state = PromotionState::kPending;
+    if (generation_out != nullptr) {
+      *generation_out = entry_it->value.generation;
+    }
+    return PromotionBegin::kBegun;
+  }
+
+  // Settle a begun promotion — mutates the entry ONLY on a FULL match of
+  // {key, dataset_id, generation} while still kPending (F11: a late result
+  // for an evicted/recreated/re-promoted entry is dropped on the floor).
+  void settlePromotion(const SessionKey& key, std::uint32_t dataset_id, std::uint64_t generation,
+                       PromotionState state) {
+    std::lock_guard<std::mutex> lock(mu_);
+    EntryIter entry_it;
+    if (!findLocked(key, &entry_it)) {
+      return;
+    }
+    CachedSession& value = entry_it->value;
+    if (value.dataset_id != dataset_id || value.generation != generation ||
+        value.promotion_state != PromotionState::kPending) {
+      return;
+    }
+    value.promotion_state = state;
   }
 
   // Record the D6 promotion-transaction state on `key`'s entry (no LRU
@@ -310,6 +364,7 @@ class SessionCache {
 
   mutable std::mutex mu_;
   std::size_t max_entries_;
+  std::uint64_t next_generation_ = 0;  // F11 store tokens
   EntryList entries_;  // front = MRU, back = LRU
   std::unordered_map<std::uint64_t, std::list<EntryIter>> index_;  // hash -> entries with that hash
 };
