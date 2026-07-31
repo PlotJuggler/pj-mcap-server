@@ -443,6 +443,12 @@ class BackendConnection {
   // payload size, not true network bytes (no TLS/TCP/IP framing overhead).
   std::atomic<std::uint64_t> session_wire_bytes_{0};
 
+  // F3: "expired?" and "cap this wait to the remaining budget" — one
+  // definition shared by the frame loop, the resume backoff and the
+  // deadline-capped RPC waits.
+  [[nodiscard]] bool sessionDeadlineExpired() const;
+  [[nodiscard]] std::chrono::milliseconds cappedToDeadline(std::chrono::milliseconds wait) const;
+
   // R2(d): the per-download hard deadline (see setSessionDeadline).
   std::optional<std::chrono::steady_clock::time_point> session_deadline_;
 

@@ -1076,9 +1076,13 @@ TEST(McapCloudProviderJob, SelfLeaseDuringTheLockWaitDoesNotTimeOut) {
   // mid-wait (shared stacks against the external exclusive? no — acquire it
   // right after releasing the external lock, in the race window).
   held.reset();
+  // Plant it through the ADOPT path: retainLeaseForLifetime would (rightly,
+  // invariant 2) refuse — nothing is published yet — but a racing memory hit
+  // holds a lease it validated earlier, which is exactly what adopt models.
   if (auto lease = h.rt.fileCache().acquireReadLease(identity, nullptr)) {
-    h.rt.retainReadLease(identity, std::move(*lease));
+    h.rt.adoptLeaseForLifetime(identity, std::move(*lease));
   }
+  ASSERT_TRUE(h.rt.hasRetainedLease(identity)) << "the racing self-lease must be planted";
 
   const auto resume_at = std::chrono::steady_clock::now();
   ASSERT_TRUE(recorder.waitTerminal(std::chrono::seconds(8)))
@@ -1142,4 +1146,64 @@ TEST(McapCloudProviderJob, NonPublishingImportRestoresTheLeaseItReleased) {
       << "a non-publishing import must restore the lease it released (R1c)";
   fs::path still_valid;
   EXPECT_TRUE(h.rt.fileCache().lookup(identity, &still_valid));
+}
+
+// Round-3 F2: a COLD materialized query hit (fresh runtime — the
+// after-restart shape, where no finalize-time lease exists) must acquire the
+// shared lease BEFORE validating and RETAIN it for the runtime lifetime, so
+// the host can load the reported path without another process's evictor
+// pulling it out from under the loader's lazy re-opens.
+TEST(McapCloudProviderQuery, ColdMaterializedHitAcquiresAndRetainsTheLease) {
+  FakeStreamingServer server(FakeStreamingServer::Mode::kComplete);
+  ASSERT_TRUE(server.ok());
+  ProviderHarness h("query-coldlease");
+  const std::string identity = identityFor(server.uri());
+  const std::string json = queryJson(server.uri());
+
+  // Materialize once, then simulate a RESTART: a brand-new runtime+provider
+  // over the same cache root, with no lease inherited from finalize.
+  {
+    JobRecorder recorder;
+    ScopedJob job;
+    ASSERT_TRUE(h.start(json, recorder, job));
+    ASSERT_TRUE(recorder.waitTerminal(std::chrono::seconds(20)));
+    job.job.vtable->join(job.job.ctx);
+  }
+  mcap_cloud::ImportRuntime cold_rt(mcap_cloud::SessionFileCache(h.cache_root.path),
+                                    mcap_cloud::TrustedOrigins(h.config_root.path));
+  mcap_cloud::DescriptorImportProvider cold(cold_rt);
+  cold.bind(PJ::sdk::SettingsView{h.settings_host.view()},
+            {[&h]() { return h.host.view(); },
+             [&h]() { return PJ::ToolboxRuntimeHostView{h.ingest.toolboxRuntime()}; }});
+  ASSERT_FALSE(cold_rt.hasRetainedLease(identity)) << "a fresh runtime starts with no lease";
+
+  PJ_descriptor_query_result_v1_t out{};
+  ASSERT_TRUE(runQuery(cold, json, &out));
+  EXPECT_EQ(out.is_materialized, 1u);
+  EXPECT_TRUE(cold_rt.hasRetainedLease(identity))
+      << "a cold materialized hit must retain the lease (F2)";
+
+  // The pin is real: an evictor (a second cache instance = the two-process
+  // equivalent) cannot take the exclusive lock, and a zero-budget cleanup
+  // skips the file.
+  mcap_cloud::SessionFileCache evictor(h.cache_root.path);
+  std::string lock_error;
+  EXPECT_FALSE(evictor.tryLockForMaterialize(identity, &lock_error).has_value())
+      << "the retained lease must block an evictor";
+  mcap_cloud::SessionFileCache::Config zero;
+  zero.max_total_bytes = 0;
+  zero.min_free_bytes = 0;
+  evictor.cleanup(zero);
+  fs::path still_there;
+  EXPECT_TRUE(cold_rt.fileCache().lookup(identity, &still_there))
+      << "cleanup must skip the leased file";
+
+  // Repeat queries take REFERENCES, never a second flock: the atomic drop
+  // reports one entry holding every reference taken.
+  ASSERT_TRUE(runQuery(cold, json, &out));
+  ASSERT_TRUE(runQuery(cold, json, &out));
+  const auto drop = cold_rt.dropLeaseForMaterialize(identity);
+  EXPECT_TRUE(drop.had_lease);
+  EXPECT_EQ(drop.refs, 3u) << "three queries = three refcounted retains on ONE lease";
+  EXPECT_FALSE(cold_rt.hasRetainedLease(identity));
 }

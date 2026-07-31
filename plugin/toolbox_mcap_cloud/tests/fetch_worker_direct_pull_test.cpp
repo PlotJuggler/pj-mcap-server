@@ -455,3 +455,53 @@ TEST(McapCloudDirectPull, SilentStreamStopsAtTheDurationDeadline) {
       << "the deadline must wake the frame wait, not the 60 s frame timeout (R2d)";
   EXPECT_FALSE(cacheRootHasPartial(cache_root.path));
 }
+
+// Round-3 F3: the session deadline must be HARD across RESUME processing —
+// not just inside the frame wait. Here the server DIES mid-download, so the
+// pull enters the reconnect/backoff loop (1 s + 4 s + 16 s of backoff plus
+// reconnect/Hello waits). With the deadline capping the backoff and gating
+// every reconnect, the pull must return at its budget instead of ~21 s later.
+TEST(McapCloudDirectPull, DurationDeadlineIsHardAcrossResumeBackoff) {
+  auto server = std::make_unique<FakeStreamingServer>(FakeStreamingServer::Mode::kStallAfterTwoBatches);
+  ASSERT_TRUE(server->ok());
+  TempRoot cache_root("resumedl-cache");
+  TempRoot config_root("resumedl-config");
+  mcap_cloud::ImportRuntime rt(mcap_cloud::SessionFileCache(cache_root.path),
+                               mcap_cloud::TrustedOrigins(config_root.path));
+
+  PullHarness h;
+  mcap_cloud::PullRequest request = h.request(rt, server->uri());
+  request.max_transfer_duration = std::chrono::milliseconds(800);
+
+  mcap_cloud::PullResult result;
+  const auto start = std::chrono::steady_clock::now();
+  std::thread pull([&] { result = h.worker.pull(std::move(request)); });
+  struct PullJoinGuard {
+    mcap_cloud::FetchWorker& worker;
+    std::thread& thread;
+    ~PullJoinGuard() {
+      if (thread.joinable()) {
+        worker.requestCancel();
+        thread.join();
+      }
+    }
+  } guard{h.worker, pull};
+
+  // Let messages flow, then kill the server: the client sees a transport
+  // drop with no terminal Eos -> the RESUMABLE path.
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  while (h.progress_messages.load() == 0 && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  ASSERT_GT(h.progress_messages.load(), 0u) << "messages must flow before the drop";
+  server.reset();  // every reconnect attempt now fails
+  pull.join();
+  const auto took =
+      std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start);
+
+  EXPECT_EQ(result.terminal, mcap_cloud::PullTerminal::kFailed) << result.error;
+  EXPECT_TRUE(result.duration_ceiling_exceeded) << result.error;
+  EXPECT_LT(took.count(), 6000)
+      << "the deadline must cap the resume backoff/reconnect chain (F3), not run it out";
+  EXPECT_FALSE(cacheRootHasPartial(cache_root.path));
+}

@@ -228,7 +228,11 @@ bool BackendConnection::sendAndWait(pj_cloud::v1::ClientMessage& request, pj_clo
     // under mu_, so the wake can't be lost. A response that already landed
     // still wins (the ready check below consumes it); a bare cancel wake
     // leaves reply null -> the false return the caller maps to "cancelled".
-    const bool got = cv_.wait_for(lock, timeout, [&] {
+    // F3: on a deadline-armed connection (the pull's own session socket; a
+    // browse connection never sets one) NO wait may outlive the session
+    // deadline — capping here covers Hello, OpenSession and OpenResume in
+    // one place.
+    const bool got = cv_.wait_for(lock, cappedToDeadline(timeout), [&] {
       auto it = pending_.find(request_id);
       return socket_closed_ || (wake_on_cancel && cancel_requested_.load()) ||
              (it != pending_.end() && it->second.ready);
@@ -339,7 +343,8 @@ bool BackendConnection::buildAndOpenSocket(std::string* error_out) {
     // reason as connect()'s Hello wake: nothing ever cancels them, so their
     // flag is never set. cancelSession() notify_all()s this cv.
     const bool signalled = cv_.wait_for(
-        lock, kRequestTimeout, [&] { return socket_open_ || socket_closed_ || cancel_requested_.load(); });
+        lock, cappedToDeadline(std::chrono::duration_cast<std::chrono::milliseconds>(kRequestTimeout)),
+        [&] { return socket_open_ || socket_closed_ || cancel_requested_.load(); });
     if (cancel_requested_.load() && !socket_open_) {
       lock.unlock();
       socket_->stop();
@@ -952,30 +957,22 @@ BackendConnection::FrameLoopResult BackendConnection::runFrameLoop(const Session
     // deadline — check it every iteration and cap the frame wait to the
     // remaining time so the wait itself cannot sleep past it. The exit is
     // NON-resumable (like a cancel): the caller's duration latch classifies.
-    auto frame_wait = std::chrono::duration_cast<std::chrono::milliseconds>(kFrameTimeout);
-    if (session_deadline_.has_value()) {
-      const auto now = std::chrono::steady_clock::now();
-      if (now >= *session_deadline_) {
-        send_cancel();
-        stats.eos = SessionEos::Cancelled;  // the pull's duration latch re-classifies
-        finish();
-        result.last_seq = last_seq;
-        return result;
-      }
-      const auto remaining =
-          std::chrono::duration_cast<std::chrono::milliseconds>(*session_deadline_ - now);
-      if (remaining < frame_wait) {
-        frame_wait = remaining;
-      }
+    if (sessionDeadlineExpired()) {
+      send_cancel();
+      stats.eos = SessionEos::Cancelled;  // the pull's duration latch re-classifies
+      finish();
+      result.last_seq = last_seq;
+      return result;
     }
+    const auto frame_wait =
+        cappedToDeadline(std::chrono::duration_cast<std::chrono::milliseconds>(kFrameTimeout));
 
     pj_cloud::v1::ServerMessage msg;
     if (!waitSessionFrame(frame_wait, &msg)) {
       // R2(d): a wait that ended AT the deadline is a deadline exit, never a
       // resumable transport drop — reconnect-retrying past the budget would
       // defeat the ceiling.
-      if (session_deadline_.has_value() &&
-          std::chrono::steady_clock::now() >= *session_deadline_) {
+      if (sessionDeadlineExpired()) {
         if (!cancel_sent) {
           send_cancel();
         }
@@ -1315,13 +1312,24 @@ SessionStats BackendConnection::downloadSessionResumable(const SessionInfo& info
                                              (last_reason.empty() ? "transport drop" : last_reason));
     }
 
-    // Backoff before the attempt (spec §10), interruptible by cancel.
+    // Round-3 F3: the session deadline is HARD across resume processing, not
+    // just inside the frame wait. Check it before sleeping, CAP the backoff
+    // to the remaining budget (a 16 s backoff must not overshoot a 400 ms
+    // deadline), and check again after — so we never start a reconnect,
+    // Hello, or OpenResume past expiry.
+    if (sessionDeadlineExpired()) {
+      return finalize(SessionEos::Cancelled, {});
+    }
     const int backoff_ms = kResumeBackoffMs[attempts_used];
     {
       std::unique_lock<std::mutex> lock(mu_);
-      cv_.wait_for(lock, std::chrono::milliseconds(backoff_ms), [&] { return cancel_requested_.load(); });
+      cv_.wait_for(lock, cappedToDeadline(std::chrono::milliseconds(backoff_ms)),
+                   [&] { return cancel_requested_.load(); });
     }
     if (cancel_requested_.load()) {
+      return finalize(SessionEos::Cancelled, {});
+    }
+    if (sessionDeadlineExpired()) {
       return finalize(SessionEos::Cancelled, {});
     }
 
@@ -1339,14 +1347,16 @@ SessionStats BackendConnection::downloadSessionResumable(const SessionInfo& info
     std::string reconnect_err;
     if (!reconnectAndHello(&reconnect_err)) {
       last_reason = reconnect_err.empty() ? std::string("reconnect failed") : reconnect_err;
+      if (sessionDeadlineExpired()) {
+        return finalize(SessionEos::Cancelled, {});  // F3: failed reconnects check too
+      }
       armed = false;  // skip runFrameLoop; go straight to the next backoff attempt
       continue;
     }
 
-    // R2(d): never resume past the session deadline — the caller's duration
-    // latch classifies the exit.
-    if (session_deadline_.has_value() &&
-        std::chrono::steady_clock::now() >= *session_deadline_) {
+    // Never resume past the session deadline — the caller's duration latch
+    // classifies the exit.
+    if (sessionDeadlineExpired()) {
       return finalize(SessionEos::Cancelled, {});
     }
     // OpenResume with the last fully-delivered seq.
@@ -1365,6 +1375,26 @@ SessionStats BackendConnection::downloadSessionResumable(const SessionInfo& info
     // Re-armed: loop back into runFrameLoop seeded with resume_cursor.
     armed = true;
   }
+}
+
+// F3 helpers: ONE definition of "past the session deadline" and "a wait
+// capped to what is left of it", used by the frame loop, the resume backoff
+// and every deadline-capped RPC wait below.
+bool BackendConnection::sessionDeadlineExpired() const {
+  return session_deadline_.has_value() && std::chrono::steady_clock::now() >= *session_deadline_;
+}
+
+std::chrono::milliseconds BackendConnection::cappedToDeadline(
+    std::chrono::milliseconds wait) const {
+  if (!session_deadline_.has_value()) {
+    return wait;
+  }
+  const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+      *session_deadline_ - std::chrono::steady_clock::now());
+  if (remaining <= std::chrono::milliseconds::zero()) {
+    return std::chrono::milliseconds::zero();
+  }
+  return remaining < wait ? remaining : wait;
 }
 
 void BackendConnection::cancelSession() {

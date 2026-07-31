@@ -6,6 +6,7 @@
 // is documented inline at runToTerminal().
 #include "descriptor_import_provider.hpp"
 
+#include <algorithm>
 #include <cstddef>
 #include <filesystem>
 #include <optional>
@@ -223,22 +224,22 @@ PJ_descriptor_import_outcome_t DescriptorImportProvider::JobState::runToTerminal
   // process B must never classify process A's live materialization as an
   // ordinary tee failure and open a duplicate network stream.
   //
-  // Lease coordination (R1(c)): our own runtime's retained read lease (F2)
-  // contends with this exclusive try, and a CONCURRENT MEMORY HIT can
-  // re-retain one at any moment during the wait — releasing once up front
-  // let the provider wait on ITS OWN runtime's lease until timeout. We hold
-  // the in-process ACTIVE TICKET for this identity (acquired above), so no
-  // other in-process MATERIALIZER can exist; any same-runtime lease observed
-  // mid-wait is therefore a racing memory hit, and it is safe to release it
-  // immediately before EACH attempt. On every abort exit that did not
-  // publish, the lease is RESTORED when the previous artifact still
-  // validates (a live dataset may depend on it).
-  auto restore_lease_if_valid = [this]() {
-    std::filesystem::path still_valid;
-    if (runtime.fileCache().lookup(identity, &still_valid)) {
-      if (auto lease = runtime.fileCache().acquireReadLease(identity, nullptr)) {
-        runtime.retainReadLease(identity, std::move(*lease));
-      }
+  // Lease coordination — THE RULE (round-3 F1), same three invariants as
+  // CacheTee: our own runtime's retained lease contends with this exclusive
+  // try, and a CONCURRENT MEMORY HIT can re-retain one at any moment during
+  // the wait, so the drop happens ATOMICALLY (one operation that releases and
+  // reports) immediately before EACH attempt. We hold the in-process ACTIVE
+  // TICKET for this identity, so no other in-process MATERIALIZER can exist:
+  // any same-runtime lease observed mid-wait is a racing memory hit. Every
+  // abort exit restores through the registry (lease-then-validate, bounded
+  // retry) WHILE THE TICKET IS STILL HELD; the drop token also rides into the
+  // tee, so the pull's own abort path restores it under the same ticket
+  // instead of a ticket-less post-pull patch-up.
+  ImportRuntime::LeaseDrop lease_drop;
+  auto merge_drop = [&lease_drop](const ImportRuntime::LeaseDrop& drop) {
+    if (drop.had_lease) {
+      lease_drop.had_lease = true;
+      lease_drop.refs = std::max(lease_drop.refs, drop.refs);
     }
   };
   std::optional<SessionFileCache::MaterializeLock> os_lock;
@@ -246,7 +247,7 @@ PJ_descriptor_import_outcome_t DescriptorImportProvider::JobState::runToTerminal
     bool waited = false;
     const auto os_deadline = std::chrono::steady_clock::now() + lock_timeout;
     for (;;) {
-      runtime.releaseRetainedLease(identity);  // R1(c): before EACH attempt
+      merge_drop(runtime.dropLeaseForMaterialize(identity));  // atomic, before EACH attempt
       std::string lock_error;
       bool contended = false;
       os_lock = runtime.fileCache().tryLockForMaterialize(identity, &lock_error, &contended);
@@ -255,12 +256,12 @@ PJ_descriptor_import_outcome_t DescriptorImportProvider::JobState::runToTerminal
       }
       waited = true;
       if (isCancelled()) {
-        restore_lease_if_valid();
+        runtime.restoreLease(identity, lease_drop);  // ticket still held
         *message = "import cancelled";
         return PJ_DESCRIPTOR_IMPORT_CANCELLED;
       }
       if (std::chrono::steady_clock::now() >= os_deadline) {
-        restore_lease_if_valid();
+        runtime.restoreLease(identity, lease_drop);  // ticket still held
         *message =
             "another process is materializing this session — retry when it completes";
         return PJ_DESCRIPTOR_IMPORT_FAILED;
@@ -271,12 +272,16 @@ PJ_descriptor_import_outcome_t DescriptorImportProvider::JobState::runToTerminal
       // Contended-then-acquired across processes: revalidate, exactly like
       // the in-process race (the same LOCKED v1 decision applies — zero
       // on_dataset ran here, so only retry-classification is truthful). The
-      // fresh valid artifact deserves the lifetime lease back.
+      // fresh valid artifact deserves the lifetime lease: restore it BEFORE
+      // the ticket goes (invariant 3), and drop the OS lock first so the
+      // shared re-acquisition is not blocked by our own exclusive.
       std::filesystem::path disk;
       if (runtime.fileCache().lookup(identity, &disk)) {
         os_lock.reset();
+        lease_drop.had_lease = true;  // a valid artifact deserves the pin either way
+        lease_drop.refs = std::max(lease_drop.refs, 1u);
+        runtime.restoreLease(identity, lease_drop);
         ticket.reset();
-        restore_lease_if_valid();
         *message =
             "session was materialized concurrently by another process — reload to classify it "
             "as a cache hit";
@@ -310,6 +315,7 @@ PJ_descriptor_import_outcome_t DescriptorImportProvider::JobState::runToTerminal
   request.identity = identity;
   request.ticket = std::move(ticket);
   request.lock = std::move(os_lock);
+  request.lease_drop = lease_drop;  // restored by the tee's abort, under the ticket
   request.max_transfer_duration = max_transfer_duration;
   // on_dataset: zero-or-one, from the pull's dataset creation, strictly
   // before any publication/progress/promotion — the pull fires this hook at
@@ -320,14 +326,12 @@ PJ_descriptor_import_outcome_t DescriptorImportProvider::JobState::runToTerminal
     }
   };
 
+  // The pull owns the lease lifecycle from here: begin() merged our drop
+  // token into the tee's, so a non-publishing pull restores it inside
+  // abortAndCleanup while the ticket is STILL held (invariant 3), and a
+  // publishing one retains the freshly-downgraded lease instead. No
+  // ticket-less post-pull patch-up.
   const PullResult res = fetch.pull(std::move(request));
-  if (res.tee_outcome != TeeOutcome::kFinalized) {
-    // R1(c): the pull did not publish (finalize re-retains on success), and
-    // begin()'s own restore-on-abort cannot cover us — the JOB released the
-    // lease, so begin never saw one to remember. Put it back if the previous
-    // artifact still validates.
-    restore_lease_if_valid();
-  }
   if (pre_terminal_hook) {
     pre_terminal_hook();  // test seam: deterministic ceiling-vs-cancel interleave
   }
@@ -545,8 +549,35 @@ bool DescriptorImportProvider::queryDescriptor(PJ_string_view_t descriptor_json,
     // summary + provenance). The in-memory SessionCache must never answer
     // this (it stores counts, not bytes). estimated_bytes = the artifact's
     // size when materialized (local metadata; never the network), else 0.
+    // Round-3 F2: a materialized hit is a path the HOST is about to load, and
+    // after a process restart no finalize-time lease exists — so the query
+    // itself must pin it. retainLeaseForLifetime is lease-then-validate
+    // (invariant 2): it acquires the shared sidecar lease FIRST and validates
+    // under it, which both answers is_materialized and leaves the artifact
+    // safe from another process's evictor while the loader lazily re-opens
+    // it. Idempotent/refcounted, so repeat queries never stack flocks.
+    //
+    // §6.3 BOUND: one NON-BLOCKING flock on the existing sidecar plus the
+    // same bounded validation lookup() already did — no blocking wait is
+    // added to the query path. On lease contention (another process holds the
+    // exclusive lock) we still answer HONESTLY from a plain validation, just
+    // without retention; the artifact is being rematerialized, and the next
+    // query re-tries the pin.
+    std::string lease_diagnostic;
+    bool materialized = runtime_.retainLeaseForLifetime(query_identity_, &lease_diagnostic);
     std::filesystem::path disk;
-    const bool materialized = runtime_.fileCache().lookup(query_identity_, &disk);
+    if (materialized) {
+      disk = runtime_.fileCache().pathFor(query_identity_);
+    } else {
+      // No retention: distinguish "not materialized" from "materialized but
+      // the lease is contended" — the latter is still a truthful hit.
+      materialized = runtime_.fileCache().lookup(query_identity_, &disk);
+      if (materialized) {
+        query_message_ = query_message_.empty()
+                             ? "cache artifact present but its read lease is contended"
+                             : query_message_;
+      }
+    }
     std::uint64_t estimated_bytes = 0;
     if (materialized) {
       std::error_code ec;

@@ -83,6 +83,11 @@ struct PullRequest {
   /// Same handoff for the CROSS-PROCESS materialize lock (adversarial F9):
   /// the job's bounded cancelable wait acquires it before the pull.
   std::optional<SessionFileCache::MaterializeLock> lock;
+  /// The dataset-lifetime lease the CALLER already dropped for this identity
+  /// (round-3 F1): merged into the tee's own token so a non-publishing pull
+  /// restores it inside abortAndCleanup — while the ticket is still held —
+  /// instead of the caller patching up ticket-less afterwards.
+  ImportRuntime::LeaseDrop lease_drop;
   /// Optional per-message transport progress (cumulative transport messages).
   /// Unthrottled; test observability — the provider job leaves it unset.
   std::function<void(std::uint64_t transport_messages)> onProgress;

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 #include "import_runtime.hpp"
 
+#include <algorithm>
 #include <limits>
 #include <stdexcept>
 #include <system_error>

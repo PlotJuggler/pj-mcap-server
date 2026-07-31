@@ -1654,7 +1654,7 @@ PullResult FetchWorker::pull(PullRequest request) {
   {
     std::string begin_error;
     if (!tee->begin(request.identity, &begin_error, std::move(request.ticket),
-                    std::move(request.lock))) {
+                    std::move(request.lock), request.lease_drop)) {
       tee.reset();
       result.tee_outcome = TeeOutcome::kFailed;
       result.tee_error = begin_error;
