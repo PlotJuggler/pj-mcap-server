@@ -13,11 +13,13 @@
 
 #include "fetch_worker.hpp"
 
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <filesystem>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -115,6 +117,63 @@ TeeTerminalOutcome finishCacheTee(
   return result;
 }
 
+// Host-stop WATCHDOG (review-caught; pure extraction from pullTopicsAsync so
+// the direct pull shares it): the in-callback isStopRequested() check only
+// runs when messages flow — a stalled server or a reconnect backoff would
+// ignore the host's Stop for the full frame-wait/backoff timeouts (minutes).
+// This poller observes the [thread-safe] stop slot from its own thread and
+// invokes `on_stop` (the owner's requestCancel), whose wake machinery
+// (cancel hook + sendAndWait/frame-wait/backoff predicates) already unblocks
+// every waiting phase promptly. stop() is the ordering point before the
+// terminal classification; the destructor is the exception-safe join (the
+// download invokes unrestricted std::function callbacks — unwinding through
+// a joinable std::thread is std::terminate).
+class HostStopWatchdog {
+ public:
+  HostStopWatchdog(ParserIngestDriver& driver, bool active, std::function<void()> on_stop,
+                   const std::function<std::thread(std::function<void()>)>& factory = {}) {
+    if (!active) {
+      return;
+    }
+    std::function<void()> body = [this, &driver, on_stop = std::move(on_stop)]() {
+      while (!done_.load(std::memory_order_relaxed)) {
+        if (driver.datasetIngest().isStopRequested()) {
+          on_stop();
+          return;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+      }
+    };
+    // Thread-spawn failure degrades to NO watchdog (adversarial F8): the
+    // per-message isStopRequested check in the download loop remains, so a
+    // host Stop is still honored while messages flow — the watchdog is an
+    // enhancement for stalled streams, never a correctness dependency, and
+    // std::system_error must not escape into the pull.
+    try {
+      thread_ = factory ? factory(std::move(body)) : std::thread(std::move(body));
+    } catch (...) {
+    }
+  }
+
+  HostStopWatchdog(const HostStopWatchdog&) = delete;
+  HostStopWatchdog& operator=(const HostStopWatchdog&) = delete;
+
+  ~HostStopWatchdog() { stop(); }
+
+  /// Signal + join (idempotent). Called before the terminal classification /
+  /// finalize() so the dataset-ingest view outlives the poller.
+  void stop() {
+    done_.store(true, std::memory_order_relaxed);
+    if (thread_.joinable()) {
+      thread_.join();
+    }
+  }
+
+ private:
+  std::atomic<bool> done_{false};
+  std::thread thread_;
+};
+
 }  // namespace
 
 FetchWorker::FetchWorker() = default;
@@ -143,6 +202,75 @@ void FetchWorker::requestCancel() {
   if (tee_for_cancel_ != nullptr) {
     tee_for_cancel_->requestAbort();
   }
+}
+
+void FetchWorker::setSessionForCancel(BackendConnection* session) {
+  std::lock_guard<std::mutex> lock(cancel_mu_);
+  backend_session_for_cancel_ = session;
+}
+
+void FetchWorker::setTeeForCancel(CacheTee* tee) {
+  std::lock_guard<std::mutex> lock(cancel_mu_);
+  tee_for_cancel_ = tee;
+}
+
+bool FetchWorker::teeEnqueueFailed(std::unique_ptr<CacheTee>& tee, const DecodedMessage& message,
+                                   std::string* error) {
+  if (tee == nullptr || tee->enqueue(message)) {
+    return false;
+  }
+  if (tee->abortRequested() && !tee->failed()) {
+    // A CANCEL-freed enqueue is NOT a failure: the tee stays alive so the
+    // single terminal boundary can still copy the readable partial for a
+    // requested export and classify the pull kAborted consistently.
+    return false;
+  }
+  // The writer thread hit a disk error (§9.6): never abort the ingest —
+  // retire + drop the tee (partial deleted, locks released) and hand the
+  // raw cause to the caller for outcome recording / export failure.
+  *error = tee->failureError();
+  setTeeForCancel(nullptr);
+  tee->abortAndCleanup();
+  tee.reset();
+  return true;
+}
+
+void FetchWorker::storeCompletedSessionEntry(
+    SessionCache& session_cache, const SessionKey& session_key, const std::string& group_name,
+    const std::string& server_uri, const std::vector<std::string>& topic_names,
+    const std::unordered_map<std::uint32_t, std::string>& name_by_id,
+    const std::unordered_map<std::uint32_t, std::uint64_t>& counts, const std::string& tee_identity,
+    TeeOutcome tee_outcome, bool refetch_after_disk_miss) {
+  CachedSession entry;
+  entry.display_name = group_name;
+  entry.server_uri = server_uri;
+  // name -> decoded count (session topic names are unique), instead of a
+  // per-topic reverse scan of name_by_id (quality review, nit 5).
+  std::unordered_map<std::string, std::uint64_t> count_by_name;
+  count_by_name.reserve(name_by_id.size());
+  for (const auto& [tid, name] : name_by_id) {
+    const auto it = counts.find(tid);
+    count_by_name[name] = (it != counts.end()) ? it->second : 0;
+  }
+  for (const auto& t : topic_names) {
+    const auto it = count_by_name.find(t);
+    const std::uint64_t count = (it != count_by_name.end()) ? it->second : 0;
+    entry.counts_by_topic[t] = count;
+    entry.total_messages += count;
+  }
+  // Stage-4 (D7) state: the STABLE dataset id this pull created (the
+  // existence key), the durable cache identity when the tee published a
+  // valid file, the tee outcome (promotion suppression, §9.6), and which
+  // §6.1 memory-hit rule led here.
+  {
+    std::lock_guard<std::mutex> lock(fetch_dataset_mu_);
+    entry.dataset_id = fetch_dataset_.has_value() ? fetch_dataset_->id : 0;
+  }
+  entry.cache_identity = (tee_outcome == TeeOutcome::kFinalized) ? tee_identity : std::string{};
+  entry.tee_outcome = tee_outcome;
+  entry.last_hit_case =
+      refetch_after_disk_miss ? MemoryHitCase::kRefetchedDiskMiss : MemoryHitCase::kNone;
+  session_cache.store(session_key, std::move(entry));
 }
 
 bool FetchWorker::datasetExistsInHost(const CachedSession& entry) const {
@@ -180,9 +308,9 @@ bool FetchWorker::datasetExistsInHost(const CachedSession& entry) const {
 
 bool FetchWorker::serveFromMemoryCache(
     ImportRuntime* rt, SessionCache& session_cache, const SessionKey& session_key,
-    const std::string& tee_identity, const std::string& group_name,
-    const std::vector<std::string>& topic_names, const std::string& save_directory,
-    const SessionCache::ExistencePredicate& exists,
+    const std::string& tee_identity, const std::string& descriptor_json,
+    const std::string& group_name, const std::vector<std::string>& topic_names,
+    const std::string& save_directory, const SessionCache::ExistencePredicate& exists,
     const std::function<void(const std::filesystem::path&)>& export_by_copy,
     TeeOutcome* tee_outcome, bool* refetch_after_disk_miss) {
   auto cached = session_cache.lookup(session_key, exists);
@@ -222,6 +350,18 @@ bool FetchWorker::serveFromMemoryCache(
   if (rt != nullptr) {
     session_cache.recordHitCase(session_key, MemoryHitCase::kServedValidDisk);
     *tee_outcome = TeeOutcome::kExistingValid;
+    // §6.1: a memory hit whose disk file exists RE-promotes it (kExistingValid
+    // is the PR-1 signal), keyed on the CACHED stable dataset id — except an
+    // entry already kPromoted (re-promoting an already-file-backed dataset
+    // would only make the host reload the same file; the promoted state IS
+    // the end state a re-promotion seeks). dataset_id==0 (legacy entry)
+    // cannot be promoted — promotion requires a live dataset to replace.
+    if (cached->dataset_id != 0 && cached->promotion_state != PromotionState::kPromoted) {
+      (void)rt->promoteToFileSource(
+          ImportRuntime::makePromotionRequest(cached->dataset_id, tee_identity, disk_file,
+                                              descriptor_json),
+          &session_key);
+    }
   }
   if (pullServedFromCache) {
     pullServedFromCache(group_name);
@@ -757,6 +897,7 @@ void FetchWorker::pullTopicsAsync(std::vector<std::string> sequence_names, std::
   // identity by construction (spec §4).
   constexpr bool kIncludeLatched = true;  // mirrored into params.include_latched below
   std::string canonical_descriptor_json;
+  std::string display_descriptor_json;  // toSourceDescriptorJson — the D6 promotion payload
   if (rt != nullptr) {
     SourceDescriptor descriptor;
     descriptor.version = 1;
@@ -769,6 +910,7 @@ void FetchWorker::pullTopicsAsync(std::vector<std::string> sequence_names, std::
     descriptor.include_latched = kIncludeLatched;
     descriptor.display_name = group_name;
     canonical_descriptor_json = canonicalSourceDescriptorJson(descriptor);
+    display_descriptor_json = toSourceDescriptorJson(descriptor);
     tee_identity = descriptorIdentity(descriptor);
   }
 
@@ -799,9 +941,9 @@ void FetchWorker::pullTopicsAsync(std::vector<std::string> sequence_names, std::
                              ? dataset_exists_
                              : SessionCache::ExistencePredicate(
                                    [this](const CachedSession& entry) { return datasetExistsInHost(entry); });
-    if (serveFromMemoryCache(rt, session_cache, session_key, tee_identity, group_name, topic_names,
-                             save_directory, exists, export_by_copy, &tee_outcome,
-                             &refetch_after_disk_miss)) {
+    if (serveFromMemoryCache(rt, session_cache, session_key, tee_identity, display_descriptor_json,
+                             group_name, topic_names, save_directory, exists, export_by_copy,
+                             &tee_outcome, &refetch_after_disk_miss)) {
       finish_all();
       return;
     }
@@ -824,18 +966,13 @@ void FetchWorker::pullTopicsAsync(std::vector<std::string> sequence_names, std::
   std::unique_ptr<CacheTee> tee;
   // Publish/retire the tee for requestCancel() (frees a backpressure-blocked
   // producer). Same discipline as backend_session_for_cancel_: always under
-  // cancel_mu_, always retired BEFORE the owning pointer resets; the scope
-  // guard (declared AFTER `tee`, so it unwinds first) covers every exit.
-  auto set_tee_cancel_hook = [this](CacheTee* hook) {
-    std::lock_guard<std::mutex> lock(cancel_mu_);
-    tee_for_cancel_ = hook;
-  };
+  // cancel_mu_ (setTeeForCancel), always retired BEFORE the owning pointer
+  // resets; the scope guard (declared AFTER `tee`, so it unwinds first)
+  // covers every exit.
+  auto set_tee_cancel_hook = [this](CacheTee* hook) { setTeeForCancel(hook); };
   struct TeeCancelHookGuard {
     FetchWorker* worker;
-    ~TeeCancelHookGuard() {
-      std::lock_guard<std::mutex> lock(worker->cancel_mu_);
-      worker->tee_for_cancel_ = nullptr;
-    }
+    ~TeeCancelHookGuard() { worker->setTeeForCancel(nullptr); }
   } tee_cancel_hook_guard{this};
   if (rt != nullptr) {
     tee = std::make_unique<CacheTee>(*rt);
@@ -895,15 +1032,9 @@ void FetchWorker::pullTopicsAsync(std::vector<std::string> sequence_names, std::
   // dereference the destroyed connection.
   struct CancelHookGuard {
     FetchWorker* worker;
-    ~CancelHookGuard() {
-      std::lock_guard<std::mutex> lock(worker->cancel_mu_);
-      worker->backend_session_for_cancel_ = nullptr;
-    }
+    ~CancelHookGuard() { worker->setSessionForCancel(nullptr); }
   } cancel_hook_guard{this};
-  {
-    std::lock_guard<std::mutex> lock(cancel_mu_);
-    backend_session_for_cancel_ = session_backend;
-  }
+  setSessionForCancel(session_backend);
   // A cancel latched BEFORE the hook was published could not reach the wire;
   // honor it cooperatively before any blocking call. (After publication a
   // cancel reaches cancelSession() directly, and BackendConnection latches it
@@ -1154,43 +1285,12 @@ void FetchWorker::pullTopicsAsync(std::vector<std::string> sequence_names, std::
   }
   std::uint64_t transport_messages_seen = 0;
 
-  // Host-stop WATCHDOG (review-caught): the in-callback isStopRequested()
-  // check below only runs when messages flow — a stalled server or a
-  // reconnect backoff would ignore the host's Stop for the full frame-wait/
-  // backoff timeouts (minutes). This poller observes the [thread-safe] stop
-  // slot from its own thread and converts a stop into requestCancel(), whose
-  // wake machinery (cancel hook + sendAndWait/frame-wait/backoff predicates)
-  // already unblocks every waiting phase promptly. Scoped strictly to the
-  // download: joined before the terminal classification and finalize(), so
-  // the dataset-ingest view outlives it.
-  std::atomic<bool> download_done{false};
-  std::thread host_stop_watchdog;
-  // Exception-safe join (re-verify-caught): the download below invokes
-  // unrestricted std::function callbacks (pullProgress, ...) — if one throws,
-  // unwinding through a still-joinable std::thread is std::terminate. The
-  // guard signals + joins on EVERY exit; the manual join before the terminal
-  // boundary below then no-ops (joinable() false) and keeps its ordering role.
-  struct WatchdogJoinGuard {
-    std::atomic<bool>& done;
-    std::thread& thread;
-    ~WatchdogJoinGuard() {
-      done.store(true, std::memory_order_relaxed);
-      if (thread.joinable()) {
-        thread.join();
-      }
-    }
-  } watchdog_join_guard{download_done, host_stop_watchdog};
-  if (host_progress_active) {
-    host_stop_watchdog = std::thread([&]() {
-      while (!download_done.load(std::memory_order_relaxed)) {
-        if (driver.datasetIngest().isStopRequested()) {
-          requestCancel();
-          return;
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(200));
-      }
-    });
-  }
+  // Host-stop WATCHDOG (extracted to HostStopWatchdog above — shared with the
+  // direct pull): scoped strictly to the download; stop()ed before the
+  // terminal classification and finalize(), so the dataset-ingest view
+  // outlives it; the destructor is the exception-safe join.
+  HostStopWatchdog host_stop_watchdog(driver, host_progress_active, [this]() { requestCancel(); },
+                                      watchdog_thread_factory_for_test_);
 
   // Progress throttle: emit pullProgress at most ~10 Hz per topic.
   std::unordered_map<std::uint32_t, std::int64_t> bytes_by_id;
@@ -1239,25 +1339,16 @@ void FetchWorker::pullTopicsAsync(std::vector<std::string> sequence_names, std::
         // RUNTIME mode: hand the record to the cache tee's bounded queue
         // (owned copy; BLOCKS briefly under backpressure when the disk lags —
         // the wait is cancellable via requestCancel -> CacheTee::requestAbort).
-        // A tee failure — the writer thread hit a disk error — never aborts
-        // the ingest (§9.6): drop the tee (partial deleted, locks released),
-        // record the outcome for promotion suppression, and fail a requested
-        // export with the raw cause (the cache is the sole encoder — there is
-        // no independent export stream to fall back to). A CANCEL-freed
-        // enqueue is NOT a failure: the tee stays alive so the single
-        // terminal boundary below can still copy the readable partial for a
-        // requested export and classify the pull kAborted consistently.
-        if (tee != nullptr && !tee->enqueue(m)) {
-          if (!(tee->abortRequested() && !tee->failed())) {
-            tee_outcome = TeeOutcome::kFailed;
-            tee_error = tee->failureError();
-            set_tee_cancel_hook(nullptr);
-            tee->abortAndCleanup();
-            tee.reset();
-            if (save_paths.has_value()) {
-              discard_partial();
-              emit_save_result(McapSaveResult{McapSaveStatus::Failed, {}, tee_error});
-            }
+        // The §9.6 failure/cancel discipline lives in teeEnqueueFailed (one
+        // place for both pulls); on a genuine tee failure the export also
+        // fails with the raw cause — the cache is the sole encoder, there is
+        // no independent export stream to fall back to.
+        if (std::string enqueue_error; teeEnqueueFailed(tee, m, &enqueue_error)) {
+          tee_outcome = TeeOutcome::kFailed;
+          tee_error = std::move(enqueue_error);
+          if (save_paths.has_value()) {
+            discard_partial();
+            emit_save_result(McapSaveResult{McapSaveStatus::Failed, {}, tee_error});
           }
         }
         (void)driver.decode(m);  // best-effort; drops + counts on failure
@@ -1298,10 +1389,7 @@ void FetchWorker::pullTopicsAsync(std::vector<std::string> sequence_names, std::
         return true;
       });
 
-  download_done.store(true, std::memory_order_relaxed);
-  if (host_stop_watchdog.joinable()) {
-    host_stop_watchdog.join();
-  }
+  host_stop_watchdog.stop();
 
   // ONE atomic terminal-outcome boundary (review-caught): sample cancel_flag_
   // exactly ONCE, here, and derive every terminal decision from it — the
@@ -1491,36 +1579,478 @@ void FetchWorker::pullTopicsAsync(std::vector<std::string> sequence_names, std::
   // zero-transport HIT.
   if (stats.eos == SessionEos::Complete && !cancelled && !session_failed && total_decode_errors == 0 &&
       driver.hasDecodable()) {
-    CachedSession entry;
-    entry.display_name = group_name;
-    entry.server_uri = conn_uri_;
-    for (const auto& t : topic_names) {
-      std::uint64_t count = 0;
-      for (const auto& [tid, name] : name_by_id) {
-        if (name == t) {
-          count = counts.count(tid) ? counts.at(tid) : 0;
-          break;
-        }
-      }
-      entry.counts_by_topic[t] = count;
-      entry.total_messages += count;
-    }
-    // Stage-4 (D7) state: the STABLE dataset id this pull created (the
-    // existence key), the durable cache identity when the tee published a
-    // valid file, the tee outcome (promotion suppression, §9.6), and which
-    // §6.1 memory-hit rule led here.
+    storeCompletedSessionEntry(session_cache, session_key, group_name, conn_uri_, topic_names,
+                               name_by_id, counts, tee_identity, tee_outcome,
+                               refetch_after_disk_miss);
+  }
+
+  // ---- promotion at completion (stage-4 PR-3, D6 — the authoring dual
+  // path, spec §6.1/§9.8): a finalized cache file + a live eager dataset =
+  // hand the artifact to the host to become a stock file-backed source.
+  // AFTER the store above so a re-entrant on_result finds the entry.
+  // Fire-and-forget on this interactive path: the shared result state
+  // (captured by the callback) updates the entry's promotion_state whenever
+  // the host settles; the worker never blocks on it. kFinalized implies a
+  // clean COMPLETE (finishCacheTee), so no extra terminal gating is needed.
+  if (rt != nullptr && tee_outcome == TeeOutcome::kFinalized) {
+    PJ::DatasetId promoted_dataset = 0;
     {
       std::lock_guard<std::mutex> lock(fetch_dataset_mu_);
-      entry.dataset_id = fetch_dataset_.has_value() ? fetch_dataset_->id : 0;
+      promoted_dataset = fetch_dataset_.has_value() ? fetch_dataset_->id : 0;
     }
-    entry.cache_identity = (tee_outcome == TeeOutcome::kFinalized) ? tee_identity : std::string{};
-    entry.tee_outcome = tee_outcome;
-    entry.last_hit_case =
-        refetch_after_disk_miss ? MemoryHitCase::kRefetchedDiskMiss : MemoryHitCase::kNone;
-    session_cache.store(session_key, std::move(entry));
+    if (promoted_dataset != 0) {
+      (void)rt->promoteToFileSource(
+          ImportRuntime::makePromotionRequest(promoted_dataset, tee_identity,
+                                              rt->fileCache().pathFor(tee_identity),
+                                              display_descriptor_json),
+          &session_key);
+    }
   }
 
   finish_all();
+}
+
+PullResult FetchWorker::pull(PullRequest request) {
+  PullResult result;  // defaults: kFailed + empty error (filled on every path)
+
+  // ---- self-contained input validation (no dialog, no connectAsync state) --
+  ImportRuntime* const rt = request.runtime;
+  if (rt == nullptr) {
+    // Nothing to restore through: with no runtime there is no registry the
+    // caller could have dropped a lease in.
+    result.error = "direct pull requires an ImportRuntime";
+    return result;
+  }
+
+  // Round-5 F1: no guard needed here anymore — request.lease_drop is the
+  // move-only RAII token, declared AFTER request.ticket, so any exit or
+  // exception before the tee captures it restores under the ticket by
+  // member-destruction order alone.
+
+  if (request.sequence_names.empty()) {
+    result.error = "empty selection (no s3 keys)";
+    return result;
+  }
+  if (!host_provider_ || !runtime_host_provider_) {
+    result.error = "toolbox host not bound";
+    return result;
+  }
+  if (request.group_name.empty()) {
+    request.group_name = request.sequence_names.front();
+  }
+  auto cancelled_now = [this]() { return cancel_flag_.load(std::memory_order_relaxed); };
+  auto finish_cancelled = [&result]() {
+    result.terminal = PullTerminal::kCancelled;
+    result.error = "cancelled";
+  };
+
+  // Reset the per-download dataset handle so this pull creates exactly one.
+  {
+    std::lock_guard<std::mutex> lock(fetch_dataset_mu_);
+    fetch_dataset_ = std::nullopt;
+  }
+
+  // ---- cache-tee phase 1 (ALWAYS-ON for direct pulls): locks BEFORE any
+  // network. Same discipline as the interactive path: the CacheTee's RAII
+  // cleanup covers every exit below, a begin failure drops the tee and the
+  // ingest continues (§9.6). Guard declared AFTER `tee` so it unwinds first.
+  std::unique_ptr<CacheTee> tee = std::make_unique<CacheTee>(*rt);
+  struct TeeCancelHookGuard {
+    FetchWorker* worker;
+    ~TeeCancelHookGuard() { worker->setTeeForCancel(nullptr); }
+  } tee_cancel_hook_guard{this};
+  {
+    std::string begin_error;
+    // The tee's NO-THROW prologue captures ticket, lock AND token before
+    // anything that can throw — including on a FAILED begin, whose abort
+    // still restores.
+    if (!tee->begin(request.identity, &begin_error, std::move(request.ticket),
+                    std::move(request.lock), std::move(request.lease_drop))) {
+      tee.reset();
+      result.tee_outcome = TeeOutcome::kFailed;
+      result.tee_error = begin_error;
+    } else {
+      setTeeForCancel(tee.get());
+    }
+  }
+
+  // FAIR admission (adversarial F10): same gate as the interactive pull —
+  // ONE pull at a time, FIFO, acquired BEFORE any session/connection
+  // resources exist (a queued job holds no remote session or inbox), held
+  // (RAII) for the whole pull including the on_dataset host-lock release
+  // window so the other producer cannot steal the turn.
+  std::optional<ImportRuntime::AdmissionTicket> admission = rt->acquireAdmission(
+      [this]() { return cancel_flag_.load(std::memory_order_relaxed); },
+      std::chrono::milliseconds(50));
+  if (!admission.has_value()) {
+    finish_cancelled();
+    return result;  // the tee's RAII cleanup deletes the partial
+  }
+
+  // ---- ONE session connection owned by the pull, published for cancel
+  // BEFORE the blocking connect (D4: a cancel during the socket-open, Hello
+  // or OpenSession wait must wake promptly — the open wait joins the cancel
+  // predicate in buildAndOpenSocket, the RPC waits ride wake_on_cancel).
+  std::unique_ptr<BackendConnection> session_owned;
+  try {
+    session_owned = std::make_unique<BackendConnection>(
+        request.connection.uri, request.connection.credentials.cert_path,
+        request.connection.credentials.api_key, request.connection.credentials.allow_insecure);
+  } catch (...) {
+    result.error = "failed to create session connection";
+    return result;
+  }
+  BackendConnection* session_backend = session_owned.get();
+  struct CancelHookGuard {
+    FetchWorker* worker;
+    ~CancelHookGuard() { worker->setSessionForCancel(nullptr); }
+  } cancel_hook_guard{this};
+  setSessionForCancel(session_backend);
+  // A cancel latched BEFORE the hook was published could not reach the wire;
+  // honor it cooperatively before any blocking call.
+  if (cancelled_now()) {
+    finish_cancelled();
+    return result;
+  }
+
+  std::string connect_err;
+  if (!session_owned->connect(&connect_err)) {
+    if (cancelled_now()) {
+      finish_cancelled();  // the cancel is the CAUSE, not a symptom
+    } else {
+      result.error = connect_err.empty() ? "session connect failed" : connect_err;
+    }
+    return result;
+  }
+  if (cancelled_now()) {
+    finish_cancelled();
+    return result;
+  }
+
+  // Key-addressed OpenFresh (wire v2). include_latched comes FROM THE
+  // DESCRIPTOR: the same field feeds the wire request and the identity the
+  // caller computed, so the identity always names the request actually sent.
+  OpenSessionParams params;
+  params.s3_keys = request.sequence_names;
+  params.topic_names = request.topic_names;
+  if (request.start_ns != 0 || request.end_ns != 0) {
+    params.start_ns = request.start_ns;
+    params.end_ns = request.end_ns;
+  }
+  params.include_latched = request.include_latched;
+
+  SessionInfo session_info;
+  std::string open_err;
+  if (!session_backend->openSessionFresh(params, &session_info, &open_err)) {
+    if (cancelled_now()) {
+      finish_cancelled();
+    } else {
+      result.error = open_err.empty() ? "failed to open session" : open_err;
+    }
+    return result;
+  }
+  if (session_info.topics.empty()) {
+    // EMPTY-PLAN: for an import there is nothing to materialize — a clean,
+    // actionable failure (the descriptor names data the server cannot serve).
+    result.error = "the server returned an EMPTY plan: no data matches the descriptor selection";
+    return result;
+  }
+
+  // Re-verify R2(a): the server's own pre-flight estimate is compared with
+  // the effective byte ceiling BEFORE any byte streams — an import that is
+  // predictably over budget is refused up front rather than billed for a
+  // partial transfer it must then discard.
+  if (request.max_transfer_bytes > 0 &&
+      session_info.estimated_chunk_bytes > request.max_transfer_bytes) {
+    result.terminal = PullTerminal::kFailed;
+    result.byte_ceiling_exceeded = true;
+    result.error = "server pre-flight estimate ~" +
+                   std::to_string(session_info.estimated_chunk_bytes) +
+                   " bytes exceeds the " + std::to_string(request.max_transfer_bytes) +
+                   "-byte transfer ceiling — refused before streaming";
+    return result;  // the tee's RAII cleanup releases locks; nothing was opened
+  }
+
+  std::unordered_map<std::uint32_t, std::string> name_by_id;
+  for (const auto& t : session_info.topics) {
+    name_by_id.emplace(t.topic_id, t.topic_name);
+  }
+
+  // ---- cache-tee phase 2: the SINGLE encoder opens BEFORE the first
+  // message (and regardless of decodability — §9.0 raw-tee parser
+  // independence). An open failure drops the tee; the ingest continues.
+  if (tee != nullptr) {
+    std::string open_error;
+    if (!tee->openWriter(session_info, request.canonical_descriptor_json,
+                         session_info.estimated_chunk_bytes, &open_error)) {
+      setTeeForCancel(nullptr);
+      tee.reset();
+      result.tee_outcome = TeeOutcome::kFailed;
+      result.tee_error = open_error;
+    }
+  }
+
+  ParserIngestDriver driver;
+  PJ::sdk::ToolboxHostView host = host_provider_();
+  PJ::ToolboxRuntimeHostView runtime = runtime_host_provider_();
+
+  // CANCEL-AWARE acquisition of the SHARED host-write mutex (quality review
+  // IMPORTANT-1): the interactive runtime-mode pull holds this mutex across
+  // its ENTIRE download, so a blocking lock here would wedge a provider job
+  // — and its cancel/join/destroy — for minutes behind an unrelated fetch.
+  // Mirror the provider's materialize-gate discipline: poll try_lock at a
+  // short cadence and honor the cancel flag between attempts.
+  constexpr auto kHostWriteLockPoll = std::chrono::milliseconds(50);
+  auto lock_host_write_cancellable = [&](std::unique_lock<std::mutex>& lock) {
+    while (!lock.try_lock()) {
+      if (cancel_flag_.load(std::memory_order_relaxed)) {
+        return false;
+      }
+      std::this_thread::sleep_for(kHostWriteLockPoll);
+    }
+    return true;
+  };
+
+  // Create the dataset under the SHARED host-write lock (the runtime mutex
+  // serializes this pull against the interactive worker), then surface it
+  // through datasetCreated OUTSIDE the lock: the PR-3 job forwards it as the
+  // ABI on_dataset, which must precede any binding/publication/progress —
+  // and host callback code must never run under our write lock.
+  std::unique_lock<std::mutex> write_lock(rt->hostWriteMutex(), std::defer_lock);
+  if (!lock_host_write_cancellable(write_lock)) {
+    finish_cancelled();
+    return result;  // the tee's RAII cleanup deletes the partial
+  }
+  auto ds = datasetForFetch(host, request.group_name);
+  if (!ds) {
+    write_lock.unlock();
+    result.error = ds.error();
+    return result;
+  }
+  result.dataset = *ds;
+  write_lock.unlock();
+  if (request.datasetCreated) {
+    request.datasetCreated(*ds);
+  }
+  if (!lock_host_write_cancellable(write_lock)) {
+    finish_cancelled();
+    return result;
+  }
+
+  const IngestBindResult bind = driver.bindSession(runtime, *ds, session_info);
+
+  if (!driver.hasDecodable() && tee == nullptr) {
+    write_lock.unlock();
+    std::string detail = "no parser bound for any selected topic and the cache tee is unavailable";
+    if (!bind.errors.empty()) {
+      detail += ": " + bind.errors.front();
+    }
+    result.error = std::move(detail);
+    return result;
+  }
+
+  // #470 progress surface + host-stop watchdog, exactly as the interactive
+  // pull (shared HostStopWatchdog; stop()ed before the terminal boundary).
+  bool host_progress_active = false;
+  if (driver.hasDecodable()) {
+    host_progress_active =
+        driver.datasetIngest()
+            .progressStart("MCAP Cloud import: " + request.group_name, session_info.approximate_messages,
+                           /*cancellable=*/true)
+            .has_value();
+  }
+  std::uint64_t transport_messages_seen = 0;
+  HostStopWatchdog host_stop_watchdog(driver, host_progress_active, [this]() { requestCancel(); },
+                                      watchdog_thread_factory_for_test_);
+
+  std::chrono::steady_clock::time_point last_host_progress_emit{};
+  const auto kProgressInterval = std::chrono::milliseconds(100);
+  bool byte_ceiling_exceeded = false;
+  bool duration_ceiling_exceeded = false;
+  const auto download_start = std::chrono::steady_clock::now();
+  // R2(d): arm the hard session deadline so a SILENT/control-only stream
+  // still stops at the duration ceiling (the frame wait is capped to it and
+  // resume never retries past it); the duration latch below classifies.
+  session_backend->setSessionDeadline(
+      request.max_transfer_duration.count() > 0
+          ? std::optional<std::chrono::steady_clock::time_point>(download_start +
+                                                                 request.max_transfer_duration)
+          : std::nullopt);
+
+  SessionStats stats = session_backend->downloadSessionResumable(
+      session_info, [&](const DecodedMessage& m) -> bool {
+        if (cancel_flag_.load(std::memory_order_relaxed)) {
+          return false;  // downloadSession sends the wire Cancel + returns
+        }
+        // §7 guard 3: the caller-imposed wire-byte ceiling. Latch the
+        // DISTINCT cause BEFORE aborting — the sink-false return classifies
+        // as SessionEos::Cancelled on the wire, and the terminal mapping
+        // below must not report a resource-limit abort as a cancel.
+        if (request.max_transfer_bytes > 0 &&
+            session_backend->sessionWireBytesReceived() > request.max_transfer_bytes) {
+          byte_ceiling_exceeded = true;
+          return false;
+        }
+        // F12: the transfer-duration ceiling, same distinct-FAILED shape.
+        if (request.max_transfer_duration.count() > 0 &&
+            std::chrono::steady_clock::now() - download_start > request.max_transfer_duration) {
+          duration_ceiling_exceeded = true;
+          return false;
+        }
+        // Cache tee: the shared §9.6 discipline (teeEnqueueFailed) — a tee
+        // FAILURE drops the tee and the ingest continues; a cancel-freed
+        // enqueue keeps the tee alive for the single terminal boundary.
+        if (std::string enqueue_error; teeEnqueueFailed(tee, m, &enqueue_error)) {
+          result.tee_outcome = TeeOutcome::kFailed;
+          result.tee_error = std::move(enqueue_error);
+        }
+        (void)driver.decode(m);  // best-effort; drops + counts on failure
+
+        ++transport_messages_seen;
+        if (request.onProgress) {
+          request.onProgress(transport_messages_seen);
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (host_progress_active && now - last_host_progress_emit >= kProgressInterval) {
+          last_host_progress_emit = now;
+          if (!driver.datasetIngest().progressUpdate(transport_messages_seen) ||
+              driver.datasetIngest().isStopRequested()) {
+            return false;
+          }
+        }
+        return true;
+      });
+
+  host_stop_watchdog.stop();
+
+  // ONE atomic terminal-outcome boundary (mirrors the interactive pull):
+  // sample cancel_flag_ exactly once and derive every decision from it.
+  const bool cancelled_after_download = cancel_flag_.load(std::memory_order_relaxed);
+
+  // FINAL cumulative ceiling check (adversarial F6): every session frame —
+  // batches, Progress, the terminal Eos, resume-leg control traffic —
+  // counts toward wire bytes, but the per-message check above can only run
+  // while messages flow; bytes arriving AFTER the last message previously
+  // finalized/stored/promoted above budget. stats.wire_bytes_received is
+  // the whole-pull total (spanning resume legs), so one comparison here
+  // closes every control-frame gap; the overage aborts the tee below
+  // (not-complete), suppresses the store/promotion (terminal != kComplete)
+  // and terminals FAILED with the byte cause.
+  if (request.max_transfer_bytes > 0 && !byte_ceiling_exceeded &&
+      stats.wire_bytes_received > request.max_transfer_bytes) {
+    byte_ceiling_exceeded = true;
+  }
+  if (request.max_transfer_duration.count() > 0 && !duration_ceiling_exceeded &&
+      std::chrono::steady_clock::now() - download_start >= request.max_transfer_duration) {
+    duration_ceiling_exceeded = true;  // F12/R2(d): same final-boundary rule as bytes
+  }
+
+  if (tee != nullptr) {
+    // No export on the direct pull: nullopt save_paths, inert helpers. A
+    // final ceiling overage must never finalize (F6) — it rides the same
+    // not-complete input as a cancel.
+    const TeeTerminalOutcome terminal = finishCacheTee(
+        *tee, stats, cancelled_after_download || byte_ceiling_exceeded || duration_ceiling_exceeded,
+        std::nullopt,
+        [](McapSaveResult) {}, []() {},
+        [](const std::filesystem::path&) {},
+        [](const std::filesystem::path&, std::string*) { return true; });
+    result.tee_outcome = terminal.outcome;
+    result.tee_error = terminal.error;
+    setTeeForCancel(nullptr);
+    tee.reset();
+  }
+
+  if (host_progress_active && stats.eos == SessionEos::Complete && !cancelled_after_download &&
+      !byte_ceiling_exceeded && !duration_ceiling_exceeded) {
+    (void)driver.datasetIngest().progressUpdate(transport_messages_seen);
+    driver.datasetIngest().progressFinish();
+  }
+
+  // Seal the host-side parser writes while still inside the critical section.
+  driver.finalize();
+
+  const auto counts = driver.decodedCounts();
+  const auto errors = driver.errorCounts();
+  std::uint64_t total_decode_errors = 0;
+  for (const auto& [tid, ec] : errors) {
+    (void)tid;
+    total_decode_errors += ec;
+  }
+  write_lock.unlock();
+
+  result.stats = stats;
+  // Usability predicate (quality review IMPORTANT-3): "some topic COULD
+  // decode" is not enough — an all-decode-errors session has decodable
+  // bindings and ZERO rows, and must not be described as a usable eager
+  // dataset. Usable = a decodable binding exists AND (at least one row
+  // actually decoded OR the stream was genuinely empty — an empty time
+  // window imports an empty-but-correct dataset).
+  std::uint64_t decoded_rows = 0;
+  for (const auto& [tid, rows] : counts) {
+    (void)tid;
+    decoded_rows += rows;
+  }
+  result.any_decodable =
+      driver.hasDecodable() && (decoded_rows > 0 || stats.messages_received == 0);
+  result.decode_errors = total_decode_errors;
+  result.byte_ceiling_exceeded = byte_ceiling_exceeded;
+  result.duration_ceiling_exceeded = duration_ceiling_exceeded;
+
+  // Terminal precedence (documented, pinned by the ABI adversarial tests):
+  // CANCEL WINS over the byte ceiling when both latched — an explicit caller
+  // cancel outranks the resource classification (the partial is deleted
+  // either way, and a retried import reports the ceiling uncontaminated);
+  // the ceiling then wins over every other failure cause.
+  if (cancelled_after_download ||
+      (stats.eos == SessionEos::Cancelled && !byte_ceiling_exceeded && !duration_ceiling_exceeded)) {
+    finish_cancelled();
+    result.error = "download cancelled";
+  } else if (byte_ceiling_exceeded) {
+    result.terminal = PullTerminal::kFailed;
+    result.error = "transfer byte ceiling exceeded: " + std::to_string(stats.wire_bytes_received) +
+                   " wire bytes received > " + std::to_string(request.max_transfer_bytes) +
+                   " byte limit";
+  } else if (duration_ceiling_exceeded) {
+    result.terminal = PullTerminal::kFailed;
+    result.error = "transfer duration ceiling exceeded (limit " +
+                   std::to_string(request.max_transfer_duration.count()) + " ms)";
+  } else if (stats.eos == SessionEos::Complete) {
+    result.terminal = PullTerminal::kComplete;
+    result.error.clear();
+  } else {
+    result.terminal = PullTerminal::kFailed;
+    result.error = stats.error.empty() ? "session ended without terminal Eos" : stats.error;
+  }
+
+  // COMPLETE-only shared SessionCache store (D7) — same suppression rules as
+  // the interactive path (decode errors / nothing decodable -> no entry).
+  const PJ::cloud::SessionKey session_key = PJ::cloud::computeSessionKey(
+      request.connection.uri, request.sequence_names, request.topic_names,
+      {request.start_ns, request.end_ns}, request.include_latched);  // F1: the descriptor field keys
+
+  if (result.terminal == PullTerminal::kComplete && total_decode_errors == 0 && driver.hasDecodable()) {
+    storeCompletedSessionEntry(rt->sessionCache(), session_key, request.group_name,
+                               request.connection.uri, request.topic_names, name_by_id, counts,
+                               request.identity, result.tee_outcome,
+                               /*refetch_after_disk_miss=*/false);
+  }
+
+  // ---- promotion at completion (D6 — the SAME ImportRuntime hook the
+  // interactive fetch uses). AFTER the store so a re-entrant on_result finds
+  // the entry. The pull does NOT wait: the shared result rides PullResult so
+  // the PR-3 job can wait cancel-aware (or detach), and the absent-service
+  // case comes back already settled EAGER_ONLY-equivalent.
+  if (result.terminal == PullTerminal::kComplete && result.tee_outcome == TeeOutcome::kFinalized &&
+      result.dataset.has_value()) {
+    result.promotion = rt->promoteToFileSource(
+        ImportRuntime::makePromotionRequest(result.dataset->id, request.identity,
+                                            rt->fileCache().pathFor(request.identity),
+                                            request.descriptor_json),
+        &session_key);
+  }
+
+  return result;
 }
 
 }  // namespace mcap_cloud

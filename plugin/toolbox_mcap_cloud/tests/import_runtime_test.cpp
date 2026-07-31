@@ -830,3 +830,41 @@ TEST(McapCloudImportRuntime, RetainRefusesWhenTheArtifactDoesNotValidate) {
   EXPECT_NE(diagnostic.find("does not validate"), std::string::npos) << diagnostic;
   EXPECT_EQ(rt.leaseRefs(identity), 0u);
 }
+
+// Round-5 F1 (adversarial red): an exception INSIDE begin() AFTER a caller
+// handed over a live drop token must not strand the restore obligation. The
+// no-throw capture prologue moves the token into the tee before any throwing
+// work, so the unwind destroys the tee and its member-destruction order
+// restores the references — under the ticket.
+TEST(McapCloudCacheTee, BeginThrowAfterAdoptionRestoresTheCallersToken) {
+  TempRoot cache_root("beginthrow-cache");
+  TempRoot config_root("beginthrow-config");
+  mcap_cloud::ImportRuntime rt(mcap_cloud::SessionFileCache(cache_root.path),
+                               mcap_cloud::TrustedOrigins(config_root.path));
+  const mcap_cloud::SourceDescriptor d = descriptor("beginthrow.mcap");
+  const std::string identity = mcap_cloud::descriptorIdentity(d);
+  publishThroughTee(rt, d);  // one holder retained by finalize
+  ASSERT_EQ(rt.leaseRefs(identity), 1u);
+
+  auto token = rt.dropLeaseForMaterializeScoped(identity);
+  ASSERT_TRUE(token.hasLease());
+  ASSERT_EQ(rt.leaseRefs(identity), 0u);
+
+  {
+    mcap_cloud::CacheTee tee(rt);
+    tee.setBeginThrowForTest(true);
+    std::string error;
+    bool threw = false;
+    try {
+      (void)tee.begin(identity, &error, std::nullopt, std::nullopt, std::move(token));
+    } catch (const std::exception&) {
+      threw = true;
+    }
+    ASSERT_TRUE(threw) << "the seam must throw after the capture prologue";
+    // The tee (not the vanished caller) owns the obligation now; nothing has
+    // been restored yet.
+    EXPECT_EQ(rt.leaseRefs(identity), 0u);
+  }
+  EXPECT_EQ(rt.leaseRefs(identity), 1u)
+      << "an unwind through begin() stranded the adopted drop token (F1)";
+}

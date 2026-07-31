@@ -29,10 +29,14 @@
 // No dialog/Qt dependencies — a future headless caller drives this directly.
 #pragma once
 
+#include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
 #include <filesystem>
+#include <functional>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -40,6 +44,8 @@
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
+
+#include <pj_base/sdk/descriptor_import.hpp>  // PJ::SourcePromotionHostView / Request
 
 #include "backend_types.hpp"
 #include "decoded_message.hpp"
@@ -49,6 +55,48 @@
 #include "trusted_origins.hpp"
 
 namespace mcap_cloud {
+
+// The stock MCAP loader's STABLE MANIFEST ID + its locked minimal preset
+// (D6, consult-locked values; grounded in pj-official-plugins
+// data_load_mcap/manifest.json:2). use_log_time is REQUIRED — the eager
+// ingest pushes log_time_ns while the loader defaults to publish time; a
+// promoted dataset must be identical to what a later import produces. NO
+// filepath in the preset — the host rewrites it (spec §6.2 step 6). Pinned
+// byte-identical by fetch_worker_promotion_test.
+inline constexpr const char* kMcapLoaderPluginId = "mcap-loader";
+inline constexpr const char* kMcapLoaderPresetJson =
+    "{\"clamp_large_arrays\":true,\"max_array_size\":500,\"selected_topics\":[],"
+    "\"use_header_timestamp\":false,\"use_log_time\":true}";
+
+/// Settled-exactly-once promotion outcome, shared (shared_ptr) between the
+/// host's on_result callback — which may fire re-entrantly, on any host
+/// thread, or long after the initiating pull returned — and any waiter (the
+/// PR-3 import job). The callback closure captures ONLY this shared state
+/// (plus a weak SessionCache handle), never plugin/GUI state, so a late
+/// result can never touch freed memory.
+class PromotionResult {
+ public:
+  /// First call wins; later calls are no-ops (defensive — the ABI promises
+  /// exactly-once, but a settle-once state costs nothing).
+  void settle(bool ok, std::string message);
+  /// nullopt while the accepted promotion is still outstanding.
+  [[nodiscard]] std::optional<bool> ok() const;
+  [[nodiscard]] std::string message() const;
+  /// Block until settled OR `cancelled()` returns true (polled every `poll`
+  /// — the job's cancel() cannot notify this cv, so the wait is a bounded
+  /// poll). Returns true when settled; false = the caller cancelled while
+  /// the promotion was still outstanding (DETACH: this shared state simply
+  /// outlives the caller and settles whenever on_result fires).
+  [[nodiscard]] bool waitSettled(const std::function<bool()>& cancelled,
+                                 std::chrono::milliseconds poll) const;
+
+ private:
+  mutable std::mutex mu_;
+  mutable std::condition_variable cv_;
+  bool done_ = false;
+  bool ok_ = false;
+  std::string message_;
+};
 
 class ImportRuntime {
  public:
@@ -63,10 +111,50 @@ class ImportRuntime {
 
   [[nodiscard]] SessionFileCache& fileCache() { return file_cache_; }
   [[nodiscard]] const SessionFileCache::Config& cacheConfig() const { return cache_config_; }
-  [[nodiscard]] SessionCache& sessionCache() { return session_cache_; }
+  [[nodiscard]] SessionCache& sessionCache() { return *session_cache_; }
   /// Serializes the host-write critical section across ALL workers of this
   /// toolbox instance (the toolbox DataWriter has no internal mutex).
   [[nodiscard]] std::mutex& hostWriteMutex() { return host_write_mu_; }
+
+  /// Bind the OPTIONAL pj.source_promotion.v1 host view (per toolbox
+  /// instance — never share a bound view across plugin instances, see
+  /// SourcePromotionHostView's doc). Absence means every completed
+  /// materialize is EAGER_ONLY-equivalent. Set at bind() on the main
+  /// thread; read from pull/job threads (mutex-guarded). The caller (the
+  /// toolbox) must keep the underlying binding alive while any promotion is
+  /// outstanding — it owns both this runtime and the bound registry scope.
+  void setPromotionHost(std::optional<PJ::SourcePromotionHostView> view);
+  [[nodiscard]] bool hasPromotionHost() const;
+
+  /// The D6 promotion request over a validated cache artifact. `dataset` is
+  /// the pull's DataSourceHandle id (the provisional dataset announced via
+  /// on_dataset); `descriptor_json` is toSourceDescriptorJson (canonical
+  /// fields + display_name), never the canonical identity serialization.
+  [[nodiscard]] static PJ::SourcePromotionRequest makePromotionRequest(
+      PJ::DatasetId dataset, const std::string& source_identity,
+      const std::filesystem::path& local_path, const std::string& descriptor_json);
+
+  /// The SHARED promotion-at-completion hook (D6 — the interactive fetch and
+  /// the PR-3 import job both terminate through this). ALWAYS returns a
+  /// non-null result:
+  ///   - service absent/invalid or synchronously rejected -> settled
+  ///     ok=false immediately (EAGER_ONLY-equivalent, message says why);
+  ///   - accepted -> settles when on_result fires (possibly re-entrantly,
+  ///     before this returns; possibly much later, after the caller moved
+  ///     on — the DETACH shape).
+  /// When `cache_key` is non-null the matching SessionCache entry's
+  /// promotion_state tracks the transaction (kPending -> kPromoted /
+  /// kEagerOnly), updated from the callback through SHARED ownership of the
+  /// thread-safe cache (weak_ptr) — safe even against runtime teardown.
+  std::shared_ptr<PromotionResult> promoteToFileSource(const PJ::SourcePromotionRequest& request,
+                                                       const SessionKey* cache_key);
+
+  /// Diagnostics-only count of ACCEPTED promotions whose on_result has not
+  /// settled yet (adversarial F7's plugin-side accounting; the
+  /// teardown-deadlock half is already covered by the job DETACH — the
+  /// promotion-shutdown reorder is the PJ4-side fix). The counter is
+  /// shared-owned so a late settle after runtime teardown decrements safely.
+  [[nodiscard]] int outstandingPromotions() const { return promotions_outstanding_->load(); }
 
   /// Write-through: records into the TrustedOrigins ledger AND — only after
   /// the DURABLE ledger write succeeded (adversarial F14) — the in-memory
@@ -316,8 +404,16 @@ class ImportRuntime {
   SessionFileCache file_cache_;
   SessionFileCache::Config cache_config_{};
   TrustedOrigins trusted_;
-  SessionCache session_cache_;
+  // shared_ptr so the promotion callback can hold a WEAK handle: a result
+  // settling after this runtime's teardown locks either a live cache
+  // (shared ownership keeps the object alive through the update) or
+  // nothing — never a dangling reference.
+  std::shared_ptr<SessionCache> session_cache_ = std::make_shared<SessionCache>();
   std::mutex host_write_mu_;
+
+  mutable std::mutex promo_mu_;
+  std::optional<PJ::SourcePromotionHostView> promotion_host_;
+  std::shared_ptr<std::atomic<int>> promotions_outstanding_ = std::make_shared<std::atomic<int>>(0);
 
   mutable std::mutex trust_mu_;
   std::unordered_set<std::string> trusted_keys_;  // trustedOriginKey shape
@@ -374,12 +470,17 @@ class CacheTee {
   /// Phase 1 (before any network): registry ticket -> cache cleanup (orphan
   /// partials + LRU; runs BEFORE our own lock so it never self-contends) ->
   /// exclusive MaterializeLock -> delete a lookup()-failing existing file
-  /// under the lock (spec §5 corruption policy).
-  /// `adopted_lock` (adversarial F9): a caller that already performed its
-  /// own bounded cancelable wait on the CROSS-PROCESS materialize lock (the
-  /// provider job) hands it in; begin() then never re-acquires (it would
-  /// self-contend on the sidecar).
+  /// under the lock (spec §5 corruption policy). `adopted_ticket` (PR-3): a
+  /// caller that already holds the in-process registry slot for this SAME
+  /// identity (the provider job's bounded lock-wait) hands it over instead
+  /// of self-contending on a second tryBeginMaterialize. `adopted_lock`
+  /// (adversarial F9): same handoff for the CROSS-PROCESS materialize lock
+  /// after the job's bounded cancelable wait — begin() then never
+  /// re-acquires either (it would self-contend on the sidecar).
   ///
+  /// Round-5 F1: `adopted_lease_drop` is the MOVE-ONLY RAII token, captured
+  /// into this tee (with the ticket and lock) in a NO-THROW prologue before
+  /// anything that can throw — no exception path can strand any of them.
   /// Round-5 F2 — REFUSAL-WHILE-REFERENCED: begin() refuses an identity the
   /// lease registry still references (kArtifactInUseError). Loaded data
   /// lazily re-opens the artifact by generation-specific chunk offsets, and
@@ -396,7 +497,9 @@ class CacheTee {
   /// structurally (the restore path only ever handles a zero-or-adopted
   /// count).
   [[nodiscard]] bool begin(const std::string& identity, std::string* error,
-                           std::optional<SessionFileCache::MaterializeLock> adopted_lock = std::nullopt);
+                           std::optional<ImportRuntime::MaterializeTicket> adopted_ticket = std::nullopt,
+                           std::optional<SessionFileCache::MaterializeLock> adopted_lock = std::nullopt,
+                           ImportRuntime::ScopedLeaseDrop adopted_lease_drop = {});
 
   /// True iff the last begin() failure was the F2 refusal (identity
   /// referenced by loaded data). Owning thread only.

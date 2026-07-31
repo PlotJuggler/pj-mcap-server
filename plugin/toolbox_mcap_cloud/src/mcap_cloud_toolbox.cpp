@@ -56,7 +56,54 @@ PJ::Status McapCloudToolbox::bind(PJ::sdk::ServiceRegistry services) {
   // (spec §6.3 — a headless provider bind must stay network-free), so a
   // re-bind after initialization swaps the view without reconnecting.
   dialog_.setSettings(services.get<PJ::sdk::SettingsStoreService>().value_or(PJ::sdk::SettingsView{}));
+  // OPTIONAL pj.source_promotion.v1 (D6): get<>, never require<> — absence
+  // means a host without promotion support, and every completed materialize
+  // is then EAGER_ONLY-equivalent. Bound per plugin instance (the host
+  // derives the provider manifest id from the binding); this instance owns
+  // both the runtime and the bound registry scope, so the view stays alive
+  // while any promotion is outstanding.
+  import_runtime_.setPromotionHost(services.get<PJ::sdk::SourcePromotionHostService>());
+  // The descriptor-import provider (PR-3): same settings view as the dialog
+  // (credential resolution at IMPORT time, main-thread), plus the host
+  // providers its per-job pulls ingest through. Network-free — the provider
+  // touches the network only inside an authorized start_import (spec §6.3).
+  provider_.bind(services.get<PJ::sdk::SettingsStoreService>().value_or(PJ::sdk::SettingsView{}),
+                 {[this]() { return toolboxHost(); }, [this]() { return runtimeHost(); }});
   return PJ::okStatus();
+}
+
+const void* McapCloudToolbox::pluginExtension(std::string_view id) {
+  if (id == PJ_DESCRIPTOR_IMPORT_EXTENSION_V1) {
+    return &descriptor_import_ext_;
+  }
+  return nullptr;
+}
+
+bool McapCloudToolbox::descriptorQueryThunk(void* plugin_ctx, PJ_string_view_t descriptor_json,
+                                            PJ_descriptor_query_result_v1_t* out_result,
+                                            PJ_error_t* out_error) noexcept {
+  if (plugin_ctx == nullptr) {
+    PJ::sdk::fillError(out_error, 1, "mcap_cloud", "null plugin_ctx");
+    return false;
+  }
+  // plugin_ctx is the toolbox instance the host called get_plugin_extension
+  // with (the PJ_TOOLBOX_PLUGIN create_fn returns `new McapCloudToolbox()`
+  // as void*, so this cast is exact). The provider walls exceptions itself.
+  return static_cast<McapCloudToolbox*>(plugin_ctx)
+      ->provider_.queryDescriptor(descriptor_json, out_result, out_error);
+}
+
+bool McapCloudToolbox::descriptorStartThunk(void* plugin_ctx,
+                                            const PJ_descriptor_import_start_request_v1_t* request,
+                                            const PJ_descriptor_import_callbacks_v1_t* callbacks,
+                                            void* callback_ctx, PJ_joinable_job_t* out_job,
+                                            PJ_error_t* out_error) noexcept {
+  if (plugin_ctx == nullptr) {
+    PJ::sdk::fillError(out_error, 1, "mcap_cloud", "null plugin_ctx");
+    return false;
+  }
+  return static_cast<McapCloudToolbox*>(plugin_ctx)
+      ->provider_.startImport(request, callbacks, callback_ctx, out_job, out_error);
 }
 
 PJ_borrowed_dialog_t McapCloudToolbox::getDialog() {

@@ -275,6 +275,16 @@ class BackendConnection {
   // it and returns. Safe to call from any thread.
   void cancelSession();
 
+  // Re-verify R2(d): a hard SESSION DEADLINE for the next download. When set,
+  // the frame loop exits AT the deadline even on a SILENT/control-only
+  // stream (the frame wait is capped to the remaining time) and the resume
+  // wrapper stops retrying past it — the caller (the direct pull) then
+  // classifies the exit through its duration-ceiling latch. nullopt = none.
+  // Set on the worker thread before a download, like setResumeHint.
+  void setSessionDeadline(std::optional<std::chrono::steady_clock::time_point> deadline) {
+    session_deadline_ = deadline;
+  }
+
  private:
   // Result of one frame-loop pass over a single (re)attached consumer. resumable
   // is true iff the loop exited on a transport drop (no terminal Eos seen) that
@@ -432,6 +442,15 @@ class BackendConnection {
   // read on the caller thread at download end — hence atomic. NOTE: this is the WS
   // payload size, not true network bytes (no TLS/TCP/IP framing overhead).
   std::atomic<std::uint64_t> session_wire_bytes_{0};
+
+  // F3: "expired?" and "cap this wait to the remaining budget" — one
+  // definition shared by the frame loop, the resume backoff and the
+  // deadline-capped RPC waits.
+  [[nodiscard]] bool sessionDeadlineExpired() const;
+  [[nodiscard]] std::chrono::milliseconds cappedToDeadline(std::chrono::milliseconds wait) const;
+
+  // R2(d): the per-download hard deadline (see setSessionDeadline).
+  std::optional<std::chrono::steady_clock::time_point> session_deadline_;
 
   // ---- reconnect-resume (Slice 8) ------------------------------------------
   // Surface "Resuming (attempt N/max)…" through the worker->dialog path.

@@ -32,6 +32,7 @@
 #include <vector>
 
 #include <ixwebsocket/IXWebSocketServer.h>
+#include <pj_base/descriptor_import_protocol.h>
 #include <pj_base/plugin_data_api.h>
 #include <pj_base/sdk/plugin_data_api.hpp>
 #include <pj_base/sdk/service_registry.hpp>
@@ -43,6 +44,7 @@
 #include "mcap_cloud_toolbox.hpp"
 #include "parser_ingest_test_support.hpp"
 #include "pj_cloud.pb.h"
+#include "source_descriptor.hpp"
 #include "test_support_env.hpp"
 #include "test_support_fs.hpp"
 
@@ -115,6 +117,9 @@ class FakeServiceRegistry {
     return PJ::sdk::ServiceRegistry(PJ_service_registry_t{this, &vtable_});
   }
 
+  // Optionally serve pj.source_promotion.v1 too (the D6 wiring test below).
+  void setPromotionService(PJ_source_promotion_host_t host) { promotion_ = host; }
+
  private:
   static bool getService(void* ctx, PJ_string_view_t name, uint32_t /*min_version*/, PJ_service_t* out,
                          PJ_error_t* err) noexcept {
@@ -132,6 +137,10 @@ class FakeServiceRegistry {
       *out = PJ_service_t{self->settings_.ctx, self->settings_.vtable};
       return true;
     }
+    if (n == PJ_SOURCE_PROMOTION_HOST_SERVICE_V1 && self->promotion_.has_value()) {
+      *out = PJ_service_t{self->promotion_->ctx, self->promotion_->vtable};
+      return true;
+    }
     PJ::sdk::fillError(err, 1, "fake_registry", "service not provided by this fake");
     return false;
   }
@@ -140,6 +149,7 @@ class FakeServiceRegistry {
   PJ_toolbox_host_t write_host_{};
   PJ_toolbox_runtime_host_t runtime_host_{};
   PJ_settings_store_t settings_{};
+  std::optional<PJ_source_promotion_host_t> promotion_;
 };
 
 // One bindable environment: fake hosts + an in-memory settings backend whose
@@ -160,49 +170,11 @@ struct BindEnv {
   FakeServiceRegistry fake_registry{write_host.makeHost(), ingest_host.toolboxRuntime(), settings_host.view()};
 };
 
-// Hermetic roots: the toolbox constructor resolves the SessionFileCache root
-// (MCAP_CLOUD_CACHE_DIR) and the trust/credential config root (XDG_CONFIG_HOME)
-// from the environment, and initFromSettings' credential resolution reads
-// MCAP_CLOUD_URL / MCAP_CLOUD_API_KEY — pin all four before construction and
-// RESTORE the prior values on destruction (capture/restore mirrors
-// credential_resolve_test's EnvGuard; a bare unsetenv of XDG_CONFIG_HOME
-// would destroy a commonly-set variable for the rest of the process).
-struct HermeticEnv {
-  HermeticEnv()
-      : cache_root("cache"),
-        config_root("config"),
-        saved_cache_dir(capture("MCAP_CLOUD_CACHE_DIR")),
-        saved_xdg_config(capture("XDG_CONFIG_HOME")),
-        saved_url(capture("MCAP_CLOUD_URL")),
-        saved_api_key(capture("MCAP_CLOUD_API_KEY")) {
-    mcap_cloud_test::setEnvVar("MCAP_CLOUD_CACHE_DIR", cache_root.path.string().c_str());
-    mcap_cloud_test::setEnvVar("XDG_CONFIG_HOME", config_root.path.string().c_str());
-    mcap_cloud_test::unsetEnvVar("MCAP_CLOUD_URL");
-    mcap_cloud_test::unsetEnvVar("MCAP_CLOUD_API_KEY");
-  }
-  ~HermeticEnv() {
-    restore("MCAP_CLOUD_CACHE_DIR", saved_cache_dir);
-    restore("XDG_CONFIG_HOME", saved_xdg_config);
-    restore("MCAP_CLOUD_URL", saved_url);
-    restore("MCAP_CLOUD_API_KEY", saved_api_key);
-  }
-  static std::optional<std::string> capture(const char* name) {
-    const char* value = std::getenv(name);
-    return value == nullptr ? std::nullopt : std::optional<std::string>(value);
-  }
-  static void restore(const char* name, const std::optional<std::string>& value) {
-    if (value.has_value()) {
-      mcap_cloud_test::setEnvVar(name, value->c_str());
-    } else {
-      mcap_cloud_test::unsetEnvVar(name);
-    }
-  }
-  TempRoot cache_root;
-  TempRoot config_root;
-  std::optional<std::string> saved_cache_dir;
-  std::optional<std::string> saved_xdg_config;
-  std::optional<std::string> saved_url;
-  std::optional<std::string> saved_api_key;
+// Hermetic env roots: hoisted VERBATIM into test_support_env.hpp (shared
+// with the PR-3 provider suites); this alias keeps the suite body unchanged.
+using HermeticEnvBase = mcap_cloud_test::HermeticEnv;
+struct HermeticEnv : HermeticEnvBase {
+  HermeticEnv() : HermeticEnvBase("mcap-cloud-headless-init") {}
 };
 
 // True once `count()` reaches `expected` within `timeout`.
@@ -361,4 +333,101 @@ TEST(McapCloudHeadlessInit, RebindAfterInitUpdatesSettingsViewWithoutReconnect) 
       << "persistState must write through the RE-BOUND settings view";
   EXPECT_FALSE(first_env.backend.contains("mcap_cloud/metadata_query"))
       << "the pre-rebind view must no longer receive writes";
+}
+
+namespace {
+
+// Minimal accepting pj.source_promotion.v1 host for the D6 wiring test.
+struct MinimalPromotionHost {
+  static bool promoteThunk(void*, const PJ_source_promotion_request_v1_t*,
+                           PJ_source_promotion_result_fn result_cb, void* callback_ctx,
+                           PJ_error_t*) noexcept {
+    const char* msg = "promoted";
+    result_cb(callback_ctx, true, PJ_string_view_t{msg, 8});
+    return true;
+  }
+  [[nodiscard]] PJ_source_promotion_host_t view() {
+    static constexpr PJ_source_promotion_host_vtable_t kVtable{
+        1, sizeof(PJ_source_promotion_host_vtable_t), &MinimalPromotionHost::promoteThunk};
+    return PJ_source_promotion_host_t{this, &kVtable};
+  }
+};
+
+}  // namespace
+
+// PR-3 wiring: pluginExtension exposes the pj.descriptor_import.v1 table
+// (nullptr for anything else), the C thunks resolve plugin_ctx == the
+// toolbox instance, and the WHOLE query path works on an instance whose
+// getDialog() was NEVER called (the PR-2 latch stays cold) with ZERO network.
+TEST(McapCloudHeadlessInit, PluginExtensionServesTheDescriptorImportProviderCold) {
+  HermeticEnv env;
+  CountingHelloServer server;
+  ASSERT_TRUE(server.ok());
+  BindEnv bind_env(server.uri());
+
+  mcap_cloud::McapCloudToolbox toolbox;
+  auto status = toolbox.bind(bind_env.registry());
+  ASSERT_TRUE(status.has_value()) << status.error();
+
+  EXPECT_EQ(toolbox.pluginExtension("pj.unknown.v1"), nullptr);
+  const void* ext = toolbox.pluginExtension(PJ_DESCRIPTOR_IMPORT_EXTENSION_V1);
+  ASSERT_NE(ext, nullptr);
+
+  // Drive the raw C surface exactly like the host: plugin_ctx = the toolbox.
+  const auto* table = static_cast<const PJ_descriptor_import_provider_v1_t*>(ext);
+  ASSERT_GE(table->struct_size, sizeof(PJ_descriptor_import_provider_v1_t));
+  ASSERT_NE(table->query_descriptor, nullptr);
+  ASSERT_NE(table->start_import, nullptr);
+
+  // Malformed -> contract failure.
+  PJ_descriptor_query_result_v1_t out{};
+  out.struct_size = sizeof(out);
+  PJ_error_t err{};
+  const char* bad = "not json";
+  EXPECT_FALSE(table->query_descriptor(&toolbox, PJ_string_view_t{bad, 8}, &out, &err));
+
+  // Well-formed -> identity + needs-confirmation, with the dialog latch COLD
+  // and zero network (the fake server counts any Hello).
+  mcap_cloud::SourceDescriptor d;
+  d.version = 1;
+  d.kind = "mcap-cloud-session";
+  d.server_uri = server.uri();
+  d.s3_keys = {"a.mcap"};
+  d.topics = {"/one"};
+  const std::string json = mcap_cloud::toSourceDescriptorJson(d);
+  out = PJ_descriptor_query_result_v1_t{};
+  out.struct_size = sizeof(out);
+  ASSERT_TRUE(table->query_descriptor(&toolbox, PJ_string_view_t{json.data(), json.size()}, &out, &err));
+  EXPECT_EQ(out.trust, PJ_DESCRIPTOR_TRUST_NEEDS_CONFIRMATION);
+  EXPECT_EQ(out.is_materialized, 0u);
+  EXPECT_EQ(std::string(out.source_identity.data, out.source_identity.size),
+            mcap_cloud::descriptorIdentity(d));
+  expectNoConnectWithin(server, 0, std::chrono::milliseconds(500));
+  EXPECT_EQ(server.helloCount(), 0) << "a provider query must never touch the network (spec §6.3)";
+}
+
+// D6 wiring: bind() resolves the OPTIONAL pj.source_promotion.v1 service into
+// the shared ImportRuntime (get<>, never require<>); absence leaves the
+// runtime promotion-less (every completed materialize EAGER_ONLY-equivalent)
+// and must not fail the bind.
+TEST(McapCloudHeadlessInit, BindResolvesTheOptionalPromotionService) {
+  HermeticEnv env;
+  // Absent service -> bind succeeds, no promotion host.
+  {
+    BindEnv bind_env("");
+    mcap_cloud::McapCloudToolbox toolbox;
+    auto status = toolbox.bind(bind_env.registry());
+    ASSERT_TRUE(status.has_value()) << status.error();
+    EXPECT_FALSE(toolbox.importRuntime().hasPromotionHost());
+  }
+  // Registered service -> the runtime holds the bound view.
+  {
+    BindEnv bind_env("");
+    MinimalPromotionHost promo;
+    bind_env.fake_registry.setPromotionService(promo.view());
+    mcap_cloud::McapCloudToolbox toolbox;
+    auto status = toolbox.bind(bind_env.registry());
+    ASSERT_TRUE(status.has_value()) << status.error();
+    EXPECT_TRUE(toolbox.importRuntime().hasPromotionHost());
+  }
 }

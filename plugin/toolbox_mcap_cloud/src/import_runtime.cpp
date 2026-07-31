@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 #include "import_runtime.hpp"
 
+#include <algorithm>
 #include <limits>
 #include <stdexcept>
 #include <system_error>
@@ -46,6 +47,155 @@ bool ImportRuntime::isTrusted(std::string_view uri) const {
   }
   std::lock_guard<std::mutex> lock(trust_mu_);
   return trusted_keys_.count(*key) > 0;
+}
+
+// ---------------------------------------------------------------------------
+// PromotionResult
+// ---------------------------------------------------------------------------
+
+void PromotionResult::settle(bool ok, std::string message) {
+  {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (done_) {
+      return;  // settle-once: the first outcome wins
+    }
+    done_ = true;
+    ok_ = ok;
+    message_ = std::move(message);
+  }
+  cv_.notify_all();
+}
+
+std::optional<bool> PromotionResult::ok() const {
+  std::lock_guard<std::mutex> lock(mu_);
+  if (!done_) {
+    return std::nullopt;
+  }
+  return ok_;
+}
+
+std::string PromotionResult::message() const {
+  std::lock_guard<std::mutex> lock(mu_);
+  return message_;
+}
+
+bool PromotionResult::waitSettled(const std::function<bool()>& cancelled,
+                                  std::chrono::milliseconds poll) const {
+  std::unique_lock<std::mutex> lock(mu_);
+  for (;;) {
+    if (done_) {
+      return true;
+    }
+    if (cancelled && cancelled()) {
+      return false;  // DETACH: the shared state settles whenever on_result fires
+    }
+    cv_.wait_for(lock, poll);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// ImportRuntime promotion hook (D6)
+// ---------------------------------------------------------------------------
+
+void ImportRuntime::setPromotionHost(std::optional<PJ::SourcePromotionHostView> view) {
+  std::lock_guard<std::mutex> lock(promo_mu_);
+  promotion_host_ = std::move(view);
+}
+
+bool ImportRuntime::hasPromotionHost() const {
+  std::lock_guard<std::mutex> lock(promo_mu_);
+  return promotion_host_.has_value() && promotion_host_->valid();
+}
+
+PJ::SourcePromotionRequest ImportRuntime::makePromotionRequest(
+    PJ::DatasetId dataset, const std::string& source_identity, const std::filesystem::path& local_path,
+    const std::string& descriptor_json) {
+  PJ::SourcePromotionRequest request;
+  request.dataset = dataset;
+  request.source_identity = source_identity;
+  request.local_path_utf8 = local_path.string();
+  request.loader_plugin_id = kMcapLoaderPluginId;
+  request.loader_config_json = kMcapLoaderPresetJson;
+  request.descriptor_json = descriptor_json;
+  return request;
+}
+
+std::shared_ptr<PromotionResult> ImportRuntime::promoteToFileSource(
+    const PJ::SourcePromotionRequest& request, const SessionKey* cache_key) {
+  auto result = std::make_shared<PromotionResult>();
+  // F11: promotion begins with an atomic CAS on the CURRENT entry — only for
+  // this dataset, only from a non-pending state — and every settle must
+  // match {key, dataset id, generation} exactly, so a late result for an
+  // evicted/recreated entry (or a racing second promotion) can never mutate
+  // the wrong entry. kNoEntry (store-suppressed sessions) proceeds without
+  // entry tracking; kAlreadyPending / kDatasetMismatch REFUSE without ever
+  // calling the host (the double-fire guard).
+  const std::optional<SessionKey> key =
+      cache_key != nullptr ? std::optional<SessionKey>(*cache_key) : std::nullopt;
+  const std::uint32_t dataset_id = static_cast<std::uint32_t>(request.dataset);
+  bool tracked = false;
+  std::uint64_t generation = 0;
+  if (key.has_value()) {
+    switch (session_cache_->beginPromotion(*key, dataset_id, &generation)) {
+      case SessionCache::PromotionBegin::kBegun:
+        tracked = true;
+        break;
+      case SessionCache::PromotionBegin::kNoEntry:
+        break;  // proceed untracked
+      case SessionCache::PromotionBegin::kAlreadyPending:
+        result->settle(false, "a promotion for this session is already pending");
+        return result;
+      case SessionCache::PromotionBegin::kDatasetMismatch:
+        result->settle(false, "the cached session now belongs to a different dataset");
+        return result;
+    }
+  }
+  // The callback closure captures ONLY shared/weak state: the settle-once
+  // result and a weak SessionCache handle. It may run re-entrantly (before
+  // promoteToFileSource returns), on any host thread, or after this runtime
+  // is gone — none of those can touch freed plugin state.
+  std::weak_ptr<SessionCache> weak_cache = session_cache_;
+  auto settle_entry = [weak_cache, key, dataset_id, generation, tracked](PromotionState state) {
+    if (!tracked || !key.has_value()) {
+      return;
+    }
+    if (auto cache = weak_cache.lock()) {
+      cache->settlePromotion(*key, dataset_id, generation, state);
+    }
+  };
+
+  std::optional<PJ::SourcePromotionHostView> view;
+  {
+    std::lock_guard<std::mutex> lock(promo_mu_);
+    view = promotion_host_;
+  }
+  if (!view.has_value() || !view->valid()) {
+    // Absent service: every completed materialize is EAGER_ONLY-equivalent.
+    settle_entry(PromotionState::kEagerOnly);
+    result->settle(false, "source promotion service not available (host without promotion support)");
+    return result;
+  }
+
+  // The outstanding counter (F7 diagnostics) increments before the call and
+  // decrements exactly once when on_result settles (or on synchronous
+  // rejection, where it never runs); the closure holds SHARED ownership of
+  // the counter so a settle after runtime teardown stays safe.
+  std::shared_ptr<std::atomic<int>> outstanding = promotions_outstanding_;
+  outstanding->fetch_add(1);
+  const PJ::Status status = view->promoteToFileSource(
+      request, [result, settle_entry, outstanding](bool ok, std::string message) {
+        // [host-callback-thread] — never assume the GUI thread here.
+        settle_entry(ok ? PromotionState::kPromoted : PromotionState::kEagerOnly);
+        outstanding->fetch_sub(1);
+        result->settle(ok, std::move(message));
+      });
+  if (!status) {
+    // Synchronous rejection: on_result will never run.
+    outstanding->fetch_sub(1);
+    settle_entry(PromotionState::kEagerOnly);
+    result->settle(false, status.error());
+  }
+  return result;
 }
 
 std::optional<ImportRuntime::MaterializeTicket> ImportRuntime::tryBeginMaterialize(
@@ -295,7 +445,24 @@ CacheTee::~CacheTee() {
 }
 
 bool CacheTee::begin(const std::string& identity, std::string* error,
-                     std::optional<SessionFileCache::MaterializeLock> adopted_lock) {
+                     std::optional<ImportRuntime::MaterializeTicket> adopted_ticket,
+                     std::optional<SessionFileCache::MaterializeLock> adopted_lock,
+                     ImportRuntime::ScopedLeaseDrop adopted_lease_drop) {
+  // NO-THROW CAPTURE PROLOGUE (round-5 F1): every adopted resource becomes
+  // member-owned BEFORE any throwing operation (even the identity_
+  // assignment below allocates). From here, an exception anywhere in begin()
+  // unwinds into this tee's teardown, whose member-destruction order
+  // restores the token BEFORE the ticket releases — stranding is impossible
+  // by construction. (Function-parameter destruction order is unspecified in
+  // C++, so parameters alone could NOT guarantee the ordering.)
+  lease_drop_.merge(std::move(adopted_lease_drop));
+  if (adopted_ticket.has_value()) {
+    ticket_ = std::move(adopted_ticket);
+  }
+  if (adopted_lock.has_value()) {
+    lock_ = std::move(adopted_lock);
+  }
+
   auto fail = [error](std::string message) {
     if (error != nullptr) {
       *error = std::move(message);
@@ -306,8 +473,12 @@ bool CacheTee::begin(const std::string& identity, std::string* error,
 
   // In-process contention first (cheap, exact), then maintenance, then the
   // cross-process lock. cleanup() runs BEFORE our own lock so its per-victim
-  // exclusive try never self-contends with this materialization.
-  ticket_ = runtime_.tryBeginMaterialize(identity);
+  // exclusive try never self-contends with this materialization. A caller
+  // that already holds the registry slot (the PR-3 job) handed its ticket in
+  // above.
+  if (!ticket_.has_value()) {
+    ticket_ = runtime_.tryBeginMaterialize(identity);
+  }
   if (!ticket_.has_value()) {
     return fail("a materialization of this session is already in progress in this process");
   }
@@ -331,13 +502,10 @@ bool CacheTee::begin(const std::string& identity, std::string* error,
     return fail(ImportRuntime::kArtifactInUseError);
   }
   runtime_.fileCache().cleanup(runtime_.cacheConfig());
-
-  if (adopted_lock.has_value()) {
-    // F9: a caller (the provider job) already performed its bounded
-    // cancelable wait on the cross-process lock and hands it in — never
-    // re-acquire (self-contention on the sidecar).
-    lock_ = std::move(adopted_lock);
-  } else {
+  if (!lock_.has_value()) {
+    // No adopted lock (F9: a provider job that already performed its bounded
+    // cancelable wait handed one in above — never re-acquire, it would
+    // self-contend on the sidecar).
     std::string lock_error;
     if (lock_fail_for_test_) {
       lock_error = "injected exclusive-lock failure (test seam)";
