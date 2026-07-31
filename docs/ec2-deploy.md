@@ -74,6 +74,11 @@ keys are ever stored. Minimal policy:
 }
 ```
 
+> **SQS event tier (optional, later):** enabling event-driven discovery
+> (`server/deploy/README.md` § "S3 event notifications") requires adding
+> `sqs:ReceiveMessage`, `sqs:DeleteMessage`, `sqs:ChangeMessageVisibility`,
+> and `sqs:GetQueueAttributes` on the events-queue ARN to **this same role**.
+
 > **CONTAINER + IMDS GOTCHA (do not skip):** a container reaching the instance
 > role is **one extra network hop**, so IMDSv2's default hop limit of 1 blocks
 > it and the containers get *no* credentials. Raise it to 2:
@@ -270,7 +275,9 @@ and restarts (`mcap_catalog/` is vendored — `git pull` brings it along).
 **Widening the served data:** edit the `prefix` in **both** artifacts (§4),
 `$C restart`. The builder's next reconcile picks up the newly-in-scope objects;
 out-of-scope rows are pruned in the same pass. Catalog freshness otherwise
-tracks the `--rescan-interval` (300s); the server hot-swaps onto each
+tracks the `--rescan-interval` (21600 s = 6 h since the 2026-07-30 event-discovery
+design Phase 0; the SQS event tier — see `server/deploy/README.md` — is the
+minutes-level freshness path once enabled); the server hot-swaps onto each
 atomically-published rebuild without a restart.
 
 ---

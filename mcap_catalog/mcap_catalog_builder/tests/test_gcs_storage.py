@@ -6,6 +6,7 @@ or google-cloud-storage. Mirrors test_s3_storage.py.
 """
 
 import io
+import threading
 
 from mcap.writer import CompressionType, Writer
 
@@ -134,6 +135,47 @@ def test_list_all_filters_non_mcap():
     assert [x.key for x in listings] == ["a/x.mcap", "b/y.mcap"]
     assert listings[0].stat.etag == "5"
     assert listings[1].stat.size == 2
+
+
+def test_list_all_stop_between_pages_does_not_request_next_page():
+    stop = threading.Event()
+
+    class FirstPage(list):
+        def __iter__(self):
+            yield from super().__iter__()
+            stop.set()
+
+    class PagedGCS(FakeGCS):
+        def __init__(self):
+            super().__init__({"a.mcap": b"a", "b.mcap": b"b"})
+            self.page_calls = 0
+
+        def list_blobs(self, bucket, prefix=""):
+            outer = self
+
+            class Pager:
+                @property
+                def pages(self):
+                    return self
+
+                def __iter__(self):
+                    return self
+
+                def __next__(self):
+                    outer.page_calls += 1
+                    if outer.page_calls == 1:
+                        return FirstPage(
+                            [_FakeBlob("a.mcap", b"a", 1, outer)]
+                        )
+                    if outer.page_calls == 2:
+                        return [_FakeBlob("b.mcap", b"b", 1, outer)]
+                    raise StopIteration
+
+            return Pager()
+
+    client = PagedGCS()
+    assert list(GCSSource(client, "bucket").list_all(stop_event=stop)) == []
+    assert client.page_calls == 1
 
 
 def test_gcs_event_translation_helpers():

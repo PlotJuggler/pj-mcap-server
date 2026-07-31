@@ -98,6 +98,20 @@ def test_fatal_writes_error_phase_immediately(tmp_path):
     assert "NoCredentialsError" in doc["last_error"]
 
 
+def test_full_audit_outcome_and_duration_are_additive(tmp_path):
+    db = str(tmp_path / "catalog.db")
+    w = StatusWriter(db, min_interval=0.0)
+    w.update(phase="idle", existing_field="preserved")
+    w.full_audit_finished("failed", 12.5)
+
+    doc = _read_status(db)
+    assert doc["phase"] == "idle"
+    assert doc["existing_field"] == "preserved"
+    assert doc["full_audit_outcome"] == "failed"
+    assert doc["full_audit_duration"] == 12.5
+    assert doc["full_audit_last"].endswith("Z")
+
+
 def test_heartbeat_refreshes_updated_at(tmp_path):
     db = str(tmp_path / "catalog.db")
     w = StatusWriter(db, min_interval=0.0)

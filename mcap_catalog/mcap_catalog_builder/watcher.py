@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class WatchEvent:
-    kind: str  # "catalog" | "delete" | "rescan" | "stop"
+    kind: str  # "catalog" | "delete" | "stop" (audits ride their own AuditItem)
     path: str | None = None
 
 

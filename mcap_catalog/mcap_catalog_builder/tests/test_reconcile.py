@@ -1,10 +1,17 @@
 """Tests for the full reconcile scan: catalog, dedup, warm no-op, deletion sweep."""
 
 import os
+import threading
+import time
 
+import pytest
 from mcap_catalog_builder.db import load_caches, open_db
-from mcap_catalog_builder.reconcile import full_reconcile, scan_disk
-from mcap_catalog_builder.storage import LocalSource
+from mcap_catalog_builder.reconcile import (
+    ReconcileCancelled,
+    full_reconcile,
+    scan_disk,
+)
+from mcap_catalog_builder.storage import Listing, LocalSource, Stat
 from mcap_catalog_builder.tests.fixtures import write_minimal_mcap
 from mcap_catalog_builder.varint import decode_counts_blob
 
@@ -366,3 +373,70 @@ def test_reconcile_deletes_removed(tmp_db, tmp_path):
     assert tally["deleted"] == 1
     assert conn.execute("SELECT COUNT(*) FROM files").fetchone()[0] == 1
     assert conn.execute("SELECT COUNT(*) FROM topic_sets").fetchone()[0] == 1  # set survives
+
+
+def test_stop_during_list_is_prompt_and_does_not_stamp_build(tmp_db, monkeypatch):
+    import mcap_catalog_builder.reconcile as reconcile_mod
+
+    conn, caches = tmp_db
+    stop = threading.Event()
+    stamped = []
+
+    class StopDuringList:
+        def list_all(self, stop_event=None):
+            assert stop_event is stop
+            stop.set()
+            yield Listing(
+                key=(
+                    "customer=globex/customer_site=london/robot=rob01/"
+                    "source=ros-bags/date=2026-06-01/a.mcap"
+                ),
+                stat=Stat(size=1, etag="e"),
+            )
+
+    monkeypatch.setattr(
+        reconcile_mod, "record_build", lambda *_a, **_k: stamped.append(True)
+    )
+    started = time.monotonic()
+    with pytest.raises(ReconcileCancelled):
+        full_reconcile(conn, caches, StopDuringList(), stop_event=stop)
+
+    assert time.monotonic() - started < 1.0
+    assert stamped == []
+    assert conn.execute("SELECT * FROM build_metadata WHERE id=1").fetchone() is None
+
+
+def test_stop_during_apply_is_prompt_and_does_not_stamp_build(
+    tmp_db, tmp_path, monkeypatch
+):
+    import mcap_catalog_builder.reconcile as reconcile_mod
+
+    conn, caches = tmp_db
+    root = str(tmp_path / "watch")
+    _hive(root, filename="a.mcap")
+    _hive(root, filename="b.mcap")
+    stop = threading.Event()
+    stamped = []
+    real_apply = reconcile_mod.apply_extract
+    applies = []
+
+    def stop_after_first_apply(*args, **kwargs):
+        result = real_apply(*args, **kwargs)
+        applies.append(result.status)
+        stop.set()
+        return result
+
+    monkeypatch.setattr(reconcile_mod, "apply_extract", stop_after_first_apply)
+    monkeypatch.setattr(
+        reconcile_mod, "record_build", lambda *_a, **_k: stamped.append(True)
+    )
+
+    started = time.monotonic()
+    with pytest.raises(ReconcileCancelled):
+        full_reconcile(conn, caches, root, workers=1, stop_event=stop)
+
+    assert time.monotonic() - started < 1.0
+    assert applies == ["cataloged"]
+    assert stamped == []
+    assert conn.execute("SELECT COUNT(*) FROM files").fetchone()[0] == 1
+    assert conn.execute("SELECT * FROM build_metadata WHERE id=1").fetchone() is None

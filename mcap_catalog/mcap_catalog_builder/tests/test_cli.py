@@ -1,12 +1,16 @@
 """Tests for the CLI parser and the single-writer worker loop."""
 
+import json
 import os
 import queue
 import signal
 import sys
+import threading
 import types
 
 from mcap_catalog_builder.__main__ import build_parser, main, worker_loop
+from mcap_catalog_builder.s3_producer import EventRecord, SqsBatch
+from mcap_catalog_builder.storage import Stat
 from mcap_catalog_builder.tests.fixtures import write_minimal_mcap
 from mcap_catalog_builder.watcher import WatchEvent
 
@@ -163,6 +167,127 @@ def test_main_s3_daemon_no_watch_skips_sqs_requirement(tmp_path, monkeypatch):
     assert producer_calls == []  # SQS long-poll producer never started
 
 
+def test_existing_db_starts_producer_and_tag_ipc_before_startup_audit(
+    tmp_path, monkeypatch
+):
+    import mcap_catalog_builder.__main__ as m
+    from mcap_catalog_builder.db import open_db
+
+    root = str(tmp_path / "watch")
+    os.makedirs(root)
+    db = str(tmp_path / "catalog.db")
+    open_db(db).close()  # clean existing served DB => non-blocking startup path
+
+    producer_started = threading.Event()
+    tag_bound = threading.Event()
+    audit_started = threading.Event()
+
+    class Observer:
+        def stop(self):
+            pass
+
+        def join(self):
+            pass
+
+    def start_observer(_root, _handler):
+        producer_started.set()
+        return Observer()
+
+    class TagServer:
+        def __init__(self, _path, _work_q):
+            tag_bound.set()  # the real server binds in its constructor
+
+        def serve_forever(self):
+            pass
+
+        def shutdown(self):
+            pass
+
+        def server_close(self):
+            pass
+
+    def startup_audit(*_args, stop_event=None, **_kwargs):
+        # A synchronous pre-service reconcile would fail these assertions.
+        assert stop_event is not None
+        assert producer_started.is_set()
+        assert tag_bound.is_set()
+        audit_started.set()
+        stop_event.set()
+        return {"cataloged": 0, "skipped": 0, "failed": 0, "deleted": 0}
+
+    monkeypatch.setattr(m, "start_observer", start_observer)
+    monkeypatch.setattr(m, "TagEditServer", TagServer)
+    monkeypatch.setattr(m, "full_reconcile", startup_audit)
+
+    rc = _run_daemon_main(
+        [
+            root,
+            "--db",
+            db,
+            "--tag-socket",
+            str(tmp_path / "tags.sock"),
+            "--rescan-interval",
+            "60",
+        ]
+    )
+    assert rc == 0
+    assert audit_started.is_set()
+    with open(db + ".status.json") as f:
+        status = json.load(f)
+    assert status["full_audit_outcome"] == "ok"
+    assert status["full_audit_duration"] >= 0.0
+
+
+def test_daemon_rebuild_remains_blocking_before_producer(tmp_path, monkeypatch):
+    import mcap_catalog_builder.__main__ as m
+    from mcap_catalog_builder.db import open_db
+    from mcap_catalog_builder.reconcile import full_reconcile as real_full_reconcile
+
+    root = str(tmp_path / "watch")
+    os.makedirs(root)
+    db = str(tmp_path / "catalog.db")
+    open_db(db).close()
+
+    producer_started = threading.Event()
+    producer_state_during_reconcile = []
+
+    class Observer:
+        def stop(self):
+            pass
+
+        def join(self):
+            pass
+
+    def start_observer(_root, _handler):
+        producer_started.set()
+        return Observer()
+
+    def spy_reconcile(*args, **kwargs):
+        producer_state_during_reconcile.append(producer_started.is_set())
+        return real_full_reconcile(*args, **kwargs)
+
+    def stop_worker(*_args, **kwargs):
+        kwargs["stop_event"].set()
+
+    monkeypatch.setattr(m, "start_observer", start_observer)
+    monkeypatch.setattr(m, "full_reconcile", spy_reconcile)
+    monkeypatch.setattr(m, "worker_loop", stop_worker)
+
+    rc = _run_daemon_main(
+        [
+            "--rebuild",
+            root,
+            "--db",
+            db,
+            "--rescan-interval",
+            "60",
+        ]
+    )
+    assert rc == 0
+    assert producer_state_during_reconcile == [False]
+    assert producer_started.is_set()
+
+
 def test_parser_once_flag():
     assert build_parser().parse_args(["d"]).once is False
     assert build_parser().parse_args(["--once", "d"]).once is True
@@ -277,3 +402,106 @@ def test_worker_loop_delete_dispatches_by_key(tmp_db, monkeypatch):
     q.put(WatchEvent("stop"))
     worker_loop(conn, caches, _FakeSource(), q)
     assert deleted == ["/w/a.mcap"]
+
+
+# --------------------------------------------------------------------------
+# EventRecord handling (design §3.3/§3.4): terminal-after-commit ack + HEAD-guard
+# --------------------------------------------------------------------------
+
+class _StatSource(_FakeSource):
+    """A Source stub whose ``stat`` is scripted, counting calls (HEAD-guard)."""
+
+    def __init__(self, stat_result=None) -> None:
+        super().__init__()
+        self._stat_result = stat_result
+        self.stat_calls: list[str] = []
+
+    def stat(self, key: str):
+        self.stat_calls.append(key)
+        return self._stat_result
+
+
+def _event_record(kind, key):
+    ack_q: queue.Queue = queue.Queue()
+    batch = SqsBatch("rh-worker", 1, ack_q)
+    return EventRecord(kind, key, batch), ack_q
+
+
+def test_worker_event_record_catalog_acks_after_commit(tmp_db, monkeypatch):
+    conn, caches = tmp_db
+    import mcap_catalog_builder.__main__ as m
+
+    cataloged: list[str] = []
+    monkeypatch.setattr(
+        m, "catalog_object", lambda c, ca, k, s, stat=None: cataloged.append(k))
+
+    rec, ack_q = _event_record("catalog", "customer=a/x.mcap")
+    q: queue.Queue = queue.Queue()
+    q.put(rec)
+    q.put(WatchEvent("stop"))
+    worker_loop(conn, caches, _StatSource(), q)
+    assert cataloged == ["customer=a/x.mcap"]
+    assert ack_q.get_nowait() is rec.batch  # terminal AFTER the commit
+
+
+def test_worker_event_record_exception_leaves_batch_unacked(tmp_db, monkeypatch):
+    conn, caches = tmp_db
+    import mcap_catalog_builder.__main__ as m
+
+    def _boom(c, ca, k, s, stat=None):
+        raise RuntimeError("transient DB failure")
+
+    monkeypatch.setattr(m, "catalog_object", _boom)
+    rec, ack_q = _event_record("catalog", "customer=a/x.mcap")
+    later: list[str] = []
+    monkeypatch.setattr(m, "delete_by_key", lambda c, ca, k: later.append(k))
+
+    q: queue.Queue = queue.Queue()
+    q.put(rec)
+    q.put(WatchEvent("delete", "/w/next.mcap"))  # the worker must survive
+    q.put(WatchEvent("stop"))
+    worker_loop(conn, caches, _StatSource(), q)
+    assert ack_q.empty()  # NOT terminal: SQS will redeliver
+    assert later == ["/w/next.mcap"]  # worker kept processing
+
+
+def test_worker_delete_event_head_guard_recatalogs_live_object(tmp_db, monkeypatch):
+    conn, caches = tmp_db
+    import mcap_catalog_builder.__main__ as m
+
+    live = Stat(size=10, etag="e1", mtime_ns=1)
+    src = _StatSource(stat_result=live)
+    calls: list[tuple] = []
+    monkeypatch.setattr(
+        m, "catalog_object", lambda c, ca, k, s, stat=None: calls.append((k, stat)))
+    deleted: list[str] = []
+    monkeypatch.setattr(m, "delete_by_key", lambda c, ca, k: deleted.append(k))
+
+    rec, ack_q = _event_record("delete", "customer=a/x.mcap")
+    q: queue.Queue = queue.Queue()
+    q.put(rec)
+    q.put(WatchEvent("stop"))
+    worker_loop(conn, caches, src, q)
+    # Out-of-order delete for a live object: re-catalog with the HEAD's Stat
+    # passed through (exactly one stat call), never a row delete.
+    assert deleted == []
+    assert calls == [("customer=a/x.mcap", live)]
+    assert src.stat_calls == ["customer=a/x.mcap"]
+    assert ack_q.get_nowait() is rec.batch
+
+
+def test_worker_delete_event_head_guard_deletes_vanished_object(tmp_db, monkeypatch):
+    conn, caches = tmp_db
+    import mcap_catalog_builder.__main__ as m
+
+    src = _StatSource(stat_result=None)  # 404: object really gone
+    deleted: list[str] = []
+    monkeypatch.setattr(m, "delete_by_key", lambda c, ca, k: deleted.append(k))
+
+    rec, ack_q = _event_record("delete", "customer=a/x.mcap")
+    q: queue.Queue = queue.Queue()
+    q.put(rec)
+    q.put(WatchEvent("stop"))
+    worker_loop(conn, caches, src, q)
+    assert deleted == ["customer=a/x.mcap"]
+    assert ack_q.get_nowait() is rec.batch

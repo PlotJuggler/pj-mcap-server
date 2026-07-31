@@ -108,7 +108,12 @@ services:
       - "--no-watch"
       - "--tag-socket=/var/lib/pj-cloud/tag.sock"
       - "--db=/var/lib/pj-cloud/catalog.db"
-      - "--rescan-interval=300"
+      # 6 h full-audit interval (design 2026-07-30 Phase 0): at millions of
+      # objects a full-bucket LIST takes tens of minutes — a 300 s interval
+      # made the builder reconcile back-to-back forever. Event-driven
+      # discovery (--sqs-url, Phase 4) is the freshness path; this rescan
+      # is the safety net and moves to nightly after burn-in (Phase 6).
+      - "--rescan-interval=21600"
       - "--log-level=INFO"
     # Healthcheck: "alive, progressing, and not fatally failed" — NEVER "first
     # build complete" (that made deploy success a function of bucket size and

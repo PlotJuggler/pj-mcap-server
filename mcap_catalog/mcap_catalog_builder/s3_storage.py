@@ -14,6 +14,7 @@ recording.
 
 import calendar
 import io
+import threading
 from typing import Iterator
 
 from .retry import retry_with
@@ -191,7 +192,9 @@ class S3Source:
             ),
         )
 
-    def list_all(self) -> Iterator[Listing]:
+    def list_all(
+        self, stop_event: threading.Event | None = None
+    ) -> Iterator[Listing]:
         # See the _LIST_SHARD_THREADS/_LIST_QUEUE_PAGES comment above for why
         # this shards at all. Yield order is NOT lexicographic — reconcile is
         # dict/set-keyed throughout, so this is safe.
@@ -203,11 +206,15 @@ class S3Source:
         shards: list[str] = []
         kw: dict = {"Bucket": self._bucket, "Prefix": self._prefix, "Delimiter": "/"}
         while True:
+            if stop_event is not None and stop_event.is_set():
+                return
             resp = self._c.list_objects_v2(**kw)
             shards += [p["Prefix"] for p in resp.get("CommonPrefixes", [])]
             for o in resp.get("Contents", []):  # keys at the prefix root itself
                 if o["Key"].endswith(".mcap"):
                     yield self._listing(o)
+            if stop_event is not None and stop_event.is_set():
+                return
             if not resp.get("IsTruncated"):
                 break
             kw["ContinuationToken"] = resp["NextContinuationToken"]
@@ -215,15 +222,19 @@ class S3Source:
             return
 
         import queue as _queue
-        import threading
         from concurrent.futures import ThreadPoolExecutor
 
         q: "_queue.Queue" = _queue.Queue(maxsize=_LIST_QUEUE_PAGES)
         cancel = threading.Event()
 
+        def stopped() -> bool:
+            return cancel.is_set() or (
+                stop_event is not None and stop_event.is_set()
+            )
+
         def put_or_cancel(item) -> bool:
             """Cancel-aware put: never blocks past teardown."""
-            while not cancel.is_set():
+            while not stopped():
                 try:
                     q.put(item, timeout=0.25)
                     return True
@@ -232,11 +243,19 @@ class S3Source:
             return False
 
         def produce(prefix: str) -> None:
-            if cancel.is_set():
+            if stopped():
                 return  # teardown already started (e.g. an earlier shard's error) — don't even LIST
             try:
-                for page in self._c.get_paginator("list_objects_v2").paginate(
-                        Bucket=self._bucket, Prefix=prefix):
+                pages = iter(self._c.get_paginator("list_objects_v2").paginate(
+                    Bucket=self._bucket, Prefix=prefix
+                ))
+                while not stopped():
+                    try:
+                        page = next(pages)
+                    except StopIteration:
+                        break
+                    if stopped():
+                        return
                     if not put_or_cancel(("page", page.get("Contents", []))):
                         return  # consumer is gone — stop paginating
             except Exception as e:  # noqa: BLE001 — surfaced on the consumer side
@@ -250,13 +269,20 @@ class S3Source:
                 pool.submit(produce, prefix)
             finished = 0
             while finished < len(shards):
-                kind, payload = q.get()
+                if stop_event is not None and stop_event.is_set():
+                    return
+                try:
+                    kind, payload = q.get(timeout=0.1)
+                except _queue.Empty:
+                    continue
                 if kind == "done":
                     finished += 1
                 elif kind == "err":
                     raise payload  # abort-the-reconcile, same as the old paginator
                 else:
                     for o in payload:
+                        if stop_event is not None and stop_event.is_set():
+                            return
                         if o["Key"].endswith(".mcap"):
                             yield self._listing(o)
         finally:

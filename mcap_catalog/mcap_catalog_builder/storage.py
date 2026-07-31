@@ -14,6 +14,7 @@ here keeps the two interchangeable and ``boto3`` an optional, runtime-only dep.
 """
 
 import os
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO, Iterator, Protocol
@@ -53,8 +54,10 @@ class Source(Protocol):
         """Parse ``key``'s MCAP summary cheaply; returns (summary, via) where
         via is the targeted/fallback disposition for reconcile telemetry."""
 
-    def list_all(self) -> Iterator[Listing]:
-        """Every catalogable ``.mcap`` (key + fingerprint) for the reconcile sweep."""
+    def list_all(
+        self, stop_event: threading.Event | None = None
+    ) -> Iterator[Listing]:
+        """Every catalogable recording, stopping between listing pages/items."""
 
     def event_key(self, payload: str) -> str:
         """Map a WatchEvent payload to this source's key (local: relpath; S3: identity)."""
@@ -134,9 +137,13 @@ class LocalSource:
     def wait_for_stable(self, payload: str) -> bool:
         return wait_for_stable(payload, self._interval, self._checks)
 
-    def list_all(self) -> Iterator[Listing]:
+    def list_all(
+        self, stop_event: threading.Event | None = None
+    ) -> Iterator[Listing]:
         root = Path(self._root)
         for p in root.rglob("*.mcap"):
+            if stop_event is not None and stop_event.is_set():
+                return
             rel = p.relative_to(root)
             if any(part.startswith(".") for part in rel.parts):
                 continue

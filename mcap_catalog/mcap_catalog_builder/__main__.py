@@ -1,10 +1,10 @@
 """CLI entry point: ``python3 -m mcap_catalog_builder <watch_root> [options]``.
 
-Architecture: the producers (the watchdog observer + debounce Timers for local,
-or the SQS event drainer for S3, plus the periodic rescan thread) only enqueue
-WatchEvents. ``worker_loop`` (run on the main thread) is the single CONSUMER and
-the only DB writer. It is driven by a storage ``Source`` and is identical for
-both backends.
+Architecture: the live producers (the watchdog observer + debounce Timers for
+local, or the SQS event drainer for S3) only enqueue WatchEvents. The audit
+coordinator likewise only enqueues one coalesced, result-bearing AuditItem.
+``worker_loop`` (run on the main thread) is the single CONSUMER and the only DB
+writer. It is driven by a storage ``Source`` and is identical for all backends.
 """
 
 import argparse
@@ -14,11 +14,14 @@ import queue
 import signal
 import sqlite3
 import threading
+import time
+from dataclasses import dataclass
 
 from .db import Caches, load_caches, open_db
 from .builder import catalog_object, delete_by_key
 from .publish import build_and_publish
-from .reconcile import SourceSpec, full_reconcile
+from .reconcile import ReconcileCancelled, SourceSpec, full_reconcile
+from .s3_producer import EventRecord, IntakeGate
 from .status import ReconcileProgress, StatusWriter
 from .storage import LocalSource
 from .tag_ipc import TagEditItem, TagEditServer, handle_tag_edit
@@ -28,6 +31,213 @@ from .writer_lock import WriterLockError, acquire_writer_lock
 logger = logging.getLogger(__name__)
 
 DEFAULT_DB = "/tmp/pj-cloud-catalog.db"
+_AUDIT_BACKOFF_INITIAL = 1.0
+
+
+@dataclass(frozen=True)
+class AuditResult:
+    """The explicit worker-to-coordinator result for one full audit."""
+
+    outcome: str  # "ok" | "failed" | "cancelled"
+    duration: float
+    error: str | None = None
+
+
+class AuditItem:
+    """A coalesced, result-bearing full-audit work item.
+
+    The coordinator creates it, the single writer calls ``start`` immediately
+    before entering ``full_reconcile``, and the worker always calls ``finish``.
+    ``cancel_if_pending`` lets shutdown drop an audit that never started without
+    removing arbitrary items from ``queue.Queue``.
+    """
+
+    kind = "audit"
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._done = threading.Event()
+        self._state = "pending"  # pending | running | finished
+        self._result: AuditResult | None = None
+
+    def start(self) -> bool:
+        """Mark the item running, or return False if shutdown already dropped it."""
+        with self._lock:
+            if self._state != "pending":
+                return False
+            self._state = "running"
+            return True
+
+    def finish(self, result: AuditResult) -> None:
+        """Publish exactly one terminal result to the coordinator."""
+        with self._lock:
+            if self._state == "finished":
+                return
+            self._state = "finished"
+            self._result = result
+            self._done.set()
+
+    def cancel_if_pending(self) -> bool:
+        """Drop an unstarted audit. A running audit cancels via ``stop_event``."""
+        with self._lock:
+            if self._state != "pending":
+                return False
+            self._state = "finished"
+            self._result = AuditResult("cancelled", 0.0)
+            self._done.set()
+            return True
+
+    def wait(self, stop_event: threading.Event) -> AuditResult | None:
+        """Wait interruptibly for the worker result.
+
+        On stop, a pending item is made terminal; a running item is left to the
+        worker's cancellation checks and the coordinator may exit immediately.
+        """
+        while not self._done.wait(0.1):
+            if stop_event.is_set():
+                self.cancel_if_pending()
+                if not self._done.is_set():
+                    return None
+        return self._result
+
+
+class AuditCoordinator:
+    """Single arbiter for completion-relative full-audit scheduling.
+
+    Exactly one item may be queued or running. Successful audits schedule the
+    next audit one full interval after completion; failures retry with
+    exponential backoff capped at that same interval.
+    """
+
+    def __init__(
+        self,
+        work_q,
+        stop_event: threading.Event,
+        interval: float,
+        *,
+        backoff_initial: float = _AUDIT_BACKOFF_INITIAL,
+        intake_gate=None,
+    ) -> None:
+        self._work_q = work_q
+        self._stop_event = stop_event
+        self._interval = max(0.0, interval)
+        self._backoff_initial = max(0.0, backoff_initial)
+        # §3.5 handshake: pause SQS intake and wait until every received batch
+        # is terminal AND acked before an audit runs (None = no event tier).
+        self._gate = intake_gate
+        self._lock = threading.Lock()
+        self._queued_or_running = False
+        self._current: AuditItem | None = None
+        self._thread: threading.Thread | None = None
+
+    @property
+    def queued_or_running(self) -> bool:
+        with self._lock:
+            return self._queued_or_running
+
+    def request_due(self) -> bool:
+        """Enqueue one due audit, or coalesce it into the active audit."""
+        item = self._enqueue_if_idle()
+        return item is not None
+
+    def start(self, *, immediate: bool) -> None:
+        """Start scheduling; ``immediate`` is used for an existing served DB."""
+        initial_delay = 0.0 if immediate else self._interval
+        self._thread = threading.Thread(
+            target=self._run,
+            args=(initial_delay,),
+            name="audit-coordinator",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def join(self, timeout: float = 5.0) -> None:
+        if self._thread is not None:
+            self._thread.join(timeout=timeout)
+            self._thread = None
+
+    def _enqueue_if_idle(self) -> AuditItem | None:
+        with self._lock:
+            if self._stop_event.is_set() or self._queued_or_running:
+                return None
+            item = AuditItem()
+            self._queued_or_running = True
+            self._current = item
+        try:
+            self._work_q.put_nowait(item)
+        except Exception:
+            with self._lock:
+                self._queued_or_running = False
+                self._current = None
+            raise
+        return item
+
+    def _clear_active(self, item: AuditItem) -> None:
+        with self._lock:
+            if self._current is item:
+                self._current = None
+                self._queued_or_running = False
+
+    def _run(self, initial_delay: float) -> None:
+        delay = initial_delay
+        failures = 0
+        while not self._stop_event.wait(delay):
+            try:
+                if self._gate is not None:
+                    # Pause intake BEFORE enqueueing the audit, then wait for
+                    # every already-received batch to be committed and acked —
+                    # a message must never sit un-acked behind a long audit
+                    # blowing its visibility timeout (§3.5). resume() runs in
+                    # the outer finally on every exit path.
+                    self._gate.pause()
+                    if not self._gate.wait_drained(self._stop_event):
+                        return  # stop arrived during the drain
+                item = self._enqueue_if_idle()
+                if item is None:
+                    # A due tick while an audit is queued/running is deliberately
+                    # coalesced. If another caller requested the active audit, this
+                    # scheduler observes that same result instead of creating work.
+                    with self._lock:
+                        item = self._current
+                    if item is None:
+                        return  # stop raced the due tick
+                result: AuditResult | None = None
+                try:
+                    result = item.wait(self._stop_event)
+                    if result is None or result.outcome == "cancelled":
+                        return
+                    if result.outcome == "ok":
+                        failures = 0
+                        delay = self._interval
+                    else:
+                        failures += 1
+                        delay = min(
+                            self._interval,
+                            self._backoff_initial * (2 ** (failures - 1)),
+                        )
+                        logger.warning(
+                            "full audit failed; retrying in %.1fs (failure %d): %s",
+                            delay,
+                            failures,
+                            result.error or "unknown error",
+                        )
+                finally:
+                    # Never leave the arbiter stuck after failure, cancellation,
+                    # or an unexpected result-handling exception.
+                    self._clear_active(item)
+            finally:
+                if self._gate is not None:
+                    self._gate.resume()
+
+        # Stop may arrive while the first/due timer is waiting. If an external
+        # due request queued an item, make it a dropped terminal item.
+        with self._lock:
+            current = self._current
+        if current is not None:
+            try:
+                current.cancel_if_pending()
+            finally:
+                self._clear_active(current)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -48,8 +258,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--db", default=DEFAULT_DB, help=f"catalog DB path (default: {DEFAULT_DB})")
     p.add_argument("--tag-socket", default=None,
                    help="path for the tag-edit IPC unix socket (default: off). Daemon "
-                        "mode only — started after the startup reconcile/publish "
-                        "completes; ignored with --once. See CATALOG_CONTRACT.md's "
+                        "mode only — started after the served DB opens (or the initial "
+                        "build publishes); ignored with --once. See CATALOG_CONTRACT.md's "
                         "'Tag-edit IPC' section (catalog-migration DECISION D2(a)).")
     p.add_argument("--once", action="store_true",
                    help="run one synchronous full reconcile, then exit (no watching). "
@@ -63,7 +273,9 @@ def build_parser() -> argparse.ArgumentParser:
                         "exist yet. Valid with --once (the primary use) or in daemon "
                         "mode (rebuilds first, then watches the published path in place).")
     p.add_argument("--rescan-interval", type=float, default=300.0,
-                   help="seconds between safety re-scans (default: 300)")
+                   help="seconds between full audits, completion-relative: the next audit "
+                        "is scheduled this long after the previous one finished; "
+                        "failures retry with capped exponential backoff (default: 300)")
     p.add_argument("--no-watch", action="store_true",
                    help="daemon mode: start no live event producer at all — no "
                         "local watchdog/inotify observer, no S3 SQS long-poll "
@@ -96,10 +308,11 @@ def worker_loop(
     conn: sqlite3.Connection,
     caches: Caches,
     source,
-    work_q: "queue.Queue[WatchEvent | TagEditItem]",
+    work_q: "queue.Queue[WatchEvent | TagEditItem | AuditItem]",
     workers: int = 1,
     source_spec: "SourceSpec | None" = None,
     progress=None,
+    stop_event: threading.Event | None = None,
 ) -> None:
     """Drain the work queue and perform all DB writes (the single writer).
 
@@ -113,7 +326,89 @@ def worker_loop(
     ``WatchEvent`` never carries).
     """
     while True:
-        ev = work_q.get()
+        if stop_event is not None and stop_event.is_set():
+            break
+        try:
+            ev = work_q.get(timeout=0.1) if stop_event is not None else work_q.get()
+        except queue.Empty:
+            continue
+
+        if stop_event is not None and stop_event.is_set():
+            if isinstance(ev, AuditItem):
+                ev.cancel_if_pending()
+            # An EventRecord in hand is simply dropped un-terminal: the SQS
+            # message stays unacked and redelivers after restart (§3.3).
+            break
+
+        if isinstance(ev, AuditItem):
+            if not ev.start():
+                continue  # pending audit was dropped during shutdown
+            started = time.monotonic()
+            outcome = "ok"
+            error = None
+            try:
+                full_reconcile(
+                    conn,
+                    caches,
+                    source,
+                    workers=workers,
+                    source_spec=source_spec,
+                    progress=progress,
+                    stop_event=stop_event,
+                )
+            except ReconcileCancelled:
+                outcome = "cancelled"
+                logger.info("full audit cancelled")
+            except Exception as e:  # noqa: BLE001 - result is explicit; worker survives
+                outcome = "failed"
+                error = f"{type(e).__name__}: {e}"
+                logger.exception("full audit failed")
+            finally:
+                result = AuditResult(outcome, time.monotonic() - started, error)
+                try:
+                    if progress is not None:
+                        progress.audit_finished(result.outcome, result.duration)
+                        progress.idle()
+                except Exception:  # noqa: BLE001 - observability cannot kill the worker
+                    logger.exception("failed to record full-audit status")
+                finally:
+                    ev.finish(result)
+            continue
+
+        if isinstance(ev, EventRecord):
+            # SQS event tier (§3.3/§3.4). ``terminal`` = the DB outcome
+            # COMMITTED (cataloged / ETag-skipped / committed quarantine /
+            # confirmed delete / safe no-op). A raised exception is NOT
+            # terminal: the message stays unacked and SQS redelivers it.
+            terminal = False
+            try:
+                if ev.kind == "catalog":
+                    catalog_object(conn, caches, ev.key, source)
+                    terminal = True
+                elif ev.kind == "delete":
+                    # HEAD-guard (§3.4): a stale/out-of-order delete for a
+                    # re-uploaded object re-catalogs from the live Stat (passed
+                    # through — no second HEAD) instead of deleting the row.
+                    st = source.stat(ev.key)
+                    if st is not None:
+                        catalog_object(conn, caches, ev.key, source, stat=st)
+                    else:
+                        delete_by_key(conn, caches, ev.key)
+                    terminal = True
+                else:
+                    logger.warning("unknown event record kind: %r", ev.kind)
+                    terminal = True  # redelivery cannot help an unknown kind
+            except Exception:  # noqa: BLE001 - the worker must never die
+                logger.exception(
+                    "event record failed; left unacked for redelivery: %s", ev.key
+                )
+            finally:
+                if terminal:
+                    ev.batch.record_terminal()
+                    if progress is not None:
+                        progress.event_applied()
+            continue
+
         try:
             if isinstance(ev, TagEditItem):
                 handle_tag_edit(conn, caches, ev)
@@ -127,11 +422,6 @@ def worker_loop(
                     logger.warning("file not stable, dropping (retries on rescan): %s", ev.path)
             elif ev.kind == "delete":
                 delete_by_key(conn, caches, source.event_key(ev.path))
-            elif ev.kind == "rescan":
-                full_reconcile(conn, caches, source, workers=workers,
-                               source_spec=source_spec, progress=progress)
-                if progress is not None:
-                    progress.idle()
             else:
                 logger.warning("unknown event: %r", ev)
         except Exception:  # noqa: BLE001 - the worker must never die
@@ -146,12 +436,13 @@ def main(argv: list[str] | None = None) -> int:
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
 
-    work_q: "queue.Queue[WatchEvent | TagEditItem]" = queue.Queue()
+    work_q: "queue.Queue[WatchEvent | TagEditItem | AuditItem]" = queue.Queue()
     stop_event = threading.Event()
     observer = None
     handler = None
     tag_server = None
-    start_producer = None  # deferred until after the startup reconcile
+    start_producer = None  # deferred until the served DB is ready
+    intake_gate = None  # §3.5 audit handshake; set only for the SQS event tier
 
     # --- build + validate the source (producers are started later) -----------
     if args.source == "s3":
@@ -186,11 +477,18 @@ def main(argv: list[str] | None = None) -> int:
             args.s3_bucket, args.s3_prefix,
         )
 
+        if args.sqs_url and not args.once and not args.no_watch:
+            intake_gate = IntakeGate()
+
         def start_producer() -> None:
+            # `status` is main()'s StatusWriter, assigned after the writer lock
+            # and before _locked_main ever calls this closure (late binding).
             threading.Thread(
                 target=s3_event_producer,
                 args=(boto3.client("sqs"), args.sqs_url, work_q, stop_event),
+                kwargs={"gate": intake_gate, "status": status},
                 daemon=True,
+                name="sqs-intake",
             ).start()
             logger.info("watching s3://%s/%s via %s", args.s3_bucket, args.s3_prefix, args.sqs_url)
     elif args.source == "gcs":
@@ -205,7 +503,7 @@ def main(argv: list[str] | None = None) -> int:
 
         def start_producer() -> None:
             # GCS has no live-event producer wired today (Pub/Sub is future work,
-            # mirroring S3's SQS); the periodic rescan keeps the catalog in sync.
+            # mirroring S3's SQS); scheduled full audits keep the catalog in sync.
             logger.info("watching gcs://%s/%s (rescan-only; --once for a one-shot build)",
                         args.gcs_bucket, args.gcs_prefix)
     else:
@@ -242,7 +540,7 @@ def main(argv: list[str] | None = None) -> int:
     status.heartbeat_start(stop_event)
     try:
         return _locked_main(args, source, start_producer, work_q, stop_event,
-                            lambda: observer, lambda: handler, status)
+                            lambda: observer, lambda: handler, status, intake_gate)
     except Exception as e:
         # Funnel any fatal error (missing credentials surfacing at the first
         # LIST, a failed publish, ...) into the sidecar so "unhealthy" comes
@@ -256,13 +554,14 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _locked_main(args, source, start_producer, work_q, stop_event,
-                 get_observer, get_handler, status) -> int:
+                 get_observer, get_handler, status, intake_gate=None) -> int:
     """The post-lock body of main(): everything that reads or writes the served
     DB / binds the tag socket runs under the single-writer lock. The observer/
     handler are read through GETTERS because the local-source start_producer
     closure assigns them in main()'s scope (nonlocal) after this function has
     already been entered."""
     tag_server = None
+    audit_coordinator = None
 
     # Sensible default, no knob: a remote bucket extracts in a PROCESS pool so the
     # GIL-bound MCAP parse scales across cores (the reason the read phase is slow on a
@@ -281,6 +580,7 @@ def _locked_main(args, source, start_producer, work_q, stop_event,
     # catalog at the served path — build to a temp DB and publish atomically
     # (catalog-migration §6.2a), instead of creating/mutating args.db directly.
     use_publish = args.rebuild or not os.path.exists(args.db)
+    startup_audit = False
 
     progress = ReconcileProgress(status=status)
 
@@ -309,57 +609,60 @@ def _locked_main(args, source, start_producer, work_q, stop_event,
         conn = open_db(args.db)
         caches = load_caches(conn)
 
-        logger.info("startup reconcile (db=%s)", args.db)
-        full_reconcile(conn, caches, source, workers=args.extract_workers,
-                       source_spec=extract_spec, progress=progress)  # synchronous, before watching
-
-        # One-shot mode: the synchronous reconcile above already built the full catalog.
-        # Exit cleanly without starting any producer/rescan thread — the caller (the
-        # Go read-only server, the cross-language e2e, CI) takes over the DB from here.
         if args.once:
+            # Preserve one-shot behavior exactly: an existing DB is reconciled
+            # synchronously and no producer, IPC server, or coordinator starts.
+            logger.info("startup reconcile (db=%s)", args.db)
+            full_reconcile(conn, caches, source, workers=args.extract_workers,
+                           source_spec=extract_spec, progress=progress)
             conn.close()
             progress.idle()
             logger.info("--once: reconcile complete, exiting")
             return 0
+        # Existing, cleanly-opened served DB: service starts first and the
+        # startup audit is an ordinary coalesced worker item.
+        startup_audit = True
+        logger.info("startup full audit scheduled (db=%s)", args.db)
 
     progress.idle()  # daemon steady state: first build done, catalog published
 
-    # Tag-edit IPC (D2(a)): daemon mode only (both --once early-returns above
-    # already skip this), and only after the served DB is open in-place — a
-    # client edit must never race the initial reconcile/publish.
-    if args.tag_socket:
-        tag_server = TagEditServer(args.tag_socket, work_q)
-        threading.Thread(target=tag_server.serve_forever, daemon=True).start()
-        logger.info("tag-edit IPC listening on %s", args.tag_socket)
-
-    if args.no_watch:
-        # Rescan-only daemon: no watchdog/inotify observer, no SQS long-poll
-        # thread — files are discovered purely by the periodic rescan thread
-        # started below. `observer`/`handler` stay None, so the shutdown
-        # `finally` block below is naturally a no-op for them.
-        logger.info(
-            "discovery is rescan-only (--no-watch): interval=%ss", args.rescan_interval
-        )
-    else:
-        start_producer()  # begin enqueuing live events only after the reconcile
-
-    def rescan_loop() -> None:
-        while not stop_event.wait(args.rescan_interval):
-            work_q.put(WatchEvent("rescan"))
-
-    threading.Thread(target=rescan_loop, daemon=True).start()
-
     def _on_signal(_signum, _frame) -> None:
+        # Set the cancellation signal immediately: a stop item alone would sit
+        # behind a long audit and could not interrupt LIST/apply/backoff work.
+        stop_event.set()
         work_q.put(WatchEvent("stop"))
 
     signal.signal(signal.SIGINT, _on_signal)
     signal.signal(signal.SIGTERM, _on_signal)
 
     try:
+        # Tag IPC binds before the startup audit is even queued. Its server
+        # thread remains enqueue-only; edits still execute on this worker.
+        if args.tag_socket:
+            tag_server = TagEditServer(args.tag_socket, work_q)
+            threading.Thread(target=tag_server.serve_forever, daemon=True).start()
+            logger.info("tag-edit IPC listening on %s", args.tag_socket)
+
+        if args.no_watch:
+            logger.info(
+                "discovery is rescan-only (--no-watch): interval=%ss",
+                args.rescan_interval,
+            )
+        else:
+            start_producer()
+
+        audit_coordinator = AuditCoordinator(
+            work_q, stop_event, args.rescan_interval, intake_gate=intake_gate
+        )
+        audit_coordinator.start(immediate=startup_audit)
+
         worker_loop(conn, caches, source, work_q, workers=args.extract_workers,
-                    source_spec=extract_spec, progress=progress)
+                    source_spec=extract_spec, progress=progress,
+                    stop_event=stop_event)
     finally:
         stop_event.set()
+        if audit_coordinator is not None:
+            audit_coordinator.join()
         if tag_server is not None:
             tag_server.shutdown()
             tag_server.server_close()  # also unlinks the socket file

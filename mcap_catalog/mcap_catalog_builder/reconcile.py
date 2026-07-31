@@ -22,6 +22,15 @@ from .storage import LocalSource
 logger = logging.getLogger(__name__)
 
 
+class ReconcileCancelled(Exception):
+    """A daemon audit stopped before it could authoritatively finish."""
+
+
+def _raise_if_stopped(stop_event) -> None:
+    if stop_event is not None and stop_event.is_set():
+        raise ReconcileCancelled("full audit cancelled")
+
+
 @dataclass(frozen=True)
 class SourceSpec:
     """A **picklable** recipe for rebuilding a read-only ``Source`` inside a worker
@@ -68,7 +77,7 @@ def _extract_task(item):
     return extract_summary(_worker_source, key, stat, dims, eff_key)
 
 
-def _bounded_completions(submit, items, window: int):
+def _bounded_completions(submit, items, window: int, stop_event=None):
     """Submit ``items`` keeping at most ``window`` futures in flight; yield each
     result as it completes.
 
@@ -79,16 +88,33 @@ def _bounded_completions(submit, items, window: int):
     is yielded, so retained results stay O(window) regardless of bucket size.
     """
     in_flight: set = set()
-    for item in items:
-        in_flight.add(submit(item))
-        if len(in_flight) >= window:
-            done, in_flight = wait(in_flight, return_when=FIRST_COMPLETED)
+    try:
+        for item in items:
+            _raise_if_stopped(stop_event)
+            in_flight.add(submit(item))
+            if len(in_flight) >= window:
+                while True:
+                    done, in_flight = wait(
+                        in_flight, timeout=0.1, return_when=FIRST_COMPLETED
+                    )
+                    _raise_if_stopped(stop_event)
+                    if done:
+                        break
+                for fut in done:
+                    _raise_if_stopped(stop_event)
+                    yield fut.result()
+        while in_flight:
+            done, in_flight = wait(
+                in_flight, timeout=0.1, return_when=FIRST_COMPLETED
+            )
+            _raise_if_stopped(stop_event)
             for fut in done:
+                _raise_if_stopped(stop_event)
                 yield fut.result()
-    while in_flight:
-        done, in_flight = wait(in_flight, return_when=FIRST_COMPLETED)
-        for fut in done:
-            yield fut.result()
+    finally:
+        if stop_event is not None and stop_event.is_set():
+            for fut in in_flight:
+                fut.cancel()
 
 
 def _is_catalogable_name(name: str) -> bool:
@@ -131,7 +157,7 @@ def _composite_ids(caches: Caches, dims) -> tuple | None:
 
 def full_reconcile(
     conn: sqlite3.Connection, caches: Caches, source, workers: int = 1,
-    source_spec: "SourceSpec | None" = None, progress=None,
+    source_spec: "SourceSpec | None" = None, progress=None, stop_event=None,
 ) -> dict[str, int]:
     """Catalog all objects in ``source``, then delete catalog rows with no object.
 
@@ -148,9 +174,16 @@ def full_reconcile(
     if isinstance(source, str):
         source = LocalSource(source)
 
+    _raise_if_stopped(stop_event)
     tally = {"cataloged": 0, "skipped": 0, "failed": 0, "deleted": 0}
     listings = []
-    for lst in source.list_all():
+    listing_iter = (
+        source.list_all(stop_event=stop_event)
+        if stop_event is not None
+        else source.list_all()
+    )
+    for lst in listing_iter:
+        _raise_if_stopped(stop_event)
         listings.append(lst)
         # First object = the LIST provably began (credentials/bucket access
         # work) — that is the sidecar's first-milestone write (§12), so the
@@ -158,6 +191,7 @@ def full_reconcile(
         # 5000 objects. Then periodic count updates.
         if progress is not None and (len(listings) == 1 or len(listings) % 5000 == 0):
             progress.listing(len(listings))
+    _raise_if_stopped(stop_event)
     if progress is not None:
         progress.listed(len(listings))
 
@@ -168,6 +202,7 @@ def full_reconcile(
     for r in conn.execute(
         "SELECT customer_id, site_id, robot_id, source_id, date, filename, etag FROM files"
     ).fetchall():
+        _raise_if_stopped(stop_event)
         stored[(
             r["customer_id"], r["site_id"], r["robot_id"], r["source_id"],
             r["date"], r["filename"],
@@ -180,6 +215,7 @@ def full_reconcile(
     dims_by_key: dict[str, dict] = {}
     to_extract: list = []  # (key, stat, dims, eff_key)
     for lst in listings:
+        _raise_if_stopped(stop_event)
         res = resolve_key_dims(lst.key, source)
         if res is None:
             record_failure(conn, lst.key, "unparseable key")
@@ -198,8 +234,10 @@ def full_reconcile(
         progress.extract_start(len(to_extract), tally["skipped"], tally["failed"])
 
     def _apply(ex) -> None:
+        _raise_if_stopped(stop_event)
         st = apply_extract(conn, caches, ex).status
         tally[st] += 1
+        _raise_if_stopped(stop_event)
         if progress is not None:
             progress.file_done(st, getattr(ex, "summary_via", ""))
 
@@ -238,19 +276,28 @@ def full_reconcile(
         else:
             pool = ThreadPoolExecutor(max_workers=n)
             submit = lambda item: pool.submit(extract_summary, source, *item)  # noqa: E731
-        with pool:
+        try:
             # window = 2n: every worker stays fed (one running + one queued each)
             # while at most ~2n results are resident awaiting the serial apply.
-            for ex in _bounded_completions(submit, to_extract, window=2 * n):
+            for ex in _bounded_completions(
+                submit, to_extract, window=2 * n, stop_event=stop_event
+            ):
                 _apply(ex)
+        finally:
+            cancelled = stop_event is not None and stop_event.is_set()
+            pool.shutdown(wait=not cancelled, cancel_futures=cancelled)
     else:
         for item in to_extract:
-            _apply(extract_summary(source, *item))
+            _raise_if_stopped(stop_event)
+            ex = extract_summary(source, *item)
+            _raise_if_stopped(stop_event)
+            _apply(ex)
 
     # Deletion sweep: composite keys present in the source (parseable + cached ids).
     # Reuses the dims parsed above; caches are now fully populated post-apply.
     present: set[tuple] = set()
     for lst in listings:
+        _raise_if_stopped(stop_event)
         dims = dims_by_key.get(lst.key)
         if dims is None:
             continue
@@ -259,21 +306,33 @@ def full_reconcile(
             continue
         present.add(comp)
 
-    for r in conn.execute(
-        "SELECT id, customer_id, site_id, robot_id, source_id, date, filename FROM files"
-    ).fetchall():
-        comp = (
-            r["customer_id"], r["site_id"], r["robot_id"], r["source_id"],
-            r["date"], r["filename"],
-        )
-        if comp not in present:
-            conn.execute("DELETE FROM files WHERE id=?", (r["id"],))
-            tally["deleted"] += 1
-    conn.commit()
+    try:
+        for r in conn.execute(
+            "SELECT id, customer_id, site_id, robot_id, source_id, date, filename FROM files"
+        ).fetchall():
+            _raise_if_stopped(stop_event)
+            comp = (
+                r["customer_id"], r["site_id"], r["robot_id"], r["source_id"],
+                r["date"], r["filename"],
+            )
+            if comp not in present:
+                conn.execute("DELETE FROM files WHERE id=?", (r["id"],))
+                tally["deleted"] += 1
+        _raise_if_stopped(stop_event)
+        conn.commit()
+    except ReconcileCancelled:
+        # The sweep is one transaction; never leave a partial set of deletes
+        # pending for an unrelated later write to commit.
+        conn.rollback()
+        raise
+    except Exception:
+        conn.rollback()
+        raise
 
     # Stamp build_metadata so the read-only Go server can report catalog freshness
     # (§6.5). files_scanned = objects seen (cataloged + skipped); outcome is
     # 'partial' if any file quarantined this build.
+    _raise_if_stopped(stop_event)
     record_build(
         conn,
         files_scanned=tally["cataloged"] + tally["skipped"],
