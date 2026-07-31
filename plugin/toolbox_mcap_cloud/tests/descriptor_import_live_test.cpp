@@ -6,8 +6,11 @@
 // pj-cloud server. Self-skips without MCAP_CLOUD_LIVE_URL (the
 // parser_ingest_live_test gating pattern); the smoke server runs
 // -allow-anonymous, so credential resolution's dev-anonymous fallback is the
-// live shape. The full smoke-integrated round trip (mcapdiff vs a CLI
-// download of the same tuple) is PR-4's.
+// live shape. The smoke-integrated §12 round trip (PR-4): when
+// MCAP_CLOUD_LIVE_CACHE_COPY names a destination path, the finalized cache
+// file is copied there so smoke.sh can mcapdiff it against a direct
+// mcap-cloud-cli download of the SAME tuple (key + /imu + full range +
+// --latched) — the cache-is-the-sole-encoder equality gate.
 #include <gtest/gtest.h>
 
 #include <chrono>
@@ -17,6 +20,7 @@
 #include <filesystem>
 #include <mutex>
 #include <string>
+#include <system_error>
 #include <vector>
 
 #include <pj_base/descriptor_import_protocol.h>
@@ -151,5 +155,18 @@ TEST(McapCloudDescriptorImportLive, QueryImportTerminalThenMaterializedHit) {
   ASSERT_TRUE(provider.queryDescriptor(PJ_string_view_t{json.data(), json.size()}, &out, &err));
   EXPECT_EQ(out.is_materialized, 1u);
   EXPECT_GT(out.estimated_bytes, 0u);
+
+  // 4) smoke's §12 round-trip hook: export the finalized cache file (the
+  //    TempRoot above is destroyed with this scope) so the harness of record
+  //    can compare it against a direct CLI download of the same tuple.
+  //    Env-gated and test-only; unset (hermetic ctest, plain live runs) it is
+  //    inert.
+  const char* copy_dest = std::getenv("MCAP_CLOUD_LIVE_CACHE_COPY");
+  if (copy_dest != nullptr && *copy_dest != '\0') {
+    std::error_code copy_ec;
+    fs::copy_file(cache_file, fs::path(copy_dest), fs::copy_options::overwrite_existing, copy_ec);
+    ASSERT_FALSE(copy_ec) << "cache-file export to " << copy_dest
+                          << " failed: " << copy_ec.message();
+  }
   // ScopedJob destroys (cancel+join+free) on scope exit.
 }
