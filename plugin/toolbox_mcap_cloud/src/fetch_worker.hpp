@@ -12,17 +12,81 @@
 #include <pj_base/sdk/plugin_data_api.hpp>
 #include <pj_base/sdk/toolbox_plugin_base.hpp>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
 #include "backend_connection.hpp"
 #include "backend_types.hpp"
+#include "credential_resolve.hpp"  // ConnectionSnapshot (the PR-2 handoff type)
 #include "session_cache.hpp"
 
 namespace mcap_cloud {
 
 class CacheTee;
 class ImportRuntime;
+
+/// Terminal classification of ONE direct pull (the headless import path).
+/// kFailed covers every non-cancel abnormal end, including the
+/// max_transfer_bytes ceiling (byte_ceiling_exceeded distinguishes it).
+enum class PullTerminal {
+  kComplete,
+  kCancelled,
+  kFailed,
+};
+
+/// The immutable input of FetchWorker::pull() — the D4-as-amended DIRECT
+/// pull: NO connectAsync, no browse backend, no credential recording. The
+/// caller (PR-3's import job, or a test) resolves everything main-thread-
+/// sensitive up front (ConnectionSnapshot — see credential_resolve.hpp's
+/// threading contract) and hands the pull a self-contained request.
+struct PullRequest {
+  ConnectionSnapshot connection;            // resolved target + credentials (by value)
+  std::vector<std::string> sequence_names;  // wire s3_keys, deterministic order
+  std::string group_name;                   // dataset display/group name
+  std::vector<std::string> topic_names;     // empty = all union topics (wire contract)
+  std::int64_t start_ns = 0;
+  std::int64_t end_ns = 0;
+  /// FROM THE DESCRIPTOR — feeds the wire request AND must match the identity
+  /// the caller computed over the same descriptor (the interactive path keeps
+  /// its own shared constant; here the descriptor is the single source).
+  bool include_latched = true;
+  /// Wire-byte ceiling (spec §7 guard 3, measured against
+  /// sessionWireBytesReceived). 0 = no caller ceiling. Exceeding it aborts
+  /// the download with a DISTINCT byte cause that terminals kFailed — never
+  /// kCancelled (a sink-false classifies as SessionEos::Cancelled on the
+  /// wire; the pull must not leak that as a cancel).
+  std::uint64_t max_transfer_bytes = 0;
+  /// REQUIRED: the shared per-toolbox ImportRuntime. The cache tee is
+  /// ALWAYS-ON for direct pulls (the single-encoder rule); a tee failure
+  /// never aborts the ingest (spec §9.6) — it is reported via
+  /// PullResult.tee_outcome.
+  ImportRuntime* runtime = nullptr;
+  std::string canonical_descriptor_json;    // tee provenance record (spec §5)
+  std::string descriptor_json;              // toSourceDescriptorJson (promotion request)
+  std::string identity;                     // descriptorIdentity — the tee identity
+  /// Fired at most ONCE, right after the pull's dataset is created and BEFORE
+  /// any parser binding / publication / progress — the PR-3 job forwards it
+  /// as the ABI on_dataset (which must precede all of those). Runs on the
+  /// pull (caller) thread, outside the host-write lock.
+  std::function<void(PJ::sdk::DataSourceHandle)> datasetCreated;
+  /// Optional per-message transport progress (cumulative transport messages).
+  /// Unthrottled; test observability — the provider job leaves it unset.
+  std::function<void(std::uint64_t transport_messages)> onProgress;
+};
+
+/// The terminal snapshot of one direct pull.
+struct PullResult {
+  PullTerminal terminal = PullTerminal::kFailed;
+  std::string error;                        // non-empty unless kComplete
+  bool byte_ceiling_exceeded = false;       // the DISTINCT kFailed byte cause
+  TeeOutcome tee_outcome = TeeOutcome::kNone;
+  std::string tee_error;
+  std::optional<PJ::sdk::DataSourceHandle> dataset;  // the eager dataset, when created
+  bool any_decodable = false;               // the eager dataset actually holds rows
+  std::uint64_t decode_errors = 0;
+  SessionStats stats;
+};
 
 enum class McapSaveStatus {
   Complete,
@@ -162,6 +226,22 @@ class FetchWorker {
   void pullTopicsAsync(std::vector<std::string> sequence_names, std::string group_name,
                        std::vector<std::string> topic_names, std::int64_t start_ns, std::int64_t end_ns,
                        std::string save_directory = {});
+
+  /// DIRECT cancellable pull (stage-4 PR-3, D4-as-amended): the headless
+  /// import entry. Unlike pullTopicsAsync it does NOT depend on a prior
+  /// connectAsync — the ConnectionSnapshot in `request` is the whole
+  /// connection state, and the pull owns exactly ONE session
+  /// BackendConnection, published for requestCancel() BEFORE the blocking
+  /// connect (the socket-open, Hello and OpenSession waits are all
+  /// cancel-woken). The cache tee is ALWAYS-ON (single-encoder rule; a tee
+  /// failure never aborts the ingest, spec §9.6); there is no export, no
+  /// in-memory cache HIT path (the provider classifies hits BEFORE starting
+  /// a job) and no per-topic ledger — the terminal snapshot is the returned
+  /// PullResult. A COMPLETE pull stores the shared SessionCache entry
+  /// exactly like the interactive path (D7). Blocking; call on a dedicated
+  /// worker/job thread. None of the interactive std::function callbacks
+  /// fire.
+  [[nodiscard]] PullResult pull(PullRequest request);
 
   // `uri` echoes the EXACT uri this connectAsync() call was invoked with (not
   // re-read from any mutable dialog state), so a caller that may have edited
@@ -408,6 +488,24 @@ class FetchWorker {
   // is bound or the host lacks acquire_catalog_snapshot (presence-unknown ->
   // MISS).
   [[nodiscard]] bool datasetExistsInHost(const CachedSession& entry) const;
+
+  // Publish/retire the cancel hooks under cancel_mu_ (shared by the
+  // interactive pull and the direct pull; see the members' comments above
+  // for the publish-before-connect / retire-before-destroy discipline).
+  void setSessionForCancel(BackendConnection* session);
+  void setTeeForCancel(CacheTee* tee);
+
+  // The COMPLETE-only SessionCache store (pure extraction from
+  // pullTopicsAsync — shared with pull()). Records the per-topic counts, the
+  // stable dataset id (D7), the durable cache identity when the tee
+  // published a valid file, and the tee outcome (§9.6 promotion
+  // suppression). Caller guarantees the download was a clean COMPLETE.
+  void storeCompletedSessionEntry(
+      SessionCache& session_cache, const SessionKey& session_key, const std::string& group_name,
+      const std::string& server_uri, const std::vector<std::string>& topic_names,
+      const std::unordered_map<std::uint32_t, std::string>& name_by_id,
+      const std::unordered_map<std::uint32_t, std::uint64_t>& counts, const std::string& tee_identity,
+      TeeOutcome tee_outcome, bool refetch_after_disk_miss);
 };
 
 }  // namespace mcap_cloud

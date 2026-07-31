@@ -331,8 +331,22 @@ bool BackendConnection::buildAndOpenSocket(std::string* error_out) {
 
   {
     std::unique_lock<std::mutex> lock(mu_);
-    const bool signalled =
-        cv_.wait_for(lock, kRequestTimeout, [&] { return socket_open_ || socket_closed_; });
+    // The open wait joins the cancel predicate (stage-4 PR-3, D4-as-amended):
+    // without it a cancelSession() during socket establishment stranded the
+    // caller for the full kRequestTimeout — the ONE session-establishment
+    // wait that ignored cancellation (Hello/OpenSession already wake via
+    // sendAndWait's wake_on_cancel). Safe for browse connections for the same
+    // reason as connect()'s Hello wake: nothing ever cancels them, so their
+    // flag is never set. cancelSession() notify_all()s this cv.
+    const bool signalled = cv_.wait_for(
+        lock, kRequestTimeout, [&] { return socket_open_ || socket_closed_ || cancel_requested_.load(); });
+    if (cancel_requested_.load() && !socket_open_) {
+      lock.unlock();
+      socket_->stop();
+      socket_.reset();
+      set_error("cancelled");
+      return false;
+    }
     if (!signalled) {
       lock.unlock();
       socket_->stop();

@@ -35,6 +35,7 @@
 #include <ixwebsocket/IXWebSocketServer.h>
 #include <mcap/reader.hpp>
 
+#include "fake_streaming_server.hpp"
 #include "fake_toolbox_host.hpp"
 #include "fetch_worker.hpp"
 #include "find_free_port.hpp"
@@ -56,157 +57,16 @@ struct TempRoot : mcap_cloud_test::ScopedTempDir {
   explicit TempRoot(const std::string& name) : ScopedTempDir("mcap-cloud-tee-test-" + name) {}
 };
 
-constexpr std::uint32_t kTopicId = 1;
-constexpr std::uint32_t kSchemaId = 5;
-constexpr int kBatches = 3;
-constexpr int kMessagesPerBatch = 4;
-constexpr std::size_t kPayloadBytes = 1024;
-
-// A fake pj_cloud server that ACTUALLY STREAMS a session: Hello ->
-// HelloResponse; OpenSession -> plan (1 topic / 1 schema) then, per mode,
-// either kBatches NONE-encoded batches + Eos{COMPLETE} or two batches
-// followed by silence (the stall the cancel test needs).
-class FakeStreamingServer {
- public:
-  enum class Mode { kComplete, kStallAfterTwoBatches, kEmptyPlan };
-
-  explicit FakeStreamingServer(Mode mode) : mode_(mode), port_(findFreePort()), server_(port_, "127.0.0.1") {
-    server_.setOnClientMessageCallback([this](std::shared_ptr<ix::ConnectionState>,
-                                              ix::WebSocket& ws,
-                                              const ix::WebSocketMessagePtr& msg) {
-      if (msg->type != ix::WebSocketMessageType::Message) {
-        return;
-      }
-      pj_cloud::v1::ClientMessage request;
-      if (!request.ParseFromString(msg->str)) {
-        return;
-      }
-      if (request.has_hello()) {
-        pj_cloud::v1::ServerMessage response;
-        response.set_request_id(request.request_id());
-        response.mutable_hello_response()->set_server_version("test-fake-1.0");
-        send(ws, response);
-        return;
-      }
-      if (!request.has_open_session()) {
-        return;  // acks/cancels need no reply here
-      }
-      open_sessions_.fetch_add(1);
-      pj_cloud::v1::ServerMessage response;
-      response.set_request_id(request.request_id());
-      auto* open = response.mutable_open_session();
-      open->set_subscription_id(7);
-      open->set_estimated_chunk_bytes(kBatches * kMessagesPerBatch * kPayloadBytes);
-      open->set_approximate_messages(kBatches * kMessagesPerBatch);
-      if (mode_ != Mode::kEmptyPlan) {
-        auto* topic = open->add_topic_id_map();
-        topic->set_topic_id(kTopicId);
-        topic->set_topic_name("/one");
-        topic->set_schema_id(kSchemaId);
-        topic->set_message_encoding("cdr");
-        auto* schema = open->add_schemas();
-        schema->set_schema_id(kSchemaId);
-        schema->set_name("demo/msg/One");
-        schema->set_encoding("ros2msg");
-        schema->set_data("int32 value");
-      }
-      send(ws, response);
-      if (mode_ == Mode::kEmptyPlan) {
-        return;
-      }
-      const int batches = (mode_ == Mode::kComplete) ? kBatches : 2;
-      std::uint64_t sent = 0;
-      for (int b = 0; b < batches; ++b) {
-        pj_cloud::v1::ServerMessage frame;
-        // Session frames MUST carry the subscription id on the envelope: the
-        // client's subscription filter DROPS a zero-id frame once it has
-        // learned the nonzero id from the OpenSessionResponse (the real
-        // server always stamps it; an unstamped fake hangs the download
-        // whenever the response is processed before the first batch).
-        frame.set_subscription_id(7);
-        auto* batch = frame.mutable_batch();
-        batch->set_seq(static_cast<std::uint64_t>(b) + 1);
-        batch->set_body_encoding(pj_cloud::v1::BODY_ENCODING_NONE);
-        for (int m = 0; m < kMessagesPerBatch; ++m) {
-          auto* message = batch->add_messages();
-          message->set_topic_id(kTopicId);
-          message->set_schema_id(kSchemaId);
-          message->set_log_time_ns(1000 + static_cast<std::int64_t>(sent));
-          message->set_publish_time_ns(990 + static_cast<std::int64_t>(sent));
-          message->set_payload_encoding(pj_cloud::v1::PAYLOAD_ENCODING_RAW);
-          message->set_payload(std::string(kPayloadBytes, 'x'));
-          ++sent;
-        }
-        send(ws, frame);
-      }
-      if (mode_ == Mode::kComplete) {
-        pj_cloud::v1::ServerMessage eos_frame;
-        eos_frame.set_subscription_id(7);  // see the batch-frame comment above
-        auto* eos = eos_frame.mutable_eos();
-        eos->set_reason(pj_cloud::v1::EOS_REASON_COMPLETE);
-        eos->set_total_messages_sent(sent);
-        eos->set_total_bytes_sent(sent * kPayloadBytes);
-        send(ws, eos_frame);
-      }
-      // kStallAfterTwoBatches: silence — the client's cancel wakes the wait.
-    });
-    auto res = server_.listen();
-    ok_ = res.first;
-    if (ok_) {
-      server_.start();
-    }
-  }
-
-  ~FakeStreamingServer() { server_.stop(); }
-
-  void stop() { server_.stop(); }
-
-  [[nodiscard]] bool ok() const { return ok_; }
-  [[nodiscard]] std::string uri() const { return "ws://127.0.0.1:" + std::to_string(port_); }
-  [[nodiscard]] int openSessions() const { return open_sessions_.load(); }
-
- private:
-  static void send(ix::WebSocket& ws, const pj_cloud::v1::ServerMessage& message) {
-    std::string payload;
-    message.SerializeToString(&payload);
-    ws.sendBinary(payload);
-  }
-
-  Mode mode_;
-  int port_;
-  ix::WebSocketServer server_;
-  bool ok_ = false;
-  std::atomic<int> open_sessions_{0};
-};
-
-// The tuple the worker sends -> the descriptor identity it must tee under.
-std::string identityFor(const std::string& uri) {
-  mcap_cloud::SourceDescriptor d;
-  d.version = 1;
-  d.kind = "mcap-cloud-session";
-  d.server_uri = uri;
-  d.s3_keys = {"a.mcap"};
-  d.topics = {"/one"};
-  d.start_ns = 0;
-  d.end_ns = 0;
-  d.include_latched = true;
-  return mcap_cloud::descriptorIdentity(d);
-}
-
-std::string readFile(const fs::path& path) {
-  std::ifstream in(path, std::ios::binary);
-  return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-}
-
-bool cacheRootHasPartial(const fs::path& root) {
-  std::error_code ec;
-  for (const auto& entry : fs::directory_iterator(root, ec)) {
-    if (entry.path().filename().string().find(".mcap.partial.") != std::string::npos) {
-      return true;
-    }
-  }
-  return false;
-}
+// The fake server, the deterministic session constants and the identityFor /
+// readFile / cacheRootHasPartial helpers moved VERBATIM to
+// fake_streaming_server.hpp (shared with the PR-3 direct-pull / promotion /
+// provider suites); local aliases keep this suite's assertions unchanged.
+using mcap_cloud_test::FakeStreamingServer;
+using mcap_cloud_test::cacheRootHasPartial;
+using mcap_cloud_test::identityFor;
+using mcap_cloud_test::readFile;
+constexpr int kBatches = mcap_cloud_test::kFakeBatches;
+constexpr int kMessagesPerBatch = mcap_cloud_test::kFakeMessagesPerBatch;
 
 struct TeeReport {
   mcap_cloud::TeeOutcome outcome = mcap_cloud::TeeOutcome::kNone;

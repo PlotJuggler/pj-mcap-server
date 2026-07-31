@@ -924,6 +924,41 @@ if(BUILD_TESTING)
            COMMAND toolbox_mcap_cloud_fetch_worker_cache_tee_test)
   set_tests_properties(McapCloudFetchWorkerCacheTeeTest PROPERTIES TIMEOUT 60)
 
+  # Direct cancellable pull (stage-4 PR-3 commit 1, HERMETIC): the headless
+  # FetchWorker::pull(PullRequest) entry — one owned session connection
+  # published for cancel BEFORE connect, cancel joining the socket-open wait,
+  # the always-on cache tee, and the max_transfer_bytes ceiling terminaling
+  # FAILED (never CANCELLED). Same link set as the cache-tee suite.
+  add_executable(toolbox_mcap_cloud_fetch_worker_direct_pull_test
+    tests/fetch_worker_direct_pull_test.cpp
+    tests/find_free_port.cpp
+    src/parser_ingest_driver.cpp
+    src/fetch_worker.cpp
+    src/backend_connection.cpp
+    src/wire_mapping.cpp
+    src/session_decode.cpp
+    src/session_mcap_writer.cpp
+    ${MCAP_CLOUD_IMPORT_SOURCES}
+    src/mcap_save_path.cpp
+    src/core/time_format.cpp
+    src/mcap_implementation.cpp
+    ${MCAP_CLOUD_PROTO_SRCS}
+  )
+  target_compile_features(toolbox_mcap_cloud_fetch_worker_direct_pull_test PRIVATE cxx_std_20)
+  target_include_directories(toolbox_mcap_cloud_fetch_worker_direct_pull_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/core
+    ${MCAP_CLOUD_PROTO_OUT_DIR}
+  )
+  target_link_libraries(toolbox_mcap_cloud_fetch_worker_direct_pull_test PRIVATE
+    plotjuggler_sdk::plugin_sdk
+    protobuf::libprotobuf ixwebsocket::ixwebsocket nlohmann_json::nlohmann_json
+    zstd::libzstd_static LZ4::lz4_static mcap::mcap GTest::gtest_main
+  )
+  add_test(NAME McapCloudFetchWorkerDirectPullTest
+           COMMAND toolbox_mcap_cloud_fetch_worker_direct_pull_test)
+  set_tests_properties(McapCloudFetchWorkerDirectPullTest PROPERTIES TIMEOUT 90)
+
   # Headless one-shot init matrix (stage-4 PR-2, HERMETIC): drives the REAL
   # McapCloudToolbox (+ its embedded dialog) through a fake service registry
   # whose settings store points at an in-process fake WS server that counts
