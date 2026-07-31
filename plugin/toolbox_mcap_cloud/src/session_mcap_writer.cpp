@@ -4,13 +4,25 @@
 
 #include <cerrno>
 #include <cstddef>
+#include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <optional>
 #include <unordered_map>
 #include <utility>
 
 #include <mcap/writer.hpp>
+
+#if defined(_WIN32)
+#include <fcntl.h>
+#include <io.h>
+#include <share.h>
+#include <sys/stat.h>
+#else
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 
 namespace mcap_cloud {
 namespace {
@@ -86,7 +98,138 @@ class CheckedFileWriter final : public mcap::IWritable {
   std::string error_;
 };
 
+// Stdio-buffered mcap sink over a caller-policy fd (exclusive create, 0600).
+// Latches short-write/flush/close failures exactly like CheckedFileWriter —
+// the vendored mcap FileWriter swallows them outside debug asserts.
+class ExclusiveStdioSink final : public mcap::IWritable {
+ public:
+  explicit ExclusiveStdioSink(std::FILE* stream) : stream_(stream) {}
+
+  void handleWrite(const std::byte* data, std::uint64_t size) override {
+    // Keep size_ advancing after a latched error: mcap::McapWriter reads
+    // IWritable::size() for its offset bookkeeping, which must stay
+    // self-consistent while the stream is drained to close().
+    if (error_.empty() && stream_ != nullptr) {
+      const std::size_t written =
+          std::fwrite(data, 1, static_cast<std::size_t>(size), stream_);
+      if (written != static_cast<std::size_t>(size)) {
+        error_ = "filesystem write failed";
+      }
+    }
+    size_ += size;
+  }
+
+  void end() override { closeStream(); }
+
+  void flush() override {
+    if (stream_ == nullptr || !error_.empty()) {
+      return;
+    }
+    if (std::fflush(stream_) != 0) {
+      error_ = "filesystem flush failed";
+    }
+  }
+
+  std::uint64_t size() const override { return size_; }
+
+  void closeStream() {
+    if (stream_ == nullptr) {
+      return;
+    }
+    if (std::fflush(stream_) != 0 && error_.empty()) {
+      error_ = "filesystem flush failed";
+    }
+    if (std::fclose(stream_) != 0 && error_.empty()) {
+      error_ = "filesystem close failed";
+    }
+    stream_ = nullptr;
+  }
+
+  [[nodiscard]] const std::string& error() const { return error_; }
+
+ private:
+  std::FILE* stream_ = nullptr;
+  std::uint64_t size_ = 0;
+  std::string error_;
+};
+
 }  // namespace
+
+struct ExclusiveFileSink::Impl {
+  std::optional<ExclusiveStdioSink> sink;
+  std::string open_error;
+};
+
+ExclusiveFileSink::ExclusiveFileSink() : impl_(std::make_unique<Impl>()) {}
+
+ExclusiveFileSink::~ExclusiveFileSink() {
+  closeFile();
+}
+
+bool ExclusiveFileSink::open(const std::filesystem::path& path, std::string* error) {
+  auto fail = [error](std::string message) {
+    if (error != nullptr) {
+      *error = std::move(message);
+    }
+    return false;
+  };
+  if (impl_->sink.has_value()) {
+    return fail("exclusive sink is already open");
+  }
+  errno = 0;
+#if defined(_WIN32)
+  int fd = -1;
+  const errno_t open_err = ::_wsopen_s(&fd, path.c_str(),
+                                       _O_WRONLY | _O_CREAT | _O_EXCL | _O_BINARY,
+                                       _SH_DENYWR, _S_IREAD | _S_IWRITE);
+  if (open_err != 0 || fd < 0) {
+    return fail("could not exclusively create '" + path.string() + "': " +
+                std::strerror(open_err != 0 ? open_err : errno));
+  }
+  std::FILE* stream = ::_fdopen(fd, "wb");
+  if (stream == nullptr) {
+    ::_close(fd);
+    // Honor the no-file-left-behind promise: the exclusive create above
+    // already made the file (POSIX branch does the same removal).
+    std::error_code remove_ec;
+    std::filesystem::remove(path, remove_ec);
+    return fail("could not open stream over '" + path.string() + "'");
+  }
+#else
+  const int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+  if (fd < 0) {
+    return fail("could not exclusively create '" + path.string() + "': " + std::strerror(errno));
+  }
+  std::FILE* stream = ::fdopen(fd, "wb");
+  if (stream == nullptr) {
+    ::close(fd);
+    std::error_code remove_ec;
+    std::filesystem::remove(path, remove_ec);
+    return fail("could not open stream over '" + path.string() + "'");
+  }
+#endif
+  impl_->sink.emplace(stream);
+  return true;
+}
+
+mcap::IWritable& ExclusiveFileSink::writable() {
+  return *impl_->sink;
+}
+
+const std::string& ExclusiveFileSink::error() const {
+  if (impl_->sink.has_value()) {
+    return impl_->sink->error();
+  }
+  return impl_->open_error;  // empty — never opened / already closed cleanly
+}
+
+void ExclusiveFileSink::closeFile() {
+  if (impl_->sink.has_value()) {
+    impl_->sink->closeStream();
+    // Preserve the latched error across the sink's lifetime for error().
+    impl_->open_error = impl_->sink->error();
+  }
+}
 
 struct SessionMcapWriter::Impl {
   // `output` must outlive `writer`: ~McapWriter() calls close(), which writes

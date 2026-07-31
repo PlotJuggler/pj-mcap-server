@@ -119,6 +119,8 @@ set(MCAP_CLOUD_SOURCES
   src/session_decode.cpp
   src/session_mcap_writer.cpp
   src/session_file_cache.cpp
+  src/source_descriptor.cpp
+  src/import_runtime.cpp
   src/mcap_save_path.cpp
   src/mcap_implementation.cpp
   src/settings_store.cpp
@@ -259,6 +261,21 @@ target_link_libraries(mcap-cloud-cli PRIVATE
 # ----------------------------------------------------------------------------
 if(BUILD_TESTING)
   find_package(GTest REQUIRED)
+
+  # Sources every FetchWorker-linking test target has needed since the
+  # stage-4 import runtime landed (fetch_worker.cpp references
+  # ImportRuntime/CacheTee, which pull the cache + descriptor + trust units).
+  set(MCAP_CLOUD_IMPORT_SOURCES
+    src/session_file_cache.cpp
+    src/source_descriptor.cpp
+    src/import_runtime.cpp
+    src/trusted_origins.cpp
+    src/origin_match.cpp
+    src/credential_store.cpp
+    src/server_history.cpp
+    src/core/file_lock.cpp
+    src/core/sha256.cpp
+  )
   # The UI well-formedness ctest below shells out to a Python interpreter; on
   # Windows runners `python3` is not reliably on PATH, so resolve it here.
   find_package(Python3 REQUIRED COMPONENTS Interpreter)
@@ -614,6 +631,38 @@ if(BUILD_TESTING)
   )
   add_test(NAME McapCloudSessionFileCacheTest COMMAND toolbox_mcap_cloud_session_file_cache_test)
 
+  # ImportRuntime + CacheTee (stage-4 PR-1, HERMETIC): the per-toolbox-instance
+  # shared runtime (thread-safe SessionCache, in-memory trust set preloaded
+  # from the TrustedOrigins ledger, keyed active-materialization registry) and
+  # the single-encoder cache tee (registry + file lock + exclusive 0600 sink +
+  # embedded provenance + bounded writer queue + validated finalize/abort).
+  # Injected temp roots only; uses the test-only reader+writer MCAP TU.
+  add_executable(toolbox_mcap_cloud_import_runtime_test
+    tests/import_runtime_test.cpp
+    src/import_runtime.cpp
+    src/session_file_cache.cpp
+    src/session_mcap_writer.cpp
+    src/source_descriptor.cpp
+    src/trusted_origins.cpp
+    src/origin_match.cpp
+    src/credential_store.cpp
+    src/server_history.cpp
+    src/core/file_lock.cpp
+    src/core/sha256.cpp
+    tests/mcap_roundtrip_implementation.cpp
+  )
+  target_compile_features(toolbox_mcap_cloud_import_runtime_test PRIVATE cxx_std_20)
+  target_include_directories(toolbox_mcap_cloud_import_runtime_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/core
+  )
+  target_link_libraries(toolbox_mcap_cloud_import_runtime_test PRIVATE
+    plotjuggler_sdk::plugin_sdk nlohmann_json::nlohmann_json
+    mcap::mcap zstd::libzstd_static LZ4::lz4_static GTest::gtest_main
+  )
+  add_test(NAME McapCloudImportRuntimeTest COMMAND toolbox_mcap_cloud_import_runtime_test)
+  set_tests_properties(McapCloudImportRuntimeTest PROPERTIES TIMEOUT 60)
+
   # D6 CredentialStore seam + file-backed fallback (HERMETIC): per-server token
   # round-trip, key normalization/collision, isolation, overwrite, erase,
   # empty-vs-absent, 0600 file / 0700 dir perms, corrupt-store tolerance, and
@@ -710,6 +759,7 @@ if(BUILD_TESTING)
     tests/session_resume_live_test.cpp
     src/parser_ingest_driver.cpp
     src/fetch_worker.cpp
+    ${MCAP_CLOUD_IMPORT_SOURCES}
     src/backend_connection.cpp
     src/wire_mapping.cpp
     src/session_decode.cpp
@@ -753,6 +803,7 @@ if(BUILD_TESTING)
     tests/fetch_worker_export_contract_test.cpp
     src/parser_ingest_driver.cpp
     src/fetch_worker.cpp
+    ${MCAP_CLOUD_IMPORT_SOURCES}
     src/backend_connection.cpp
     src/wire_mapping.cpp
     src/session_decode.cpp
@@ -785,6 +836,7 @@ if(BUILD_TESTING)
     tests/find_free_port.cpp
     src/parser_ingest_driver.cpp
     src/fetch_worker.cpp
+    ${MCAP_CLOUD_IMPORT_SOURCES}
     src/backend_connection.cpp
     src/wire_mapping.cpp
     src/session_decode.cpp
@@ -809,10 +861,49 @@ if(BUILD_TESTING)
            COMMAND toolbox_mcap_cloud_fetch_worker_cancel_test)
   set_tests_properties(McapCloudFetchWorkerCancelTest PROPERTIES TIMEOUT 30)
 
+  # Interactive save+cache matrix (stage-4 PR-1, HERMETIC): the single-encoder
+  # cache tee through the REAL FetchWorker::pullTopicsAsync against an
+  # in-process fake WS server that streams session batches. Pins the D5
+  # amendments: cache sole encoder / exports byte copies, cancel keeps the
+  # export .partial COPY while the cache partial never survives, §9.6 tee-
+  # failure isolation, the §6.1 memory-hit rules, RAII partial-guard exits,
+  # and §9.0 raw-tee parser independence. TIMEOUT 60 turns a wedged pull
+  # into a fast FAIL.
+  add_executable(toolbox_mcap_cloud_fetch_worker_cache_tee_test
+    tests/fetch_worker_cache_tee_test.cpp
+    tests/find_free_port.cpp
+    src/parser_ingest_driver.cpp
+    src/fetch_worker.cpp
+    src/backend_connection.cpp
+    src/wire_mapping.cpp
+    src/session_decode.cpp
+    src/session_mcap_writer.cpp
+    ${MCAP_CLOUD_IMPORT_SOURCES}
+    src/mcap_save_path.cpp
+    src/core/time_format.cpp
+    src/mcap_implementation.cpp
+    ${MCAP_CLOUD_PROTO_SRCS}
+  )
+  target_compile_features(toolbox_mcap_cloud_fetch_worker_cache_tee_test PRIVATE cxx_std_20)
+  target_include_directories(toolbox_mcap_cloud_fetch_worker_cache_tee_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/core
+    ${MCAP_CLOUD_PROTO_OUT_DIR}
+  )
+  target_link_libraries(toolbox_mcap_cloud_fetch_worker_cache_tee_test PRIVATE
+    plotjuggler_sdk::plugin_sdk
+    protobuf::libprotobuf ixwebsocket::ixwebsocket nlohmann_json::nlohmann_json
+    zstd::libzstd_static LZ4::lz4_static mcap::mcap GTest::gtest_main
+  )
+  add_test(NAME McapCloudFetchWorkerCacheTeeTest
+           COMMAND toolbox_mcap_cloud_fetch_worker_cache_tee_test)
+  set_tests_properties(McapCloudFetchWorkerCacheTeeTest PROPERTIES TIMEOUT 60)
+
   add_executable(toolbox_mcap_cloud_parser_ingest_live_test
     tests/parser_ingest_live_test.cpp
     src/parser_ingest_driver.cpp
     src/fetch_worker.cpp
+    ${MCAP_CLOUD_IMPORT_SOURCES}
     src/backend_connection.cpp
     src/wire_mapping.cpp
     src/session_decode.cpp
@@ -1010,6 +1101,7 @@ if(BUILD_TESTING)
     src/origin_match.cpp
     src/credential_store.cpp
     src/server_history.cpp
+    src/core/file_lock.cpp
   )
   target_compile_features(toolbox_mcap_cloud_trusted_origins_test PRIVATE cxx_std_20)
   target_include_directories(toolbox_mcap_cloud_trusted_origins_test PRIVATE

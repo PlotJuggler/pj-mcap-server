@@ -23,19 +23,129 @@
 #include <vector>
 
 #include "decoded_message.hpp"
+#include "import_runtime.hpp"
 #include "parser_ingest_driver.hpp"
 #include "mcap_save_path.hpp"
 #include "session_cache.hpp"
 #include "session_key.hpp"
 #include "session_mcap_writer.hpp"
+#include "source_descriptor.hpp"
 #include "vocab_select.hpp"
 
 namespace mcap_cloud {
 
+namespace {
+
+struct TeeTerminalOutcome {
+  TeeOutcome outcome = TeeOutcome::kNone;
+  std::string error;
+};
+
+// The RUNTIME-mode terminal for one pull's cache tee (pure extraction from
+// pullTopicsAsync — quality review IMPORTANT-3). SINGLE-ENCODER retention
+// rules:
+//   Complete  -> drain+close -> validated finalize (producer-count pinned)
+//                -> export (if requested) = byte COPY of the finalized
+//                cache file, atomic temp+rename;
+//   otherwise -> drain+close leaves a READABLE partial; a requested export
+//                receives a COPY of it at the reserved `.mcap.partial` name
+//                (the user-facing export DELIBERATELY keeps readable
+//                partials), then the CACHE partial is DELETED — cache
+//                partials never survive (spec §10). Do not "align" the two
+//                retentions: they are opposite by design.
+// Ends with abortAndCleanup() (no-op after a successful finalize; otherwise
+// it deletes the cache partial and releases the locks).
+TeeTerminalOutcome finishCacheTee(
+    CacheTee& tee, const SessionStats& stats, bool cancelled_after_download,
+    const std::optional<McapOutputPaths>& save_paths,
+    const std::function<void(McapSaveResult)>& emit_save_result,
+    const std::function<void()>& discard_partial,
+    const std::function<void(const std::filesystem::path&)>& export_by_copy,
+    const std::function<bool(const std::filesystem::path&, std::string*)>& copy_to_export_partial) {
+  TeeTerminalOutcome result;
+  std::string close_error;
+  const bool closed_ok = tee.drainAndClose(&close_error);
+  const bool complete = stats.eos == SessionEos::Complete && !cancelled_after_download;
+  if (!closed_ok) {
+    // Writer/finalize failure: no readable file exists at all.
+    result.outcome = TeeOutcome::kFailed;
+    result.error = close_error;
+    if (save_paths.has_value()) {
+      discard_partial();
+      emit_save_result(McapSaveResult{McapSaveStatus::Failed, {}, close_error});
+    }
+  } else if (complete) {
+    std::string finalize_error;
+    if (tee.finalize(std::nullopt, &finalize_error)) {
+      result.outcome = TeeOutcome::kFinalized;
+      if (save_paths.has_value()) {
+        export_by_copy(tee.finalPath());
+      }
+    } else {
+      result.outcome = TeeOutcome::kFailed;
+      result.error = finalize_error;
+      if (save_paths.has_value()) {
+        discard_partial();
+        emit_save_result(McapSaveResult{McapSaveStatus::Failed, {}, finalize_error});
+      }
+    }
+  } else {
+    // Cancelled / transport drop / server error: the closed partial is a
+    // readable MCAP. Copy it out for a requested export BEFORE the cache
+    // partial is deleted. Wording derives from the SAME terminal snapshot
+    // as every other surface.
+    result.outcome = TeeOutcome::kAborted;
+    result.error = !stats.error.empty()
+                       ? stats.error
+                       : ((stats.eos == SessionEos::Cancelled || cancelled_after_download)
+                              ? "download cancelled"
+                              : "download ended before completion");
+    if (save_paths.has_value()) {
+      std::string copy_error;
+      if (!copy_to_export_partial(tee.partialPath(), &copy_error)) {
+        discard_partial();
+        emit_save_result(McapSaveResult{McapSaveStatus::Failed, {}, copy_error});
+      } else {
+        emit_save_result(
+            McapSaveResult{McapSaveStatus::Partial, save_paths->partial_path.string(), result.error});
+      }
+    }
+  }
+  tee.abortAndCleanup();  // no-op after finalize; else deletes the cache partial
+  return result;
+}
+
+}  // namespace
+
 FetchWorker::FetchWorker() = default;
 FetchWorker::~FetchWorker() = default;
 
-bool FetchWorker::datasetExistsInHost(const std::string& display_name) const {
+void FetchWorker::requestCancel() {
+  cancel_flag_.store(true, std::memory_order_relaxed);
+  // Signal any in-flight wire session so downloadSession() returns. The
+  // pointer is guarded by cancel_mu_ (NOT a bare atomic): the worker clears it
+  // BEFORE destroying the session backend, all under the same lock, so
+  // cancelSession() can never run against a destroyed object (the prior bare
+  // atomic left a load->call window where the worker could destroy it — a
+  // use-after-free). cancelSession() only sets a flag + notifies, so holding
+  // the leaf lock across it does not block.
+  std::lock_guard<std::mutex> lock(cancel_mu_);
+  if (backend_session_for_cancel_ != nullptr) {
+    backend_session_for_cancel_->cancelSession();
+  }
+  // Free a pull thread blocked in the cache tee's backpressure wait (quality
+  // review IMPORTANT-2): without this, only the tee's writer thread could
+  // signal queue_not_full_, so a stalled disk wedged the pull AND this very
+  // cancel behind it. requestAbort only flips an atomic + notifies (leaf
+  // queue mutex), so holding cancel_mu_ across it cannot block; the pointer
+  // rides the same publish/retire-under-cancel_mu_ discipline as the backend
+  // hook above.
+  if (tee_for_cancel_ != nullptr) {
+    tee_for_cancel_->requestAbort();
+  }
+}
+
+bool FetchWorker::datasetExistsInHost(const CachedSession& entry) const {
   // Presence-unknown -> false (-> cache MISS), never a false HIT. No host
   // provider bound, or the host lacks acquire_catalog_snapshot, both yield false.
   if (!host_provider_) {
@@ -48,11 +158,97 @@ bool FetchWorker::datasetExistsInHost(const std::string& display_name) const {
   }
   for (const auto& ds : snap->dataSources()) {
     const std::string_view name(ds.name.data, ds.name.size);
-    if (name == display_name) {
-      return true;
+    if (entry.dataset_id != 0) {
+      // D7: the STABLE dataset id is the existence key (display names collide
+      // and mutate); the recorded name doubles as a recycle tiebreak — an id
+      // match wearing a different name means the host reused the id for some
+      // OTHER dataset, which is proven-gone for this entry. KEPT under
+      // adversarial F11: SDK 0.20.0 documents NO non-recycling guarantee for
+      // PJ_data_source_handle_t ids (verified — no such contract text in
+      // plugin_data_api.h), so dropping the tiebreak would trade a rare
+      // rename false-miss for a wrong-dataset false-HIT. Rename-induced
+      // misses only cost a refetch.
+      if (ds.handle.id == entry.dataset_id) {
+        return name == entry.display_name;
+      }
+    } else if (name == entry.display_name) {
+      return true;  // legacy entry (no id recorded): name-only fallback
     }
   }
   return false;
+}
+
+bool FetchWorker::serveFromMemoryCache(
+    ImportRuntime* rt, SessionCache& session_cache, const SessionKey& session_key,
+    const std::string& tee_identity, const std::string& group_name,
+    const std::vector<std::string>& topic_names, const std::string& save_directory,
+    const SessionCache::ExistencePredicate& exists,
+    const std::function<void(const std::filesystem::path&)>& export_by_copy,
+    TeeOutcome* tee_outcome, bool* refetch_after_disk_miss) {
+  auto cached = session_cache.lookup(session_key, exists);
+  if (!cached.has_value()) {
+    return false;  // plain miss
+  }
+  // Hold a SHARED read lease across the disk validity check AND the export
+  // copy below: a concurrent cross-process eviction (which needs the
+  // exclusive lock) cannot delete the file mid-serve. Best-effort — a live
+  // exclusive holder (a re-materialization) makes the lease unavailable, and
+  // the lookup/copy failure paths below stay reported, never silent.
+  std::optional<FileLock> read_lease;
+  if (rt != nullptr) {
+    read_lease = rt->fileCache().acquireReadLease(tee_identity, nullptr);
+  }
+  std::filesystem::path disk_file;
+  const bool disk_valid = (rt != nullptr) && rt->fileCache().lookup(tee_identity, &disk_file);
+  // Belt-and-braces identity binding (adversarial F1, independent of the
+  // include_latched key fix): the entry must have been stored for EXACTLY the
+  // requested durable identity — a mismatched (or empty, tee-failed)
+  // cache_identity means the in-memory counts and the on-disk artifact
+  // describe different requests, so serving the memory entry (or later
+  // promoting the disk file over its dataset) would mix sessions.
+  const bool identity_ok = (rt == nullptr) || cached->cache_identity == tee_identity;
+  if (rt != nullptr && (!disk_valid || !identity_ok)) {
+    // §6.1: the durable file is gone/invalid (or provably not THIS request's)
+    // — the memory entry cannot stand in for it. Evict and refetch.
+    session_cache.evict(session_key);
+    *refetch_after_disk_miss = true;
+    return false;
+  }
+  // HIT: re-emit the per-topic pullFinished ledger from cached counts
+  // with NO BackendConnection construction. Each requested topic reports
+  // ok with a final progress sample from its cached count (count ==
+  // "messages", a reasonable progress proxy since the bytes already live
+  // in the store).
+  if (rt != nullptr) {
+    session_cache.recordHitCase(session_key, MemoryHitCase::kServedValidDisk);
+    *tee_outcome = TeeOutcome::kExistingValid;
+  }
+  if (pullServedFromCache) {
+    pullServedFromCache(group_name);
+  }
+  for (const auto& t : topic_names) {
+    auto cit = cached->counts_by_topic.find(t);
+    const std::uint64_t count = (cit != cached->counts_by_topic.end()) ? cit->second : 0;
+    if (pullProgress) {
+      pullProgress(t, static_cast<std::int64_t>(count));
+    }
+    if (pullFinished) {
+      pullFinished(group_name, t, /*ok=*/true, {});
+    }
+  }
+  if (rt != nullptr && !save_directory.empty()) {
+    export_by_copy(disk_file);  // export = byte copy of the valid cache file
+  }
+  // Adversarial F2: the served dataset keeps depending on the disk file
+  // (lazy re-opens) — RETAIN the read lease for the runtime lifetime instead
+  // of dropping it at scope exit (no-op when an identity lease is already
+  // retained, e.g. from the original finalize).
+  if (rt != nullptr && read_lease.has_value()) {
+    // The lease was acquired BEFORE the disk validation above and held
+    // across it (invariant 2), so this only records it.
+    rt->adoptLeaseForLifetime(tee_identity, std::move(*read_lease));
+  }
+  return true;
 }
 
 PJ::Expected<PJ::sdk::DataSourceHandle> FetchWorker::datasetForFetch(
@@ -433,20 +629,83 @@ void FetchWorker::pullTopicsAsync(std::vector<std::string> sequence_names, std::
       std::filesystem::remove(save_paths->partial_path, ec);
     }
   };
+  // ---- cache-tee bookkeeping (RUNTIME mode, stage-4 PR-1) ------------------
+  // rt != nullptr selects the single-encoder shape: the session tees ONCE
+  // into the SessionFileCache and export destinations receive byte copies.
+  // Declared before finish_all so the exactly-one teeFinished report rides
+  // the same terminal flush as the export contract.
+  ImportRuntime* const rt = import_runtime_;
+  TeeOutcome tee_outcome = TeeOutcome::kNone;
+  std::string tee_identity;
+  std::string tee_error;
+  bool tee_report_emitted = false;
+  auto emit_tee_report = [&]() {
+    if (rt == nullptr || tee_report_emitted) {
+      return;
+    }
+    tee_report_emitted = true;
+    if (teeFinished) {
+      teeFinished(tee_outcome, tee_identity, tee_error);
+    }
+  };
   // Always emit allFetchesComplete on every exit path so the dialog clears
   // fetch_active (and re-enables Close). Doubles as the terminal flush for the
   // export contract: an export that never started reports Skipped (the pull's
   // own error reporting already covers the cause) and releases its
-  // reservation.
+  // reservation. The tee report flushes here too (before allFetchesComplete).
   auto finish_all = [&]() {
     if (!save_directory.empty() && !save_result_emitted) {
       discard_partial();
       emit_save_result(
           McapSaveResult{McapSaveStatus::Skipped, {}, "download ended before the export could start"});
     }
+    emit_tee_report();
     if (allFetchesComplete) {
       allFetchesComplete(group_name);
     }
+  };
+  // The ONE copy step both export shapes share (the single-encoder rule):
+  // copy `source` into the reserved `.mcap.partial` (ours by exclusive
+  // reservation). What happens NEXT deliberately diverges: the Complete path
+  // publishes it (atomic rename to the final name), the cancel path RETAINS
+  // it as the readable export partial — keep that divergence explicit at the
+  // call sites, never inside this helper.
+  auto copy_to_export_partial = [&](const std::filesystem::path& source, std::string* error) {
+    std::error_code ec;
+    std::filesystem::copy_file(source, save_paths->partial_path,
+                               std::filesystem::copy_options::overwrite_existing, ec);
+    if (ec) {
+      if (error != nullptr) {
+        *error = "could not copy the cached session to '" + save_paths->partial_path.string() +
+                 "': " + ec.message();
+      }
+      return false;
+    }
+    return true;
+  };
+  // Fulfill a requested export as a byte COPY of `source`, PUBLISHED under
+  // the reserved final name (copy into the reserved partial, then atomic
+  // rename). Emits exactly one Complete/Failed result.
+  auto export_by_copy = [&](const std::filesystem::path& source) {
+    if (!save_paths.has_value()) {
+      return;  // reservation already failed and was reported
+    }
+    std::string copy_error;
+    if (!copy_to_export_partial(source, &copy_error)) {
+      discard_partial();
+      emit_save_result(McapSaveResult{McapSaveStatus::Failed, {}, copy_error});
+      return;
+    }
+    std::error_code ec;
+    std::filesystem::rename(save_paths->partial_path, save_paths->final_path, ec);
+    if (ec) {
+      discard_partial();
+      emit_save_result(McapSaveResult{
+          McapSaveStatus::Failed, {},
+          "could not finalize MCAP '" + save_paths->final_path.string() + "': " + ec.message()});
+      return;
+    }
+    emit_save_result(McapSaveResult{McapSaveStatus::Complete, save_paths->final_path.string(), {}});
   };
   // Emit pullFinished for EVERY requested topic with the same outcome (used for
   // early bail-outs: not connected / open failed / no topics could bind).
@@ -489,6 +748,30 @@ void FetchWorker::pullTopicsAsync(std::vector<std::string> sequence_names, std::
     return;
   }
 
+  // ---- descriptor identity (RUNTIME mode) -----------------------------------
+  // The canonical SourceDescriptor over the EXACT fetch tuple this pull sends
+  // to OpenFresh below: `sequence_names` ARE the wire s3_keys (key-addressed
+  // wire v2 — see the OpenSessionParams construction), `topic_names` the wire
+  // topic list, the raw ns window ("0"/"0" = whole range) and the
+  // include_latched flag the request carries. display_name is excluded from
+  // identity by construction (spec §4).
+  constexpr bool kIncludeLatched = true;  // mirrored into params.include_latched below
+  std::string canonical_descriptor_json;
+  if (rt != nullptr) {
+    SourceDescriptor descriptor;
+    descriptor.version = 1;
+    descriptor.kind = "mcap-cloud-session";
+    descriptor.server_uri = conn_uri_;
+    descriptor.s3_keys = sequence_names;
+    descriptor.topics = topic_names;
+    descriptor.start_ns = start_ns;
+    descriptor.end_ns = end_ns;
+    descriptor.include_latched = kIncludeLatched;
+    descriptor.display_name = group_name;
+    canonical_descriptor_json = canonicalSourceDescriptorJson(descriptor);
+    tee_identity = descriptorIdentity(descriptor);
+  }
+
   // ---- SessionCache HIT path (Slice 8): ZERO transport ----------------------
   // Compute the SessionKey over the EXACT logical selection (server_uri,
   // sequence_names[], topics[], time_range). Keyed on `sequence_names` directly
@@ -500,31 +783,25 @@ void FetchWorker::pullTopicsAsync(std::vector<std::string> sequence_names, std::
   // session_key.hpp's header comment). `sequence_names` is always available
   // here (no resolve, no MISS fallthrough needed). A HIT requires the cached
   // dataset to STILL exist in the host.
-  if (!save_paths.has_value()) {
-    const PJ::cloud::SessionKey key =
-        PJ::cloud::computeSessionKey(conn_uri_, sequence_names, topic_names, {start_ns, end_ns});
+  //
+  // LEGACY mode: a requested export bypasses the count-only HIT (no raw bytes
+  // to reconstruct a file from). RUNTIME mode applies the spec §6.1 rules
+  // instead: memory hit + VALID disk cache -> serve from memory and satisfy
+  // any export by COPY; memory hit + missing/invalid disk -> EVICT the memory
+  // entry and fall through to a normal network refetch (never re-tee from
+  // memory — the in-memory cache stores counts, not bytes).
+  const PJ::cloud::SessionKey session_key = PJ::cloud::computeSessionKey(
+      conn_uri_, sequence_names, topic_names, {start_ns, end_ns}, kIncludeLatched);
+  SessionCache& session_cache = (rt != nullptr) ? rt->sessionCache() : session_cache_;
+  bool refetch_after_disk_miss = false;
+  if (rt != nullptr || !save_paths.has_value()) {
     const auto& exists = dataset_exists_
                              ? dataset_exists_
                              : SessionCache::ExistencePredicate(
-                                   [this](const std::string& name) { return datasetExistsInHost(name); });
-    if (auto cached = session_cache_.lookup(key, exists)) {
-      // HIT: re-emit the per-topic pullFinished ledger from cached counts with
-      // NO BackendConnection construction. Each requested topic reports ok with
-      // a final progress sample from its cached count (count == "messages", a
-      // reasonable progress proxy since the bytes already live in the store).
-      if (pullServedFromCache) {
-        pullServedFromCache(group_name);
-      }
-      for (const auto& t : topic_names) {
-        auto cit = cached->counts_by_topic.find(t);
-        const std::uint64_t count = (cit != cached->counts_by_topic.end()) ? cit->second : 0;
-        if (pullProgress) {
-          pullProgress(t, static_cast<std::int64_t>(count));
-        }
-        if (pullFinished) {
-          pullFinished(group_name, t, /*ok=*/true, {});
-        }
-      }
+                                   [this](const CachedSession& entry) { return datasetExistsInHost(entry); });
+    if (serveFromMemoryCache(rt, session_cache, session_key, tee_identity, group_name, topic_names,
+                             save_directory, exists, export_by_copy, &tee_outcome,
+                             &refetch_after_disk_miss)) {
       finish_all();
       return;
     }
@@ -534,6 +811,63 @@ void FetchWorker::pullTopicsAsync(std::vector<std::string> sequence_names, std::
   {
     std::lock_guard<std::mutex> lock(fetch_dataset_mu_);
     fetch_dataset_ = std::nullopt;
+  }
+
+  // ---- cache-tee phase 1 (RUNTIME mode): locks BEFORE any network -----------
+  // Registry ticket + cache cleanup + exclusive MaterializeLock + under-lock
+  // corruption deletion. Acquired here so the CacheTee's RAII cleanup covers
+  // EVERY exit below (connect failure, open-session failure, empty plan,
+  // exceptions): the cache partial never survives and the lock is always
+  // released. A begin failure (lock busy, unusable root) drops the tee — the
+  // ingest continues (§9.6) — and, because the cache is the sole encoder,
+  // fails a requested export with the actionable cause.
+  std::unique_ptr<CacheTee> tee;
+  // Publish/retire the tee for requestCancel() (frees a backpressure-blocked
+  // producer). Same discipline as backend_session_for_cancel_: always under
+  // cancel_mu_, always retired BEFORE the owning pointer resets; the scope
+  // guard (declared AFTER `tee`, so it unwinds first) covers every exit.
+  auto set_tee_cancel_hook = [this](CacheTee* hook) {
+    std::lock_guard<std::mutex> lock(cancel_mu_);
+    tee_for_cancel_ = hook;
+  };
+  struct TeeCancelHookGuard {
+    FetchWorker* worker;
+    ~TeeCancelHookGuard() {
+      std::lock_guard<std::mutex> lock(worker->cancel_mu_);
+      worker->tee_for_cancel_ = nullptr;
+    }
+  } tee_cancel_hook_guard{this};
+  if (rt != nullptr) {
+    tee = std::make_unique<CacheTee>(*rt);
+    std::string begin_error;
+    if (!tee->begin(tee_identity, &begin_error)) {
+      tee.reset();
+      tee_outcome = TeeOutcome::kFailed;
+      tee_error = begin_error;
+      if (save_paths.has_value()) {
+        discard_partial();
+        emit_save_result(McapSaveResult{McapSaveStatus::Failed, {}, begin_error});
+      }
+    } else {
+      set_tee_cancel_hook(tee.get());
+    }
+  }
+
+  // FAIR admission (adversarial F10): ONE pull at a time, FIFO, acquired
+  // BEFORE any session/connection exists so a queued pull holds no remote
+  // resources while waiting; held (RAII) for the whole pull, including the
+  // on_dataset host-lock release window. Runtime mode only — legacy mode has
+  // a single worker by construction.
+  std::optional<ImportRuntime::AdmissionTicket> admission;
+  if (rt != nullptr) {
+    admission = rt->acquireAdmission(
+        [this]() { return cancel_flag_.load(std::memory_order_relaxed); },
+        std::chrono::milliseconds(50));
+    if (!admission.has_value()) {
+      finish_all_topics(false, "cancelled");
+      finish_all();
+      return;
+    }
   }
 
   // Open a FRESH session connection (NOT the browse socket): a cancelled or
@@ -619,7 +953,9 @@ void FetchWorker::pullTopicsAsync(std::vector<std::string> sequence_names, std::
   // last value even when the time window opens after they were published once at
   // the start (otherwise they vanish with "no messages in the selected time
   // range"). GUI default-on; harmless without a window (server ignores it).
-  params.include_latched = true;
+  // ONE constant feeds this flag AND the descriptor identity above — the
+  // identity must name the request actually sent.
+  params.include_latched = kIncludeLatched;
 
   // Phase feedback: opening a session does real server-side storage work
   // (chunk-index loads scale with the stitched file count and the WAN), and
@@ -685,6 +1021,29 @@ void FetchWorker::pullTopicsAsync(std::vector<std::string> sequence_names, std::
     return;
   }
 
+  // ---- cache-tee phase 2 (RUNTIME mode): the SINGLE encoder opens ----------
+  // BEFORE the hasDecodable early-exit below (§9.0 raw-tee parser
+  // independence: a no-decoder session must still materialize the cache
+  // file) and BEFORE the first message: free-space check against the
+  // server's pre-flight estimate, exclusive 0600 sink at the per-process
+  // partial, the embedded canonical-descriptor provenance record, and the
+  // bounded writer thread. An open failure drops the tee (ingest continues,
+  // §9.6) and fails a requested export — the cache is the sole encoder.
+  if (tee != nullptr) {
+    std::string open_error;
+    if (!tee->openWriter(session_info, canonical_descriptor_json,
+                         session_info.estimated_chunk_bytes, &open_error)) {
+      set_tee_cancel_hook(nullptr);
+      tee.reset();
+      tee_outcome = TeeOutcome::kFailed;
+      tee_error = open_error;
+      if (save_paths.has_value()) {
+        discard_partial();
+        emit_save_result(McapSaveResult{McapSaveStatus::Failed, {}, open_error});
+      }
+    }
+  }
+
   ParserIngestDriver driver;
   PJ::sdk::ToolboxHostView host = host_provider_();
 
@@ -697,8 +1056,9 @@ void FetchWorker::pullTopicsAsync(std::vector<std::string> sequence_names, std::
 
   // Hold the host-write lock across the WHOLE bind + decode loop: the toolbox
   // DataWriter has no internal mutex and this worker runs host writes on its
-  // own thread.
-  std::unique_lock<std::mutex> write_lock(host_write_mu_);
+  // own thread. RUNTIME mode locks the ImportRuntime's SHARED mutex — the
+  // one that also serializes future provider jobs against this worker.
+  std::unique_lock<std::mutex> write_lock(rt != nullptr ? rt->hostWriteMutex() : host_write_mu_);
 
   auto ds = datasetForFetch(host, group_name);
   if (!ds) {
@@ -732,7 +1092,11 @@ void FetchWorker::pullTopicsAsync(std::vector<std::string> sequence_names, std::
     errorOccurred(std::move(detail));
   }
 
-  if (!driver.hasDecodable()) {
+  // No-decoder early exit — ONLY when no cache tee is running. With a live
+  // tee the download proceeds regardless (§9.0: a raw cache file must not
+  // require a bound parser); the post-download per-topic classification still
+  // reports every topic's no-parser reason.
+  if (!driver.hasDecodable() && tee == nullptr) {
     write_lock.unlock();
     // Surface each requested topic's failure with its own reason where known.
     // A topic missing from the session dictionary means the server's plan had
@@ -754,9 +1118,11 @@ void FetchWorker::pullTopicsAsync(std::vector<std::string> sequence_names, std::
     return;
   }
 
+  // LEGACY-mode direct export writer only: in RUNTIME mode the cache is the
+  // sole encoder and the export is fulfilled by COPY at the terminal below.
   std::unique_ptr<SessionMcapWriter> mcap_writer;
   std::string mcap_write_error;
-  if (save_paths.has_value()) {
+  if (rt == nullptr && save_paths.has_value()) {
     mcap_writer = std::make_unique<SessionMcapWriter>();
     if (!mcap_writer->open(save_paths->partial_path, session_info, &mcap_write_error)) {
       // Export is SECONDARY: report + drop the tee, keep downloading. No path
@@ -870,6 +1236,30 @@ void FetchWorker::pullTopicsAsync(std::vector<std::string> sequence_names, std::
           emit_save_result(McapSaveResult{McapSaveStatus::Failed, {}, mcap_write_error});
           mcap_write_error.clear();
         }
+        // RUNTIME mode: hand the record to the cache tee's bounded queue
+        // (owned copy; BLOCKS briefly under backpressure when the disk lags —
+        // the wait is cancellable via requestCancel -> CacheTee::requestAbort).
+        // A tee failure — the writer thread hit a disk error — never aborts
+        // the ingest (§9.6): drop the tee (partial deleted, locks released),
+        // record the outcome for promotion suppression, and fail a requested
+        // export with the raw cause (the cache is the sole encoder — there is
+        // no independent export stream to fall back to). A CANCEL-freed
+        // enqueue is NOT a failure: the tee stays alive so the single
+        // terminal boundary below can still copy the readable partial for a
+        // requested export and classify the pull kAborted consistently.
+        if (tee != nullptr && !tee->enqueue(m)) {
+          if (!(tee->abortRequested() && !tee->failed())) {
+            tee_outcome = TeeOutcome::kFailed;
+            tee_error = tee->failureError();
+            set_tee_cancel_hook(nullptr);
+            tee->abortAndCleanup();
+            tee.reset();
+            if (save_paths.has_value()) {
+              discard_partial();
+              emit_save_result(McapSaveResult{McapSaveStatus::Failed, {}, tee_error});
+            }
+          }
+        }
         (void)driver.decode(m);  // best-effort; drops + counts on failure
 
         // Throttled per-topic progress.
@@ -922,6 +1312,18 @@ void FetchWorker::pullTopicsAsync(std::vector<std::string> sequence_names, std::
   // arriving after this boundary is consistently ignored everywhere.
   const bool cancelled_after_download = cancel_flag_.load(std::memory_order_relaxed);
 
+  // ---- cache-tee terminal (RUNTIME mode; mutually exclusive with the legacy
+  // mcap_writer block below) — the retention rules live in finishCacheTee.
+  if (tee != nullptr) {
+    const TeeTerminalOutcome terminal = finishCacheTee(
+        *tee, stats, cancelled_after_download, save_paths, emit_save_result, discard_partial,
+        export_by_copy, copy_to_export_partial);
+    tee_outcome = terminal.outcome;
+    tee_error = terminal.error;
+    set_tee_cancel_hook(nullptr);
+    tee.reset();
+  }
+
   if (mcap_writer) {
     // The import outcome (stats/topic ledger) is NEVER touched here: any
     // export/finalize failure is a purely local problem — the mcap_save_failed
@@ -947,9 +1349,12 @@ void FetchWorker::pullTopicsAsync(std::vector<std::string> sequence_names, std::
     } else {
       // DELIBERATE retention: a user-requested export KEEPS the readable
       // partial after a cancellation/transport drop (close() above finalized
-      // footer + summary). The future replay-cache tee does the OPPOSITE —
-      // its partials never survive (docs/canonical-layout-import.md §6.1) —
-      // do not "align" the two when unifying the write path.
+      // footer + summary). The cache tee (the RUNTIME-mode terminal above)
+      // does the OPPOSITE — its partials never survive
+      // (docs/canonical-layout-import.md §10); in that mode the export
+      // partial that survives is a byte COPY of the cache partial, taken
+      // BEFORE the cache partial is deleted. Do not "align" the two
+      // retentions — they are opposite by design.
       result.status = McapSaveStatus::Partial;
       // Wording derives from the SAME terminal snapshot as every other
       // surface (re-verify-caught): a Complete-but-cancelled-at-the-boundary
@@ -1075,15 +1480,17 @@ void FetchWorker::pullTopicsAsync(std::vector<std::string> sequence_names, std::
 
   // ---- SessionCache store: COMPLETE-only (Slice 8) --------------------------
   // Store the per-topic counts ONLY on a clean COMPLETE download (no cancel, no
-  // error/Unset, no decode errors). cancel / error / no-terminal-Eos / partial
-  // decode -> NO entry (no half-cached state). The key is the SAME tuple the HIT
-  // path computes — `sequence_names` directly, never a resolved file_id (post-M6
-  // rowids renumber across catalog rebuilds; see session_key.hpp). The datastore
-  // now owns the decoded rows under group_name; the cache records only counts
-  // metadata so a repeat fetch is a zero-transport HIT.
-  if (stats.eos == SessionEos::Complete && !cancelled && !session_failed && total_decode_errors == 0) {
-    const PJ::cloud::SessionKey key =
-        PJ::cloud::computeSessionKey(conn_uri_, sequence_names, topic_names, {start_ns, end_ns});
+  // error/Unset, no decode errors, and at least one decodable topic — a
+  // tee-only download-through holds no rows the datastore could serve a HIT
+  // from). cancel / error / no-terminal-Eos / partial decode -> NO entry (no
+  // half-cached state). The key is the SAME tuple the HIT path computes —
+  // `sequence_names` directly, never a resolved file_id (post-M6 rowids
+  // renumber across catalog rebuilds; see session_key.hpp). The datastore now
+  // owns the decoded rows under group_name; the cache records only counts
+  // metadata (plus the stage-4 dataset/tee state) so a repeat fetch is a
+  // zero-transport HIT.
+  if (stats.eos == SessionEos::Complete && !cancelled && !session_failed && total_decode_errors == 0 &&
+      driver.hasDecodable()) {
     CachedSession entry;
     entry.display_name = group_name;
     entry.server_uri = conn_uri_;
@@ -1098,7 +1505,19 @@ void FetchWorker::pullTopicsAsync(std::vector<std::string> sequence_names, std::
       entry.counts_by_topic[t] = count;
       entry.total_messages += count;
     }
-    session_cache_.store(key, std::move(entry));
+    // Stage-4 (D7) state: the STABLE dataset id this pull created (the
+    // existence key), the durable cache identity when the tee published a
+    // valid file, the tee outcome (promotion suppression, §9.6), and which
+    // §6.1 memory-hit rule led here.
+    {
+      std::lock_guard<std::mutex> lock(fetch_dataset_mu_);
+      entry.dataset_id = fetch_dataset_.has_value() ? fetch_dataset_->id : 0;
+    }
+    entry.cache_identity = (tee_outcome == TeeOutcome::kFinalized) ? tee_identity : std::string{};
+    entry.tee_outcome = tee_outcome;
+    entry.last_hit_case =
+        refetch_after_disk_miss ? MemoryHitCase::kRefetchedDiskMiss : MemoryHitCase::kNone;
+    session_cache.store(session_key, std::move(entry));
   }
 
   finish_all();

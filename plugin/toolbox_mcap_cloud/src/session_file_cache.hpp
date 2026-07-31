@@ -70,8 +70,23 @@ class SessionFileCache {
   /// renames over it (deletion policy is the provider flow's).
   [[nodiscard]] bool lookup(std::string_view identity, std::filesystem::path* out);
 
+  /// `contended` (optional out, adversarial F9): true iff the failure is the
+  /// lock being held by ANOTHER holder (any process — retry-able), false for
+  /// OS/identity errors.
   [[nodiscard]] std::optional<MaterializeLock> tryLockForMaterialize(
-      std::string_view identity, std::string* error);
+      std::string_view identity, std::string* error, bool* contended = nullptr);
+
+
+  /// Adversarial F2: convert a finalized identity's EXCLUSIVE materialize
+  /// lock into a SHARED read lease WITHOUT closing the underlying handle —
+  /// the exclusive->shared handoff that keeps another process's cleanup from
+  /// unlinking a just-published file that live datasets will lazily re-open.
+  /// The platform conversion has a microscopic non-atomic window (see
+  /// FileLock::downgradeToShared); on failure nullopt is returned with the
+  /// lock RELEASED — the caller revalidates and proceeds lease-less. Call
+  /// only AFTER finalize() succeeded.
+  [[nodiscard]] static std::optional<FileLock> toSharedLease(MaterializeLock&& lock,
+                                                             std::string* error);
   /// The partial path this process must write under `lock`.
   [[nodiscard]] std::filesystem::path partialPathFor(const MaterializeLock& lock) const;
 
@@ -96,9 +111,30 @@ class SessionFileCache {
   [[nodiscard]] bool finalize(const MaterializeLock& lock,
                               const std::optional<ExpectedContent>& expected, std::string* error);
 
+  /// SHARED read lease on `identity`'s lock sidecar (spec §5: every live
+  /// cache-backed consumer holds one for the file's whole lifetime — Linux
+  /// unlink-while-open does NOT protect lazy re-opens). While any lease is
+  /// live, cleanup()/eviction and tryLockForMaterialize (both exclusive on
+  /// the same sidecar) fail/skip; leases stack across holders. Pair with
+  /// lookup() — this takes no position on whether the cache file exists.
+  [[nodiscard]] std::optional<FileLock> acquireReadLease(std::string_view identity,
+                                                         std::string* error);
+
+  /// Round-3 F4 test probe: counts how many times lookup()'s validation
+  /// reached the SDK's ReadRecord() for the embedded descriptor. The raw
+  /// preflight's whole purpose is that a forged record never gets there, and
+  /// the SDK's own InvalidRecord rejection is indistinguishable from the
+  /// preflight's by return value alone — this counter makes "the parser was
+  /// not reached" observable, so removing the preflight turns the forge test
+  /// red. Test-only; never read by production code.
+  static std::uint64_t readRecordCallsForTest();
+  static void resetReadRecordCallsForTest();
+
   /// Startup/maintenance: remove orphaned partials older than
   /// orphan_partial_age whose lock is free; then LRU-evict unlocked files
   /// (touch-file order) until under max_total_bytes AND min_free_bytes holds.
+  /// Skips any file whose identity lock is busy — a live materialization OR a
+  /// shared read lease (acquireReadLease) both hold that lock.
   void cleanup(const Config& cfg);
 
  private:

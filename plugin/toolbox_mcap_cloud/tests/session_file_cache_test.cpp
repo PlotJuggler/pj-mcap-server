@@ -9,11 +9,14 @@
 #include "session_file_cache.hpp"
 
 #include <gtest/gtest.h>
+#include <mcap/reader.hpp>
 #include <mcap/writer.hpp>
 
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
+#include <cstring>
+#include <cstdint>
 #include <fstream>
 #include <string>
 #include <thread>
@@ -437,6 +440,78 @@ TEST(SessionFileCache, CleanupEvictsOldestTouchedFirstAndStopsAtCap) {
   EXPECT_TRUE(fs::exists(fs::path(file_new.string() + ".touch")));
 }
 
+// Stage-4 shared read leases (spec §5): a live cache-backed consumer holds a
+// SHARED lease on the identity's lock sidecar for the file's whole lifetime,
+// so eviction (which takes the exclusive lock per victim) must skip it and
+// resume once the lease is released.
+TEST(SessionFileCache, CleanupSkipsSharedLeasedFileAndEvictsAfterRelease) {
+  TempRoot root("lease-evict");
+  mcap_cloud::SessionFileCache cache(root.path);
+  const auto d = descriptor("leased.mcap");
+  const std::string identity = mcap_cloud::descriptorIdentity(d);
+  const fs::path file = materialize(cache, d);
+  ASSERT_TRUE(fs::exists(file));
+
+  std::string error;
+  auto lease = cache.acquireReadLease(identity, &error);
+  ASSERT_TRUE(lease.has_value()) << error;
+
+  // A second shared lease on the SAME identity coexists (read leases stack).
+  std::string error2;
+  auto lease2 = cache.acquireReadLease(identity, &error2);
+  EXPECT_TRUE(lease2.has_value()) << error2;
+
+  mcap_cloud::SessionFileCache::Config cfg;
+  cfg.max_total_bytes = 0;  // evict everything evictable
+  cfg.min_free_bytes = 0;
+  cache.cleanup(cfg);
+  EXPECT_TRUE(fs::exists(file)) << "a shared-leased file must never be evicted";
+
+  // While a shared lease is live, a materialization of the same identity is
+  // refused (the lease holder is reading the file the writer would replace).
+  std::string mat_error;
+  EXPECT_FALSE(cache.tryLockForMaterialize(identity, &mat_error).has_value());
+
+  lease.reset();
+  lease2.reset();
+  cache.cleanup(cfg);
+  EXPECT_FALSE(fs::exists(file)) << "eviction must resume after the lease is released";
+}
+
+TEST(SessionFileCache, ReadLeaseRejectsMalformedIdentity) {
+  TempRoot root("lease-identity");
+  mcap_cloud::SessionFileCache cache(root.path);
+  std::string error;
+  EXPECT_FALSE(cache.acquireReadLease("garbage", &error).has_value());
+  EXPECT_NE(error.find("identity"), std::string::npos) << error;
+}
+
+// FileLock-level shared/exclusive contract (POSIX flock LOCK_SH / Windows
+// LockFileEx without LOCKFILE_EXCLUSIVE_LOCK): shared locks stack; an
+// exclusive try fails while any shared holder is live and succeeds after.
+TEST(SessionFileCache, FileLockSharedExclusiveContract) {
+  TempRoot root("filelock-shared");
+  const fs::path lock_path = root.path / "contract.lock";
+
+  std::string error;
+  auto shared1 = mcap_cloud::FileLock::tryShared(lock_path, &error);
+  ASSERT_TRUE(shared1.has_value()) << error;
+  auto shared2 = mcap_cloud::FileLock::tryShared(lock_path, &error);
+  EXPECT_TRUE(shared2.has_value()) << "shared locks must coexist: " << error;
+
+  EXPECT_FALSE(mcap_cloud::FileLock::tryExclusive(lock_path, &error).has_value())
+      << "exclusive must fail while shared holders are live";
+
+  shared1.reset();
+  shared2.reset();
+  EXPECT_TRUE(mcap_cloud::FileLock::tryExclusive(lock_path, &error).has_value()) << error;
+
+  // And the inverse: an exclusive holder blocks a shared try.
+  auto exclusive = mcap_cloud::FileLock::tryExclusive(lock_path, &error);
+  ASSERT_TRUE(exclusive.has_value()) << error;
+  EXPECT_FALSE(mcap_cloud::FileLock::tryShared(lock_path, &error).has_value());
+}
+
 TEST(SessionFileCache, CleanupSkipsLockedVictims) {
   TempRoot root("lru-locked");
   mcap_cloud::SessionFileCache cache(root.path);
@@ -474,3 +549,137 @@ TEST(SessionFileCache, StandardHonoursCacheDirOverride) {
   ::unsetenv("MCAP_CLOUD_CACHE_DIR");
 }
 #endif
+
+// Adversarial F13: a forged <digest>.mcap whose footer points at a
+// multi-gigabyte summary span must be refused by raw-footer preflight BEFORE
+// the MCAP summary parser allocates anything — a plain miss, on the GUI
+// thread's fixed query budget. (Sparse file: huge st_size, tiny disk use.)
+TEST(SessionFileCache, ForgedOversizedSummarySpanIsRefusedBeforeParsing) {
+  TempRoot root("forged-summary");
+  mcap_cloud::SessionFileCache cache(root.path);
+  const std::string identity = "mcap-cloud:v1:sha256/128:22222222222222222222222222222222";
+  const std::filesystem::path target = cache.pathFor(identity);
+  {
+    std::ofstream out(target, std::ios::binary);
+    out.write("\x89MCAP0\r\n", 8);  // start magic
+  }
+  // Grow sparsely to ~64 MiB, then write a footer claiming summary_start=8:
+  // span = size - tail - 8 >> the 16 MiB query budget.
+  std::error_code ec;
+  std::filesystem::resize_file(target, 64ull * 1024 * 1024, ec);
+  ASSERT_FALSE(ec);
+  {
+    std::fstream out(target, std::ios::binary | std::ios::in | std::ios::out);
+    // Footer record: op 0x02, len=20 (LE u64), summary_start=8 (LE u64),
+    // summary_offset_start=0, summary_crc=0, then the end magic.
+    unsigned char tail[37] = {0};
+    tail[0] = 0x02;
+    tail[1] = 20;                       // length LE
+    tail[9] = 8;                        // summary_start LE = 8
+    const char magic[8] = {'\x89', 'M', 'C', 'A', 'P', '0', '\r', '\n'};
+    std::memcpy(tail + 29, magic, 8);
+    out.seekp(-37, std::ios::end);
+    out.write(reinterpret_cast<const char*>(tail), sizeof(tail));
+  }
+  std::filesystem::path out_path;
+  EXPECT_FALSE(cache.lookup(identity, &out_path))
+      << "a forged oversized summary span must be a miss (F13)";
+}
+
+// Adversarial F9: cross-process contention is DISTINGUISHABLE from OS
+// failure. Two SessionFileCache instances over one root contend exactly like
+// two processes (flock treats each FileLock's descriptor as an independent
+// holder — see FileLock::tryExclusive's doc).
+TEST(SessionFileCache, MaterializeLockContentionIsDistinguished) {
+  TempRoot root("lock-contention");
+  mcap_cloud::SessionFileCache a(root.path);
+  mcap_cloud::SessionFileCache b(root.path);
+  const std::string identity = "mcap-cloud:v1:sha256/128:33333333333333333333333333333333";
+
+  std::string err;
+  bool contended = true;
+  auto lock_a = a.tryLockForMaterialize(identity, &err, &contended);
+  ASSERT_TRUE(lock_a.has_value()) << err;
+  EXPECT_FALSE(contended);
+
+  auto lock_b = b.tryLockForMaterialize(identity, &err, &contended);
+  EXPECT_FALSE(lock_b.has_value());
+  EXPECT_TRUE(contended) << "held-elsewhere must classify as contention (F9)";
+
+  // A malformed identity is an ERROR, never contention.
+  contended = true;
+  auto bad = b.tryLockForMaterialize("not-an-identity", &err, &contended);
+  EXPECT_FALSE(bad.has_value());
+  EXPECT_FALSE(contended);
+}
+
+// Re-verify R3: capping MetadataIndex.length alone is bypassable — the SDK's
+// ReadRecord re-reads the record size FROM THE FILE at the indexed offset
+// and resizes its buffer to that DECLARED value. Forge: take a VALID cache
+// file and overwrite the metadata record's declared size with a huge value
+// while the index still claims a small length. Pre-fix this drove a
+// multi-exabyte vector resize inside lookup() (length_error/bad_alloc
+// escaping on the GUI thread); post-fix the raw header preflight rejects it
+// as a plain miss.
+TEST(SessionFileCache, ForgedMetadataRecordSizeIsRefusedBeforeAllocation) {
+  TempRoot root("forged-metadata");
+  mcap_cloud::SessionFileCache cache(root.path);
+  const mcap_cloud::SourceDescriptor d = descriptor("forge-meta.mcap");
+  const fs::path file = materialize(cache, d);
+  ASSERT_FALSE(file.empty());
+  const std::string identity = mcap_cloud::descriptorIdentity(d);
+  fs::path ok_path;
+  ASSERT_TRUE(cache.lookup(identity, &ok_path)) << "the un-forged file must be a hit";
+
+  // Locate the provenance metadata record via the reader's own index, then
+  // overwrite its DECLARED size (bytes [offset+1, offset+9)) with 2^62.
+  std::uint64_t record_offset = 0;
+  {
+    mcap::McapReader reader;
+    ASSERT_TRUE(reader.open(file.string()).ok());
+    ASSERT_TRUE(reader.readSummary(mcap::ReadSummaryMethod::NoFallbackScan).ok());
+    const auto it = reader.metadataIndexes().find("mcap_cloud/source_descriptor");
+    ASSERT_NE(it, reader.metadataIndexes().end());
+    record_offset = it->second.offset;
+    reader.close();
+  }
+  {
+    std::fstream out(file, std::ios::binary | std::ios::in | std::ios::out);
+    ASSERT_TRUE(out.is_open());
+    out.seekp(static_cast<std::streamoff>(record_offset + 1));
+    const std::uint64_t huge = std::uint64_t{1} << 62;
+    unsigned char bytes[8];
+    for (int i = 0; i < 8; ++i) {
+      bytes[i] = static_cast<unsigned char>((huge >> (8 * i)) & 0xFF);
+    }
+    out.write(reinterpret_cast<const char*>(bytes), sizeof(bytes));
+  }
+
+  // F4: pin the PREFLIGHT, not just the outcome. The SDK's own ReadRecord
+  // would also reject this file (it bounds the declared size against the file
+  // remainder BEFORE the allocating read — reader.inl:676) and returns the
+  // same false, so the probe counter is what distinguishes "the parser was
+  // never reached" from "the parser rejected it": with the preflight in place
+  // ReadRecord must NOT be called at all. Removing the preflight makes this
+  // assertion (not the miss) go red.
+  mcap_cloud::SessionFileCache::resetReadRecordCallsForTest();
+  fs::path out_path;
+  EXPECT_FALSE(cache.lookup(identity, &out_path))
+      << "a forged declared record size must be a bounded-preflight miss (R3)";
+  EXPECT_EQ(mcap_cloud::SessionFileCache::readRecordCallsForTest(), 0u)
+      << "the raw preflight must reject BEFORE the SDK's ReadRecord runs (F4)";
+}
+
+// F4 control: an UNFORGED file must reach ReadRecord — otherwise the counter
+// assertion above could pass for the wrong reason (e.g. validation bailing
+// out earlier for every file).
+TEST(SessionFileCache, ValidFileReachesReadRecord) {
+  TempRoot root("probe-control");
+  mcap_cloud::SessionFileCache cache(root.path);
+  const mcap_cloud::SourceDescriptor d = descriptor("probe-control.mcap");
+  ASSERT_FALSE(materialize(cache, d).empty());
+  mcap_cloud::SessionFileCache::resetReadRecordCallsForTest();
+  fs::path out_path;
+  ASSERT_TRUE(cache.lookup(mcap_cloud::descriptorIdentity(d), &out_path));
+  EXPECT_GT(mcap_cloud::SessionFileCache::readRecordCallsForTest(), 0u);
+}

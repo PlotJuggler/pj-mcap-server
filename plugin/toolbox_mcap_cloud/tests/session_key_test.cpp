@@ -17,36 +17,36 @@ using namespace PJ::cloud;
 // Unified-plan §6 L1: the key is over the NORMALIZED tuple
 // (server_uri, sorted sequence_names[], sorted topic_names[], time_range).
 TEST(McapCloudSessionKeyTest, ReorderedSequenceNamesAndTopicsProduceSameKey) {
-  SessionKey a = computeSessionKey("wss://h/api/ws", {"c", "a", "b"}, {"/b", "/a"}, {100, 200});
-  SessionKey b = computeSessionKey("wss://h/api/ws", {"a", "b", "c"}, {"/a", "/b"}, {100, 200});
+  SessionKey a = computeSessionKey("wss://h/api/ws", {"c", "a", "b"}, {"/b", "/a"}, {100, 200}, true);
+  SessionKey b = computeSessionKey("wss://h/api/ws", {"a", "b", "c"}, {"/a", "/b"}, {100, 200}, true);
   EXPECT_EQ(a, b);
   EXPECT_EQ(a.hash, b.hash);
 }
 
 TEST(McapCloudSessionKeyTest, DifferentUriProducesDifferentKey) {
-  SessionKey a = computeSessionKey("wss://h1/api/ws", {"a"}, {"/a"}, {0, 0});
-  SessionKey b = computeSessionKey("wss://h2/api/ws", {"a"}, {"/a"}, {0, 0});
+  SessionKey a = computeSessionKey("wss://h1/api/ws", {"a"}, {"/a"}, {0, 0}, true);
+  SessionKey b = computeSessionKey("wss://h2/api/ws", {"a"}, {"/a"}, {0, 0}, true);
   EXPECT_NE(a, b);
   EXPECT_NE(a.hash, b.hash);
 }
 
 TEST(McapCloudSessionKeyTest, DifferentTimeRangeProducesDifferentKey) {
-  SessionKey a = computeSessionKey("wss://h/api/ws", {"a"}, {"/a"}, {100, 200});
-  SessionKey b = computeSessionKey("wss://h/api/ws", {"a"}, {"/a"}, {100, 201});
+  SessionKey a = computeSessionKey("wss://h/api/ws", {"a"}, {"/a"}, {100, 200}, true);
+  SessionKey b = computeSessionKey("wss://h/api/ws", {"a"}, {"/a"}, {100, 201}, true);
   EXPECT_NE(a, b);
 }
 
 TEST(McapCloudSessionKeyTest, EmptyTopicsMeansAllTopicsAndIsStable) {
-  SessionKey a = computeSessionKey("wss://h/api/ws", {"a", "b"}, {}, {0, 0});
-  SessionKey b = computeSessionKey("wss://h/api/ws", {"b", "a"}, {}, {0, 0});
+  SessionKey a = computeSessionKey("wss://h/api/ws", {"a", "b"}, {}, {0, 0}, true);
+  SessionKey b = computeSessionKey("wss://h/api/ws", {"b", "a"}, {}, {0, 0}, true);
   EXPECT_EQ(a, b);
 }
 
 // Different sequence NAMES (the identity axis, post-M6) must produce a
 // different key — the counterpart to the reordered-equal case above.
 TEST(McapCloudSessionKeyTest, DifferentSequenceNamesProduceDifferentKey) {
-  SessionKey a = computeSessionKey("wss://h/api/ws", {"seq_a"}, {"/a"}, {0, 0});
-  SessionKey b = computeSessionKey("wss://h/api/ws", {"seq_b"}, {"/a"}, {0, 0});
+  SessionKey a = computeSessionKey("wss://h/api/ws", {"seq_a"}, {"/a"}, {0, 0}, true);
+  SessionKey b = computeSessionKey("wss://h/api/ws", {"seq_b"}, {"/a"}, {0, 0}, true);
   EXPECT_NE(a, b);
   EXPECT_NE(a.hash, b.hash);
 }
@@ -62,17 +62,30 @@ TEST(McapCloudSessionKeyTest, DifferentSequenceNamesProduceDifferentKey) {
 // numeric id).
 TEST(McapCloudSessionKeyTest, NameKeyedIdentitySurvivesCatalogRebuildRenumbering) {
   // "Before a rebuild": some file_id used to resolve to seq_a/seq_b.
-  SessionKey before = computeSessionKey("wss://h/api/ws", {"seq_a", "seq_b"}, {"/a"}, {100, 200});
+  SessionKey before = computeSessionKey("wss://h/api/ws", {"seq_a", "seq_b"}, {"/a"}, {100, 200}, true);
   // "After a rebuild": the SAME names, SAME topics, SAME range — regardless of
   // whatever new numeric ids the builder assigned this generation — must key
   // identically (the whole point: identity is name-based, not id-based).
-  SessionKey after = computeSessionKey("wss://h/api/ws", {"seq_b", "seq_a"}, {"/a"}, {100, 200});
+  SessionKey after = computeSessionKey("wss://h/api/ws", {"seq_b", "seq_a"}, {"/a"}, {100, 200}, true);
   EXPECT_EQ(before, after);
   EXPECT_EQ(before.hash, after.hash);
 
   // A genuinely different selection (different name) must NOT collide, even
   // though a stale numeric-id-based key could have (if some OTHER file
   // inherited the old id across the rebuild).
-  SessionKey different = computeSessionKey("wss://h/api/ws", {"seq_a", "seq_c"}, {"/a"}, {100, 200});
+  SessionKey different = computeSessionKey("wss://h/api/ws", {"seq_a", "seq_c"}, {"/a"}, {100, 200}, true);
   EXPECT_NE(before, different);
+}
+
+// Adversarial F1: include_latched is part of the LOGICAL selection — the
+// server delivers different messages for the two values, so they must never
+// alias to one key (a false-latched dataset could serve a true-latched
+// request and then promote the true artifact over the false dataset).
+TEST(SessionKeyTest, IncludeLatchedDistinguishesRequests) {
+  SessionKey latched_true = computeSessionKey("wss://h/api/ws", {"a"}, {"/a"}, {100, 200}, true);
+  SessionKey latched_false = computeSessionKey("wss://h/api/ws", {"a"}, {"/a"}, {100, 200}, false);
+  EXPECT_FALSE(latched_true == latched_false);
+  EXPECT_NE(latched_true.hash, latched_false.hash);
+  EXPECT_TRUE(latched_true.include_latched);
+  EXPECT_FALSE(latched_false.include_latched);
 }

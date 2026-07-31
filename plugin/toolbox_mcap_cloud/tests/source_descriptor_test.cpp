@@ -201,3 +201,33 @@ TEST(SourceDescriptor, RejectionMatrix) {
     expectReject(oversized, "byte limit");
   }
 }
+
+// Adversarial F3: the OpenFresh protocol rule (proto/pj_cloud.proto: s3_keys
+// ">=1; no empty/duplicate keys") is enforced at DESCRIPTOR parse time — an
+// accepted empty-key descriptor previously reached provider code that
+// dereferenced s3_keys.front() (UB), and empty/duplicate keys would only fail
+// deep in the server. Rejecting at the parse boundary makes query/start fail
+// cleanly as a contract error.
+TEST(SourceDescriptor, RejectsEmptyKeyArrayEmptyKeysAndDuplicateKeys) {
+  {  // Empty s3_keys array (the F3 crash shape).
+    auto j = baseJson();
+    j["s3_keys"] = nlohmann::json::array();
+    expectReject(j.dump(), "at least one");
+  }
+  {  // Empty-string key.
+    auto j = baseJson();
+    j["s3_keys"] = nlohmann::json::array({""});
+    expectReject(j.dump(), "empty");
+  }
+  {  // Duplicate keys.
+    auto j = baseJson();
+    j["s3_keys"] = nlohmann::json::array({"a.mcap", "b.mcap", "a.mcap"});
+    expectReject(j.dump(), "duplicate");
+  }
+  {  // An empty TOPICS array stays legal (empty = all union topics).
+    auto j = baseJson();
+    j["topics"] = nlohmann::json::array();
+    std::string error;
+    EXPECT_TRUE(mcap_cloud::parseSourceDescriptor(j.dump(), &error).has_value()) << error;
+  }
+}

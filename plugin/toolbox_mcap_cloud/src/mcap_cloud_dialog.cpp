@@ -39,6 +39,7 @@
 #include "fetch_summary.h"
 #include "fetch_worker.hpp"
 #include "format_utils.h"
+#include "import_runtime.hpp"
 #include "mcap_cloud_panel_manifest.hpp"
 #include "mcap_cloud_panel_ui.hpp"
 #include "name_filter.h"
@@ -592,6 +593,11 @@ void McapCloudDialog::setHostProvider(std::function<PJ::sdk::ToolboxHostView()> 
 void McapCloudDialog::setRuntimeHostProvider(std::function<PJ::ToolboxRuntimeHostView()> provider) {
   worker_->setRuntimeHostProvider(provider);
   runtime_host_provider_ = std::move(provider);
+}
+
+void McapCloudDialog::setImportRuntime(ImportRuntime* runtime) {
+  import_runtime_ = runtime;
+  worker_->setImportRuntime(runtime);
 }
 
 void McapCloudDialog::initFromSettings() {
@@ -2651,8 +2657,20 @@ void McapCloudDialog::onConnectFinished(bool ok, std::string uri, std::string st
 
     // Spec §7 guard 1: a successful interactive Hello is the ONLY event that
     // marks an origin trusted for auto-import — recorded here, alongside the
-    // MRU write, about the server that actually answered.
-    trustedOrigins().recordSuccessfulHello(uri);
+    // MRU write, about the server that actually answered. Through the
+    // ImportRuntime when bound (write-through: same ledger file + the bounded
+    // in-memory set the provider queries); direct ledger only for a
+    // runtime-less dialog unit load.
+    const bool trust_recorded = (import_runtime_ != nullptr)
+                                    ? import_runtime_->recordSuccessfulHello(uri)
+                                    : trustedOrigins().recordSuccessfulHello(uri);
+    if (!trust_recorded) {
+      // F14: a failed durable write means the origin is NOT trusted anywhere
+      // (no silent transient trust) — say so instead of pretending.
+      notify(PJ::ToolboxMessageLevel::kWarning,
+             "MCAP Cloud: could not persist the trusted-origin ledger — layout imports from "
+             "this server will keep asking for confirmation.");
+    }
 
     notify(PJ::ToolboxMessageLevel::kInfo, status);
     // The catalog is NEVER fetched unfiltered: fetch the vocabulary (the

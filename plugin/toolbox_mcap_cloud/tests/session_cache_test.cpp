@@ -41,9 +41,11 @@ CachedSession makeEntry(const std::string& display_name, std::uint64_t a, std::u
   return e;
 }
 
-// "Everything present" predicate (used for plain HIT tests).
+// "Everything present" predicate (used for plain HIT tests). D7: the
+// predicate receives the whole CachedSession so existence can key on the
+// stable dataset_id, not the mutable display name.
 auto alwaysPresent() {
-  return [](const std::string&) { return true; };
+  return [](const CachedSession&) { return true; };
 }
 
 }  // namespace
@@ -52,7 +54,7 @@ auto alwaysPresent() {
 // that returns the cached counts with ZERO transport.
 TEST(McapCloudSessionCacheTest, HitReturnsCachedCountsZeroTransport) {
   SessionCache cache;
-  const SessionKey key = computeSessionKey(kUri, {"file_1", "file_2"}, {"/a", "/b"}, {0, 0});
+  const SessionKey key = computeSessionKey(kUri, {"file_1", "file_2"}, {"/a", "/b"}, {0, 0}, true);
   cache.store(key, makeEntry("seq_x", 10, 20));
 
   int transport_calls = 0;
@@ -68,10 +70,10 @@ TEST(McapCloudSessionCacheTest, HitReturnsCachedCountsZeroTransport) {
 // Reordered/duplicated inputs collide -> HIT on the same key.
 TEST(McapCloudSessionCacheTest, ReorderedSelectionHits) {
   SessionCache cache;
-  const SessionKey stored = computeSessionKey(kUri, {"file_1", "file_2", "file_3"}, {"/a", "/b"}, {100, 200});
+  const SessionKey stored = computeSessionKey(kUri, {"file_1", "file_2", "file_3"}, {"/a", "/b"}, {100, 200}, true);
   cache.store(stored, makeEntry("seq_y", 5, 7));
 
-  const SessionKey reordered = computeSessionKey(kUri, {"file_3", "file_2", "file_1"}, {"/b", "/a"}, {100, 200});
+  const SessionKey reordered = computeSessionKey(kUri, {"file_3", "file_2", "file_1"}, {"/b", "/a"}, {100, 200}, true);
   auto hit = cache.lookup(reordered, alwaysPresent());
   ASSERT_TRUE(hit.has_value());
   EXPECT_EQ(hit->display_name, "seq_y");
@@ -80,7 +82,7 @@ TEST(McapCloudSessionCacheTest, ReorderedSelectionHits) {
 // Exact-tuple only: a different time-range / topic set / sequence_names is a MISS.
 TEST(McapCloudSessionCacheTest, KeyExactnessMissesOnAnyDifference) {
   SessionCache cache;
-  const SessionKey base = computeSessionKey(kUri, {"file_1", "file_2"}, {"/a", "/b"}, {100, 200});
+  const SessionKey base = computeSessionKey(kUri, {"file_1", "file_2"}, {"/a", "/b"}, {100, 200}, true);
   cache.store(base, makeEntry("seq_z", 1, 1));
 
   int transport_calls = 0;
@@ -92,21 +94,21 @@ TEST(McapCloudSessionCacheTest, KeyExactnessMissesOnAnyDifference) {
     return hit.has_value();
   };
 
-  EXPECT_FALSE(miss_on_range(computeSessionKey(kUri, {"file_1", "file_2"}, {"/a", "/b"}, {100, 201})));  // range
-  EXPECT_FALSE(miss_on_range(computeSessionKey(kUri, {"file_1", "file_2"}, {"/a"}, {100, 200})));         // topics
+  EXPECT_FALSE(miss_on_range(computeSessionKey(kUri, {"file_1", "file_2"}, {"/a", "/b"}, {100, 201}, true)));  // range
+  EXPECT_FALSE(miss_on_range(computeSessionKey(kUri, {"file_1", "file_2"}, {"/a"}, {100, 200}, true)));         // topics
   EXPECT_FALSE(
-      miss_on_range(computeSessionKey(kUri, {"file_1", "file_2", "file_3"}, {"/a", "/b"}, {100, 200})));  // names
+      miss_on_range(computeSessionKey(kUri, {"file_1", "file_2", "file_3"}, {"/a", "/b"}, {100, 200}, true)));  // names
   EXPECT_FALSE(
-      miss_on_range(computeSessionKey("ws://other:8082", {"file_1", "file_2"}, {"/a", "/b"}, {100, 200})));  // uri
+      miss_on_range(computeSessionKey("ws://other:8082", {"file_1", "file_2"}, {"/a", "/b"}, {100, 200}, true)));  // uri
   EXPECT_EQ(transport_calls, 4);
 }
 
 // LRU eviction over a small entry budget: the LRU entry is dropped first.
 TEST(McapCloudSessionCacheTest, LruEvictsLeastRecentlyUsedOverBudget) {
   SessionCache cache(/*max_entries=*/2);
-  const SessionKey k1 = computeSessionKey(kUri, {"file_1"}, {"/a"}, {0, 0});
-  const SessionKey k2 = computeSessionKey(kUri, {"file_2"}, {"/a"}, {0, 0});
-  const SessionKey k3 = computeSessionKey(kUri, {"file_3"}, {"/a"}, {0, 0});
+  const SessionKey k1 = computeSessionKey(kUri, {"file_1"}, {"/a"}, {0, 0}, true);
+  const SessionKey k2 = computeSessionKey(kUri, {"file_2"}, {"/a"}, {0, 0}, true);
+  const SessionKey k3 = computeSessionKey(kUri, {"file_3"}, {"/a"}, {0, 0}, true);
 
   cache.store(k1, makeEntry("one", 1, 0));
   cache.store(k2, makeEntry("two", 2, 0));
@@ -126,7 +128,7 @@ TEST(McapCloudSessionCacheTest, LruEvictsLeastRecentlyUsedOverBudget) {
 TEST(McapCloudSessionCacheTest, FreshInstanceIsEmpty) {
   SessionCache cache;
   EXPECT_EQ(cache.size(), 0u);
-  const SessionKey key = computeSessionKey(kUri, {"file_1"}, {"/a"}, {0, 0});
+  const SessionKey key = computeSessionKey(kUri, {"file_1"}, {"/a"}, {0, 0}, true);
   EXPECT_FALSE(cache.lookup(key, alwaysPresent()).has_value());
 }
 
@@ -135,11 +137,11 @@ TEST(McapCloudSessionCacheTest, FreshInstanceIsEmpty) {
 // evicted so the next fetch re-fills it.
 TEST(McapCloudSessionCacheTest, DatasetGoneEvictsAndMisses) {
   SessionCache cache;
-  const SessionKey key = computeSessionKey(kUri, {"file_1"}, {"/a"}, {0, 0});
+  const SessionKey key = computeSessionKey(kUri, {"file_1"}, {"/a"}, {0, 0}, true);
   cache.store(key, makeEntry("cleared_seq", 9, 9));
   EXPECT_EQ(cache.size(), 1u);
 
-  auto gone = [](const std::string&) { return false; };  // user cleared the dataset
+  auto gone = [](const CachedSession&) { return false; };  // user cleared the dataset
   EXPECT_FALSE(cache.lookup(key, gone).has_value());
   EXPECT_EQ(cache.size(), 0u) << "a proven-gone dataset must be evicted";
 }
@@ -148,7 +150,7 @@ TEST(McapCloudSessionCacheTest, DatasetGoneEvictsAndMisses) {
 // as a MISS, but the entry is NOT evicted (we cannot prove it gone).
 TEST(McapCloudSessionCacheTest, PresenceUnknownMissesWithoutEvicting) {
   SessionCache cache;
-  const SessionKey key = computeSessionKey(kUri, {"file_1"}, {"/a"}, {0, 0});
+  const SessionKey key = computeSessionKey(kUri, {"file_1"}, {"/a"}, {0, 0}, true);
   cache.store(key, makeEntry("unknown_seq", 3, 4));
 
   SessionCache::ExistencePredicate none;  // null predicate == presence-unknown
@@ -166,27 +168,76 @@ TEST(McapCloudSessionCacheTest, PresenceUnknownMissesWithoutEvicting) {
 // silently collide with an unrelated file's) cached session identity.
 TEST(McapCloudSessionCacheTest, NameKeyedIdentitySurvivesCatalogRebuildRenumbering) {
   SessionCache cache;
-  const SessionKey stored = computeSessionKey(kUri, {"nissan_zala_50"}, {"/a"}, {0, 0});
+  const SessionKey stored = computeSessionKey(kUri, {"nissan_zala_50"}, {"/a"}, {0, 0}, true);
   cache.store(stored, makeEntry("nissan_zala_50", 42, 0));
 
   // "After a rebuild": the same logical selection (same name) still HITs.
-  const SessionKey after_rebuild = computeSessionKey(kUri, {"nissan_zala_50"}, {"/a"}, {0, 0});
+  const SessionKey after_rebuild = computeSessionKey(kUri, {"nissan_zala_50"}, {"/a"}, {0, 0}, true);
   auto hit = cache.lookup(after_rebuild, alwaysPresent());
   ASSERT_TRUE(hit.has_value());
   EXPECT_EQ(hit->total_messages, 42u);
 
   // A DIFFERENT name (a different file) never collides, even though a stale
   // numeric-id-based key could have if some other file inherited the old id.
-  const SessionKey different_file = computeSessionKey(kUri, {"other_seq"}, {"/a"}, {0, 0});
+  const SessionKey different_file = computeSessionKey(kUri, {"other_seq"}, {"/a"}, {0, 0}, true);
   EXPECT_FALSE(cache.lookup(different_file, alwaysPresent()).has_value());
 }
 
 // evict() drops a specific entry; re-store re-fills.
 TEST(McapCloudSessionCacheTest, ExplicitEvict) {
   SessionCache cache;
-  const SessionKey key = computeSessionKey(kUri, {"file_1"}, {"/a"}, {0, 0});
+  const SessionKey key = computeSessionKey(kUri, {"file_1"}, {"/a"}, {0, 0}, true);
   cache.store(key, makeEntry("e", 1, 1));
   cache.evict(key);
   EXPECT_EQ(cache.size(), 0u);
   EXPECT_FALSE(cache.lookup(key, alwaysPresent()).has_value());
+}
+
+// D7: the existence predicate receives the FULL stored entry — dataset_id
+// (the stable host handle id) is the primary existence key; display names
+// collide and mutate. The new cache-file/promotion fields round-trip too.
+TEST(McapCloudSessionCacheTest, PredicateReceivesStoredEntryWithDatasetId) {
+  SessionCache cache;
+  const SessionKey key = computeSessionKey(kUri, {"file_1"}, {"/a"}, {0, 0}, true);
+  CachedSession entry = makeEntry("renamable display", 4, 2);
+  entry.dataset_id = 77;
+  entry.cache_identity = "mcap-cloud:v1:sha256/128:" + std::string(32, 'a');
+  entry.tee_outcome = mcap_cloud::TeeOutcome::kFinalized;
+  cache.store(key, entry);
+
+  std::uint32_t seen_dataset_id = 0;
+  auto by_id = [&](const CachedSession& e) {
+    seen_dataset_id = e.dataset_id;
+    return e.dataset_id == 77;
+  };
+  auto hit = cache.lookup(key, by_id);
+  ASSERT_TRUE(hit.has_value());
+  EXPECT_EQ(seen_dataset_id, 77u);
+  EXPECT_EQ(hit->dataset_id, 77u);
+  EXPECT_EQ(hit->cache_identity, entry.cache_identity);
+  EXPECT_EQ(hit->tee_outcome, mcap_cloud::TeeOutcome::kFinalized);
+  EXPECT_EQ(hit->last_hit_case, mcap_cloud::MemoryHitCase::kNone);
+
+  // An id mismatch (recycled handle) is proven-gone: evicted + miss.
+  auto wrong_id = [](const CachedSession& e) { return e.dataset_id == 78; };
+  EXPECT_FALSE(cache.lookup(key, wrong_id).has_value());
+  EXPECT_EQ(cache.size(), 0u);
+}
+
+// The memory-hit disposition (spec §6.1 rules) is recorded ON the entry so
+// the provider/promotion flow can query which case last occurred.
+TEST(McapCloudSessionCacheTest, RecordHitCaseUpdatesEntry) {
+  SessionCache cache;
+  const SessionKey key = computeSessionKey(kUri, {"file_1"}, {"/a"}, {0, 0}, true);
+  cache.store(key, makeEntry("e", 1, 1));
+
+  cache.recordHitCase(key, mcap_cloud::MemoryHitCase::kServedValidDisk);
+  auto hit = cache.lookup(key, alwaysPresent());
+  ASSERT_TRUE(hit.has_value());
+  EXPECT_EQ(hit->last_hit_case, mcap_cloud::MemoryHitCase::kServedValidDisk);
+
+  // Unknown key: no-op, no crash.
+  const SessionKey other = computeSessionKey(kUri, {"file_2"}, {"/a"}, {0, 0}, true);
+  cache.recordHitCase(other, mcap_cloud::MemoryHitCase::kRefetchedDiskMiss);
+  EXPECT_EQ(cache.size(), 1u);
 }

@@ -6,7 +6,9 @@
 #include <pj_base/sdk/platform.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <fstream>
+#include <limits>
 #include <system_error>
 #include <vector>
 
@@ -24,6 +26,11 @@ namespace mcap_cloud {
 namespace fs = std::filesystem;
 
 namespace {
+
+// F4 probe counter: incremented immediately before the SDK's ReadRecord on
+// the embedded-descriptor path (see readRecordCallsForTest).
+std::atomic<std::uint64_t> g_read_record_calls{0};
+
 
 constexpr std::string_view kIdentityPrefix = "mcap-cloud:v1:sha256/128:";
 constexpr std::size_t kDigestHexChars = 32;  // 128 bits, lowercase hex
@@ -100,9 +107,71 @@ void touchStamp(const fs::path& file) {
 // the identity is DEFINED as sha256/128 over those exact bytes (see
 // descriptorIdentity), so byte-hashing detects wrong-file substitution and
 // name collisions from the file alone, without a JSON parse here.
+// Fixed query budgets (adversarial F13): lookup() runs on the GUI thread
+// under the SDK's strictly-bounded query contract, but readSummary() parses
+// and allocates according to the file's OWN summary section — a forged
+// <digest>.mcap could carry a multi-gigabyte span. Read the fixed-size
+// footer FIRST with raw I/O and refuse anything whose summary span (or
+// embedded-descriptor record) exceeds the budget BEFORE the MCAP parser
+// ever runs. Legit session summaries are far below these bounds
+// (schemas + channels + chunk indexes; ~hundreds of KiB even for huge
+// sessions); descriptors are <=64 KiB by the parse limit.
+constexpr std::uintmax_t kQuerySummaryBudget = 16ull * 1024 * 1024;
+constexpr std::uint64_t kQueryMetadataBudget = 1ull * 1024 * 1024;
+// MCAP file tail: Footer record (1-byte op 0x02 + 8-byte length + 20-byte
+// payload {summary_start, summary_offset_start, summary_crc}) + 8-byte magic.
+constexpr std::uintmax_t kMcapTailBytes = 29 + 8;
+
+bool summarySpanWithinBudget(const fs::path& path, std::string* error) {
+  std::error_code ec;
+  const std::uintmax_t size = fs::file_size(path, ec);
+  if (ec || size < kMcapTailBytes + 8) {
+    *error = "not a readable MCAP: too small";
+    return false;
+  }
+  std::ifstream in(path, std::ios::binary);
+  if (!in) {
+    *error = "not a readable MCAP: open failed";
+    return false;
+  }
+  unsigned char tail[kMcapTailBytes];
+  in.seekg(static_cast<std::streamoff>(size - kMcapTailBytes));
+  in.read(reinterpret_cast<char*>(tail), sizeof(tail));
+  if (!in) {
+    *error = "not a readable MCAP: footer unreadable";
+    return false;
+  }
+  if (tail[0] != 0x02) {
+    *error = "not a readable MCAP: footer opcode mismatch";
+    return false;
+  }
+  std::uint64_t summary_start = 0;
+  for (int i = 0; i < 8; ++i) {
+    summary_start |= static_cast<std::uint64_t>(tail[9 + i]) << (8 * i);
+  }
+  if (summary_start == 0) {
+    return true;  // no summary — the reader will reject it as unreadable
+  }
+  const std::uintmax_t footer_offset = size - kMcapTailBytes;
+  if (summary_start > footer_offset) {
+    *error = "forged summary offset (past the footer)";
+    return false;
+  }
+  const std::uintmax_t span = footer_offset - summary_start;
+  if (span > kQuerySummaryBudget) {
+    *error = "summary section exceeds the bounded query budget (" +
+             std::to_string(span) + " bytes)";
+    return false;
+  }
+  return true;
+}
+
 bool validateMcap(const fs::path& path, const std::string& hex,
                   const std::optional<SessionFileCache::ExpectedContent>& expected,
                   std::string* error) {
+  if (!summarySpanWithinBudget(path, error)) {
+    return false;  // F13: refuse before the parser allocates anything
+  }
   mcap::McapReader reader;
   mcap::Status status = reader.open(path.string());
   if (!status.ok()) {
@@ -139,7 +208,46 @@ bool validateMcap(const fs::path& path, const std::string& hex,
     *error = std::string("missing embedded source descriptor (") + kProvenanceName + ")";
     return false;
   }
+  if (index->second.length > kQueryMetadataBudget) {
+    reader.close();
+    *error = "embedded descriptor record exceeds the bounded query budget";
+    return false;  // F13: descriptors are <=64 KiB; a forged record is not read
+  }
+  // Re-verify R3: capping MetadataIndex.length alone is BYPASSABLE —
+  // ReadRecord() re-reads an 8-byte record size FROM THE FILE at the
+  // (attacker-controlled) offset and resizes its buffer to that DECLARED
+  // value (mcap reader.inl), so a small index length can point at a sparse
+  // record declaring a multi-gigabyte payload. Raw-preflight the 9-byte
+  // record header (opcode + declared size) and validate BOTH against the
+  // index claim and the query budget before the parser allocates anything.
+  {
+    std::error_code size_ec;
+    const std::uintmax_t file_bytes = fs::file_size(path, size_ec);
+    unsigned char header[9] = {0};
+    std::ifstream raw(path, std::ios::binary);
+    bool header_ok = !size_ec && raw.is_open() &&
+                     index->second.offset + sizeof(header) <= file_bytes;
+    if (header_ok) {
+      raw.seekg(static_cast<std::streamoff>(index->second.offset));
+      raw.read(reinterpret_cast<char*>(header), sizeof(header));
+      header_ok = static_cast<bool>(raw);
+    }
+    std::uint64_t declared = 0;
+    for (int i = 0; i < 8; ++i) {
+      declared |= static_cast<std::uint64_t>(header[1 + i]) << (8 * i);
+    }
+    // Order matters: the budget check runs before any +9 arithmetic so a
+    // huge declared size can never overflow a later comparison.
+    if (!header_ok || header[0] != static_cast<unsigned char>(mcap::OpCode::Metadata) ||
+        declared > kQueryMetadataBudget || declared + 9 > index->second.length ||
+        index->second.offset + 9 + declared > file_bytes) {
+      reader.close();
+      *error = "embedded descriptor record failed the bounded raw preflight";
+      return false;
+    }
+  }
   mcap::Record record;
+  g_read_record_calls.fetch_add(1, std::memory_order_relaxed);  // F4 probe (test-only)
   status = mcap::McapReader::ReadRecord(*reader.dataSource(), index->second.offset, &record);
   if (!status.ok()) {
     reader.close();
@@ -266,7 +374,10 @@ bool SessionFileCache::lookup(std::string_view identity, fs::path* out) {
 }
 
 std::optional<SessionFileCache::MaterializeLock> SessionFileCache::tryLockForMaterialize(
-    std::string_view identity, std::string* error) {
+    std::string_view identity, std::string* error, bool* contended) {
+  if (contended != nullptr) {
+    *contended = false;
+  }
   const auto hex = identityHex(identity);
   if (!hex.has_value()) {
     if (error) {
@@ -282,7 +393,7 @@ std::optional<SessionFileCache::MaterializeLock> SessionFileCache::tryLockForMat
   }
   ensureDir0700(root_);
   std::string lock_error;
-  auto lock = FileLock::tryExclusive(root_ / (*hex + ".mcap.lock"), &lock_error);
+  auto lock = FileLock::tryExclusive(root_ / (*hex + ".mcap.lock"), &lock_error, contended);
   if (!lock.has_value()) {
     if (error) {
       *error = "cache materialize lock unavailable: " + lock_error;
@@ -298,8 +409,52 @@ std::optional<SessionFileCache::MaterializeLock> SessionFileCache::tryLockForMat
   return MaterializeLock(std::move(*lock), *hex, std::move(partial));
 }
 
+std::uint64_t SessionFileCache::readRecordCallsForTest() {
+  return g_read_record_calls.load(std::memory_order_relaxed);
+}
+
+void SessionFileCache::resetReadRecordCallsForTest() {
+  g_read_record_calls.store(0, std::memory_order_relaxed);
+}
+
+std::optional<FileLock> SessionFileCache::toSharedLease(MaterializeLock&& lock,
+                                                        std::string* error) {
+  FileLock held = std::move(lock.lock_);
+  if (!held.downgradeToShared(error)) {
+    return std::nullopt;  // released; the caller proceeds lease-less
+  }
+  return held;
+}
+
 fs::path SessionFileCache::partialPathFor(const MaterializeLock& lock) const {
   return lock.partial_;
+}
+
+std::optional<FileLock> SessionFileCache::acquireReadLease(std::string_view identity,
+                                                           std::string* error) {
+  const auto hex = identityHex(identity);
+  if (!hex.has_value()) {
+    if (error) {
+      *error = "invalid descriptor identity (want mcap-cloud:v1:sha256/128:<32 lowercase hex>)";
+    }
+    return std::nullopt;
+  }
+  if (root_.empty()) {
+    if (error) {
+      *error = "cache root is not configured";
+    }
+    return std::nullopt;
+  }
+  ensureDir0700(root_);
+  std::string lock_error;
+  auto lease = FileLock::tryShared(root_ / (*hex + ".mcap.lock"), &lock_error);
+  if (!lease.has_value()) {
+    if (error) {
+      *error = "cache read lease unavailable: " + lock_error;
+    }
+    return std::nullopt;
+  }
+  return lease;
 }
 
 bool SessionFileCache::finalize(const MaterializeLock& lock,
