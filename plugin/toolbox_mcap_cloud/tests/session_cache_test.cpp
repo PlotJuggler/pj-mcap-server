@@ -41,9 +41,11 @@ CachedSession makeEntry(const std::string& display_name, std::uint64_t a, std::u
   return e;
 }
 
-// "Everything present" predicate (used for plain HIT tests).
+// "Everything present" predicate (used for plain HIT tests). D7: the
+// predicate receives the whole CachedSession so existence can key on the
+// stable dataset_id, not the mutable display name.
 auto alwaysPresent() {
-  return [](const std::string&) { return true; };
+  return [](const CachedSession&) { return true; };
 }
 
 }  // namespace
@@ -139,7 +141,7 @@ TEST(McapCloudSessionCacheTest, DatasetGoneEvictsAndMisses) {
   cache.store(key, makeEntry("cleared_seq", 9, 9));
   EXPECT_EQ(cache.size(), 1u);
 
-  auto gone = [](const std::string&) { return false; };  // user cleared the dataset
+  auto gone = [](const CachedSession&) { return false; };  // user cleared the dataset
   EXPECT_FALSE(cache.lookup(key, gone).has_value());
   EXPECT_EQ(cache.size(), 0u) << "a proven-gone dataset must be evicted";
 }
@@ -189,4 +191,53 @@ TEST(McapCloudSessionCacheTest, ExplicitEvict) {
   cache.evict(key);
   EXPECT_EQ(cache.size(), 0u);
   EXPECT_FALSE(cache.lookup(key, alwaysPresent()).has_value());
+}
+
+// D7: the existence predicate receives the FULL stored entry — dataset_id
+// (the stable host handle id) is the primary existence key; display names
+// collide and mutate. The new cache-file/promotion fields round-trip too.
+TEST(McapCloudSessionCacheTest, PredicateReceivesStoredEntryWithDatasetId) {
+  SessionCache cache;
+  const SessionKey key = computeSessionKey(kUri, {"file_1"}, {"/a"}, {0, 0});
+  CachedSession entry = makeEntry("renamable display", 4, 2);
+  entry.dataset_id = 77;
+  entry.cache_identity = "mcap-cloud:v1:sha256/128:" + std::string(32, 'a');
+  entry.tee_outcome = mcap_cloud::TeeOutcome::kFinalized;
+  cache.store(key, entry);
+
+  std::uint32_t seen_dataset_id = 0;
+  auto by_id = [&](const CachedSession& e) {
+    seen_dataset_id = e.dataset_id;
+    return e.dataset_id == 77;
+  };
+  auto hit = cache.lookup(key, by_id);
+  ASSERT_TRUE(hit.has_value());
+  EXPECT_EQ(seen_dataset_id, 77u);
+  EXPECT_EQ(hit->dataset_id, 77u);
+  EXPECT_EQ(hit->cache_identity, entry.cache_identity);
+  EXPECT_EQ(hit->tee_outcome, mcap_cloud::TeeOutcome::kFinalized);
+  EXPECT_EQ(hit->last_hit_case, mcap_cloud::MemoryHitCase::kNone);
+
+  // An id mismatch (recycled handle) is proven-gone: evicted + miss.
+  auto wrong_id = [](const CachedSession& e) { return e.dataset_id == 78; };
+  EXPECT_FALSE(cache.lookup(key, wrong_id).has_value());
+  EXPECT_EQ(cache.size(), 0u);
+}
+
+// The memory-hit disposition (spec §6.1 rules) is recorded ON the entry so
+// the provider/promotion flow can query which case last occurred.
+TEST(McapCloudSessionCacheTest, RecordHitCaseUpdatesEntry) {
+  SessionCache cache;
+  const SessionKey key = computeSessionKey(kUri, {"file_1"}, {"/a"}, {0, 0});
+  cache.store(key, makeEntry("e", 1, 1));
+
+  cache.recordHitCase(key, mcap_cloud::MemoryHitCase::kServedValidDisk);
+  auto hit = cache.lookup(key, alwaysPresent());
+  ASSERT_TRUE(hit.has_value());
+  EXPECT_EQ(hit->last_hit_case, mcap_cloud::MemoryHitCase::kServedValidDisk);
+
+  // Unknown key: no-op, no crash.
+  const SessionKey other = computeSessionKey(kUri, {"file_2"}, {"/a"}, {0, 0});
+  cache.recordHitCase(other, mcap_cloud::MemoryHitCase::kRefetchedDiskMiss);
+  EXPECT_EQ(cache.size(), 1u);
 }

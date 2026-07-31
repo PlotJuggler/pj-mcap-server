@@ -123,13 +123,13 @@ void testSessionCache() {
   cache.store(k1, v1);
   check(cache.size() == 1, "session_cache size-after-store");
 
-  // Present predicate -> HIT.
-  auto present = [](const std::string&) { return true; };
+  // Present predicate -> HIT (D7: the predicate receives the whole entry).
+  auto present = [](const CachedSession&) { return true; };
   auto hit = cache.lookup(k1, present);
   check(hit.has_value() && hit->total_messages == 42, "session_cache hit");
 
   // Gone predicate -> MISS + eviction.
-  auto gone = [](const std::string&) { return false; };
+  auto gone = [](const CachedSession&) { return false; };
   auto miss = cache.lookup(k1, gone);
   check(!miss.has_value(), "session_cache gone-miss");
   check(cache.size() == 0, "session_cache evicts-gone");

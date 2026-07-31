@@ -186,7 +186,7 @@ TEST(McapCloudSessionResumeLive, RepeatFetchIsCacheHitZeroTransport) {
   worker.setRuntimeHostProvider([&fake]() { return PJ::ToolboxRuntimeHostView{fake.toolboxRuntime()}; });
   // The FakeToolboxHost has no catalogSnapshot; inject an existence predicate so
   // the cache can confirm the dataset is still present (it is — we keep host).
-  worker.setDatasetExistsForTest([](const std::string&) { return true; });
+  worker.setDatasetExistsForTest([](const mcap_cloud::CachedSession&) { return true; });
 
   bool connected = false;
   std::string connect_err;

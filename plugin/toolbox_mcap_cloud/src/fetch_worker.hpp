@@ -347,10 +347,12 @@ class FetchWorker {
   [[nodiscard]] const SessionCache& sessionCacheForTest() const { return session_cache_; }
 
  private:
-  // Default existence predicate: true iff `display_name` appears in the toolbox
-  // host's catalog snapshot dataSources(). Returns false when no host is bound or
-  // the host lacks acquire_catalog_snapshot (presence-unknown -> MISS).
-  [[nodiscard]] bool datasetExistsInHost(const std::string& display_name) const;
+  // Default existence predicate (D7): keyed on the entry's stable dataset_id
+  // when recorded (recorded display name as the id-recycle tiebreak), with a
+  // name-only fallback for legacy id-less entries. Returns false when no host
+  // is bound or the host lacks acquire_catalog_snapshot (presence-unknown ->
+  // MISS).
+  [[nodiscard]] bool datasetExistsInHost(const CachedSession& entry) const;
 };
 
 }  // namespace mcap_cloud

@@ -91,6 +91,14 @@ void writeOrigins(const fs::path& file, const nlohmann::json& origins) {
 
 }  // namespace
 
+std::optional<std::string> trustedOriginKey(std::string_view uri) {
+  const auto origin = parseWsOrigin(uri);
+  if (!origin.has_value()) {
+    return std::nullopt;
+  }
+  return serializeOrigin(*origin);
+}
+
 TrustedOrigins::TrustedOrigins(fs::path config_root) : path_(std::move(config_root)) {
   path_ /= "trusted_origins.json";
 }
@@ -113,6 +121,18 @@ void TrustedOrigins::recordSuccessfulHello(std::string_view uri) {
   }
   origins.push_back(entry);
   writeOrigins(path_, origins);
+}
+
+std::vector<std::string> TrustedOrigins::allOrigins() const {
+  std::vector<std::string> out;
+  const nlohmann::json origins = loadOrigins(path_);
+  out.reserve(origins.size());
+  for (const auto& existing : origins) {
+    if (existing.is_string()) {
+      out.push_back(existing.get<std::string>());
+    }
+  }
+  return out;
 }
 
 bool TrustedOrigins::isTrusted(std::string_view uri) const {

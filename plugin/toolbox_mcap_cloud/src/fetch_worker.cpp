@@ -35,7 +35,7 @@ namespace mcap_cloud {
 FetchWorker::FetchWorker() = default;
 FetchWorker::~FetchWorker() = default;
 
-bool FetchWorker::datasetExistsInHost(const std::string& display_name) const {
+bool FetchWorker::datasetExistsInHost(const CachedSession& entry) const {
   // Presence-unknown -> false (-> cache MISS), never a false HIT. No host
   // provider bound, or the host lacks acquire_catalog_snapshot, both yield false.
   if (!host_provider_) {
@@ -48,8 +48,16 @@ bool FetchWorker::datasetExistsInHost(const std::string& display_name) const {
   }
   for (const auto& ds : snap->dataSources()) {
     const std::string_view name(ds.name.data, ds.name.size);
-    if (name == display_name) {
-      return true;
+    if (entry.dataset_id != 0) {
+      // D7: the STABLE dataset id is the existence key (display names collide
+      // and mutate); the recorded name doubles as a recycle tiebreak — an id
+      // match wearing a different name means the host reused the id for some
+      // OTHER dataset, which is proven-gone for this entry.
+      if (ds.handle.id == entry.dataset_id) {
+        return name == entry.display_name;
+      }
+    } else if (name == entry.display_name) {
+      return true;  // legacy entry (no id recorded): name-only fallback
     }
   }
   return false;
@@ -506,7 +514,7 @@ void FetchWorker::pullTopicsAsync(std::vector<std::string> sequence_names, std::
     const auto& exists = dataset_exists_
                              ? dataset_exists_
                              : SessionCache::ExistencePredicate(
-                                   [this](const std::string& name) { return datasetExistsInHost(name); });
+                                   [this](const CachedSession& entry) { return datasetExistsInHost(entry); });
     if (auto cached = session_cache_.lookup(key, exists)) {
       // HIT: re-emit the per-topic pullFinished ledger from cached counts with
       // NO BackendConnection construction. Each requested topic reports ok with

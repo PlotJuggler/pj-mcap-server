@@ -16,10 +16,19 @@
 #pragma once
 
 #include <filesystem>
+#include <optional>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace mcap_cloud {
+
+// The canonical serialized trust key for `uri` — "scheme://host:port" with the
+// EFFECTIVE port always explicit (the exact string the ledger stores, so
+// default-port spellings collide on one entry). nullopt for shapes
+// parseWsOrigin rejects. Shared with ImportRuntime's in-memory trust set so
+// the two can never drift on normalization.
+[[nodiscard]] std::optional<std::string> trustedOriginKey(std::string_view uri);
 
 // Ledger of origins that completed a successful interactive Hello on this
 // machine (file: <config_root>/trusted_origins.json, 0600, atomic replace).
@@ -32,8 +41,13 @@ class TrustedOrigins {
 
   // Record the origin of `uri` (parseWsOrigin; no-op on unparsable).
   void recordSuccessfulHello(std::string_view uri);
-  // True iff `uri`'s origin was ever recorded.
+  // True iff `uri`'s origin was ever recorded. NOTE: re-reads the ledger file
+  // per call — bounded-query consumers (§6.3) go through ImportRuntime's
+  // in-memory trust set instead of calling this on a hot path.
   [[nodiscard]] bool isTrusted(std::string_view uri) const;
+  // Every recorded serialized origin (trustedOriginKey shape). The
+  // ImportRuntime construction-time preload for its in-memory trust set.
+  [[nodiscard]] std::vector<std::string> allOrigins() const;
 
  private:
   std::filesystem::path path_;

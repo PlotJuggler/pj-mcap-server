@@ -120,6 +120,7 @@ set(MCAP_CLOUD_SOURCES
   src/session_mcap_writer.cpp
   src/session_file_cache.cpp
   src/source_descriptor.cpp
+  src/import_runtime.cpp
   src/mcap_save_path.cpp
   src/mcap_implementation.cpp
   src/settings_store.cpp
@@ -614,6 +615,38 @@ if(BUILD_TESTING)
     mcap::mcap zstd::libzstd_static LZ4::lz4_static GTest::gtest_main
   )
   add_test(NAME McapCloudSessionFileCacheTest COMMAND toolbox_mcap_cloud_session_file_cache_test)
+
+  # ImportRuntime + CacheTee (stage-4 PR-1, HERMETIC): the per-toolbox-instance
+  # shared runtime (thread-safe SessionCache, in-memory trust set preloaded
+  # from the TrustedOrigins ledger, keyed active-materialization registry) and
+  # the single-encoder cache tee (registry + file lock + exclusive 0600 sink +
+  # embedded provenance + bounded writer queue + validated finalize/abort).
+  # Injected temp roots only; uses the test-only reader+writer MCAP TU.
+  add_executable(toolbox_mcap_cloud_import_runtime_test
+    tests/import_runtime_test.cpp
+    src/import_runtime.cpp
+    src/session_file_cache.cpp
+    src/session_mcap_writer.cpp
+    src/source_descriptor.cpp
+    src/trusted_origins.cpp
+    src/origin_match.cpp
+    src/credential_store.cpp
+    src/server_history.cpp
+    src/core/file_lock.cpp
+    src/core/sha256.cpp
+    tests/mcap_roundtrip_implementation.cpp
+  )
+  target_compile_features(toolbox_mcap_cloud_import_runtime_test PRIVATE cxx_std_20)
+  target_include_directories(toolbox_mcap_cloud_import_runtime_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/core
+  )
+  target_link_libraries(toolbox_mcap_cloud_import_runtime_test PRIVATE
+    plotjuggler_sdk::plugin_sdk nlohmann_json::nlohmann_json
+    mcap::mcap zstd::libzstd_static LZ4::lz4_static GTest::gtest_main
+  )
+  add_test(NAME McapCloudImportRuntimeTest COMMAND toolbox_mcap_cloud_import_runtime_test)
+  set_tests_properties(McapCloudImportRuntimeTest PROPERTIES TIMEOUT 60)
 
   # D6 CredentialStore seam + file-backed fallback (HERMETIC): per-server token
   # round-trip, key normalization/collision, isolation, overwrite, erase,
