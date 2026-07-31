@@ -11,6 +11,17 @@
 // reason.
 #pragma once
 
+// Portable raw-socket includes for SilentTcpServer (the windows-2022 release
+// leg builds + runs the hermetic ctest — see release.yml).
+#ifdef _WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#else
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#endif
+
 #include <atomic>
 #include <cstdint>
 #include <filesystem>
@@ -20,6 +31,7 @@
 #include <string>
 #include <system_error>
 
+#include <ixwebsocket/IXNetSystem.h>
 #include <ixwebsocket/IXWebSocketServer.h>
 
 #include "find_free_port.hpp"
@@ -196,5 +208,89 @@ inline bool cacheRootHasPartial(const std::filesystem::path& root) {
   }
   return false;
 }
+
+// A TCP listener that accepts the connection into its backlog but never
+// completes the WebSocket handshake — the client's socket-open wait then
+// blocks until its timeout (10 s) unless a cancel wakes it. (Hoisted from
+// fetch_worker_direct_pull_test.cpp for the provider's destroy-during-connect
+// pin; made winsock-portable because the windows-2022 release leg runs the
+// hermetic ctest.) ix::initNetSystem() covers WSAStartup on Windows and is a
+// no-op elsewhere.
+class SilentTcpServer {
+ public:
+#ifdef _WIN32
+  using SocketHandle = SOCKET;
+  static constexpr SocketHandle kInvalidSocket = INVALID_SOCKET;
+#else
+  using SocketHandle = int;
+  static constexpr SocketHandle kInvalidSocket = -1;
+#endif
+
+  SilentTcpServer() {
+    ix::initNetSystem();
+    fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (fd_ == kInvalidSocket) {
+      return;
+    }
+    int one = 1;
+    ::setsockopt(fd_, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&one), sizeof(one));
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = 0;  // ephemeral
+    if (::bind(fd_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+      return;
+    }
+    socklen_t len = sizeof(addr);
+    if (::getsockname(fd_, reinterpret_cast<sockaddr*>(&addr), &len) != 0) {
+      return;
+    }
+    port_ = ntohs(addr.sin_port);
+    ok_ = ::listen(fd_, 8) == 0;  // never accept(): handshake bytes go unanswered
+  }
+  ~SilentTcpServer() {
+    if (fd_ != kInvalidSocket) {
+#ifdef _WIN32
+      ::closesocket(fd_);
+#else
+      ::close(fd_);
+#endif
+    }
+  }
+  SilentTcpServer(const SilentTcpServer&) = delete;
+  SilentTcpServer& operator=(const SilentTcpServer&) = delete;
+  [[nodiscard]] bool ok() const { return ok_; }
+  [[nodiscard]] std::string uri() const { return "ws://127.0.0.1:" + std::to_string(port_); }
+
+ private:
+  SocketHandle fd_ = kInvalidSocket;
+  int port_ = 0;
+  bool ok_ = false;
+};
+
+// A WS server that completes the socket open but never answers the Hello —
+// pins the (wake_on_cancel) Hello wait staying promptly cancellable.
+class SilentHelloServer {
+ public:
+  SilentHelloServer() : port_(findFreePort()), server_(port_, "127.0.0.1") {
+    server_.setOnClientMessageCallback(
+        [](std::shared_ptr<ix::ConnectionState>, ix::WebSocket&, const ix::WebSocketMessagePtr&) {});
+    auto res = server_.listen();
+    ok_ = res.first;
+    if (ok_) {
+      server_.start();
+    }
+  }
+  ~SilentHelloServer() { server_.stop(); }
+  SilentHelloServer(const SilentHelloServer&) = delete;
+  SilentHelloServer& operator=(const SilentHelloServer&) = delete;
+  [[nodiscard]] bool ok() const { return ok_; }
+  [[nodiscard]] std::string uri() const { return "ws://127.0.0.1:" + std::to_string(port_); }
+
+ private:
+  int port_;
+  ix::WebSocketServer server_;
+  bool ok_ = false;
+};
 
 }  // namespace mcap_cloud_test

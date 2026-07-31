@@ -548,6 +548,115 @@ TEST(McapCloudProviderJob, ConcurrentMaterializeRaceFailsAsRetryClassification) 
   EXPECT_EQ(recorder.datasetCount(), 0u) << "zero on_dataset in the race end";
 }
 
+// ---------------------------------------------------------------------------
+// ABI adversarial set (PR-3 commit 4)
+// ---------------------------------------------------------------------------
+
+TEST(McapCloudProviderAbi, ShortQueryResultStructSizeLeavesUncoveredBytesUntouched) {
+  ProviderHarness h("abi-shortquery");
+  const std::string json = queryJson("ws://127.0.0.1:9");
+
+  // Full allocation filled with a canary; struct_size covers only through
+  // is_materialized. The provider must write trust+is_materialized and leave
+  // every byte beyond the declared size EXACTLY as it found it (growth
+  // contract: read/write only fields wholly covered by struct_size).
+  PJ_descriptor_query_result_v1_t out;
+  std::memset(&out, 0xAB, sizeof(out));
+  out.struct_size = offsetof(PJ_descriptor_query_result_v1_t, source_identity);
+  out.reserved0 = 0;
+  PJ_error_t err{};
+  ASSERT_TRUE(h.provider.queryDescriptor(PJ_string_view_t{json.data(), json.size()}, &out, &err));
+  EXPECT_EQ(out.trust, PJ_DESCRIPTOR_TRUST_NEEDS_CONFIRMATION);
+  EXPECT_EQ(out.is_materialized, 0u);
+
+  const auto* bytes = reinterpret_cast<const unsigned char*>(&out);
+  for (std::size_t i = out.struct_size; i < sizeof(out); ++i) {
+    ASSERT_EQ(bytes[i], 0xAB) << "byte " << i << " beyond struct_size was written";
+  }
+}
+
+TEST(McapCloudProviderAbi, QueryStringLifetimeCopiesSurviveTheNextQuery) {
+  ProviderHarness h("abi-strlife");
+  const std::string uri_a = "ws://127.0.0.1:9";
+  const std::string uri_b = "ws://127.0.0.1:10";
+
+  PJ_descriptor_query_result_v1_t out{};
+  ASSERT_TRUE(runQuery(h.provider, queryJson(uri_a), &out));
+  // The ABI-correct consumption pattern: COPY the views immediately (they
+  // are only valid until the NEXT query on this instance). ASAN-friendly:
+  // the stale views are never dereferenced after the second query.
+  const std::string identity_a(out.source_identity.data, out.source_identity.size);
+  const std::string path_a(out.local_path_utf8.data, out.local_path_utf8.size);
+
+  ASSERT_TRUE(runQuery(h.provider, queryJson(uri_b), &out));
+  const std::string identity_b(out.source_identity.data, out.source_identity.size);
+
+  EXPECT_EQ(identity_a, identityFor(uri_a)) << "the copies keep the FIRST query's values";
+  EXPECT_EQ(path_a, h.rt.fileCache().pathFor(identityFor(uri_a)).string());
+  EXPECT_EQ(identity_b, identityFor(uri_b)) << "the second query serves its own values";
+  EXPECT_NE(identity_a, identity_b);
+}
+
+TEST(McapCloudProviderAbi, CeilingVsCancelRaceProducesOneCancelledTerminal) {
+  FakeStreamingServer server(FakeStreamingServer::Mode::kComplete);
+  ASSERT_TRUE(server.ok());
+  ProviderHarness h("abi-race");
+
+  // Deterministic interleave via the pre-terminal seam: the pull returns
+  // with the byte ceiling latched, THEN the job is cancelled before the
+  // terminal mapping runs — both flags set. The documented precedence:
+  // CANCEL WINS (an explicit caller cancel outranks the resource
+  // classification; the partial is deleted either way) — and there is
+  // EXACTLY ONE terminal.
+  JobRecorder recorder;
+  ScopedJob job;
+  std::atomic<bool> hook_ran{false};
+  h.provider.setPreTerminalHookForTest([&]() {
+    if (job.job.vtable != nullptr) {
+      job.job.vtable->cancel(job.job.ctx);
+    }
+    hook_ran.store(true);
+  });
+  ASSERT_TRUE(h.start(queryJson(server.uri()), recorder, job, /*max_transfer_bytes=*/1));
+  ASSERT_TRUE(recorder.waitTerminal(std::chrono::seconds(20)));
+  job.job.vtable->join(job.job.ctx);
+
+  EXPECT_TRUE(hook_ran.load());
+  ASSERT_EQ(recorder.terminalCount(), 1u) << "both flags set must still yield ONE terminal";
+  EXPECT_EQ(recorder.terminal(0).first, PJ_DESCRIPTOR_IMPORT_CANCELLED)
+      << "documented precedence: cancel wins over the byte ceiling — got: "
+      << recorder.terminal(0).second;
+}
+
+TEST(McapCloudProviderAbi, DestroyDuringConnectUnblocksFast) {
+  mcap_cloud_test::SilentTcpServer server;
+  ASSERT_TRUE(server.ok());
+  ProviderHarness h("abi-destroyconnect");
+
+  JobRecorder recorder;
+  PJ_joinable_job_t job{};
+  const std::string json = queryJson(server.uri());
+  PJ_descriptor_import_start_request_v1_t request{};
+  request.struct_size = sizeof(request);
+  request.descriptor_json = PJ_string_view_t{json.data(), json.size()};
+  const PJ_descriptor_import_callbacks_v1_t cbs = recorder.callbacks();
+  PJ_error_t err{};
+  ASSERT_TRUE(h.provider.startImport(&request, &cbs, &recorder, &job, &err));
+
+  // Let the job reach the (silent) WebSocket-open wait, then destroy: the
+  // commit-1 cancellable open wait must unblock it well under the 10 s
+  // handshake timeout.
+  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+  const auto destroy_at = std::chrono::steady_clock::now();
+  job.vtable->destroy(job.ctx);
+  const auto destroy_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - destroy_at);
+
+  EXPECT_LT(destroy_ms.count(), 2000) << "destroy must cancel-wake the connect wait promptly";
+  ASSERT_EQ(recorder.terminalCount(), 1u);
+  EXPECT_EQ(recorder.terminal(0).first, PJ_DESCRIPTOR_IMPORT_CANCELLED);
+}
+
 TEST(McapCloudProviderJob, DestroyImmediatelyAfterStartIsSafeAndTerminalsOnce) {
   FakeStreamingServer server(FakeStreamingServer::Mode::kStallAfterTwoBatches);
   ASSERT_TRUE(server.ok());

@@ -1034,6 +1034,42 @@ if(BUILD_TESTING)
            COMMAND toolbox_mcap_cloud_descriptor_import_provider_test)
   set_tests_properties(McapCloudDescriptorImportProviderTest PROPERTIES TIMEOUT 120)
 
+  # LIVE descriptor-import round trip (query -> import -> terminal ->
+  # materialized re-query) against a real server; self-skips without
+  # MCAP_CLOUD_LIVE_URL (the parser_ingest_live_test gating pattern). The
+  # smoke-integrated mcapdiff round trip is PR-4's.
+  add_executable(toolbox_mcap_cloud_descriptor_import_live_test
+    tests/descriptor_import_live_test.cpp
+    src/descriptor_import_provider.cpp
+    src/parser_ingest_driver.cpp
+    src/fetch_worker.cpp
+    src/backend_connection.cpp
+    src/wire_mapping.cpp
+    src/session_decode.cpp
+    src/session_mcap_writer.cpp
+    ${MCAP_CLOUD_IMPORT_SOURCES}
+    src/settings_store.cpp
+    src/credential_resolve.cpp
+    src/mcap_save_path.cpp
+    src/core/time_format.cpp
+    src/mcap_implementation.cpp
+    ${MCAP_CLOUD_PROTO_SRCS}
+  )
+  target_compile_features(toolbox_mcap_cloud_descriptor_import_live_test PRIVATE cxx_std_20)
+  target_include_directories(toolbox_mcap_cloud_descriptor_import_live_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/core
+    ${MCAP_CLOUD_PROTO_OUT_DIR}
+  )
+  target_link_libraries(toolbox_mcap_cloud_descriptor_import_live_test PRIVATE
+    plotjuggler_sdk::plugin_sdk
+    protobuf::libprotobuf ixwebsocket::ixwebsocket nlohmann_json::nlohmann_json
+    zstd::libzstd_static LZ4::lz4_static mcap::mcap GTest::gtest_main
+  )
+  add_test(NAME McapCloudDescriptorImportLiveTest
+           COMMAND toolbox_mcap_cloud_descriptor_import_live_test)
+  set_tests_properties(McapCloudDescriptorImportLiveTest PROPERTIES TIMEOUT 180)
+
   # Headless one-shot init matrix (stage-4 PR-2, HERMETIC): drives the REAL
   # McapCloudToolbox (+ its embedded dialog) through a fake service registry
   # whose settings store points at an in-process fake WS server that counts

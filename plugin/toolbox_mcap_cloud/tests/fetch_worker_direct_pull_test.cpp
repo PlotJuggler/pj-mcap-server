@@ -22,10 +22,6 @@
 //     cancel) — and the cache partial never survives.
 #include <gtest/gtest.h>
 
-#include <netinet/in.h>
-#include <sys/socket.h>
-#include <unistd.h>
-
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -62,68 +58,10 @@ struct TempRoot : mcap_cloud_test::ScopedTempDir {
   explicit TempRoot(const std::string& name) : ScopedTempDir("mcap-cloud-direct-pull-" + name) {}
 };
 
-// A TCP listener that accepts the connection into its backlog but never
-// completes the WebSocket handshake — the client's socket-open wait then
-// blocks until its timeout (10 s) unless a cancel wakes it.
-class SilentTcpServer {
- public:
-  SilentTcpServer() {
-    fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
-    if (fd_ < 0) {
-      return;
-    }
-    int one = 1;
-    ::setsockopt(fd_, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
-    sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    addr.sin_port = 0;  // ephemeral
-    if (::bind(fd_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
-      return;
-    }
-    socklen_t len = sizeof(addr);
-    if (::getsockname(fd_, reinterpret_cast<sockaddr*>(&addr), &len) != 0) {
-      return;
-    }
-    port_ = ntohs(addr.sin_port);
-    ok_ = ::listen(fd_, 8) == 0;  // never accept(): handshake bytes go unanswered
-  }
-  ~SilentTcpServer() {
-    if (fd_ >= 0) {
-      ::close(fd_);
-    }
-  }
-  [[nodiscard]] bool ok() const { return ok_; }
-  [[nodiscard]] std::string uri() const { return "ws://127.0.0.1:" + std::to_string(port_); }
-
- private:
-  int fd_ = -1;
-  int port_ = 0;
-  bool ok_ = false;
-};
-
-// A WS server that completes the socket open but never answers the Hello —
-// pins the (already wake_on_cancel) Hello wait staying promptly cancellable.
-class SilentHelloServer {
- public:
-  SilentHelloServer() : port_(findFreePort()), server_(port_, "127.0.0.1") {
-    server_.setOnClientMessageCallback(
-        [](std::shared_ptr<ix::ConnectionState>, ix::WebSocket&, const ix::WebSocketMessagePtr&) {});
-    auto res = server_.listen();
-    ok_ = res.first;
-    if (ok_) {
-      server_.start();
-    }
-  }
-  ~SilentHelloServer() { server_.stop(); }
-  [[nodiscard]] bool ok() const { return ok_; }
-  [[nodiscard]] std::string uri() const { return "ws://127.0.0.1:" + std::to_string(port_); }
-
- private:
-  int port_;
-  ix::WebSocketServer server_;
-  bool ok_ = false;
-};
+// SilentTcpServer / SilentHelloServer hoisted VERBATIM into
+// fake_streaming_server.hpp (shared with the provider ABI suite).
+using mcap_cloud_test::SilentHelloServer;
+using mcap_cloud_test::SilentTcpServer;
 
 // A fully-wired headless worker (NO connectAsync — the direct-pull contract).
 struct PullHarness {
