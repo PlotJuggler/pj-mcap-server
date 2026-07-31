@@ -53,11 +53,17 @@ struct SessionKey {
   std::vector<std::string> topics;           // ascending, deduped; empty == "all topics"
   std::int64_t start_ns{0};
   std::int64_t end_ns{0};
+  // Part of the LOGICAL selection (adversarial F1): include_latched changes
+  // which messages the server delivers, so two requests differing only in it
+  // are DIFFERENT sessions — aliasing them under one key let a false-latched
+  // dataset serve a true-latched request (and promote the wrong artifact
+  // over it).
+  bool include_latched{false};
   std::uint64_t hash{0};            // FNV-1a over the canonical encoding
 
   bool operator==(const SessionKey& o) const {
     return server_uri == o.server_uri && sequence_names == o.sequence_names && topics == o.topics &&
-           start_ns == o.start_ns && end_ns == o.end_ns;
+           start_ns == o.start_ns && end_ns == o.end_ns && include_latched == o.include_latched;
   }
   bool operator!=(const SessionKey& o) const { return !(*this == o); }
 };
@@ -96,7 +102,8 @@ inline void fnvStr(std::uint64_t& h, const std::string& s) {
 // "all". sequence_names are the stable s3 keys (SequenceInfo.name) — see the
 // header comment for why this is a name, not a file_id.
 inline SessionKey computeSessionKey(const std::string& server_uri, std::vector<std::string> sequence_names,
-                                    std::vector<std::string> topics, TimeRangeNs time_range) {
+                                    std::vector<std::string> topics, TimeRangeNs time_range,
+                                    bool include_latched) {
   std::sort(sequence_names.begin(), sequence_names.end());
   sequence_names.erase(std::unique(sequence_names.begin(), sequence_names.end()), sequence_names.end());
   std::sort(topics.begin(), topics.end());
@@ -114,6 +121,7 @@ inline SessionKey computeSessionKey(const std::string& server_uri, std::vector<s
   }
   detail::fnvI64(h, time_range.start_ns);
   detail::fnvI64(h, time_range.end_ns);
+  detail::fnvU64(h, include_latched ? 1u : 0u);
 
   SessionKey key;
   key.server_uri = server_uri;
@@ -121,6 +129,7 @@ inline SessionKey computeSessionKey(const std::string& server_uri, std::vector<s
   key.topics = std::move(topics);
   key.start_ns = time_range.start_ns;
   key.end_ns = time_range.end_ns;
+  key.include_latched = include_latched;
   key.hash = h;
   return key;
 }

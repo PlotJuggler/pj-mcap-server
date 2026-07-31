@@ -195,9 +195,16 @@ bool FetchWorker::serveFromMemoryCache(
   }
   std::filesystem::path disk_file;
   const bool disk_valid = (rt != nullptr) && rt->fileCache().lookup(tee_identity, &disk_file);
-  if (rt != nullptr && !disk_valid) {
-    // §6.1: the durable file is gone/invalid — the memory entry cannot
-    // stand in for it. Evict and refetch over the network.
+  // Belt-and-braces identity binding (adversarial F1, independent of the
+  // include_latched key fix): the entry must have been stored for EXACTLY the
+  // requested durable identity — a mismatched (or empty, tee-failed)
+  // cache_identity means the in-memory counts and the on-disk artifact
+  // describe different requests, so serving the memory entry (or later
+  // promoting the disk file over its dataset) would mix sessions.
+  const bool identity_ok = (rt == nullptr) || cached->cache_identity == tee_identity;
+  if (rt != nullptr && (!disk_valid || !identity_ok)) {
+    // §6.1: the durable file is gone/invalid (or provably not THIS request's)
+    // — the memory entry cannot stand in for it. Evict and refetch.
     session_cache.evict(session_key);
     *refetch_after_disk_miss = true;
     return false;
@@ -769,8 +776,8 @@ void FetchWorker::pullTopicsAsync(std::vector<std::string> sequence_names, std::
   // any export by COPY; memory hit + missing/invalid disk -> EVICT the memory
   // entry and fall through to a normal network refetch (never re-tee from
   // memory — the in-memory cache stores counts, not bytes).
-  const PJ::cloud::SessionKey session_key =
-      PJ::cloud::computeSessionKey(conn_uri_, sequence_names, topic_names, {start_ns, end_ns});
+  const PJ::cloud::SessionKey session_key = PJ::cloud::computeSessionKey(
+      conn_uri_, sequence_names, topic_names, {start_ns, end_ns}, kIncludeLatched);
   SessionCache& session_cache = (rt != nullptr) ? rt->sessionCache() : session_cache_;
   bool refetch_after_disk_miss = false;
   if (rt != nullptr || !save_paths.has_value()) {

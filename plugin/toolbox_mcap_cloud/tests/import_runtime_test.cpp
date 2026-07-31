@@ -160,7 +160,7 @@ TEST(McapCloudImportRuntime, SessionCacheConcurrencySmoke) {
     threads.emplace_back([&, t] {
       for (int i = 0; i < 500; ++i) {
         const PJ::cloud::SessionKey key = PJ::cloud::computeSessionKey(
-            "ws://h", {"file_" + std::to_string((t * 500 + i) % 16)}, {"/a"}, {0, 0});
+            "ws://h", {"file_" + std::to_string((t * 500 + i) % 16)}, {"/a"}, {0, 0}, true);
         mcap_cloud::CachedSession e;
         e.display_name = "d" + std::to_string(t);
         e.dataset_id = static_cast<std::uint32_t>(t + 1);

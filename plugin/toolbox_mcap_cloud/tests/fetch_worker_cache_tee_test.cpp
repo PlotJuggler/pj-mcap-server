@@ -305,7 +305,7 @@ TEST(McapCloudFetchWorkerCacheTee, CompleteFetchFinalizesCacheAndExportIsAByteCo
 
   // The shared in-memory cache holds the completed entry with tee state.
   const PJ::cloud::SessionKey key =
-      PJ::cloud::computeSessionKey(server.uri(), {"a.mcap"}, {"/one"}, {0, 0});
+      PJ::cloud::computeSessionKey(server.uri(), {"a.mcap"}, {"/one"}, {0, 0}, true);
   auto entry = rt.sessionCache().lookup(key, [](const mcap_cloud::CachedSession&) { return true; });
   ASSERT_TRUE(entry.has_value());
   EXPECT_EQ(entry->tee_outcome, mcap_cloud::TeeOutcome::kFinalized);
@@ -395,7 +395,7 @@ TEST(McapCloudFetchWorkerCacheTee, TeeFailureNeverAbortsTheFetch) {
   // The completed entry is still stored (rows live in the host datastore),
   // carrying the failed tee outcome for promotion suppression.
   const PJ::cloud::SessionKey key =
-      PJ::cloud::computeSessionKey(server.uri(), {"a.mcap"}, {"/one"}, {0, 0});
+      PJ::cloud::computeSessionKey(server.uri(), {"a.mcap"}, {"/one"}, {0, 0}, true);
   auto entry = rt.sessionCache().lookup(key, [](const mcap_cloud::CachedSession&) { return true; });
   ASSERT_TRUE(entry.has_value());
   EXPECT_EQ(entry->tee_outcome, mcap_cloud::TeeOutcome::kFailed);
@@ -429,7 +429,7 @@ TEST(McapCloudFetchWorkerCacheTee, MemoryHitWithMissingDiskFileEvictsAndRefetche
   ASSERT_TRUE(rt.fileCache().lookup(identity, &cache_file)) << "refetch re-materializes";
 
   const PJ::cloud::SessionKey key =
-      PJ::cloud::computeSessionKey(server.uri(), {"a.mcap"}, {"/one"}, {0, 0});
+      PJ::cloud::computeSessionKey(server.uri(), {"a.mcap"}, {"/one"}, {0, 0}, true);
   auto entry = rt.sessionCache().lookup(key, [](const mcap_cloud::CachedSession&) { return true; });
   ASSERT_TRUE(entry.has_value());
   EXPECT_EQ(entry->last_hit_case, mcap_cloud::MemoryHitCase::kRefetchedDiskMiss);
@@ -464,7 +464,7 @@ TEST(McapCloudFetchWorkerCacheTee, MemoryHitWithValidDiskServesFromMemoryAndCopi
   EXPECT_EQ(h.tee.outcome, mcap_cloud::TeeOutcome::kExistingValid);
 
   const PJ::cloud::SessionKey key =
-      PJ::cloud::computeSessionKey(server.uri(), {"a.mcap"}, {"/one"}, {0, 0});
+      PJ::cloud::computeSessionKey(server.uri(), {"a.mcap"}, {"/one"}, {0, 0}, true);
   auto entry = rt.sessionCache().lookup(key, [](const mcap_cloud::CachedSession&) { return true; });
   ASSERT_TRUE(entry.has_value());
   EXPECT_EQ(entry->last_hit_case, mcap_cloud::MemoryHitCase::kServedValidDisk);
@@ -538,4 +538,37 @@ TEST(McapCloudFetchWorkerCacheTee, NoDecoderSessionStillMaterializesTheCacheFile
   // COMPLETE-only memory store still refuses a nothing-decodable session (a
   // zero-count entry would false-HIT a future fetch).
   EXPECT_EQ(rt.sessionCache().size(), 0u);
+}
+
+// Adversarial F1 (belt-and-braces half): a memory entry whose recorded
+// cache_identity does not match the REQUESTED identity must never serve a
+// hit — evict + refetch, exactly like a disk miss. (The include_latched key
+// fix removes the aliasing that produced such entries; this pins the
+// independent identity binding.)
+TEST(McapCloudFetchWorkerCacheTee, MemoryHitRequiresMatchingCacheIdentity) {
+  FakeStreamingServer server(FakeStreamingServer::Mode::kComplete);
+  ASSERT_TRUE(server.ok());
+  TempRoot cache_root("idmismatch-cache");
+  TempRoot config_root("idmismatch-config");
+  mcap_cloud::ImportRuntime rt(mcap_cloud::SessionFileCache(cache_root.path),
+                               mcap_cloud::TrustedOrigins(config_root.path));
+
+  Harness h(rt, server.uri());
+  h.pull();
+  ASSERT_EQ(server.openSessions(), 1);
+
+  // Sabotage: rewrite the stored entry with a DIFFERENT (well-formed)
+  // cache identity — the disk file for the requested identity stays valid.
+  const PJ::cloud::SessionKey key =
+      PJ::cloud::computeSessionKey(server.uri(), {"a.mcap"}, {"/one"}, {0, 0}, true);
+  auto entry = rt.sessionCache().lookup(key, [](const mcap_cloud::CachedSession&) { return true; });
+  ASSERT_TRUE(entry.has_value());
+  mcap_cloud::CachedSession mutated = *entry;
+  mutated.cache_identity = "mcap-cloud:v1:sha256/128:00000000000000000000000000000000";
+  rt.sessionCache().store(key, std::move(mutated));
+
+  h.pull();
+  EXPECT_EQ(server.openSessions(), 2)
+      << "an identity-mismatched memory entry must refetch, never serve (adversarial F1)";
+  EXPECT_EQ(h.served_from_cache, 0);
 }
