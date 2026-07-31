@@ -20,6 +20,8 @@
 
 namespace mcap_cloud {
 
+class ImportRuntime;
+
 enum class McapSaveStatus {
   Complete,
   Partial,
@@ -70,6 +72,16 @@ class FetchWorker {
   void setRuntimeHostProvider(std::function<PJ::ToolboxRuntimeHostView()> provider) {
     runtime_host_provider_ = std::move(provider);
   }
+
+  /// Bind the per-toolbox-instance ImportRuntime (stage-4 PR-1). Set once on
+  /// the GUI thread BEFORE any pull, like the providers above; non-owning
+  /// (the toolbox owns the runtime, which outlives every worker). When bound:
+  /// the pull serializes host writes on the runtime's SHARED mutex, uses the
+  /// runtime's thread-safe SessionCache, and ALWAYS tees the session once
+  /// into the SessionFileCache (the single-encoder rule — exports become
+  /// byte copies of the cache file; see pullTopicsAsync). Unset (legacy /
+  /// CLI-shaped tests): the pre-stage-4 behavior is preserved verbatim.
+  void setImportRuntime(ImportRuntime* runtime) { import_runtime_ = runtime; }
 
   void requestCancel() {
     cancel_flag_.store(true, std::memory_order_relaxed);
@@ -138,12 +150,22 @@ class FetchWorker {
   /// Honors requestCancel(). The whole host-write critical section is serialized
   /// by host_write_mu_. driver.finalize() seals host parser writes (flushAll)
   /// while still inside the critical section, before notifyDataChanged.
-  /// A non-empty `save_directory` additionally tees the raw session records
-  /// into one collision-safe local MCAP (export). The export is strictly
-  /// SECONDARY: any export open/write/finalize failure is reported via
-  /// mcapSaveFinished but never aborts the download or the host import. A
-  /// non-empty save_directory also bypasses the count-only SessionCache HIT
-  /// (the cache holds no raw payloads to reconstruct a file from).
+  /// A non-empty `save_directory` additionally requests a local MCAP export.
+  /// The export is strictly SECONDARY: any export failure is reported via
+  /// mcapSaveFinished but never aborts the download or the host import.
+  /// LEGACY mode (no ImportRuntime bound): the worker writes the export
+  /// directly and a non-empty save_directory bypasses the count-only
+  /// SessionCache HIT (the in-memory cache holds no raw payloads).
+  /// RUNTIME mode (setImportRuntime): the CACHE IS THE SOLE ENCODER (spec
+  /// docs/canonical-layout-import.md §9) — every pull tees the raw records
+  /// once into the SessionFileCache partial (CacheTee: provenance record,
+  /// bounded async queue, validated finalize; a tee failure never aborts the
+  /// ingest, §9.6) and the export receives a byte COPY (Complete: of the
+  /// finalized cache file, atomic temp+rename; cancel: of the readable cache
+  /// partial into the export .partial, after which the cache partial is
+  /// DELETED — cache partials never survive, spec §10). A memory hit with a
+  /// valid disk cache file serves the export by copy with zero transport; a
+  /// memory hit whose disk file is gone evicts the entry and refetches.
   void pullTopicsAsync(std::vector<std::string> sequence_names, std::string group_name,
                        std::vector<std::string> topic_names, std::int64_t start_ns, std::int64_t end_ns,
                        std::string save_directory = {});
@@ -227,6 +249,13 @@ class FetchWorker {
   /// = the download aborted before the export started, no file exists).
   /// Fires before allFetchesComplete so the dialog's close policy sees it.
   std::function<void(McapSaveResult result)> mcapSaveFinished;
+  /// Cache-tee outcome for one RUNTIME-mode pull (fires exactly once per
+  /// pull when an ImportRuntime is bound, before allFetchesComplete; never
+  /// fires in legacy mode). `identity` is the canonical descriptor identity
+  /// the session tees under; `error` is non-empty for kFailed/kAborted. The
+  /// same outcome is recorded on the stored SessionCache entry — PR-3's
+  /// promotion hook keys off it (kFailed suppresses promotion, §9.6).
+  std::function<void(TeeOutcome outcome, std::string identity, std::string error)> teeFinished;
   /// Tag-edit commit result. ok=false carries the verbatim server/transport
   /// error. On ok=true a sequencesReady follows so the dialog refreshes the
   /// catalog metadata (the Lua filter re-evaluates against the new tags).
@@ -309,13 +338,19 @@ class FetchWorker {
   bool conn_allow_insecure_ = false;
   std::function<PJ::sdk::ToolboxHostView()> host_provider_;
   std::function<PJ::ToolboxRuntimeHostView()> runtime_host_provider_;
+  // Non-owning; set once on the GUI thread before any pull (see
+  // setImportRuntime). nullptr = legacy mode.
+  ImportRuntime* import_runtime_ = nullptr;
   std::atomic<bool> cancel_flag_{false};
 
   std::optional<PJ::sdk::DataSourceHandle> fetch_dataset_;
   std::mutex fetch_dataset_mu_;
   // Serializes the host-write critical section (createDataSource + bindSession +
   // decode loop) — the toolbox DataWriter has no internal mutex. Lock order is
-  // always host_write_mu_ -> fetch_dataset_mu_, never the reverse.
+  // always host_write_mu_ -> fetch_dataset_mu_, never the reverse. RUNTIME
+  // mode locks the ImportRuntime's SHARED host-write mutex instead: a private
+  // per-worker mutex cannot serialize a future provider job against the
+  // interactive worker (this member remains the legacy-mode fallback).
   std::mutex host_write_mu_;
 
   // The session BackendConnection in flight during a pull, exposed for
@@ -329,9 +364,11 @@ class FetchWorker {
   BackendConnection* backend_session_for_cancel_{nullptr};
 
   // ---- in-memory SessionCache (Slice 8) ------------------------------------
-  // Owned by the worker (per-plugin-instance lifetime; single worker thread, no
-  // extra locking). A HIT re-emits the per-topic pullFinished ledger from cached
-  // counts with ZERO transport; entries are stored only on a COMPLETE download.
+  // LEGACY-mode instance, owned by the worker. A HIT re-emits the per-topic
+  // pullFinished ledger from cached counts with ZERO transport; entries are
+  // stored only on a COMPLETE download. RUNTIME mode uses the ImportRuntime's
+  // SHARED (thread-safe) SessionCache instead so provider jobs and the
+  // interactive worker observe one cache (D7).
   SessionCache session_cache_;
   // Existence predicate seam: answers "is this dataset still in the host?".
   // Defaults to a catalogSnapshot()-backed check when a host provider is bound;

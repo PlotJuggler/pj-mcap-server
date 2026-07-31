@@ -26,6 +26,7 @@
 #include <pj_base/sdk/toolbox_plugin_base.hpp>
 #include <pj_plugins/sdk/dialog_plugin_typed.hpp>
 
+#include "import_runtime.hpp"
 #include "mcap_cloud_dialog.hpp"
 #include "mcap_cloud_panel_manifest.hpp"
 
@@ -33,6 +34,15 @@ namespace mcap_cloud {
 
 class McapCloudToolbox : public PJ::ToolboxPluginBase {
  public:
+  McapCloudToolbox() {
+    // ONE ImportRuntime per toolbox instance (stage-4 PR-1): the dialog's
+    // FetchWorker and the future descriptor-import provider (PR-3) share its
+    // SessionFileCache, thread-safe SessionCache, host-write mutex, in-memory
+    // trust set and materialization registry. Wired in the constructor —
+    // before bind()/setSettings can enqueue any worker command.
+    dialog_.setImportRuntime(&import_runtime_);
+  }
+
   uint64_t capabilities() const override {
     // Non-modal panel (the Mosaico shape): HAS_DIALOG + NON_MODAL_DIALOG.
     return PJ::kToolboxCapabilityHasDialog | PJ::kToolboxCapabilityNonModalDialog;
@@ -63,6 +73,11 @@ class McapCloudToolbox : public PJ::ToolboxPluginBase {
   }
 
  private:
+  // Declared BEFORE dialog_ so the runtime outlives the dialog (and its
+  // worker thread) on destruction. Standard roots: the user cache dir
+  // (MCAP_CLOUD_CACHE_DIR || XDG) + the trusted-origins ledger under the
+  // config root — construction reads only the ledger, no network.
+  ImportRuntime import_runtime_{SessionFileCache::standard(nullptr), TrustedOrigins::standard()};
   McapCloudDialog dialog_;
 };
 

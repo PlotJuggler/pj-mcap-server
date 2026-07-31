@@ -31,6 +31,7 @@
 
 namespace mcap_cloud {
 
+class ImportRuntime;
 class LuaQueryEngine;
 struct McapSaveResult;
 
@@ -422,6 +423,12 @@ class McapCloudDialog : public PJ::DialogPluginTyped {
   // Provider seams wired by the toolbox plugin (toolboxHost / runtimeHost).
   void setHostProvider(std::function<PJ::sdk::ToolboxHostView()> provider);
   void setRuntimeHostProvider(std::function<PJ::ToolboxRuntimeHostView()> provider);
+  // The per-toolbox-instance ImportRuntime (stage-4 PR-1). Non-owning; wired
+  // by the toolbox constructor BEFORE bind()/setSettings. Forwarded to the
+  // worker (cache tee + shared host-write mutex + shared SessionCache); the
+  // dialog itself routes successful-Hello trust recording through it so the
+  // in-memory trust set and the ledger stay in lockstep.
+  void setImportRuntime(ImportRuntime* runtime);
 
   // Binds the host's `pj.settings.v1` store and restores persisted UI state
   // (+ auto-connect). Called by the toolbox during bind(). An unbound view
@@ -624,9 +631,14 @@ class McapCloudDialog : public PJ::DialogPluginTyped {
   // Trusted-origin ledger (spec §7 guard 1): origins that completed a
   // successful interactive Hello — the future auto-replay trust source.
   // Deliberately separate from credentials_ (a stored token must never imply
-  // replay trust). Lazily constructed like credentials_ above.
+  // replay trust). Lazily constructed like credentials_ above. When an
+  // ImportRuntime is bound, trust recording goes THROUGH it instead (write-
+  // through keeps the same ledger file while updating the bounded in-memory
+  // set) — this member is the runtime-less (unit-load) fallback only.
   std::unique_ptr<TrustedOrigins> trusted_origins_;
   TrustedOrigins& trustedOrigins();
+  // Non-owning; see setImportRuntime. nullptr for a dialog-only unit load.
+  ImportRuntime* import_runtime_ = nullptr;
   // Toolbox runtime host provider (notifyDataChanged after import + the
   // reportMessage notification bell). Set by the toolbox during bind(); unset
   // for a dialog-only smoke load (notify() then no-ops).
