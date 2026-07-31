@@ -171,6 +171,14 @@ PJ_descriptor_import_outcome_t DescriptorImportProvider::JobState::runToTerminal
   }
 
   // ---- the direct cancellable pull (cache-tee mode, ticket adopted) --------
+  // Defensive empty-selection guard (adversarial F3): the parser rejects
+  // empty s3_keys, so this is unreachable via the ABI — but the .front()
+  // below must never be UB even if a future caller constructs a JobState
+  // some other way.
+  if (descriptor.s3_keys.empty()) {
+    *message = "descriptor has no s3 keys";
+    return PJ_DESCRIPTOR_IMPORT_FAILED;
+  }
   PullRequest request;
   request.connection = connection;
   request.sequence_names = descriptor.s3_keys;

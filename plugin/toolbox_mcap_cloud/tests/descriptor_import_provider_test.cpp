@@ -834,3 +834,29 @@ TEST(McapCloudProviderAbi, OutstandingPromotionAtCancelDetachesCancelled) {
   EXPECT_EQ(entry->promotion_state, mcap_cloud::PromotionState::kPromoted)
       << "the detached shared state must settle the entry after the job is gone";
 }
+
+// Adversarial F3 at the provider surface: an empty-s3_keys descriptor is a
+// CONTRACT failure at both entry points — query false + error, start false
+// with no job and no callbacks (previously it started a worker that
+// dereferenced s3_keys.front(): UB, potentially no terminal at all).
+TEST(McapCloudProviderAbi, EmptyKeyDescriptorRejectedAtQueryAndStart) {
+  ProviderHarness h("abi-emptykeys");
+  const std::string json =
+      R"({"v":1,"kind":"mcap-cloud-session","server_uri":"ws://127.0.0.1:9","s3_keys":[],)"
+      R"("topics":[],"start_ns":"0","end_ns":"0","include_latched":true})";
+
+  PJ_descriptor_query_result_v1_t out{};
+  std::string query_error;
+  EXPECT_FALSE(runQuery(h.provider, json, &out, &query_error));
+  EXPECT_FALSE(query_error.empty());
+
+  JobRecorder recorder;
+  ScopedJob job;
+  std::string start_error;
+  EXPECT_FALSE(h.start(json, recorder, job, 0, &start_error));
+  EXPECT_FALSE(start_error.empty());
+  EXPECT_EQ(job.job.vtable, nullptr) << "no job may exist for an empty selection";
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  EXPECT_EQ(recorder.terminalCount(), 0u);
+  EXPECT_EQ(recorder.datasetCount(), 0u);
+}
