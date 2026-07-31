@@ -22,8 +22,12 @@
 // keeps the PJ_TOOLBOX_PLUGIN / PJ_DIALOG_PLUGIN exports.
 #pragma once
 
+#include <string_view>
+
+#include <pj_base/descriptor_import_protocol.h>
 #include <pj_base/sdk/toolbox_plugin_base.hpp>
 
+#include "descriptor_import_provider.hpp"
 #include "import_runtime.hpp"
 #include "mcap_cloud_dialog.hpp"
 
@@ -34,6 +38,12 @@ class McapCloudToolbox : public PJ::ToolboxPluginBase {
   McapCloudToolbox();
 
   uint64_t capabilities() const override;
+
+  // pj.descriptor_import.v1 (stage-4 PR-3): returns the provider extension
+  // table for PJ_DESCRIPTOR_IMPORT_EXTENSION_V1, nullptr for anything else.
+  // The ABI's plugin_ctx at the thunks is THIS toolbox instance (the same
+  // ctx get_plugin_extension was called with — never the extension table).
+  const void* pluginExtension(std::string_view id) override;
 
   // Wires the dialog's host/runtime providers + the settings view. Network-
   // free by contract (spec docs/canonical-layout-import.md §6.3: a provider
@@ -51,13 +61,35 @@ class McapCloudToolbox : public PJ::ToolboxPluginBase {
   // the descriptor-import provider; the promotion host (D6) binds onto it.
   // Exposed for the provider glue and the hermetic wiring tests.
   [[nodiscard]] ImportRuntime& importRuntime() { return import_runtime_; }
+  [[nodiscard]] DescriptorImportProvider& descriptorImportProvider() { return provider_; }
 
  private:
+  // The C thunks behind descriptor_import_ext_: plugin_ctx is THIS toolbox
+  // instance; they forward to provider_ (exception-walled at the boundary).
+  static bool descriptorQueryThunk(void* plugin_ctx, PJ_string_view_t descriptor_json,
+                                   PJ_descriptor_query_result_v1_t* out_result,
+                                   PJ_error_t* out_error) noexcept;
+  static bool descriptorStartThunk(void* plugin_ctx,
+                                   const PJ_descriptor_import_start_request_v1_t* request,
+                                   const PJ_descriptor_import_callbacks_v1_t* callbacks,
+                                   void* callback_ctx, PJ_joinable_job_t* out_job,
+                                   PJ_error_t* out_error) noexcept;
+
   // Declared BEFORE dialog_ so the runtime outlives the dialog (and its
-  // worker thread) on destruction. Standard roots: the user cache dir
+  // worker thread) on destruction — and BEFORE provider_ (the provider
+  // borrows the runtime). Standard roots: the user cache dir
   // (MCAP_CLOUD_CACHE_DIR || XDG) + the trusted-origins ledger under the
   // config root — construction reads only the ledger, no network.
+  // NOTE (ABI): the host must destroy every started import job before
+  // destroying this plugin instance — reverse member order then tears down
+  // dialog_, provider_, import_runtime_ with no job threads left.
   ImportRuntime import_runtime_{SessionFileCache::standard(nullptr), TrustedOrigins::standard()};
+  DescriptorImportProvider provider_{import_runtime_};
+  // The plugin-owned extension table (must stay valid for the instance
+  // lifetime — ABI rule); the thunks resolve the provider via plugin_ctx.
+  PJ_descriptor_import_provider_v1_t descriptor_import_ext_{
+      sizeof(PJ_descriptor_import_provider_v1_t), 0, &McapCloudToolbox::descriptorQueryThunk,
+      &McapCloudToolbox::descriptorStartThunk};
   McapCloudDialog dialog_;
 };
 

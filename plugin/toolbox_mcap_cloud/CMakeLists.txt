@@ -111,6 +111,7 @@ set_source_files_properties(${MCAP_CLOUD_PROTO_SRCS} PROPERTIES
 # (OpenSession/MessageBatch/Cancel/Ack/Eos) drives the in-dialog download.
 set(MCAP_CLOUD_SOURCES
   src/mcap_cloud_toolbox.cpp
+  src/descriptor_import_provider.cpp
   src/parser_ingest_driver.cpp
   src/mcap_cloud_dialog.cpp
   src/fetch_worker.cpp
@@ -994,6 +995,45 @@ if(BUILD_TESTING)
            COMMAND toolbox_mcap_cloud_fetch_worker_promotion_test)
   set_tests_properties(McapCloudFetchWorkerPromotionTest PROPERTIES TIMEOUT 90)
 
+  # pj.descriptor_import.v1 provider matrix (stage-4 PR-3 commit 3, HERMETIC):
+  # query trust/hit/miss/malformed (bounded, offsetof-covered), start_import
+  # fail-closed flags + callback validation + the post-return start gate, the
+  # job runner terminals (promoted/eager-only/cancel/ceiling/lock-contention/
+  # concurrent-materialize race) and cancel/join/destroy over the raw C
+  # surface. Needs credential_resolve (main-thread snapshot) + settings_store.
+  add_executable(toolbox_mcap_cloud_descriptor_import_provider_test
+    tests/descriptor_import_provider_test.cpp
+    tests/find_free_port.cpp
+    src/descriptor_import_provider.cpp
+    src/parser_ingest_driver.cpp
+    src/fetch_worker.cpp
+    src/backend_connection.cpp
+    src/wire_mapping.cpp
+    src/session_decode.cpp
+    src/session_mcap_writer.cpp
+    ${MCAP_CLOUD_IMPORT_SOURCES}
+    src/settings_store.cpp
+    src/credential_resolve.cpp
+    src/mcap_save_path.cpp
+    src/core/time_format.cpp
+    src/mcap_implementation.cpp
+    ${MCAP_CLOUD_PROTO_SRCS}
+  )
+  target_compile_features(toolbox_mcap_cloud_descriptor_import_provider_test PRIVATE cxx_std_20)
+  target_include_directories(toolbox_mcap_cloud_descriptor_import_provider_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/core
+    ${MCAP_CLOUD_PROTO_OUT_DIR}
+  )
+  target_link_libraries(toolbox_mcap_cloud_descriptor_import_provider_test PRIVATE
+    plotjuggler_sdk::plugin_sdk
+    protobuf::libprotobuf ixwebsocket::ixwebsocket nlohmann_json::nlohmann_json
+    zstd::libzstd_static LZ4::lz4_static mcap::mcap GTest::gtest_main
+  )
+  add_test(NAME McapCloudDescriptorImportProviderTest
+           COMMAND toolbox_mcap_cloud_descriptor_import_provider_test)
+  set_tests_properties(McapCloudDescriptorImportProviderTest PROPERTIES TIMEOUT 120)
+
   # Headless one-shot init matrix (stage-4 PR-2, HERMETIC): drives the REAL
   # McapCloudToolbox (+ its embedded dialog) through a fake service registry
   # whose settings store points at an in-process fake WS server that counts
@@ -1008,6 +1048,7 @@ if(BUILD_TESTING)
     tests/headless_init_test.cpp
     tests/find_free_port.cpp
     src/mcap_cloud_toolbox.cpp
+    src/descriptor_import_provider.cpp
     src/mcap_cloud_dialog.cpp
     src/parser_ingest_driver.cpp
     src/fetch_worker.cpp

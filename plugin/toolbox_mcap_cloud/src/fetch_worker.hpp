@@ -19,13 +19,10 @@
 #include "backend_connection.hpp"
 #include "backend_types.hpp"
 #include "credential_resolve.hpp"  // ConnectionSnapshot (the PR-2 handoff type)
+#include "import_runtime.hpp"      // ImportRuntime::MaterializeTicket rides PullRequest
 #include "session_cache.hpp"
 
 namespace mcap_cloud {
-
-class CacheTee;
-class ImportRuntime;
-class PromotionResult;
 
 /// Terminal classification of ONE direct pull (the headless import path).
 /// kFailed covers every non-cancel abnormal end, including the
@@ -71,6 +68,12 @@ struct PullRequest {
   /// as the ABI on_dataset (which must precede all of those). Runs on the
   /// pull (caller) thread, outside the host-write lock.
   std::function<void(PJ::sdk::DataSourceHandle)> datasetCreated;
+  /// Optional PRE-ACQUIRED in-process materialization ticket for `identity`
+  /// (the provider job's bounded lock-wait acquires it before starting the
+  /// pull); the cache tee ADOPTS it instead of re-acquiring — without this a
+  /// job's own ticket would self-contend with the tee's begin(). Must have
+  /// been acquired for the SAME identity.
+  std::optional<ImportRuntime::MaterializeTicket> ticket;
   /// Optional per-message transport progress (cumulative transport messages).
   /// Unthrottled; test observability — the provider job leaves it unset.
   std::function<void(std::uint64_t transport_messages)> onProgress;

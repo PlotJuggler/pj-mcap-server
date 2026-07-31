@@ -1627,7 +1627,7 @@ PullResult FetchWorker::pull(PullRequest request) {
   } tee_cancel_hook_guard{this};
   {
     std::string begin_error;
-    if (!tee->begin(request.identity, &begin_error)) {
+    if (!tee->begin(request.identity, &begin_error, std::move(request.ticket))) {
       tee.reset();
       result.tee_outcome = TeeOutcome::kFailed;
       result.tee_error = begin_error;
