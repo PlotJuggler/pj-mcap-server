@@ -6,7 +6,9 @@
 #include <pj_base/sdk/platform.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <fstream>
+#include <limits>
 #include <system_error>
 #include <vector>
 
@@ -24,6 +26,11 @@ namespace mcap_cloud {
 namespace fs = std::filesystem;
 
 namespace {
+
+// F4 probe counter: incremented immediately before the SDK's ReadRecord on
+// the embedded-descriptor path (see readRecordCallsForTest).
+std::atomic<std::uint64_t> g_read_record_calls{0};
+
 
 constexpr std::string_view kIdentityPrefix = "mcap-cloud:v1:sha256/128:";
 constexpr std::size_t kDigestHexChars = 32;  // 128 bits, lowercase hex
@@ -240,6 +247,7 @@ bool validateMcap(const fs::path& path, const std::string& hex,
     }
   }
   mcap::Record record;
+  g_read_record_calls.fetch_add(1, std::memory_order_relaxed);  // F4 probe (test-only)
   status = mcap::McapReader::ReadRecord(*reader.dataSource(), index->second.offset, &record);
   if (!status.ok()) {
     reader.close();
@@ -399,6 +407,14 @@ std::optional<SessionFileCache::MaterializeLock> SessionFileCache::tryLockForMat
 #endif
   fs::path partial = root_ / (*hex + ".mcap.partial." + std::to_string(pid));
   return MaterializeLock(std::move(*lock), *hex, std::move(partial));
+}
+
+std::uint64_t SessionFileCache::readRecordCallsForTest() {
+  return g_read_record_calls.load(std::memory_order_relaxed);
+}
+
+void SessionFileCache::resetReadRecordCallsForTest() {
+  g_read_record_calls.store(0, std::memory_order_relaxed);
 }
 
 std::optional<FileLock> SessionFileCache::toSharedLease(MaterializeLock&& lock,

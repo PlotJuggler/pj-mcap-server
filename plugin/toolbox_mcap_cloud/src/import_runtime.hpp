@@ -125,22 +125,86 @@ class ImportRuntime {
   [[nodiscard]] std::optional<AdmissionTicket> acquireAdmission(
       const std::function<bool()>& cancelled, std::chrono::milliseconds poll);
 
-  // ---- CONSERVATIVE-INTERIM dataset-lifetime leases (adversarial F2) -------
-  // The runtime retains ONE shared read lease per finalized/served identity
-  // for the TOOLBOX-INSTANCE lifetime, so another process's cleanup/eviction
-  // (exclusive on the same sidecar) can never unlink a cache file that live
-  // datasets may lazily re-open (a promoted source's loader cold-reads
-  // chunks long after finalize). Per-dataset release requires a host
-  // dataset-DELETION callback the SDK does not expose yet — recorded as an
-  // SDK follow-up; until then leases die with the runtime (destructor).
-  // A duplicate retain for an identity keeps the EXISTING lease.
-  void retainReadLease(std::string_view identity, FileLock lease);
-  /// Drop the retained lease for `identity`: a re-materialization must be
-  /// able to take the exclusive lock on its own sidecar (CacheTee::begin
-  /// calls this; rename-over replacement is safe for already-open handles —
-  /// only lazy re-opens observe the new file, exactly as before F2).
-  void releaseRetainedLease(std::string_view identity);
+  // ---- dataset-lifetime lease registry (round-3 THE RULE) ------------------
+  // The runtime retains ONE shared read lease per finalized/served/queried
+  // identity for the TOOLBOX-INSTANCE lifetime, so another process's
+  // cleanup/eviction (exclusive on the same sidecar) can never unlink a cache
+  // file that live datasets may lazily re-open (a promoted source's loader
+  // cold-reads chunks long after finalize).
+  //
+  // THREE INVARIANTS, applied uniformly — the individual races the reviews
+  // found were all symptoms of violating one of them:
+  //
+  //  1. ATOMIC BOOKKEEPING. Every step below is ONE operation on this one
+  //     mutex-guarded, identity-keyed, REFCOUNTED registry. There is no
+  //     has-then-release (or check-then-act) two-step in production code, so
+  //     a racing retain can never be erased unnoticed.
+  //  2. LEASE-THEN-VALIDATE. Retention ALWAYS acquires the shared sidecar
+  //     lease FIRST and validates the artifact UNDER it. An evictor needs
+  //     the EXCLUSIVE lock on that same sidecar, so while our shared lease is
+  //     held the file cannot go away: the outcome is either
+  //     leased-and-present or no-lease — never a lease pinning a missing
+  //     file, never a validated file that is evicted before we lease it.
+  //  3. RESTORE BEFORE THE TICKET. A materialization drops the lease to take
+  //     the exclusive lock; the restore runs while the in-process
+  //     MaterializeTicket is STILL held (the ticket is what stops a
+  //     same-process materializer from stealing the window). The OS lock may
+  //     be released first — shared acquisition contends correctly.
+  //
+  // REFCOUNT semantics: retains stack (repeat queries take another reference
+  // instead of a second flock); the ONLY thing that drops references is a
+  // materialization, which drops them ALL (it needs the exclusive lock) and
+  // restores the same count afterwards. There is deliberately no per-holder
+  // release yet: releasing when a DATASET dies needs a host dataset-deletion
+  // callback the SDK does not expose (recorded SDK follow-up), so until then
+  // leases die with the runtime (destructor). The refcount is maintained now
+  // so that follow-up is a local change.
+  struct LeaseDrop {
+    bool had_lease = false;
+    unsigned refs = 0;
+  };
+
+  /// Acquire (shared, NON-BLOCKING) + validate + retain for `identity`.
+  /// Idempotent/refcounted: an already-retained identity just takes another
+  /// reference. False when the lease is unavailable (a cross-process
+  /// exclusive holder is rematerializing) or the artifact does not validate
+  /// UNDER the lease; `diagnostic` (optional) says which. Bounded: one flock
+  /// on the existing sidecar + the same bounded validation lookup() does —
+  /// safe on the §6.3 query path.
+  [[nodiscard]] bool retainLeaseForLifetime(std::string_view identity, std::string* diagnostic);
+
+  /// Retain an ALREADY-ACQUIRED, already-validated lease (the finalize
+  /// handoff and the memory-hit serve both hold one). Same idempotent
+  /// refcount; a duplicate simply releases the passed lease.
+  void adoptLeaseForLifetime(std::string_view identity, FileLock lease);
+
+  /// ATOMIC drop of every reference for `identity` — one operation that both
+  /// releases the lease and reports what was released, so the restore can
+  /// never disagree with a racing retain (invariant 1). A materialization
+  /// must do this before taking the exclusive sidecar lock.
+  [[nodiscard]] LeaseDrop dropLeaseForMaterialize(std::string_view identity);
+
+  /// Restore what `drop` recorded (invariant 2 + 3): lease-then-validate,
+  /// with a BOUNDED short retry while a cross-process exclusive holder still
+  /// owns the sidecar. After that window we give up WITHOUT a lease and
+  /// record a diagnostic — the artifact is being rematerialized externally,
+  /// and pinning a stale generation would be worse than not pinning. No-op
+  /// when the token holds no lease. CALL BEFORE RELEASING THE TICKET.
+  void restoreLease(std::string_view identity, const LeaseDrop& drop);
+
+  /// The last restore/retain failure diagnostic (empty when none). Surfaces
+  /// the deliberately-quiet give-up above; read by the owning path and the
+  /// tests.
+  [[nodiscard]] std::string lastLeaseDiagnostic() const;
+
+  /// Diagnostics/tests only — NEVER the first half of a check-then-act (see
+  /// invariant 1; production paths use the atomic operations above).
   [[nodiscard]] bool hasRetainedLease(std::string_view identity) const;
+  /// Test seam: shrink the bounded restore retry window.
+  void setLeaseRestoreRetryForTest(unsigned attempts, std::chrono::milliseconds poll) {
+    lease_retry_attempts_ = attempts;
+    lease_retry_poll_ = poll;
+  }
 
  private:
   void endMaterialize(const std::string& identity);
@@ -157,8 +221,23 @@ class ImportRuntime {
   std::mutex active_mu_;
   std::unordered_set<std::string> active_identities_;
 
+  // The lease registry (see THE RULE above). `lease_mu_` is a LEAF lock: the
+  // flock + validation happen OUTSIDE it (the lease is held continuously
+  // across both, which is what makes lease-then-validate sound), and only the
+  // map mutation is guarded.
+  struct LeaseEntry {
+    FileLock lock;
+    unsigned refs = 0;
+  };
+  bool insertLeaseLocked(const std::string& key, FileLock lease, unsigned refs);
+  [[nodiscard]] std::optional<FileLock> acquireValidatedLease(std::string_view identity,
+                                                              std::string* diagnostic);
   mutable std::mutex lease_mu_;
-  std::unordered_map<std::string, FileLock> retained_leases_;  // F2 (see above)
+  std::unordered_map<std::string, LeaseEntry> retained_leases_;
+  mutable std::mutex lease_diag_mu_;
+  std::string last_lease_diagnostic_;
+  unsigned lease_retry_attempts_ = 5;                        // bounded restore window
+  std::chrono::milliseconds lease_retry_poll_{20};           // ~100 ms total by default
 
   // F10 admission gate: a FIFO queue of waiter records; the releaser hands
   // the (held) gate to the front waiter directly, so admission order is
@@ -241,6 +320,13 @@ class CacheTee {
   void setWriterHookForTest(std::function<void(const DecodedMessage&)> hook) {
     writer_hook_for_test_ = std::move(hook);
   }
+  /// Round-3 F1 seam: runs inside abortAndCleanup at the EXACT point between
+  /// releasing the OS lock and restoring the lease — i.e. inside the window
+  /// invariant 3 protects with the still-held ticket. A test drives a rival
+  /// same-process materializer here to prove it cannot steal that window.
+  void setPreRestoreHookForTest(std::function<void()> hook) {
+    pre_restore_hook_for_test_ = std::move(hook);
+  }
   /// R1(a) seam: force the finalize-time lease handoff to fail (the platform
   /// downgrade race is not deterministically constructible from outside).
   void setLeaseHandoffFailForTest(bool fail) { lease_handoff_fail_for_test_ = fail; }
@@ -281,7 +367,7 @@ class CacheTee {
   ImportRuntime& runtime_;
   std::string identity_;
   bool begin_lock_contended_ = false;  // F9 (see beginFailedOnLockContention)
-  bool had_retained_lease_ = false;    // R1(b): restore-on-abort bookkeeping
+  ImportRuntime::LeaseDrop lease_drop_{};  // what begin() dropped; abort restores it
   bool lease_handoff_fail_for_test_ = false;  // R1(a) seam (see below)
   std::optional<ImportRuntime::MaterializeTicket> ticket_;
   std::optional<SessionFileCache::MaterializeLock> lock_;
@@ -305,6 +391,7 @@ class CacheTee {
   static constexpr std::size_t kMaxQueuedBytes = 32ull * 1024 * 1024;
   std::size_t max_queued_messages_ = kMaxQueuedMessages;  // test seam
   std::function<void(const DecodedMessage&)> writer_hook_for_test_;
+  std::function<void()> pre_restore_hook_for_test_;
   std::function<std::thread(std::function<void()>)> thread_factory_for_test_;
   std::atomic<bool> abort_requested_{false};
   mutable std::mutex queue_mu_;

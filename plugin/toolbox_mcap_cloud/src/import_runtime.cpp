@@ -123,18 +123,113 @@ void ImportRuntime::releaseAdmission() {
   adm_held_ = false;
 }
 
-void ImportRuntime::retainReadLease(std::string_view identity, FileLock lease) {
-  std::lock_guard<std::mutex> lock(lease_mu_);
-  const std::string key(identity);
-  if (retained_leases_.count(key) > 0) {
-    return;  // keep the existing lease; the duplicate releases on return
+// Insert (or refcount into) the registry. Caller-provided `lease` is dropped
+// when an entry already exists — the existing flock stays authoritative.
+// Returns true when THIS call created the entry.
+bool ImportRuntime::insertLeaseLocked(const std::string& key, FileLock lease, unsigned refs) {
+  auto it = retained_leases_.find(key);
+  if (it != retained_leases_.end()) {
+    it->second.refs += refs;  // repeat retains stack; the passed lease releases on return
+    return false;
   }
-  retained_leases_.emplace(key, std::move(lease));
+  retained_leases_.emplace(key, LeaseEntry{std::move(lease), refs});
+  return true;
 }
 
-void ImportRuntime::releaseRetainedLease(std::string_view identity) {
+// LEASE-THEN-VALIDATE (invariant 2), performed OUTSIDE lease_mu_: acquire the
+// shared sidecar lease first, then validate the artifact while still holding
+// it, so no evictor can slip between the two. nullopt = no lease (contended
+// or invalid); `diagnostic` distinguishes.
+std::optional<FileLock> ImportRuntime::acquireValidatedLease(std::string_view identity,
+                                                             std::string* diagnostic) {
+  std::string lease_error;
+  auto lease = file_cache_.acquireReadLease(identity, &lease_error);
+  if (!lease.has_value()) {
+    if (diagnostic != nullptr) {
+      *diagnostic = "read lease unavailable (" + lease_error + ")";
+    }
+    return std::nullopt;
+  }
+  std::filesystem::path validated;
+  if (!file_cache_.lookup(identity, &validated)) {
+    if (diagnostic != nullptr) {
+      *diagnostic = "cache artifact does not validate under the lease";
+    }
+    return std::nullopt;  // lease releases here: never pin a missing/invalid file
+  }
+  return lease;
+}
+
+bool ImportRuntime::retainLeaseForLifetime(std::string_view identity, std::string* diagnostic) {
+  const std::string key(identity);
+  {
+    // Idempotent fast path: an existing entry just takes another reference —
+    // repeat queries never stack flocks (invariant 1: one atomic step).
+    std::lock_guard<std::mutex> lock(lease_mu_);
+    auto it = retained_leases_.find(key);
+    if (it != retained_leases_.end()) {
+      ++it->second.refs;
+      return true;
+    }
+  }
+  std::string local_diagnostic;
+  auto lease = acquireValidatedLease(identity, &local_diagnostic);
+  if (!lease.has_value()) {
+    if (diagnostic != nullptr) {
+      *diagnostic = local_diagnostic;
+    }
+    std::lock_guard<std::mutex> lock(lease_diag_mu_);
+    last_lease_diagnostic_ = local_diagnostic;
+    return false;
+  }
   std::lock_guard<std::mutex> lock(lease_mu_);
-  retained_leases_.erase(std::string(identity));
+  (void)insertLeaseLocked(key, std::move(*lease), 1);
+  return true;
+}
+
+void ImportRuntime::adoptLeaseForLifetime(std::string_view identity, FileLock lease) {
+  std::lock_guard<std::mutex> lock(lease_mu_);
+  (void)insertLeaseLocked(std::string(identity), std::move(lease), 1);
+}
+
+ImportRuntime::LeaseDrop ImportRuntime::dropLeaseForMaterialize(std::string_view identity) {
+  std::lock_guard<std::mutex> lock(lease_mu_);
+  auto it = retained_leases_.find(std::string(identity));
+  if (it == retained_leases_.end()) {
+    return LeaseDrop{};
+  }
+  const LeaseDrop drop{true, it->second.refs};
+  retained_leases_.erase(it);  // the flock releases here, atomically with the report
+  return drop;
+}
+
+void ImportRuntime::restoreLease(std::string_view identity, const LeaseDrop& drop) {
+  if (!drop.had_lease) {
+    return;
+  }
+  // Bounded short retry: a cross-process EXCLUSIVE holder means the artifact
+  // is being rematerialized right now — after the window we give up without a
+  // lease and record why (a stale-generation pin would be worse).
+  std::string diagnostic;
+  for (unsigned attempt = 0; attempt <= lease_retry_attempts_; ++attempt) {
+    if (attempt > 0) {
+      std::this_thread::sleep_for(lease_retry_poll_);
+    }
+    auto lease = acquireValidatedLease(identity, &diagnostic);
+    if (lease.has_value()) {
+      std::lock_guard<std::mutex> lock(lease_mu_);
+      (void)insertLeaseLocked(std::string(identity), std::move(*lease), drop.refs);
+      return;
+    }
+  }
+  std::lock_guard<std::mutex> lock(lease_diag_mu_);
+  last_lease_diagnostic_ = "could not restore the dataset-lifetime cache lease for " +
+                           std::string(identity) + ": " + diagnostic;
+}
+
+std::string ImportRuntime::lastLeaseDiagnostic() const {
+  std::lock_guard<std::mutex> lock(lease_diag_mu_);
+  return last_lease_diagnostic_;
 }
 
 bool ImportRuntime::hasRetainedLease(std::string_view identity) const {
@@ -202,14 +297,15 @@ bool CacheTee::begin(const std::string& identity, std::string* error,
     return fail("a materialization of this session is already in progress in this process");
   }
   runtime_.fileCache().cleanup(runtime_.cacheConfig());
-  // A retained dataset-lifetime lease (F2) on THIS identity would block our
-  // own exclusive materialize lock below — release it first (see
-  // ImportRuntime::releaseRetainedLease for why replacement stays safe).
-  // Remember that we dropped one (re-verify R1(b)): a FAILED/cancelled
-  // rematerialization must RESTORE it in abortAndCleanup, or the previous
-  // valid artifact backing a live dataset is left permanently unleased.
-  had_retained_lease_ = runtime_.hasRetainedLease(identity);
-  runtime_.releaseRetainedLease(identity);
+  // A retained dataset-lifetime lease on THIS identity would block our own
+  // exclusive materialize lock below — drop it. ONE atomic operation that
+  // both releases and reports (invariant 1): a racing memory-hit retain can
+  // no longer be erased without being recorded, which the previous
+  // has-then-release two-step allowed. A FAILED/cancelled rematerialization
+  // restores exactly this token in abortAndCleanup, BEFORE the ticket goes
+  // (invariant 3), or the previous valid artifact backing a live dataset is
+  // left permanently unleased.
+  lease_drop_ = runtime_.dropLeaseForMaterialize(identity);
 
   if (adopted_lock.has_value()) {
     // F9: a caller (the provider job) already performed its bounded
@@ -539,7 +635,9 @@ bool CacheTee::finalize(const std::optional<SessionFileCache::ExpectedContent>& 
     }
     return false;
   }
-  runtime_.retainReadLease(identity_, std::move(*lease));
+  // Already lease-then-validated: the downgraded lease is held across the
+  // revalidation above, so this only records it (invariant 2 satisfied).
+  runtime_.adoptLeaseForLifetime(identity_, std::move(*lease));
   return true;
 }
 
@@ -577,21 +675,23 @@ void CacheTee::abortAndCleanup() {
     std::error_code ec;
     fs::remove(partial_path_, ec);
   }
-  lock_.reset();    // release the cross-process materialize lock
-  ticket_.reset();  // release the in-process registry slot
-  if (!finalized_ && had_retained_lease_) {
-    // R1(b): begin() dropped a live dataset's lifetime lease to take the
-    // exclusive lock; this materialization did NOT publish, so if the
-    // previous artifact still validates, put the lease back (otherwise a
-    // later cleanup could evict a file a live dataset still lazily
-    // re-opens). Must run AFTER lock_ released (shared vs exclusive).
-    std::filesystem::path still_valid;
-    if (runtime_.fileCache().lookup(identity_, &still_valid)) {
-      if (auto lease = runtime_.fileCache().acquireReadLease(identity_, nullptr)) {
-        runtime_.retainReadLease(identity_, std::move(*lease));
-      }
-    }
+  // ORDERING (invariant 3): release the OS exclusive lock FIRST (our own
+  // exclusive would block the shared re-acquisition), then restore the lease
+  // WHILE THE TICKET IS STILL HELD — the ticket is what stops a same-process
+  // materializer from taking the identity mid-restore and leaving nobody to
+  // put the lease back — and only then release the ticket.
+  lock_.reset();
+  if (pre_restore_hook_for_test_) {
+    pre_restore_hook_for_test_();  // F1 seam: the ticket is still held here
   }
+  if (!finalized_) {
+    // begin() dropped a live dataset's lifetime lease to take the exclusive
+    // lock and this materialization did NOT publish: put it back
+    // (lease-then-validate, bounded retry, no-op when nothing was dropped).
+    runtime_.restoreLease(identity_, lease_drop_);
+    lease_drop_ = ImportRuntime::LeaseDrop{};
+  }
+  ticket_.reset();  // release the in-process registry slot LAST
 }
 
 }  // namespace mcap_cloud

@@ -244,7 +244,9 @@ bool FetchWorker::serveFromMemoryCache(
   // of dropping it at scope exit (no-op when an identity lease is already
   // retained, e.g. from the original finalize).
   if (rt != nullptr && read_lease.has_value()) {
-    rt->retainReadLease(tee_identity, std::move(*read_lease));
+    // The lease was acquired BEFORE the disk validation above and held
+    // across it (invariant 2), so this only records it.
+    rt->adoptLeaseForLifetime(tee_identity, std::move(*read_lease));
   }
   return true;
 }

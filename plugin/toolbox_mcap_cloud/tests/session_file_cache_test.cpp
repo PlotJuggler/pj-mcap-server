@@ -655,7 +655,31 @@ TEST(SessionFileCache, ForgedMetadataRecordSizeIsRefusedBeforeAllocation) {
     out.write(reinterpret_cast<const char*>(bytes), sizeof(bytes));
   }
 
+  // F4: pin the PREFLIGHT, not just the outcome. The SDK's own ReadRecord
+  // would also reject this file (it bounds the declared size against the file
+  // remainder BEFORE the allocating read — reader.inl:676) and returns the
+  // same false, so the probe counter is what distinguishes "the parser was
+  // never reached" from "the parser rejected it": with the preflight in place
+  // ReadRecord must NOT be called at all. Removing the preflight makes this
+  // assertion (not the miss) go red.
+  mcap_cloud::SessionFileCache::resetReadRecordCallsForTest();
   fs::path out_path;
   EXPECT_FALSE(cache.lookup(identity, &out_path))
       << "a forged declared record size must be a bounded-preflight miss (R3)";
+  EXPECT_EQ(mcap_cloud::SessionFileCache::readRecordCallsForTest(), 0u)
+      << "the raw preflight must reject BEFORE the SDK's ReadRecord runs (F4)";
+}
+
+// F4 control: an UNFORGED file must reach ReadRecord — otherwise the counter
+// assertion above could pass for the wrong reason (e.g. validation bailing
+// out earlier for every file).
+TEST(SessionFileCache, ValidFileReachesReadRecord) {
+  TempRoot root("probe-control");
+  mcap_cloud::SessionFileCache cache(root.path);
+  const mcap_cloud::SourceDescriptor d = descriptor("probe-control.mcap");
+  ASSERT_FALSE(materialize(cache, d).empty());
+  mcap_cloud::SessionFileCache::resetReadRecordCallsForTest();
+  fs::path out_path;
+  ASSERT_TRUE(cache.lookup(mcap_cloud::descriptorIdentity(d), &out_path));
+  EXPECT_GT(mcap_cloud::SessionFileCache::readRecordCallsForTest(), 0u);
 }

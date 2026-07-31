@@ -574,3 +574,174 @@ TEST(McapCloudCacheTee, AbortedRematerializationRestoresTheDroppedLease) {
   std::filesystem::path still_valid;
   EXPECT_TRUE(rt.fileCache().lookup(identity, &still_valid));
 }
+
+// ---------------------------------------------------------------------------
+// Round-3 F1: THE RULE — atomic, refcounted, lease-then-validate, restore
+// before the ticket.
+// ---------------------------------------------------------------------------
+
+// Invariant 3: a same-process materializer must NOT be able to steal the
+// identity during the abort's restore window — the ticket is still held, so
+// its begin() is refused and the original lease is the one that comes back.
+TEST(McapCloudCacheTee, SameProcessMaterializerCannotStealTheAbortRestoreWindow) {
+  TempRoot cache_root("stealwindow-cache");
+  TempRoot config_root("stealwindow-config");
+  mcap_cloud::ImportRuntime rt(mcap_cloud::SessionFileCache(cache_root.path),
+                               mcap_cloud::TrustedOrigins(config_root.path));
+  const mcap_cloud::SourceDescriptor d = descriptor("steal.mcap");
+  const std::string identity = mcap_cloud::descriptorIdentity(d);
+
+  // A published artifact with its lifetime lease retained.
+  {
+    mcap_cloud::CacheTee tee(rt);
+    std::string error;
+    ASSERT_TRUE(tee.begin(identity, &error)) << error;
+    ASSERT_TRUE(
+        tee.openWriter(sessionInfo(), mcap_cloud::canonicalSourceDescriptorJson(d), 0, &error))
+        << error;
+    ASSERT_TRUE(tee.enqueue({.topic_id = 11,
+                             .schema_id = 5,
+                             .log_time_ns = 100,
+                             .publish_time_ns = 90,
+                             .payload = std::string(64, 'x')}));
+    ASSERT_TRUE(tee.drainAndClose(&error)) << error;
+    ASSERT_TRUE(tee.finalize(std::nullopt, &error)) << error;
+  }
+  ASSERT_TRUE(rt.hasRetainedLease(identity));
+
+  // A rematerialization begins (dropping the lease) and then aborts. While it
+  // is alive, a SECOND same-process materializer must be refused by the
+  // ticket — so it can never occupy the restore window.
+  mcap_cloud::CacheTee aborting(rt);
+  std::string error;
+  ASSERT_TRUE(aborting.begin(identity, &error)) << error;
+  EXPECT_FALSE(rt.hasRetainedLease(identity)) << "begin() drops the lease for its exclusive lock";
+
+  // The rival runs at the EXACT point the ordering protects: after the OS
+  // lock is released, before the restore. With invariant 3 (restore before
+  // ticket) the ticket is still held here, so the rival is refused and the
+  // lease comes back. Release the ticket first (the pre-round-3 ordering)
+  // and the rival takes the identity + exclusive lock, the bounded restore
+  // retry exhausts, and the artifact is left permanently unleased.
+  bool rival_refused = false;
+  std::optional<mcap_cloud::CacheTee> rival;
+  rt.setLeaseRestoreRetryForTest(1, std::chrono::milliseconds(5));
+  aborting.setPreRestoreHookForTest([&]() {
+    rival.emplace(rt);
+    std::string rival_error;
+    rival_refused = !rival->begin(identity, &rival_error);
+  });
+  aborting.abortAndCleanup();
+  if (rival.has_value()) {
+    rival->abortAndCleanup();
+    rival.reset();
+  }
+  EXPECT_TRUE(rival_refused)
+      << "a same-process materializer must be refused inside the restore window (invariant 3)";
+
+  EXPECT_TRUE(rt.hasRetainedLease(identity))
+      << "the aborting materialization restores the lease it dropped";
+  std::filesystem::path still_valid;
+  EXPECT_TRUE(rt.fileCache().lookup(identity, &still_valid));
+}
+
+// Invariant 2: an evictor racing the restore can never produce "a retained
+// lease for a missing file". Here the artifact is DELETED while the
+// materialization is aborting: the restore must end with NO lease (and a
+// diagnostic), not a lease pinning a hole.
+TEST(McapCloudCacheTee, EvictorRacingTheRestoreLeavesNoLeaseForAMissingFile) {
+  TempRoot cache_root("evictrace-cache");
+  TempRoot config_root("evictrace-config");
+  mcap_cloud::ImportRuntime rt(mcap_cloud::SessionFileCache(cache_root.path),
+                               mcap_cloud::TrustedOrigins(config_root.path));
+  rt.setLeaseRestoreRetryForTest(1, std::chrono::milliseconds(5));
+  const mcap_cloud::SourceDescriptor d = descriptor("evictrace.mcap");
+  const std::string identity = mcap_cloud::descriptorIdentity(d);
+
+  {
+    mcap_cloud::CacheTee tee(rt);
+    std::string error;
+    ASSERT_TRUE(tee.begin(identity, &error)) << error;
+    ASSERT_TRUE(
+        tee.openWriter(sessionInfo(), mcap_cloud::canonicalSourceDescriptorJson(d), 0, &error))
+        << error;
+    ASSERT_TRUE(tee.enqueue({.topic_id = 11,
+                             .schema_id = 5,
+                             .log_time_ns = 100,
+                             .publish_time_ns = 90,
+                             .payload = std::string(64, 'x')}));
+    ASSERT_TRUE(tee.drainAndClose(&error)) << error;
+    ASSERT_TRUE(tee.finalize(std::nullopt, &error)) << error;
+  }
+  ASSERT_TRUE(rt.hasRetainedLease(identity));
+
+  mcap_cloud::CacheTee aborting(rt);
+  std::string error;
+  ASSERT_TRUE(aborting.begin(identity, &error)) << error;
+  // The evictor wins the window: the artifact is gone before the restore.
+  std::error_code ec;
+  fs::remove(rt.fileCache().pathFor(identity), ec);
+  aborting.abortAndCleanup();
+
+  EXPECT_FALSE(rt.hasRetainedLease(identity))
+      << "no lease may be retained for a file that does not validate (invariant 2)";
+  EXPECT_NE(rt.lastLeaseDiagnostic().find("could not restore"), std::string::npos)
+      << "the give-up must not be silent: " << rt.lastLeaseDiagnostic();
+}
+
+// Invariant 1 + refcount: repeat retains stack instead of stacking flocks,
+// and a materialization's atomic drop reports (and later restores) exactly
+// the reference count it removed.
+TEST(McapCloudImportRuntime, LeaseRetainsAreRefcountedAndDropIsAtomic) {
+  TempRoot cache_root("refcount-cache");
+  TempRoot config_root("refcount-config");
+  mcap_cloud::ImportRuntime rt(mcap_cloud::SessionFileCache(cache_root.path),
+                               mcap_cloud::TrustedOrigins(config_root.path));
+  const mcap_cloud::SourceDescriptor d = descriptor("refcount.mcap");
+  const std::string identity = mcap_cloud::descriptorIdentity(d);
+  {
+    mcap_cloud::CacheTee tee(rt);
+    std::string error;
+    ASSERT_TRUE(tee.begin(identity, &error)) << error;
+    ASSERT_TRUE(
+        tee.openWriter(sessionInfo(), mcap_cloud::canonicalSourceDescriptorJson(d), 0, &error))
+        << error;
+    ASSERT_TRUE(tee.enqueue({.topic_id = 11,
+                             .schema_id = 5,
+                             .log_time_ns = 100,
+                             .publish_time_ns = 90,
+                             .payload = std::string(64, 'x')}));
+    ASSERT_TRUE(tee.drainAndClose(&error)) << error;
+    ASSERT_TRUE(tee.finalize(std::nullopt, &error)) << error;
+  }
+
+  std::string diagnostic;
+  ASSERT_TRUE(rt.retainLeaseForLifetime(identity, &diagnostic)) << diagnostic;
+  ASSERT_TRUE(rt.retainLeaseForLifetime(identity, &diagnostic)) << diagnostic;
+  ASSERT_TRUE(rt.retainLeaseForLifetime(identity, &diagnostic)) << diagnostic;
+
+  const auto drop = rt.dropLeaseForMaterialize(identity);
+  EXPECT_TRUE(drop.had_lease);
+  EXPECT_GE(drop.refs, 3u) << "the atomic drop reports every reference it removed";
+  EXPECT_FALSE(rt.hasRetainedLease(identity));
+
+  rt.restoreLease(identity, drop);
+  EXPECT_TRUE(rt.hasRetainedLease(identity));
+  const auto second = rt.dropLeaseForMaterialize(identity);
+  EXPECT_EQ(second.refs, drop.refs) << "restore re-establishes the same reference count";
+}
+
+// Invariant 2 on the plain retain path: a retain for an identity with NO
+// valid artifact must not pin anything.
+TEST(McapCloudImportRuntime, RetainRefusesWhenTheArtifactDoesNotValidate) {
+  TempRoot cache_root("novalidate-cache");
+  TempRoot config_root("novalidate-config");
+  mcap_cloud::ImportRuntime rt(mcap_cloud::SessionFileCache(cache_root.path),
+                               mcap_cloud::TrustedOrigins(config_root.path));
+  const std::string identity =
+      "mcap-cloud:v1:sha256/128:44444444444444444444444444444444";
+  std::string diagnostic;
+  EXPECT_FALSE(rt.retainLeaseForLifetime(identity, &diagnostic));
+  EXPECT_NE(diagnostic.find("does not validate"), std::string::npos) << diagnostic;
+  EXPECT_FALSE(rt.hasRetainedLease(identity));
+}

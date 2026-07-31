@@ -120,6 +120,16 @@ class SessionFileCache {
   [[nodiscard]] std::optional<FileLock> acquireReadLease(std::string_view identity,
                                                          std::string* error);
 
+  /// Round-3 F4 test probe: counts how many times lookup()'s validation
+  /// reached the SDK's ReadRecord() for the embedded descriptor. The raw
+  /// preflight's whole purpose is that a forged record never gets there, and
+  /// the SDK's own InvalidRecord rejection is indistinguishable from the
+  /// preflight's by return value alone — this counter makes "the parser was
+  /// not reached" observable, so removing the preflight turns the forge test
+  /// red. Test-only; never read by production code.
+  static std::uint64_t readRecordCallsForTest();
+  static void resetReadRecordCallsForTest();
+
   /// Startup/maintenance: remove orphaned partials older than
   /// orphan_partial_age whose lock is free; then LRU-evict unlocked files
   /// (touch-file order) until under max_total_bytes AND min_free_bytes holds.
