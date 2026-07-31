@@ -125,6 +125,7 @@ set(MCAP_CLOUD_SOURCES
   src/mcap_implementation.cpp
   src/settings_store.cpp
   src/credential_store.cpp
+  src/credential_resolve.cpp
   src/origin_match.cpp
   src/trusted_origins.cpp
   src/server_history.cpp
@@ -682,6 +683,30 @@ if(BUILD_TESTING)
   )
   add_test(NAME McapCloudCredentialStoreTest COMMAND toolbox_mcap_cloud_credential_store_test)
 
+  # Shared credential resolver (stage-4 PR-2, D2 amendment, HERMETIC): the
+  # dialog's resolution chain hoisted into src/credential_resolve.* so PR-3's
+  # start_import can resolve on the MAIN thread and hand each job an immutable
+  # ConnectionSnapshot. Pins the exact chain order (origin-bound env token >
+  # stored > empty), the normalized settings prefix for the non-secret prefs,
+  # the save/load round-trip, and the snapshot handoff type. In-memory
+  # settings backend + a temp-rooted FileCredentialStore — no socket, no Qt.
+  add_executable(toolbox_mcap_cloud_credential_resolve_test
+    tests/credential_resolve_test.cpp
+    src/credential_resolve.cpp
+    src/settings_store.cpp
+    src/credential_store.cpp
+    src/server_history.cpp
+    src/origin_match.cpp
+  )
+  target_compile_features(toolbox_mcap_cloud_credential_resolve_test PRIVATE cxx_std_20)
+  target_include_directories(toolbox_mcap_cloud_credential_resolve_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+  )
+  target_link_libraries(toolbox_mcap_cloud_credential_resolve_test PRIVATE
+    plotjuggler_sdk::plugin_sdk nlohmann_json::nlohmann_json GTest::gtest_main
+  )
+  add_test(NAME McapCloudCredentialResolveTest COMMAND toolbox_mcap_cloud_credential_resolve_test)
+
   # Wire mapping: protobuf round-trip of ListFilesResponse / GetFileResponse ->
   # the dialog's SequenceInfo / TopicInfo. Socket-free (no live server): it
   # builds protobuf messages, serializes + parses them, then asserts the pure
@@ -922,6 +947,7 @@ if(BUILD_TESTING)
     src/session_mcap_writer.cpp
     ${MCAP_CLOUD_IMPORT_SOURCES}
     src/settings_store.cpp
+    src/credential_resolve.cpp
     src/mcap_save_path.cpp
     src/core/time_format.cpp
     src/mcap_implementation.cpp
