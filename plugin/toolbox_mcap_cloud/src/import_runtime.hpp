@@ -196,6 +196,13 @@ class CacheTee {
   void setWriterHookForTest(std::function<void(const DecodedMessage&)> hook) {
     writer_hook_for_test_ = std::move(hook);
   }
+  /// Injectable writer-thread factory (adversarial F8): a test injects a
+  /// throwing factory to pin that spawn failure degrades to the documented
+  /// NONFATAL tee failure (partial removed, ingest continues) instead of an
+  /// exception escaping into the caller.
+  void setThreadFactoryForTest(std::function<std::thread(std::function<void()>)> factory) {
+    thread_factory_for_test_ = std::move(factory);
+  }
 
   /// Terminal, on the owning thread: close the queue, join the writer thread,
   /// close the MCAP writer (footer+summary) and the sink. After a true
@@ -247,6 +254,7 @@ class CacheTee {
   static constexpr std::size_t kMaxQueuedBytes = 32ull * 1024 * 1024;
   std::size_t max_queued_messages_ = kMaxQueuedMessages;  // test seam
   std::function<void(const DecodedMessage&)> writer_hook_for_test_;
+  std::function<std::thread(std::function<void()>)> thread_factory_for_test_;
   std::atomic<bool> abort_requested_{false};
   mutable std::mutex queue_mu_;
   std::condition_variable queue_not_full_;

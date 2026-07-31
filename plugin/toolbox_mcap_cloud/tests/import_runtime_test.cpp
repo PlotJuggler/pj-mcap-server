@@ -22,6 +22,8 @@
 
 #include <atomic>
 #include <filesystem>
+#include <functional>
+#include <system_error>
 #include <fstream>
 #include <optional>
 #include <string>
@@ -396,4 +398,53 @@ TEST(McapCloudImportRuntime, CacheTeeBeginFailsCleanlyOnUnusableRoot) {
   std::string error;
   EXPECT_FALSE(tee.begin(mcap_cloud::descriptorIdentity(d), &error));
   EXPECT_FALSE(error.empty());
+}
+
+// Adversarial F8 (the tee half): writer-thread spawn failure must degrade to
+// the documented NONFATAL tee failure — openWriter returns false with the
+// cause, no partial survives, the lock is released at cleanup, and nothing
+// throws into the caller.
+TEST(McapCloudCacheTee, WriterThreadSpawnFailureIsNonfatal) {
+  TempRoot cache_root("spawnfail-cache");
+  TempRoot config_root("spawnfail-config");
+  mcap_cloud::ImportRuntime rt(mcap_cloud::SessionFileCache(cache_root.path),
+                               mcap_cloud::TrustedOrigins(config_root.path));
+  const std::string identity =
+      "mcap-cloud:v1:sha256/128:11111111111111111111111111111111";
+
+  mcap_cloud::SessionInfo info;
+  mcap_cloud::SessionTopic topic;
+  topic.topic_id = 1;
+  topic.topic_name = "/one";
+  topic.schema_id = 5;
+  info.topics.push_back(topic);
+  mcap_cloud::SessionSchema schema;
+  schema.schema_id = 5;
+  schema.name = "demo/msg/One";
+  schema.encoding = "ros2msg";
+  schema.data = "int32 value";
+  info.schemas.push_back(schema);
+
+  {
+    mcap_cloud::CacheTee tee(rt);
+    std::string begin_error;
+    ASSERT_TRUE(tee.begin(identity, &begin_error)) << begin_error;
+    tee.setThreadFactoryForTest([](std::function<void()>) -> std::thread {
+      throw std::system_error(std::make_error_code(std::errc::resource_unavailable_try_again),
+                              "injected spawn failure");
+    });
+    std::string open_error;
+    EXPECT_FALSE(tee.openWriter(info, "{}", 0, &open_error))
+        << "spawn failure must be a reported tee failure, not success";
+    EXPECT_NE(open_error.find("writer thread"), std::string::npos) << open_error;
+    tee.abortAndCleanup();
+  }
+  // Nothing survives: no partial, and the exclusive lock is free again.
+  std::error_code ec;
+  for (const auto& entry : std::filesystem::directory_iterator(cache_root.path, ec)) {
+    EXPECT_EQ(entry.path().filename().string().find(".mcap.partial."), std::string::npos)
+        << "leftover partial: " << entry.path();
+  }
+  std::string err;
+  EXPECT_TRUE(rt.fileCache().tryLockForMaterialize(identity, &err).has_value()) << err;
 }

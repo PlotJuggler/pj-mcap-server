@@ -218,7 +218,21 @@ bool CacheTee::openWriter(const SessionInfo& info, const std::string& canonical_
     known_topic_ids_.insert(topic.topic_id);
   }
 
-  writer_thread_ = std::thread([this] { writerLoop(); });
+  // Thread-spawn failure is a resource-exhaustion reality (adversarial F8):
+  // it must degrade to the documented NONFATAL tee failure — close + remove
+  // the partial, report the cause — never let std::system_error escape into
+  // the pull (the interactive command pump would std::terminate).
+  try {
+    writer_thread_ = thread_factory_for_test_
+                         ? thread_factory_for_test_([this] { writerLoop(); })
+                         : std::thread([this] { writerLoop(); });
+  } catch (...) {
+    std::string ignored;
+    (void)writer_.close(&ignored);
+    sink_.closeFile();
+    writer_open_ = false;
+    return fail("could not start the cache writer thread (resource exhaustion)");
+  }
   return true;
 }
 
