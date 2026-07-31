@@ -1207,3 +1207,47 @@ TEST(McapCloudProviderQuery, ColdMaterializedHitAcquiresAndRetainsTheLease) {
   EXPECT_EQ(drop.refs, 3u) << "three queries = three refcounted retains on ONE lease";
   EXPECT_FALSE(cold_rt.hasRetainedLease(identity));
 }
+
+// Round-4 R3: a job that drops the lease across MULTIPLE lock attempts (a
+// racing memory hit re-retains between them) must restore EVERY reference it
+// removed — independent drops add, they do not collapse to max.
+TEST(McapCloudProviderJob, MultipleAttemptDropsRestoreEveryReference) {
+  FakeStreamingServer server(FakeStreamingServer::Mode::kComplete);
+  ASSERT_TRUE(server.ok());
+  ProviderHarness h("job-refmerge");
+  h.provider.setLockWaitForTest(std::chrono::milliseconds(20), std::chrono::seconds(10));
+  const std::string identity = identityFor(server.uri());
+
+  // Publish first, so a real artifact exists and can be legitimately pinned.
+  {
+    JobRecorder recorder;
+    ScopedJob job;
+    ASSERT_TRUE(h.start(queryJson(server.uri()), recorder, job));
+    ASSERT_TRUE(recorder.waitTerminal(std::chrono::seconds(20)));
+    job.job.vtable->join(job.job.ctx);
+  }
+  ASSERT_TRUE(h.rt.hasRetainedLease(identity));
+
+  // Two extra holders (e.g. repeat query hits): three references in total.
+  std::string diagnostic;
+  ASSERT_TRUE(h.rt.retainLeaseForLifetime(identity, &diagnostic)) << diagnostic;
+  ASSERT_TRUE(h.rt.retainLeaseForLifetime(identity, &diagnostic)) << diagnostic;
+  const auto baseline = h.rt.dropLeaseForMaterialize(identity);
+  ASSERT_EQ(baseline.refs, 3u);
+  h.rt.restoreLease(identity, baseline);
+
+  // A second import of the SAME identity: it drops all three, republishes,
+  // and must end holding all three again (the tee's merge + finalize adopt).
+  {
+    JobRecorder recorder;
+    ScopedJob job;
+    ASSERT_TRUE(h.start(queryJson(server.uri()), recorder, job));
+    ASSERT_TRUE(recorder.waitTerminal(std::chrono::seconds(20)));
+    job.job.vtable->join(job.job.ctx);
+    ASSERT_EQ(recorder.terminalCount(), 1u);
+  }
+  const auto after = h.rt.dropLeaseForMaterialize(identity);
+  EXPECT_TRUE(after.had_lease);
+  EXPECT_EQ(after.refs, baseline.refs)
+      << "every reference the job removed must come back (R3)";
+}

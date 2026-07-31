@@ -830,3 +830,35 @@ TEST(McapCloudImportRuntime, RetainRefusesWhenTheArtifactDoesNotValidate) {
   EXPECT_NE(diagnostic.find("does not validate"), std::string::npos) << diagnostic;
   EXPECT_EQ(rt.leaseRefs(identity), 0u);
 }
+
+// Round-4 R3 (merge site): a caller's drop token and the tee's OWN drop
+// removed INDEPENDENT reference sets, so begin() must ADD them — with max()
+// one holder's references are silently discarded and never restored.
+TEST(McapCloudCacheTee, AdoptedAndOwnDropsAddRatherThanCollapse) {
+  TempRoot cache_root("mergeadd-cache");
+  TempRoot config_root("mergeadd-config");
+  mcap_cloud::ImportRuntime rt(mcap_cloud::SessionFileCache(cache_root.path),
+                               mcap_cloud::TrustedOrigins(config_root.path));
+  const mcap_cloud::SourceDescriptor d = descriptor("mergeadd.mcap");
+  const std::string identity = mcap_cloud::descriptorIdentity(d);
+  publishThroughTee(rt, d);  // one holder retained by finalize
+  ASSERT_TRUE(rt.hasRetainedLease(identity));
+
+  // The caller (a provider job) already dropped TWO references of its own in
+  // an earlier attempt; the tee's own drop will remove the one still held.
+  mcap_cloud::ImportRuntime::LeaseDrop adopted;
+  adopted.had_lease = true;
+  adopted.refs = 2;
+
+  {
+    mcap_cloud::CacheTee tee(rt);
+    std::string error;
+    ASSERT_TRUE(tee.begin(identity, &error, std::nullopt, std::nullopt, adopted)) << error;
+    tee.abortAndCleanup();  // no publish -> restore the MERGED count
+  }
+
+  const auto restored = rt.dropLeaseForMaterialize(identity);
+  ASSERT_TRUE(restored.had_lease);
+  EXPECT_EQ(restored.refs, 3u)
+      << "adopted (2) + own (1) must ADD; max() would restore only 2 (R3)";
+}

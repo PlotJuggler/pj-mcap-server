@@ -1616,9 +1616,31 @@ PullResult FetchWorker::pull(PullRequest request) {
   // ---- self-contained input validation (no dialog, no connectAsync state) --
   ImportRuntime* const rt = request.runtime;
   if (rt == nullptr) {
+    // Nothing to restore through: with no runtime there is no registry the
+    // caller could have dropped a lease in.
     result.error = "direct pull requires an ImportRuntime";
     return result;
   }
+
+  // Round-4 R1(b): the caller's lease-drop token becomes structurally RAII
+  // from here. Every exit below — validation refusals, allocation failures,
+  // the pre-stream estimate refusal, an exception — restores it, and does so
+  // WHILE THE TICKET IS STILL HELD (invariant 3). Both hold by construction:
+  // this guard is a LOCAL, so it is destroyed BEFORE the by-value `request`
+  // parameter that owns the ticket, and it becomes a no-op once a tee adopts
+  // the token (the tee then owns the restore, under the same ticket).
+  struct PendingLeaseDrop {
+    ImportRuntime* runtime;
+    const std::string* identity;
+    ImportRuntime::LeaseDrop drop;
+    bool adopted = false;
+    ~PendingLeaseDrop() {
+      if (!adopted && drop.had_lease && runtime != nullptr) {
+        runtime->restoreLease(*identity, drop);
+      }
+    }
+  } pending_lease_drop{rt, &request.identity, request.lease_drop};
+
   if (request.sequence_names.empty()) {
     result.error = "empty selection (no s3 keys)";
     return result;
@@ -1653,6 +1675,10 @@ PullResult FetchWorker::pull(PullRequest request) {
   } tee_cancel_hook_guard{this};
   {
     std::string begin_error;
+    // The tee takes over the token's restore obligation from here (it merges
+    // the token into its own and restores under the ticket in
+    // abortAndCleanup) — including on a FAILED begin, whose abort still runs.
+    pending_lease_drop.adopted = true;
     if (!tee->begin(request.identity, &begin_error, std::move(request.ticket),
                     std::move(request.lock), request.lease_drop)) {
       tee.reset();

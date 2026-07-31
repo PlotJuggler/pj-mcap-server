@@ -236,10 +236,14 @@ PJ_descriptor_import_outcome_t DescriptorImportProvider::JobState::runToTerminal
   // tee, so the pull's own abort path restores it under the same ticket
   // instead of a ticket-less post-pull patch-up.
   ImportRuntime::LeaseDrop lease_drop;
+  // Round-4 R3: independent drops ADD. Each successful attempt-drop removed a
+  // DIFFERENT set of references (a racing memory hit re-retained between
+  // attempts), so max() silently discarded holders; the restore must put back
+  // every reference this job ever took away.
   auto merge_drop = [&lease_drop](const ImportRuntime::LeaseDrop& drop) {
     if (drop.had_lease) {
       lease_drop.had_lease = true;
-      lease_drop.refs = std::max(lease_drop.refs, drop.refs);
+      lease_drop.refs += drop.refs;
     }
   };
   std::optional<SessionFileCache::MaterializeLock> os_lock;
@@ -278,8 +282,12 @@ PJ_descriptor_import_outcome_t DescriptorImportProvider::JobState::runToTerminal
       std::filesystem::path disk;
       if (runtime.fileCache().lookup(identity, &disk)) {
         os_lock.reset();
-        lease_drop.had_lease = true;  // a valid artifact deserves the pin either way
-        lease_drop.refs = std::max(lease_drop.refs, 1u);
+        // A valid artifact deserves the pin either way; if this job never
+        // dropped a reference, it still restores one for the fresh artifact.
+        if (!lease_drop.had_lease) {
+          lease_drop.had_lease = true;
+          lease_drop.refs = 1u;
+        }
         runtime.restoreLease(identity, lease_drop);
         ticket.reset();
         *message =

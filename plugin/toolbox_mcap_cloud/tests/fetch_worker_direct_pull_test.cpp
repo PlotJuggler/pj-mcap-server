@@ -505,3 +505,73 @@ TEST(McapCloudDirectPull, DurationDeadlineIsHardAcrossResumeBackoff) {
       << "the deadline must cap the resume backoff/reconnect chain (F3), not run it out";
   EXPECT_FALSE(cacheRootHasPartial(cache_root.path));
 }
+
+// Round-4 R1(b): a PRE-TEE pull exit must still restore the caller's
+// lease-drop token — and under the ticket. Here the pull is refused by the
+// pre-stream estimate check (R2a), which returns long before any tee adopts
+// the token; the guard has to put the prior dataset's pin back.
+TEST(McapCloudDirectPull, PreTeeExitRestoresTheCallersLeaseDrop) {
+  FakeStreamingServer server(FakeStreamingServer::Mode::kComplete);
+  ASSERT_TRUE(server.ok());
+  TempRoot cache_root("pretee-cache");
+  TempRoot config_root("pretee-config");
+  mcap_cloud::ImportRuntime rt(mcap_cloud::SessionFileCache(cache_root.path),
+                               mcap_cloud::TrustedOrigins(config_root.path));
+  const std::string identity = identityFor(server.uri());
+
+  // Publish once so a real artifact + lifetime lease exist.
+  {
+    PullHarness first;
+    const auto seeded = first.worker.pull(first.request(rt, server.uri()));
+    ASSERT_EQ(seeded.terminal, mcap_cloud::PullTerminal::kComplete) << seeded.error;
+  }
+  ASSERT_TRUE(rt.hasRetainedLease(identity));
+
+  // The caller (a provider job) drops the lease and hands the token to a pull
+  // that will be refused BEFORE the tee: estimate 12288 > ceiling 5000.
+  const auto drop = rt.dropLeaseForMaterialize(identity);
+  ASSERT_TRUE(drop.had_lease);
+  ASSERT_FALSE(rt.hasRetainedLease(identity));
+
+  PullHarness h;
+  mcap_cloud::PullRequest request = h.request(rt, server.uri());
+  request.max_transfer_bytes = 5000;
+  request.lease_drop = drop;
+  const auto result = h.worker.pull(std::move(request));
+
+  EXPECT_EQ(result.terminal, mcap_cloud::PullTerminal::kFailed);
+  EXPECT_TRUE(result.byte_ceiling_exceeded);
+  EXPECT_TRUE(rt.hasRetainedLease(identity))
+      << "a pre-tee pull exit must restore the caller's lease drop (R1b)";
+  const auto after = rt.dropLeaseForMaterialize(identity);
+  EXPECT_EQ(after.refs, drop.refs) << "and restore the same reference count";
+}
+
+// Round-4 R1(b): the earliest exits of all — bad input — must not strand a
+// token either (the guard is entered before every validation).
+TEST(McapCloudDirectPull, EarlyValidationExitRestoresTheCallersLeaseDrop) {
+  FakeStreamingServer server(FakeStreamingServer::Mode::kComplete);
+  ASSERT_TRUE(server.ok());
+  TempRoot cache_root("earlyexit-cache");
+  TempRoot config_root("earlyexit-config");
+  mcap_cloud::ImportRuntime rt(mcap_cloud::SessionFileCache(cache_root.path),
+                               mcap_cloud::TrustedOrigins(config_root.path));
+  const std::string identity = identityFor(server.uri());
+  {
+    PullHarness first;
+    const auto seeded = first.worker.pull(first.request(rt, server.uri()));
+    ASSERT_EQ(seeded.terminal, mcap_cloud::PullTerminal::kComplete) << seeded.error;
+  }
+  const auto drop = rt.dropLeaseForMaterialize(identity);
+  ASSERT_TRUE(drop.had_lease);
+
+  PullHarness h;
+  mcap_cloud::PullRequest request = h.request(rt, server.uri());
+  request.sequence_names.clear();  // refused by the very first validation
+  request.lease_drop = drop;
+  const auto result = h.worker.pull(std::move(request));
+
+  EXPECT_EQ(result.terminal, mcap_cloud::PullTerminal::kFailed);
+  EXPECT_TRUE(rt.hasRetainedLease(identity))
+      << "even the earliest validation exit must restore the token (R1b)";
+}
