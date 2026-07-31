@@ -204,6 +204,27 @@ void FetchWorker::setTeeForCancel(CacheTee* tee) {
   tee_for_cancel_ = tee;
 }
 
+bool FetchWorker::teeEnqueueFailed(std::unique_ptr<CacheTee>& tee, const DecodedMessage& message,
+                                   std::string* error) {
+  if (tee == nullptr || tee->enqueue(message)) {
+    return false;
+  }
+  if (tee->abortRequested() && !tee->failed()) {
+    // A CANCEL-freed enqueue is NOT a failure: the tee stays alive so the
+    // single terminal boundary can still copy the readable partial for a
+    // requested export and classify the pull kAborted consistently.
+    return false;
+  }
+  // The writer thread hit a disk error (§9.6): never abort the ingest —
+  // retire + drop the tee (partial deleted, locks released) and hand the
+  // raw cause to the caller for outcome recording / export failure.
+  *error = tee->failureError();
+  setTeeForCancel(nullptr);
+  tee->abortAndCleanup();
+  tee.reset();
+  return true;
+}
+
 void FetchWorker::storeCompletedSessionEntry(
     SessionCache& session_cache, const SessionKey& session_key, const std::string& group_name,
     const std::string& server_uri, const std::vector<std::string>& topic_names,
@@ -213,14 +234,17 @@ void FetchWorker::storeCompletedSessionEntry(
   CachedSession entry;
   entry.display_name = group_name;
   entry.server_uri = server_uri;
+  // name -> decoded count (session topic names are unique), instead of a
+  // per-topic reverse scan of name_by_id (quality review, nit 5).
+  std::unordered_map<std::string, std::uint64_t> count_by_name;
+  count_by_name.reserve(name_by_id.size());
+  for (const auto& [tid, name] : name_by_id) {
+    const auto it = counts.find(tid);
+    count_by_name[name] = (it != counts.end()) ? it->second : 0;
+  }
   for (const auto& t : topic_names) {
-    std::uint64_t count = 0;
-    for (const auto& [tid, name] : name_by_id) {
-      if (name == t) {
-        count = counts.count(tid) ? counts.at(tid) : 0;
-        break;
-      }
-    }
+    const auto it = count_by_name.find(t);
+    const std::uint64_t count = (it != count_by_name.end()) ? it->second : 0;
     entry.counts_by_topic[t] = count;
     entry.total_messages += count;
   }
@@ -1304,25 +1328,16 @@ void FetchWorker::pullTopicsAsync(std::vector<std::string> sequence_names, std::
         // RUNTIME mode: hand the record to the cache tee's bounded queue
         // (owned copy; BLOCKS briefly under backpressure when the disk lags —
         // the wait is cancellable via requestCancel -> CacheTee::requestAbort).
-        // A tee failure — the writer thread hit a disk error — never aborts
-        // the ingest (§9.6): drop the tee (partial deleted, locks released),
-        // record the outcome for promotion suppression, and fail a requested
-        // export with the raw cause (the cache is the sole encoder — there is
-        // no independent export stream to fall back to). A CANCEL-freed
-        // enqueue is NOT a failure: the tee stays alive so the single
-        // terminal boundary below can still copy the readable partial for a
-        // requested export and classify the pull kAborted consistently.
-        if (tee != nullptr && !tee->enqueue(m)) {
-          if (!(tee->abortRequested() && !tee->failed())) {
-            tee_outcome = TeeOutcome::kFailed;
-            tee_error = tee->failureError();
-            set_tee_cancel_hook(nullptr);
-            tee->abortAndCleanup();
-            tee.reset();
-            if (save_paths.has_value()) {
-              discard_partial();
-              emit_save_result(McapSaveResult{McapSaveStatus::Failed, {}, tee_error});
-            }
+        // The §9.6 failure/cancel discipline lives in teeEnqueueFailed (one
+        // place for both pulls); on a genuine tee failure the export also
+        // fails with the raw cause — the cache is the sole encoder, there is
+        // no independent export stream to fall back to.
+        if (std::string enqueue_error; teeEnqueueFailed(tee, m, &enqueue_error)) {
+          tee_outcome = TeeOutcome::kFailed;
+          tee_error = std::move(enqueue_error);
+          if (save_paths.has_value()) {
+            discard_partial();
+            emit_save_result(McapSaveResult{McapSaveStatus::Failed, {}, tee_error});
           }
         }
         (void)driver.decode(m);  // best-effort; drops + counts on failure
@@ -1728,12 +1743,33 @@ PullResult FetchWorker::pull(PullRequest request) {
   PJ::sdk::ToolboxHostView host = host_provider_();
   PJ::ToolboxRuntimeHostView runtime = runtime_host_provider_();
 
+  // CANCEL-AWARE acquisition of the SHARED host-write mutex (quality review
+  // IMPORTANT-1): the interactive runtime-mode pull holds this mutex across
+  // its ENTIRE download, so a blocking lock here would wedge a provider job
+  // — and its cancel/join/destroy — for minutes behind an unrelated fetch.
+  // Mirror the provider's materialize-gate discipline: poll try_lock at a
+  // short cadence and honor the cancel flag between attempts.
+  constexpr auto kHostWriteLockPoll = std::chrono::milliseconds(50);
+  auto lock_host_write_cancellable = [&](std::unique_lock<std::mutex>& lock) {
+    while (!lock.try_lock()) {
+      if (cancel_flag_.load(std::memory_order_relaxed)) {
+        return false;
+      }
+      std::this_thread::sleep_for(kHostWriteLockPoll);
+    }
+    return true;
+  };
+
   // Create the dataset under the SHARED host-write lock (the runtime mutex
   // serializes this pull against the interactive worker), then surface it
   // through datasetCreated OUTSIDE the lock: the PR-3 job forwards it as the
   // ABI on_dataset, which must precede any binding/publication/progress —
   // and host callback code must never run under our write lock.
-  std::unique_lock<std::mutex> write_lock(rt->hostWriteMutex());
+  std::unique_lock<std::mutex> write_lock(rt->hostWriteMutex(), std::defer_lock);
+  if (!lock_host_write_cancellable(write_lock)) {
+    finish_cancelled();
+    return result;  // the tee's RAII cleanup deletes the partial
+  }
   auto ds = datasetForFetch(host, request.group_name);
   if (!ds) {
     write_lock.unlock();
@@ -1745,7 +1781,10 @@ PullResult FetchWorker::pull(PullRequest request) {
   if (request.datasetCreated) {
     request.datasetCreated(*ds);
   }
-  write_lock.lock();
+  if (!lock_host_write_cancellable(write_lock)) {
+    finish_cancelled();
+    return result;
+  }
 
   const IngestBindResult bind = driver.bindSession(runtime, *ds, session_info);
 
@@ -1790,17 +1829,12 @@ PullResult FetchWorker::pull(PullRequest request) {
           byte_ceiling_exceeded = true;
           return false;
         }
-        // Cache tee: identical §9.6 discipline to the interactive pull — a
-        // tee FAILURE drops the tee and the ingest continues; a cancel-freed
+        // Cache tee: the shared §9.6 discipline (teeEnqueueFailed) — a tee
+        // FAILURE drops the tee and the ingest continues; a cancel-freed
         // enqueue keeps the tee alive for the single terminal boundary.
-        if (tee != nullptr && !tee->enqueue(m)) {
-          if (!(tee->abortRequested() && !tee->failed())) {
-            result.tee_outcome = TeeOutcome::kFailed;
-            result.tee_error = tee->failureError();
-            setTeeForCancel(nullptr);
-            tee->abortAndCleanup();
-            tee.reset();
-          }
+        if (std::string enqueue_error; teeEnqueueFailed(tee, m, &enqueue_error)) {
+          result.tee_outcome = TeeOutcome::kFailed;
+          result.tee_error = std::move(enqueue_error);
         }
         (void)driver.decode(m);  // best-effort; drops + counts on failure
 
@@ -1856,7 +1890,19 @@ PullResult FetchWorker::pull(PullRequest request) {
   write_lock.unlock();
 
   result.stats = stats;
-  result.any_decodable = driver.hasDecodable();
+  // Usability predicate (quality review IMPORTANT-3): "some topic COULD
+  // decode" is not enough — an all-decode-errors session has decodable
+  // bindings and ZERO rows, and must not be described as a usable eager
+  // dataset. Usable = a decodable binding exists AND (at least one row
+  // actually decoded OR the stream was genuinely empty — an empty time
+  // window imports an empty-but-correct dataset).
+  std::uint64_t decoded_rows = 0;
+  for (const auto& [tid, rows] : counts) {
+    (void)tid;
+    decoded_rows += rows;
+  }
+  result.any_decodable =
+      driver.hasDecodable() && (decoded_rows > 0 || stats.messages_received == 0);
   result.decode_errors = total_decode_errors;
   result.byte_ceiling_exceeded = byte_ceiling_exceeded;
 

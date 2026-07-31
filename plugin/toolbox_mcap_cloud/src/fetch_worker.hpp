@@ -87,7 +87,13 @@ struct PullResult {
   TeeOutcome tee_outcome = TeeOutcome::kNone;
   std::string tee_error;
   std::optional<PJ::sdk::DataSourceHandle> dataset;  // the eager dataset, when created
-  bool any_decodable = false;               // the eager dataset actually holds rows
+  /// The eager dataset is GENUINELY usable: a decodable parser binding
+  /// exists AND (at least one row actually decoded OR the stream was
+  /// genuinely empty — zero messages received). An all-decode-errors
+  /// session (messages received, zero rows) is NOT usable and reads false
+  /// here, so the provider terminals it FAILED rather than EAGER_ONLY; an
+  /// empty time window (a valid plan with nothing in range) stays usable.
+  bool any_decodable = false;
   std::uint64_t decode_errors = 0;
   SessionStats stats;
   /// The D6 promotion-at-completion result (non-null iff the tee finalized
@@ -252,6 +258,15 @@ class FetchWorker {
   /// exactly like the interactive path (D7). Blocking; call on a dedicated
   /// worker/job thread. None of the interactive std::function callbacks
   /// fire.
+  ///
+  /// Relied-on invariants (quality review, nit 3):
+  ///   - the cancel flag is NOT reset across pulls (deliberate: a cancel
+  ///     latched before the session hook publishes must still abort the
+  ///     next blocking phase). A caller reusing one worker for a second
+  ///     pull must resetCancel() itself; the provider sidesteps this by
+  ///     construction — ONE fresh FetchWorker per job (D4).
+  ///   - at most ONE pull may be in flight per worker at a time (the cancel
+  ///     hooks and the per-download dataset handle are single-slot).
   [[nodiscard]] PullResult pull(PullRequest request);
 
   // `uri` echoes the EXACT uri this connectAsync() call was invoked with (not
@@ -505,6 +520,16 @@ class FetchWorker {
   // for the publish-before-connect / retire-before-destroy discipline).
   void setSessionForCancel(BackendConnection* session);
   void setTeeForCancel(CacheTee* tee);
+
+  // The ONE §9.6 in-loop tee discipline, shared by both pulls: enqueue
+  // `message`; a cancel-freed enqueue keeps the tee alive (the single
+  // terminal boundary still copies/classifies it); a genuine tee FAILURE
+  // retires the cancel hook, aborts + resets the tee and returns true with
+  // *error = the raw cause — the caller only records the outcome (and, on
+  // the interactive path, fails a requested export). Never aborts the
+  // ingest.
+  [[nodiscard]] bool teeEnqueueFailed(std::unique_ptr<CacheTee>& tee, const DecodedMessage& message,
+                                      std::string* error);
 
   // The COMPLETE-only SessionCache store (pure extraction from
   // pullTopicsAsync — shared with pull()). Records the per-topic counts, the

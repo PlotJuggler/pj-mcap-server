@@ -48,11 +48,13 @@ inline constexpr std::size_t kFakePayloadBytes = 1024;
 
 // A fake pj_cloud server that ACTUALLY STREAMS a session: Hello ->
 // HelloResponse; OpenSession -> plan (1 topic / 1 schema) then, per mode,
-// either kFakeBatches NONE-encoded batches + Eos{COMPLETE} or two batches
-// followed by silence (the stall the cancel tests need).
+// kFakeBatches NONE-encoded batches + Eos{COMPLETE}, or two batches followed
+// by silence (the stall the cancel tests need), or ZERO batches + an
+// immediate Eos{COMPLETE} (kCompleteEmpty — the empty-time-window shape: a
+// real plan whose selection holds no messages).
 class FakeStreamingServer {
  public:
-  enum class Mode { kComplete, kStallAfterTwoBatches, kEmptyPlan };
+  enum class Mode { kComplete, kStallAfterTwoBatches, kEmptyPlan, kCompleteEmpty };
 
   explicit FakeStreamingServer(Mode mode) : mode_(mode), port_(findFreePort()), server_(port_, "127.0.0.1") {
     server_.setOnClientMessageCallback([this](std::shared_ptr<ix::ConnectionState>,
@@ -98,7 +100,8 @@ class FakeStreamingServer {
       if (mode_ == Mode::kEmptyPlan) {
         return;
       }
-      const int batches = (mode_ == Mode::kComplete) ? kFakeBatches : 2;
+      const int batches =
+          (mode_ == Mode::kComplete) ? kFakeBatches : (mode_ == Mode::kCompleteEmpty ? 0 : 2);
       std::uint64_t sent = 0;
       for (int b = 0; b < batches; ++b) {
         pj_cloud::v1::ServerMessage frame;
@@ -123,7 +126,7 @@ class FakeStreamingServer {
         }
         send(ws, frame);
       }
-      if (mode_ == Mode::kComplete) {
+      if (mode_ == Mode::kComplete || mode_ == Mode::kCompleteEmpty) {
         pj_cloud::v1::ServerMessage eos_frame;
         eos_frame.set_subscription_id(7);  // see the batch-frame comment above
         auto* eos = eos_frame.mutable_eos();

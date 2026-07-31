@@ -58,6 +58,7 @@
 #include "fake_toolbox_host.hpp"
 #include "import_runtime.hpp"
 #include "parser_ingest_test_support.hpp"
+#include "scoped_job.hpp"
 #include "session_file_cache.hpp"
 #include "source_descriptor.hpp"
 #include "test_support_env.hpp"
@@ -127,15 +128,8 @@ struct JobRecorder {
   }
 };
 
-// RAII over the ABI fat-pointer job: destroy on scope exit.
-struct ScopedJob {
-  PJ_joinable_job_t job{};
-  ~ScopedJob() {
-    if (job.vtable != nullptr && job.vtable->destroy != nullptr) {
-      job.vtable->destroy(job.ctx);
-    }
-  }
-};
+// RAII job handle hoisted to scoped_job.hpp (shared with the live suite).
+using mcap_cloud_test::ScopedJob;
 
 // The wired provider harness: runtime over temp roots, in-memory settings,
 // fake toolbox + ingest hosts. NO dialog, NO getDialog — the provider must
@@ -675,5 +669,119 @@ TEST(McapCloudProviderJob, DestroyImmediatelyAfterStartIsSafeAndTerminalsOnce) {
 
   ASSERT_EQ(recorder.terminalCount(), 1u) << "destroy implies the terminal already fired";
   EXPECT_EQ(recorder.terminal(0).first, PJ_DESCRIPTOR_IMPORT_CANCELLED)
+      << recorder.terminal(0).second;
+}
+
+// ---------------------------------------------------------------------------
+// PR-3 quality-review set (IMPORTANT-1/2/3)
+// ---------------------------------------------------------------------------
+
+// IMPORTANT-1: the interactive runtime-mode pull holds the SHARED host-write
+// mutex across its ENTIRE download — a provider job blocking on that mutex
+// must still honor cancel promptly (poll-try_lock, mirroring the
+// materialize-gate discipline), or cancel/join/destroy stall for minutes.
+TEST(McapCloudProviderJob, CancelWhileHostWriteMutexHeldUnblocksFast) {
+  FakeStreamingServer server(FakeStreamingServer::Mode::kComplete);
+  ASSERT_TRUE(server.ok());
+  ProviderHarness h("job-hostwrite");
+
+  // The "interactive worker mid-download": hold the shared host-write mutex.
+  std::unique_lock<std::mutex> host_write_hold(h.rt.hostWriteMutex());
+
+  JobRecorder recorder;
+  ScopedJob job;
+  ASSERT_TRUE(h.start(queryJson(server.uri()), recorder, job));
+  // Let the job connect + open the session and reach the host-write wait.
+  const auto open_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  while (server.openSessions() == 0 && std::chrono::steady_clock::now() < open_deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  ASSERT_GT(server.openSessions(), 0);
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));  // firmly in the lock wait
+
+  const auto cancel_at = std::chrono::steady_clock::now();
+  job.job.vtable->cancel(job.job.ctx);
+  const bool got_terminal = recorder.waitTerminal(std::chrono::seconds(2));
+  const auto unblock_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - cancel_at);
+  host_write_hold.unlock();  // let a non-cancellable (red) pull run to its end
+  job.job.vtable->join(job.job.ctx);
+
+  EXPECT_TRUE(got_terminal) << "cancel must wake the host-write lock wait";
+  EXPECT_LT(unblock_ms.count(), 2000);
+  ASSERT_EQ(recorder.terminalCount(), 1u);
+  EXPECT_EQ(recorder.terminal(0).first, PJ_DESCRIPTOR_IMPORT_CANCELLED)
+      << recorder.terminal(0).second;
+}
+
+// IMPORTANT-2: a cancel landing AFTER a kComplete pull (tee finalized, entry
+// stored, promotion settled) must NOT rewrite history — the job reports its
+// TRUTHFUL terminal (here: PROMOTED). Deterministic via the pre-terminal
+// seam. Mid-download/non-complete cancels keep cancel-wins (the ceiling
+// race test above).
+TEST(McapCloudProviderAbi, PostCompleteCancelReportsTruthfulTerminal) {
+  FakeStreamingServer server(FakeStreamingServer::Mode::kComplete);
+  ASSERT_TRUE(server.ok());
+  ProviderHarness h("abi-postcomplete");
+  FakePromotionHost promo;  // re-entrant: settled by the time the pull returns
+  h.rt.setPromotionHost(PJ::SourcePromotionHostView(promo.view()));
+
+  JobRecorder recorder;
+  ScopedJob job;
+  h.provider.setPreTerminalHookForTest([&]() {
+    if (job.job.vtable != nullptr) {
+      job.job.vtable->cancel(job.job.ctx);  // the post-complete cancel
+    }
+  });
+  ASSERT_TRUE(h.start(queryJson(server.uri()), recorder, job));
+  ASSERT_TRUE(recorder.waitTerminal(std::chrono::seconds(20)));
+  job.job.vtable->join(job.job.ctx);
+
+  ASSERT_EQ(recorder.terminalCount(), 1u);
+  EXPECT_EQ(recorder.terminal(0).first, PJ_DESCRIPTOR_IMPORT_SUCCEEDED_PROMOTED)
+      << "a completed pull must report its truthful terminal even if a cancel raced in "
+         "post-completion — got: "
+      << recorder.terminal(0).second;
+  EXPECT_EQ(promo.calls.load(), 1);
+}
+
+// IMPORTANT-3: an all-decode-errors session (every message received, zero
+// rows decoded) is NOT a usable eager dataset — FAILED, not EAGER_ONLY.
+TEST(McapCloudProviderJob, AllDecodeErrorsSessionFails) {
+  FakeStreamingServer server(FakeStreamingServer::Mode::kComplete);
+  ASSERT_TRUE(server.ok());
+  ProviderHarness h("job-decodeerrors");
+  h.ingest.refuse_push = true;  // bindings succeed; every push fails -> decode errors only
+
+  JobRecorder recorder;
+  ScopedJob job;
+  ASSERT_TRUE(h.start(queryJson(server.uri()), recorder, job));
+  ASSERT_TRUE(recorder.waitTerminal(std::chrono::seconds(20)));
+  job.job.vtable->join(job.job.ctx);
+
+  ASSERT_EQ(recorder.terminalCount(), 1u);
+  EXPECT_EQ(recorder.terminal(0).first, PJ_DESCRIPTOR_IMPORT_FAILED)
+      << "zero decoded rows out of a non-empty stream must FAIL, never EAGER_ONLY — got: "
+      << recorder.terminal(0).second;
+  EXPECT_NE(recorder.terminal(0).second.find("decoded"), std::string::npos)
+      << recorder.terminal(0).second;
+}
+
+// IMPORTANT-3 (the other side): a genuinely EMPTY time window — a real plan
+// whose selection holds zero messages, Eos{COMPLETE} — stays EAGER_ONLY
+// (nothing failed; there was simply nothing to decode).
+TEST(McapCloudProviderJob, EmptyWindowCompleteIsEagerOnly) {
+  FakeStreamingServer server(FakeStreamingServer::Mode::kCompleteEmpty);
+  ASSERT_TRUE(server.ok());
+  ProviderHarness h("job-emptywindow");
+
+  JobRecorder recorder;
+  ScopedJob job;
+  ASSERT_TRUE(h.start(queryJson(server.uri()), recorder, job));
+  ASSERT_TRUE(recorder.waitTerminal(std::chrono::seconds(20)));
+  job.job.vtable->join(job.job.ctx);
+
+  ASSERT_EQ(recorder.terminalCount(), 1u);
+  EXPECT_EQ(recorder.terminal(0).first, PJ_DESCRIPTOR_IMPORT_SUCCEEDED_EAGER_ONLY)
       << recorder.terminal(0).second;
 }

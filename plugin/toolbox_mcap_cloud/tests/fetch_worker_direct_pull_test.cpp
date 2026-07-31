@@ -31,15 +31,11 @@
 #include <thread>
 #include <vector>
 
-#include <ixwebsocket/IXWebSocketServer.h>
-
 #include "fake_streaming_server.hpp"
 #include "fake_toolbox_host.hpp"
 #include "fetch_worker.hpp"
-#include "find_free_port.hpp"
 #include "import_runtime.hpp"
 #include "parser_ingest_test_support.hpp"
-#include "pj_cloud.pb.h"
 #include "session_file_cache.hpp"
 #include "session_key.hpp"
 #include "test_support_fs.hpp"
@@ -51,7 +47,6 @@ namespace fs = std::filesystem;
 using mcap_cloud_test::FakeStreamingServer;
 using mcap_cloud_test::cacheRootHasPartial;
 using mcap_cloud_test::descriptorFor;
-using mcap_cloud_test::findFreePort;
 using mcap_cloud_test::identityFor;
 
 struct TempRoot : mcap_cloud_test::ScopedTempDir {

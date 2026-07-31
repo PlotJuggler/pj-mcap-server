@@ -201,13 +201,22 @@ PJ_descriptor_import_outcome_t DescriptorImportProvider::JobState::runToTerminal
   }
 
   // ---- terminal mapping ----------------------------------------------------
-  // Documented precedence (pinned by the adversarial suite): CANCEL WINS
-  // when both the cancel flag and the byte ceiling latched — an explicit
-  // caller cancel outranks the resource classification (the partial is
-  // deleted either way; a retry reports the ceiling uncontaminated). The
-  // ceiling then wins over every other failure cause and is FAILED, never
-  // CANCELLED.
-  if (res.terminal == PullTerminal::kCancelled || isCancelled()) {
+  // Documented precedence (pinned by the adversarial suite): for a
+  // NON-COMPLETE pull, CANCEL WINS — even over the byte ceiling when both
+  // latched (an explicit caller cancel outranks the resource
+  // classification; the partial is deleted either way; a retry reports the
+  // ceiling uncontaminated), and the ceiling then wins over every other
+  // failure cause (FAILED, never CANCELLED). A COMPLETE pull is different
+  // (quality review IMPORTANT-2): the download finished, the tee finalized
+  // and the entry stored BEFORE the cancel could land, so a cancel racing
+  // in post-completion must not rewrite history — the job reports its
+  // TRUTHFUL terminal (PROMOTED/EAGER_ONLY per the settled promotion; the
+  // host's cancel rollback is ledger-based over produced datasets, so a
+  // SUCCEEDED_* at a cancelling batch is removed cleanly either way). The
+  // one exception below: a promotion still OUTSTANDING at cancel detaches
+  // as CANCELLED — join() must stay unblockable.
+  if (res.terminal == PullTerminal::kCancelled ||
+      (res.terminal != PullTerminal::kComplete && isCancelled())) {
     *message = "import cancelled";
     return PJ_DESCRIPTOR_IMPORT_CANCELLED;  // the tee already deleted the partial
   }
@@ -295,6 +304,11 @@ void DescriptorImportProvider::jobDestroy(void* ctx) noexcept {
   if (ctx == nullptr) {
     return;
   }
+  // NOTE: jobJoin's self-join guard does NOT make destroy-from-a-callback
+  // survivable — the guard only skips the join, and `delete state` below
+  // then destroys a still-joinable std::thread member, which is
+  // std::terminate. The ABI's "never call join/destroy from a job callback"
+  // rule is load-bearing here, not merely advisory.
   auto* state = static_cast<JobState*>(ctx);
   jobCancel(ctx);
   // Defensive: startImport always releases the gate before returning, but a

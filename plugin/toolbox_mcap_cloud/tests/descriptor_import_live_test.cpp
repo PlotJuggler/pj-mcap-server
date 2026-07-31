@@ -27,6 +27,7 @@
 #include "fake_toolbox_host.hpp"
 #include "import_runtime.hpp"
 #include "parser_ingest_test_support.hpp"
+#include "scoped_job.hpp"
 #include "session_file_cache.hpp"
 #include "source_descriptor.hpp"
 #include "test_support_fs.hpp"
@@ -118,6 +119,8 @@ TEST(McapCloudDescriptorImportLive, QueryImportTerminalThenMaterializedHit) {
 
   // 2) import: full round trip to the exactly-once terminal. No promotion
   //    host is bound -> SUCCEEDED_EAGER_ONLY is the correct live terminal.
+  //    ScopedJob (IMPORTANT-4): declared AFTER provider/rt/hosts so a failing
+  //    ASSERT below destroys (cancel+join) the worker BEFORE they unwind.
   LiveRecorder recorder;
   PJ_descriptor_import_start_request_v1_t request{};
   request.struct_size = sizeof(request);
@@ -126,10 +129,10 @@ TEST(McapCloudDescriptorImportLive, QueryImportTerminalThenMaterializedHit) {
   cbs.struct_size = sizeof(cbs);
   cbs.on_dataset = &LiveRecorder::onDataset;
   cbs.on_terminal = &LiveRecorder::onTerminal;
-  PJ_joinable_job_t job{};
-  ASSERT_TRUE(provider.startImport(&request, &cbs, &recorder, &job, &err)) << err.message;
+  mcap_cloud_test::ScopedJob job;
+  ASSERT_TRUE(provider.startImport(&request, &cbs, &recorder, &job.job, &err)) << err.message;
   ASSERT_TRUE(recorder.waitTerminal(std::chrono::seconds(120)));
-  job.vtable->join(job.ctx);
+  job.job.vtable->join(job.job.ctx);
 
   ASSERT_EQ(recorder.terminals.size(), 1u);
   EXPECT_EQ(recorder.terminals[0].first, PJ_DESCRIPTOR_IMPORT_SUCCEEDED_EAGER_ONLY)
@@ -148,6 +151,5 @@ TEST(McapCloudDescriptorImportLive, QueryImportTerminalThenMaterializedHit) {
   ASSERT_TRUE(provider.queryDescriptor(PJ_string_view_t{json.data(), json.size()}, &out, &err));
   EXPECT_EQ(out.is_materialized, 1u);
   EXPECT_GT(out.estimated_bytes, 0u);
-
-  job.vtable->destroy(job.ctx);
+  // ScopedJob destroys (cancel+join+free) on scope exit.
 }
