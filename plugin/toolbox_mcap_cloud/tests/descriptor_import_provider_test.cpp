@@ -253,7 +253,7 @@ TEST(McapCloudProviderQuery, AlwaysReturnsIdentityAndPathWithTrustMatrix) {
   EXPECT_GT(out.message.size, 0u) << "needs-confirmation carries a diagnostic";
 
   // Trust flips through the in-memory set (recordSuccessfulHello).
-  h.rt.recordSuccessfulHello(uri);
+  ASSERT_TRUE(h.rt.recordSuccessfulHello(uri));
   ASSERT_TRUE(runQuery(h.provider, json, &out));
   EXPECT_EQ(out.trust, PJ_DESCRIPTOR_TRUST_TRUSTED);
 }
@@ -1050,12 +1050,12 @@ TEST(McapCloudProviderJob, ProviderEnvByteCapAppliesWithoutCallerCeiling) {
       << recorder.terminal(0).second;
 }
 
-// Re-verify R1(c): a lease retained on the job's OWN runtime DURING its
-// cross-process wait (a racing memory hit) must not dead-hand the job into
-// its timeout — the release happens before EACH attempt (safe: the job holds
-// the in-process active ticket, so any same-runtime lease is a memory hit,
-// never another materializer).
-TEST(McapCloudProviderJob, SelfLeaseDuringTheLockWaitDoesNotTimeOut) {
+// Round-5 F2 (was R1c): a lease retained on the job's OWN runtime DURING its
+// cross-process wait (a racing memory hit) means the identity is IN USE by
+// loaded data again — the job must fail fast with the distinct in-use error,
+// never drop the reference (rename-over-live is forbidden) and never burn
+// its bounded timeout contending with its own shared lock.
+TEST(McapCloudProviderJob, SelfLeaseDuringTheLockWaitFailsFastAsInUse) {
   FakeStreamingServer server(FakeStreamingServer::Mode::kComplete);
   ASSERT_TRUE(server.ok());
   ProviderHarness h("job-selflease");
@@ -1072,13 +1072,12 @@ TEST(McapCloudProviderJob, SelfLeaseDuringTheLockWaitDoesNotTimeOut) {
   ASSERT_TRUE(h.start(queryJson(server.uri()), recorder, job));
   std::this_thread::sleep_for(std::chrono::milliseconds(120));  // the job is waiting
 
-  // The racing memory hit: a shared lease lands on the JOB'S OWN runtime
-  // mid-wait (shared stacks against the external exclusive? no — acquire it
-  // right after releasing the external lock, in the race window).
+  // The racing memory hit: a shared lease lands on the JOB'S OWN runtime in
+  // the race window right after the external exclusive lets go. Plant it
+  // through the ADOPT path (retainLeaseForLifetime would rightly refuse —
+  // nothing is published yet — but a racing memory hit holds a lease it
+  // validated earlier, which is exactly what adopt models).
   held.reset();
-  // Plant it through the ADOPT path: retainLeaseForLifetime would (rightly,
-  // invariant 2) refuse — nothing is published yet — but a racing memory hit
-  // holds a lease it validated earlier, which is exactly what adopt models.
   if (auto lease = h.rt.fileCache().acquireReadLease(identity, nullptr)) {
     h.rt.adoptLeaseForLifetime(identity, std::move(*lease));
   }
@@ -1086,29 +1085,32 @@ TEST(McapCloudProviderJob, SelfLeaseDuringTheLockWaitDoesNotTimeOut) {
 
   const auto resume_at = std::chrono::steady_clock::now();
   ASSERT_TRUE(recorder.waitTerminal(std::chrono::seconds(8)))
-      << "the job must not wait out its own runtime's lease (R1c)";
+      << "the job must fail fast, not wait out its own runtime's lease";
   const auto took = std::chrono::duration_cast<std::chrono::milliseconds>(
       std::chrono::steady_clock::now() - resume_at);
   job.job.vtable->join(job.job.ctx);
 
   ASSERT_EQ(recorder.terminalCount(), 1u);
-  EXPECT_EQ(recorder.terminal(0).first, PJ_DESCRIPTOR_IMPORT_SUCCEEDED_EAGER_ONLY)
+  EXPECT_EQ(recorder.terminal(0).first, PJ_DESCRIPTOR_IMPORT_FAILED)
       << recorder.terminal(0).second;
-  EXPECT_LT(took.count(), 5000) << "must proceed promptly, not burn the bounded timeout";
-  fs::path cache_file;
-  EXPECT_TRUE(h.rt.fileCache().lookup(identity, &cache_file));
+  EXPECT_EQ(recorder.terminal(0).second, mcap_cloud::ImportRuntime::kArtifactInUseError);
+  EXPECT_LT(took.count(), 5000) << "must refuse promptly, not burn the bounded timeout";
+  EXPECT_TRUE(h.rt.hasRetainedLease(identity))
+      << "the refusal must leave the racing holder's reference intact (F2)";
 }
 
-// Re-verify R1(c): the JOB (not the tee) released the lifetime lease, so on
-// a pull that did NOT publish (tee failure -> EAGER_ONLY) the JOB restores
-// it — otherwise the previous valid artifact stays permanently unleased.
-TEST(McapCloudProviderJob, NonPublishingImportRestoresTheLeaseItReleased) {
+// Round-5 F2: a job asked to REMATERIALIZE an identity that loaded data
+// still references must go terminal FAILED carrying the distinct in-use
+// error — loaded datasets keep generation-specific chunk offsets into the
+// artifact, so a rename-over re-encoding would corrupt their lazy reads.
+// The references and the valid artifact stay untouched.
+TEST(McapCloudProviderJob, MaterializeWhileReferencedFailsTheJobAsInUse) {
   FakeStreamingServer server(FakeStreamingServer::Mode::kComplete);
   ASSERT_TRUE(server.ok());
-  ProviderHarness h("job-leaserestore");
+  ProviderHarness h("job-inuse");
   const std::string identity = identityFor(server.uri());
 
-  // Import #1: publishes + retains the lifetime lease.
+  // Import #1: publishes + retains the lifetime lease (= a loaded dataset).
   {
     JobRecorder recorder;
     ScopedJob job;
@@ -1118,34 +1120,24 @@ TEST(McapCloudProviderJob, NonPublishingImportRestoresTheLeaseItReleased) {
   }
   ASSERT_TRUE(h.rt.hasRetainedLease(identity));
 
-  // Sabotage import #2's tee NON-fatally: squat a directory on the partial
-  // path this process would write (pid-suffixed — predictable in-test), so
-  // openWriter fails and the pull completes tee-less (§9.6, EAGER_ONLY).
-  const std::string hex = identity.substr(identity.size() - 32);
-#ifdef _WIN32
-  const auto own_pid = static_cast<unsigned long>(::GetCurrentProcessId());
-#else
-  const auto own_pid = static_cast<unsigned long>(::getpid());
-#endif
-  const fs::path partial =
-      h.cache_root.path / (hex + ".mcap.partial." + std::to_string(own_pid));
-  std::error_code ec;
-  fs::create_directories(partial / "squat", ec);
-  ASSERT_FALSE(ec);
-
+  // Import #2 of the SAME identity: refused before any lock, stream, or
+  // registry mutation.
   JobRecorder recorder;
   ScopedJob job;
   ASSERT_TRUE(h.start(queryJson(server.uri()), recorder, job));
   ASSERT_TRUE(recorder.waitTerminal(std::chrono::seconds(20)));
   job.job.vtable->join(job.job.ctx);
   ASSERT_EQ(recorder.terminalCount(), 1u);
-  EXPECT_EQ(recorder.terminal(0).first, PJ_DESCRIPTOR_IMPORT_SUCCEEDED_EAGER_ONLY)
+  EXPECT_EQ(recorder.terminal(0).first, PJ_DESCRIPTOR_IMPORT_FAILED)
       << recorder.terminal(0).second;
+  EXPECT_EQ(recorder.terminal(0).second, mcap_cloud::ImportRuntime::kArtifactInUseError)
+      << "the job terminal must carry the distinct in-use diagnostic (F2)";
 
   EXPECT_TRUE(h.rt.hasRetainedLease(identity))
-      << "a non-publishing import must restore the lease it released (R1c)";
+      << "the refusal must leave the loaded data's reference intact";
   fs::path still_valid;
-  EXPECT_TRUE(h.rt.fileCache().lookup(identity, &still_valid));
+  EXPECT_TRUE(h.rt.fileCache().lookup(identity, &still_valid))
+      << "and the artifact it reads stays published";
 }
 
 // Round-3 F2: a COLD materialized query hit (fresh runtime — the
@@ -1208,10 +1200,11 @@ TEST(McapCloudProviderQuery, ColdMaterializedHitAcquiresAndRetainsTheLease) {
   EXPECT_FALSE(cold_rt.hasRetainedLease(identity));
 }
 
-// Round-4 R3: a job that drops the lease across MULTIPLE lock attempts (a
-// racing memory hit re-retains between them) must restore EVERY reference it
-// removed — independent drops add, they do not collapse to max.
-TEST(McapCloudProviderJob, MultipleAttemptDropsRestoreEveryReference) {
+// Round-5 F2 (was round-4 R3): with MULTIPLE holders on the identity the
+// refusal must leave EVERY reference exactly as it found it — the job never
+// drops any of them (the round-4 drop/merge/restore cycle is gone; there is
+// nothing to conserve because nothing moves).
+TEST(McapCloudProviderJob, ReferencedIdentityRefusalLeavesEveryReferenceIntact) {
   FakeStreamingServer server(FakeStreamingServer::Mode::kComplete);
   ASSERT_TRUE(server.ok());
   ProviderHarness h("job-refmerge");
@@ -1232,12 +1225,9 @@ TEST(McapCloudProviderJob, MultipleAttemptDropsRestoreEveryReference) {
   std::string diagnostic;
   ASSERT_TRUE(h.rt.retainLeaseForLifetime(identity, &diagnostic)) << diagnostic;
   ASSERT_TRUE(h.rt.retainLeaseForLifetime(identity, &diagnostic)) << diagnostic;
-  const auto baseline = h.rt.dropLeaseForMaterialize(identity);
-  ASSERT_EQ(baseline.refs, 3u);
-  h.rt.restoreLease(identity, baseline);
+  ASSERT_EQ(h.rt.leaseRefs(identity), 3u);
 
-  // A second import of the SAME identity: it drops all three, republishes,
-  // and must end holding all three again (the tee's merge + finalize adopt).
+  // A second import of the SAME identity: refused, all three intact.
   {
     JobRecorder recorder;
     ScopedJob job;
@@ -1245,9 +1235,10 @@ TEST(McapCloudProviderJob, MultipleAttemptDropsRestoreEveryReference) {
     ASSERT_TRUE(recorder.waitTerminal(std::chrono::seconds(20)));
     job.job.vtable->join(job.job.ctx);
     ASSERT_EQ(recorder.terminalCount(), 1u);
+    EXPECT_EQ(recorder.terminal(0).first, PJ_DESCRIPTOR_IMPORT_FAILED)
+        << recorder.terminal(0).second;
+    EXPECT_EQ(recorder.terminal(0).second, mcap_cloud::ImportRuntime::kArtifactInUseError);
   }
-  const auto after = h.rt.dropLeaseForMaterialize(identity);
-  EXPECT_TRUE(after.had_lease);
-  EXPECT_EQ(after.refs, baseline.refs)
-      << "every reference the job removed must come back (R3)";
+  EXPECT_EQ(h.rt.leaseRefs(identity), 3u)
+      << "a refused job must not disturb a single reference (F2)";
 }

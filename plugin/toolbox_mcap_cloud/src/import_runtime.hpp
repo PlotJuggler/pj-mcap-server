@@ -470,12 +470,17 @@ class CacheTee {
   /// Phase 1 (before any network): registry ticket -> cache cleanup (orphan
   /// partials + LRU; runs BEFORE our own lock so it never self-contends) ->
   /// exclusive MaterializeLock -> delete a lookup()-failing existing file
-  /// under the lock (spec §5 corruption policy).
-  /// `adopted_lock` (adversarial F9): a caller that already performed its
-  /// own bounded cancelable wait on the CROSS-PROCESS materialize lock (the
-  /// provider job) hands it in; begin() then never re-acquires (it would
-  /// self-contend on the sidecar).
+  /// under the lock (spec §5 corruption policy). `adopted_ticket` (PR-3): a
+  /// caller that already holds the in-process registry slot for this SAME
+  /// identity (the provider job's bounded lock-wait) hands it over instead
+  /// of self-contending on a second tryBeginMaterialize. `adopted_lock`
+  /// (adversarial F9): same handoff for the CROSS-PROCESS materialize lock
+  /// after the job's bounded cancelable wait — begin() then never
+  /// re-acquires either (it would self-contend on the sidecar).
   ///
+  /// Round-5 F1: `adopted_lease_drop` is the MOVE-ONLY RAII token, captured
+  /// into this tee (with the ticket and lock) in a NO-THROW prologue before
+  /// anything that can throw — no exception path can strand any of them.
   /// Round-5 F2 — REFUSAL-WHILE-REFERENCED: begin() refuses an identity the
   /// lease registry still references (kArtifactInUseError). Loaded data
   /// lazily re-opens the artifact by generation-specific chunk offsets, and
@@ -492,7 +497,9 @@ class CacheTee {
   /// structurally (the restore path only ever handles a zero-or-adopted
   /// count).
   [[nodiscard]] bool begin(const std::string& identity, std::string* error,
-                           std::optional<SessionFileCache::MaterializeLock> adopted_lock = std::nullopt);
+                           std::optional<ImportRuntime::MaterializeTicket> adopted_ticket = std::nullopt,
+                           std::optional<SessionFileCache::MaterializeLock> adopted_lock = std::nullopt,
+                           ImportRuntime::ScopedLeaseDrop adopted_lease_drop = {});
 
   /// True iff the last begin() failure was the F2 refusal (identity
   /// referenced by loaded data). Owning thread only.

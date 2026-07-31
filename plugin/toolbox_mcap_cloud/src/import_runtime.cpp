@@ -445,7 +445,24 @@ CacheTee::~CacheTee() {
 }
 
 bool CacheTee::begin(const std::string& identity, std::string* error,
-                     std::optional<SessionFileCache::MaterializeLock> adopted_lock) {
+                     std::optional<ImportRuntime::MaterializeTicket> adopted_ticket,
+                     std::optional<SessionFileCache::MaterializeLock> adopted_lock,
+                     ImportRuntime::ScopedLeaseDrop adopted_lease_drop) {
+  // NO-THROW CAPTURE PROLOGUE (round-5 F1): every adopted resource becomes
+  // member-owned BEFORE any throwing operation (even the identity_
+  // assignment below allocates). From here, an exception anywhere in begin()
+  // unwinds into this tee's teardown, whose member-destruction order
+  // restores the token BEFORE the ticket releases — stranding is impossible
+  // by construction. (Function-parameter destruction order is unspecified in
+  // C++, so parameters alone could NOT guarantee the ordering.)
+  lease_drop_.merge(std::move(adopted_lease_drop));
+  if (adopted_ticket.has_value()) {
+    ticket_ = std::move(adopted_ticket);
+  }
+  if (adopted_lock.has_value()) {
+    lock_ = std::move(adopted_lock);
+  }
+
   auto fail = [error](std::string message) {
     if (error != nullptr) {
       *error = std::move(message);
@@ -456,8 +473,12 @@ bool CacheTee::begin(const std::string& identity, std::string* error,
 
   // In-process contention first (cheap, exact), then maintenance, then the
   // cross-process lock. cleanup() runs BEFORE our own lock so its per-victim
-  // exclusive try never self-contends with this materialization.
-  ticket_ = runtime_.tryBeginMaterialize(identity);
+  // exclusive try never self-contends with this materialization. A caller
+  // that already holds the registry slot (the PR-3 job) handed its ticket in
+  // above.
+  if (!ticket_.has_value()) {
+    ticket_ = runtime_.tryBeginMaterialize(identity);
+  }
   if (!ticket_.has_value()) {
     return fail("a materialization of this session is already in progress in this process");
   }
@@ -481,13 +502,10 @@ bool CacheTee::begin(const std::string& identity, std::string* error,
     return fail(ImportRuntime::kArtifactInUseError);
   }
   runtime_.fileCache().cleanup(runtime_.cacheConfig());
-
-  if (adopted_lock.has_value()) {
-    // F9: a caller (the provider job) already performed its bounded
-    // cancelable wait on the cross-process lock and hands it in — never
-    // re-acquire (self-contention on the sidecar).
-    lock_ = std::move(adopted_lock);
-  } else {
+  if (!lock_.has_value()) {
+    // No adopted lock (F9: a provider job that already performed its bounded
+    // cancelable wait handed one in above — never re-acquire, it would
+    // self-contend on the sidecar).
     std::string lock_error;
     if (lock_fail_for_test_) {
       lock_error = "injected exclusive-lock failure (test seam)";

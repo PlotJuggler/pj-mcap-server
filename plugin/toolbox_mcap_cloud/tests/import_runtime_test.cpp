@@ -831,34 +831,40 @@ TEST(McapCloudImportRuntime, RetainRefusesWhenTheArtifactDoesNotValidate) {
   EXPECT_EQ(rt.leaseRefs(identity), 0u);
 }
 
-// Round-4 R3 (merge site): a caller's drop token and the tee's OWN drop
-// removed INDEPENDENT reference sets, so begin() must ADD them — with max()
-// one holder's references are silently discarded and never restored.
-TEST(McapCloudCacheTee, AdoptedAndOwnDropsAddRatherThanCollapse) {
-  TempRoot cache_root("mergeadd-cache");
-  TempRoot config_root("mergeadd-config");
+// Round-5 F1 (adversarial red): an exception INSIDE begin() AFTER a caller
+// handed over a live drop token must not strand the restore obligation. The
+// no-throw capture prologue moves the token into the tee before any throwing
+// work, so the unwind destroys the tee and its member-destruction order
+// restores the references — under the ticket.
+TEST(McapCloudCacheTee, BeginThrowAfterAdoptionRestoresTheCallersToken) {
+  TempRoot cache_root("beginthrow-cache");
+  TempRoot config_root("beginthrow-config");
   mcap_cloud::ImportRuntime rt(mcap_cloud::SessionFileCache(cache_root.path),
                                mcap_cloud::TrustedOrigins(config_root.path));
-  const mcap_cloud::SourceDescriptor d = descriptor("mergeadd.mcap");
+  const mcap_cloud::SourceDescriptor d = descriptor("beginthrow.mcap");
   const std::string identity = mcap_cloud::descriptorIdentity(d);
   publishThroughTee(rt, d);  // one holder retained by finalize
-  ASSERT_TRUE(rt.hasRetainedLease(identity));
+  ASSERT_EQ(rt.leaseRefs(identity), 1u);
 
-  // The caller (a provider job) already dropped TWO references of its own in
-  // an earlier attempt; the tee's own drop will remove the one still held.
-  mcap_cloud::ImportRuntime::LeaseDrop adopted;
-  adopted.had_lease = true;
-  adopted.refs = 2;
+  auto token = rt.dropLeaseForMaterializeScoped(identity);
+  ASSERT_TRUE(token.hasLease());
+  ASSERT_EQ(rt.leaseRefs(identity), 0u);
 
   {
     mcap_cloud::CacheTee tee(rt);
+    tee.setBeginThrowForTest(true);
     std::string error;
-    ASSERT_TRUE(tee.begin(identity, &error, std::nullopt, std::nullopt, adopted)) << error;
-    tee.abortAndCleanup();  // no publish -> restore the MERGED count
+    bool threw = false;
+    try {
+      (void)tee.begin(identity, &error, std::nullopt, std::nullopt, std::move(token));
+    } catch (const std::exception&) {
+      threw = true;
+    }
+    ASSERT_TRUE(threw) << "the seam must throw after the capture prologue";
+    // The tee (not the vanished caller) owns the obligation now; nothing has
+    // been restored yet.
+    EXPECT_EQ(rt.leaseRefs(identity), 0u);
   }
-
-  const auto restored = rt.dropLeaseForMaterialize(identity);
-  ASSERT_TRUE(restored.had_lease);
-  EXPECT_EQ(restored.refs, 3u)
-      << "adopted (2) + own (1) must ADD; max() would restore only 2 (R3)";
+  EXPECT_EQ(rt.leaseRefs(identity), 1u)
+      << "an unwind through begin() stranded the adopted drop token (F1)";
 }

@@ -218,54 +218,62 @@ PJ_descriptor_import_outcome_t DescriptorImportProvider::JobState::runToTerminal
     // It failed or was cancelled: proceed with a fresh download on our slot.
   }
 
+  // ---- round-5 F2: REFUSAL-WHILE-REFERENCED --------------------------------
+  // We are on the MISS path yet the lease registry still references this
+  // identity: loaded data keeps generation-specific chunk offsets into the
+  // artifact and lazily re-opens the pathname, so a rename-over
+  // rematerialization (even a logically-equal re-encoding) would silently
+  // corrupt those reads. Refuse honestly instead of dropping the references
+  // — the round-4 drop-per-attempt machinery is GONE; this path never
+  // mutates the registry. (CacheTee::begin() re-checks as the authoritative
+  // belt.)
+  if (runtime.leaseRefs(identity) > 0) {
+    *message = ImportRuntime::kArtifactInUseError;
+    return PJ_DESCRIPTOR_IMPORT_FAILED;
+  }
+
   // ---- the CROSS-PROCESS materialization gate (adversarial F9, re-verify
   // R1(c)) -------------------------------------------------------------------
   // The same bounded cancelable wait + revalidate, now around the OS lock:
   // process B must never classify process A's live materialization as an
   // ordinary tee failure and open a duplicate network stream.
   //
-  // Lease coordination — THE RULE (round-3 F1), same three invariants as
-  // CacheTee: our own runtime's retained lease contends with this exclusive
-  // try, and a CONCURRENT MEMORY HIT can re-retain one at any moment during
-  // the wait, so the drop happens ATOMICALLY (one operation that releases and
-  // reports) immediately before EACH attempt. We hold the in-process ACTIVE
-  // TICKET for this identity, so no other in-process MATERIALIZER can exist:
-  // any same-runtime lease observed mid-wait is a racing memory hit. Every
-  // abort exit restores through the registry (lease-then-validate, bounded
-  // retry) WHILE THE TICKET IS STILL HELD; the drop token also rides into the
-  // tee, so the pull's own abort path restores it under the same ticket
-  // instead of a ticket-less post-pull patch-up.
-  ImportRuntime::LeaseDrop lease_drop;
-  // Round-4 R3: independent drops ADD. Each successful attempt-drop removed a
-  // DIFFERENT set of references (a racing memory hit re-retained between
-  // attempts), so max() silently discarded holders; the restore must put back
-  // every reference this job ever took away.
-  auto merge_drop = [&lease_drop](const ImportRuntime::LeaseDrop& drop) {
-    if (drop.had_lease) {
-      lease_drop.had_lease = true;
-      lease_drop.refs += drop.refs;
-    }
-  };
+  // Lease coordination, round-5 shape: the refusal above guarantees ZERO
+  // in-process references at entry, so our own runtime can contend with this
+  // exclusive try only if a racing memory hit re-retained a lease mid-wait
+  // (possible only once ANOTHER process rematerialized a valid artifact —
+  // retain validates). That identity is in use again: fail fast with the
+  // same refusal instead of timing out against our own shared lock.
+  // Cross-process reference holders remain indistinguishable from remote
+  // materializers at the flock level (limit lifted only by the
+  // generation-suffixed-paths follow-up recorded in core/file_lock.h).
+  //
+  // The move-only token below stays EMPTY except in the revalidate arm; it
+  // is declared AFTER `ticket`, so any unwind restores under the ticket by
+  // destruction order alone (round-5 F1 — stranding impossible by
+  // construction).
+  ImportRuntime::ScopedLeaseDrop lease_drop;
   std::optional<SessionFileCache::MaterializeLock> os_lock;
   {
     bool waited = false;
     const auto os_deadline = std::chrono::steady_clock::now() + lock_timeout;
     for (;;) {
-      merge_drop(runtime.dropLeaseForMaterialize(identity));  // atomic, before EACH attempt
       std::string lock_error;
       bool contended = false;
       os_lock = runtime.fileCache().tryLockForMaterialize(identity, &lock_error, &contended);
       if (os_lock.has_value() || !contended) {
         break;  // acquired, or a NON-contended OS failure (tee-begin will report it, §9.6)
       }
+      if (runtime.leaseRefs(identity) > 0) {
+        *message = ImportRuntime::kArtifactInUseError;  // racing memory hit re-pinned it
+        return PJ_DESCRIPTOR_IMPORT_FAILED;
+      }
       waited = true;
       if (isCancelled()) {
-        runtime.restoreLease(identity, lease_drop);  // ticket still held
         *message = "import cancelled";
         return PJ_DESCRIPTOR_IMPORT_CANCELLED;
       }
       if (std::chrono::steady_clock::now() >= os_deadline) {
-        runtime.restoreLease(identity, lease_drop);  // ticket still held
         *message =
             "another process is materializing this session — retry when it completes";
         return PJ_DESCRIPTOR_IMPORT_FAILED;
@@ -278,17 +286,15 @@ PJ_descriptor_import_outcome_t DescriptorImportProvider::JobState::runToTerminal
       // on_dataset ran here, so only retry-classification is truthful). The
       // fresh valid artifact deserves the lifetime lease: restore it BEFORE
       // the ticket goes (invariant 3), and drop the OS lock first so the
-      // shared re-acquisition is not blocked by our own exclusive.
+      // shared re-acquisition inside the restore is not blocked by our own
+      // exclusive. This is the ONLY place the token becomes non-empty, and
+      // it restores with zero prior references (the F2 refusal above plus
+      // the retain-validates rule guarantee it — the registry asserts).
       std::filesystem::path disk;
       if (runtime.fileCache().lookup(identity, &disk)) {
         os_lock.reset();
-        // A valid artifact deserves the pin either way; if this job never
-        // dropped a reference, it still restores one for the fresh artifact.
-        if (!lease_drop.had_lease) {
-          lease_drop.had_lease = true;
-          lease_drop.refs = 1u;
-        }
-        runtime.restoreLease(identity, lease_drop);
+        lease_drop.ensureRestoresAtLeastOne(&runtime, identity);
+        lease_drop.restoreNow();
         ticket.reset();
         *message =
             "session was materialized concurrently by another process — reload to classify it "
@@ -323,7 +329,7 @@ PJ_descriptor_import_outcome_t DescriptorImportProvider::JobState::runToTerminal
   request.identity = identity;
   request.ticket = std::move(ticket);
   request.lock = std::move(os_lock);
-  request.lease_drop = lease_drop;  // restored by the tee's abort, under the ticket
+  request.lease_drop = std::move(lease_drop);  // move-only RAII token (empty under F2)
   request.max_transfer_duration = max_transfer_duration;
   // on_dataset: zero-or-one, from the pull's dataset creation, strictly
   // before any publication/progress/promotion — the pull fires this hook at
@@ -334,11 +340,11 @@ PJ_descriptor_import_outcome_t DescriptorImportProvider::JobState::runToTerminal
     }
   };
 
-  // The pull owns the lease lifecycle from here: begin() merged our drop
-  // token into the tee's, so a non-publishing pull restores it inside
-  // abortAndCleanup while the ticket is STILL held (invariant 3), and a
-  // publishing one retains the freshly-downgraded lease instead. No
-  // ticket-less post-pull patch-up.
+  // The pull owns the token from here: begin()'s NO-THROW capture prologue
+  // moves it into the tee before anything that can throw, the tee's
+  // abortAndCleanup restores it while the ticket is STILL held (invariant
+  // 3), and a publishing finalize dismisses it. Under F2 the token is empty
+  // in production — the mechanism is the structural exception-safety net.
   const PullResult res = fetch.pull(std::move(request));
   if (pre_terminal_hook) {
     pre_terminal_hook();  // test seam: deterministic ceiling-vs-cancel interleave
