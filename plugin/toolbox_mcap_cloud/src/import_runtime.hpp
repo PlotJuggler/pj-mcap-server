@@ -175,8 +175,11 @@ class ImportRuntime {
 
   /// Retain an ALREADY-ACQUIRED, already-validated lease (the finalize
   /// handoff and the memory-hit serve both hold one). Same idempotent
-  /// refcount; a duplicate simply releases the passed lease.
-  void adoptLeaseForLifetime(std::string_view identity, FileLock lease);
+  /// refcount; a duplicate simply releases the passed lease. `refs` is the
+  /// reference count to record — a successful rematerialization passes the
+  /// count its drop removed, so the documented "drops them all and restores
+  /// the same count" holds on the SUCCESS path too (round-4 R3).
+  void adoptLeaseForLifetime(std::string_view identity, FileLock lease, unsigned refs = 1);
 
   /// ATOMIC drop of every reference for `identity` — one operation that both
   /// releases the lease and reports what was released, so the restore can
@@ -327,6 +330,13 @@ class CacheTee {
   void setPreRestoreHookForTest(std::function<void()> hook) {
     pre_restore_hook_for_test_ = std::move(hook);
   }
+  /// Round-4 R1(a) seam: force begin()'s exclusive-lock acquisition to fail.
+  /// The real trigger (an external process winning the microscopic window
+  /// between our lease drop and our lock try) is not deterministically
+  /// constructible — and a test cannot hold that external lock while our own
+  /// shared lease is retained, since the two are mutually exclusive by
+  /// design. This drives the same failure ARM.
+  void setLockFailForTest(bool fail) { lock_fail_for_test_ = fail; }
   /// R1(a) seam: force the finalize-time lease handoff to fail (the platform
   /// downgrade race is not deterministically constructible from outside).
   void setLeaseHandoffFailForTest(bool fail) { lease_handoff_fail_for_test_ = fail; }
@@ -369,6 +379,7 @@ class CacheTee {
   bool begin_lock_contended_ = false;  // F9 (see beginFailedOnLockContention)
   ImportRuntime::LeaseDrop lease_drop_{};  // what begin() dropped; abort restores it
   bool lease_handoff_fail_for_test_ = false;  // R1(a) seam (see below)
+  bool lock_fail_for_test_ = false;           // round-4 R1(a) seam
   std::optional<ImportRuntime::MaterializeTicket> ticket_;
   std::optional<SessionFileCache::MaterializeLock> lock_;
   std::filesystem::path partial_path_;

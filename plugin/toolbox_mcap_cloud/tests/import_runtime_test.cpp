@@ -745,3 +745,126 @@ TEST(McapCloudImportRuntime, RetainRefusesWhenTheArtifactDoesNotValidate) {
   EXPECT_NE(diagnostic.find("does not validate"), std::string::npos) << diagnostic;
   EXPECT_FALSE(rt.hasRetainedLease(identity));
 }
+
+// ---------------------------------------------------------------------------
+// Round-4: restore-before-ticket must have NO bypass, and a published-but-
+// unhandoffed finalize must still re-pin the prior dataset.
+// ---------------------------------------------------------------------------
+
+// Helper: publish `d` into `rt`'s cache through the real tee path.
+void publishThroughTee(mcap_cloud::ImportRuntime& rt, const mcap_cloud::SourceDescriptor& d) {
+  mcap_cloud::CacheTee tee(rt);
+  std::string error;
+  ASSERT_TRUE(tee.begin(mcap_cloud::descriptorIdentity(d), &error)) << error;
+  ASSERT_TRUE(tee.openWriter(sessionInfo(), mcap_cloud::canonicalSourceDescriptorJson(d), 0, &error))
+      << error;
+  ASSERT_TRUE(tee.enqueue({.topic_id = 11,
+                           .schema_id = 5,
+                           .log_time_ns = 100,
+                           .publish_time_ns = 90,
+                           .payload = std::string(64, 'x')}));
+  ASSERT_TRUE(tee.drainAndClose(&error)) << error;
+  ASSERT_TRUE(tee.finalize(std::nullopt, &error)) << error;
+}
+
+// R1(a): begin() failing on the EXCLUSIVE LOCK must not release the ticket
+// early — the lease it already dropped has to be restored under that ticket.
+// The rival seam proves no same-process materializer can occupy the window.
+// (The lock failure is injected: the real trigger is an external process
+// winning the window between our drop and our try, which no test can hold
+// open — an external exclusive lock and our own shared lease are mutually
+// exclusive by construction.)
+TEST(McapCloudCacheTee, FailedLockBeginRestoresTheLeaseUnderTheTicket) {
+  TempRoot cache_root("failedlock-cache");
+  TempRoot config_root("failedlock-config");
+  mcap_cloud::ImportRuntime rt(mcap_cloud::SessionFileCache(cache_root.path),
+                               mcap_cloud::TrustedOrigins(config_root.path));
+  const mcap_cloud::SourceDescriptor d = descriptor("failedlock.mcap");
+  const std::string identity = mcap_cloud::descriptorIdentity(d);
+  publishThroughTee(rt, d);
+  ASSERT_TRUE(rt.hasRetainedLease(identity)) << "the prior dataset holds the pin";
+
+  bool rival_refused = false;
+  {
+    mcap_cloud::CacheTee blocked(rt);
+    blocked.setLockFailForTest(true);
+    blocked.setPreRestoreHookForTest([&]() {
+      mcap_cloud::CacheTee rival(rt);
+      std::string rival_error;
+      rival_refused = !rival.begin(identity, &rival_error);
+    });
+    std::string begin_error;
+    EXPECT_FALSE(blocked.begin(identity, &begin_error)) << "the injected lock failure fails begin()";
+    EXPECT_FALSE(rt.hasRetainedLease(identity)) << "begin() dropped the pin before failing";
+  }  // ~CacheTee -> abortAndCleanup -> restore (ticket held) -> ticket release
+
+  EXPECT_TRUE(rival_refused)
+      << "the ticket must still be held during the failed-begin restore (R1a)";
+  EXPECT_TRUE(rt.hasRetainedLease(identity))
+      << "a failed-lock begin must restore the lease it dropped (R1a)";
+}
+
+// R2: a finalize whose lease handoff fails, WITH a prior retained lease, must
+// leave the prior dataset re-pinned — the published-but-not-finalized state.
+TEST(McapCloudCacheTee, HandoffFailureWithAPriorLeaseRestoresThePriorPin) {
+  TempRoot cache_root("handoffprior-cache");
+  TempRoot config_root("handoffprior-config");
+  mcap_cloud::ImportRuntime rt(mcap_cloud::SessionFileCache(cache_root.path),
+                               mcap_cloud::TrustedOrigins(config_root.path));
+  const mcap_cloud::SourceDescriptor d = descriptor("handoffprior.mcap");
+  const std::string identity = mcap_cloud::descriptorIdentity(d);
+  publishThroughTee(rt, d);
+  ASSERT_TRUE(rt.hasRetainedLease(identity)) << "the prior dataset holds the pin";
+
+  {
+    mcap_cloud::CacheTee remat(rt);
+    std::string error;
+    ASSERT_TRUE(remat.begin(identity, &error)) << error;
+    EXPECT_FALSE(rt.hasRetainedLease(identity)) << "begin() drops the prior pin";
+    remat.setLeaseHandoffFailForTest(true);
+    ASSERT_TRUE(remat.openWriter(sessionInfo(), mcap_cloud::canonicalSourceDescriptorJson(d), 0,
+                                 &error))
+        << error;
+    ASSERT_TRUE(remat.enqueue({.topic_id = 11,
+                               .schema_id = 5,
+                               .log_time_ns = 100,
+                               .publish_time_ns = 90,
+                               .payload = std::string(64, 'x')}));
+    ASSERT_TRUE(remat.drainAndClose(&error)) << error;
+    EXPECT_FALSE(remat.finalize(std::nullopt, &error)) << "the handoff failure fails finalize";
+    remat.abortAndCleanup();
+  }
+
+  EXPECT_TRUE(rt.hasRetainedLease(identity))
+      << "the prior live dataset must be re-pinned after a failed handoff (R2)";
+  // The published file stays (abort deletes only the partial) and still
+  // validates — the pin protects exactly what a lazy re-open will find.
+  fs::path published;
+  EXPECT_TRUE(rt.fileCache().lookup(identity, &published));
+}
+
+// R3: two independent holders' references survive a full drop -> merge ->
+// successful finalize cycle (documented "restores the same count").
+TEST(McapCloudCacheTee, SuccessfulFinalizeConservesTheReferenceCount) {
+  TempRoot cache_root("refconserve-cache");
+  TempRoot config_root("refconserve-config");
+  mcap_cloud::ImportRuntime rt(mcap_cloud::SessionFileCache(cache_root.path),
+                               mcap_cloud::TrustedOrigins(config_root.path));
+  const mcap_cloud::SourceDescriptor d = descriptor("refconserve.mcap");
+  const std::string identity = mcap_cloud::descriptorIdentity(d);
+  publishThroughTee(rt, d);
+
+  // A second holder (e.g. a query hit on the same identity).
+  std::string diagnostic;
+  ASSERT_TRUE(rt.retainLeaseForLifetime(identity, &diagnostic)) << diagnostic;
+  const auto before = rt.dropLeaseForMaterialize(identity);
+  ASSERT_EQ(before.refs, 2u) << "publish + query = two holders";
+  rt.restoreLease(identity, before);
+
+  publishThroughTee(rt, d);  // rematerialize: drop-all then finalize
+
+  const auto after = rt.dropLeaseForMaterialize(identity);
+  EXPECT_TRUE(after.had_lease);
+  EXPECT_EQ(after.refs, before.refs)
+      << "a successful rematerialization must restore the SAME count (R3)";
+}

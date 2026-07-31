@@ -187,9 +187,10 @@ bool ImportRuntime::retainLeaseForLifetime(std::string_view identity, std::strin
   return true;
 }
 
-void ImportRuntime::adoptLeaseForLifetime(std::string_view identity, FileLock lease) {
+void ImportRuntime::adoptLeaseForLifetime(std::string_view identity, FileLock lease,
+                                          unsigned refs) {
   std::lock_guard<std::mutex> lock(lease_mu_);
-  (void)insertLeaseLocked(std::string(identity), std::move(lease), 1);
+  (void)insertLeaseLocked(std::string(identity), std::move(lease), refs == 0 ? 1u : refs);
 }
 
 ImportRuntime::LeaseDrop ImportRuntime::dropLeaseForMaterialize(std::string_view identity) {
@@ -314,10 +315,19 @@ bool CacheTee::begin(const std::string& identity, std::string* error,
     lock_ = std::move(adopted_lock);
   } else {
     std::string lock_error;
-    lock_ = runtime_.fileCache().tryLockForMaterialize(identity, &lock_error,
-                                                       &begin_lock_contended_);
+    if (lock_fail_for_test_) {
+      lock_error = "injected exclusive-lock failure (test seam)";
+    } else {
+      lock_ = runtime_.fileCache().tryLockForMaterialize(identity, &lock_error,
+                                                         &begin_lock_contended_);
+    }
     if (!lock_.has_value()) {
-      ticket_.reset();
+      // Round-4 R1(a): do NOT release the ticket here. begin() has already
+      // dropped this identity's lifetime lease, and releasing the ticket
+      // before that lease is restored reopens exactly the ticket-less
+      // restoration window invariant 3 exists to close. The failure returns
+      // with the ticket STILL held; the owner destroys/aborts the tee, and
+      // abortAndCleanup restores the lease and only then releases the ticket.
       return fail(lock_error);
     }
   }
@@ -601,7 +611,26 @@ bool CacheTee::finalize(const std::optional<SessionFileCache::ExpectedContent>& 
   if (!runtime_.fileCache().finalize(*lock_, expected, error)) {
     return false;
   }
-  finalized_ = true;  // the publish happened: cleanup below must not delete anything
+  // Round-4 R2: `finalized_` is NOT set here. It gates abortAndCleanup's
+  // lease restoration, so setting it at the rename meant a later
+  // handoff failure returned false while the abort skipped restoring
+  // lease_drop_ — leaving the PRIOR live dataset unpinned during a
+  // rematerialization of an already-leased identity. It is set only after
+  // the ENTIRE sequence (publish + handoff + adoption) has succeeded.
+  //
+  // PUBLISHED-BUT-NOT-FINALIZED state (reachable between here and the end):
+  //   * the renamed final file STAYS — abortAndCleanup deletes only
+  //     partial_path_, which the rename already moved away, so the remove is
+  //     a no-op (verified at that site);
+  //   * lease_drop_ IS restored, re-pinning the identity for the prior live
+  //     dataset — and since the identity's path now holds the freshly
+  //     published, content-equivalent file, that pin is exactly what a lazy
+  //     re-open needs (rename-over replacement is safe by construction);
+  //   * the caller records FAILURE (no kFinalized, no stored identity, no
+  //     promotion), so nothing points at the new artifact;
+  //   * that leaves an orphaned published file, which is plain evictable
+  //     cache content for a later cleanup — the conservative outcome.
+  //
   // Adversarial F2 + re-verify R1(a): hand the exclusive materialize lock
   // over as a SHARED dataset-lifetime lease retained by the runtime. The
   // handoff is LOAD-BEARING, not best-effort: if the platform downgrade
@@ -637,7 +666,15 @@ bool CacheTee::finalize(const std::optional<SessionFileCache::ExpectedContent>& 
   }
   // Already lease-then-validated: the downgraded lease is held across the
   // revalidation above, so this only records it (invariant 2 satisfied).
-  runtime_.adoptLeaseForLifetime(identity_, std::move(*lease));
+  // Round-4 R3: adopt the FULL count begin() dropped — the documented
+  // semantics are "a materialization drops every reference and restores the
+  // same count", so the prior holders' references must survive a successful
+  // rematerialization exactly as they survive an aborted one. No prior lease
+  // means this materialization is the first holder: 1.
+  runtime_.adoptLeaseForLifetime(identity_, std::move(*lease),
+                                 lease_drop_.had_lease ? lease_drop_.refs : 1u);
+  lease_drop_ = ImportRuntime::LeaseDrop{};  // consumed: the abort must not re-restore
+  finalized_ = true;                         // the WHOLE sequence succeeded (R2)
   return true;
 }
 
