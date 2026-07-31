@@ -319,10 +319,15 @@ cancellation-vs-successful-rename race, and shutdown ordering (batch jobs are ow
 — #470's shutdown only joins `FileLoader` and panel ingest hosts).
 
 **Provider bind mode:** binding the provider for query/materialize **must not** run the
-interactive dialog initialization — today `setSettings()` triggers `initFromSettings()` which
-auto-connects to the most recent server (`mcap_cloud_dialog.cpp:553, 567`). The plugin adds a
-headless provider entry that performs no auto-connect and touches the network only inside an
-authorized `materialize`.
+interactive dialog initialization — pre-stage-4, `setSettings()` triggered `initFromSettings()`
+which auto-connected to the most recent server. As built (stage-4): `setSettings()` is
+store-only, and the one-shot persisted-state restore + auto-connect run at the FIRST
+`getDialog()` — the interactive-only entry point, latched once per plugin lifetime (repeated
+calls and re-binds are plain borrows) — so a headless bind performs no auto-connect and the
+provider touches the network only inside an authorized `start_import`. Accepted residual
+(consult-reviewed, not a §6.3 violation): constructing the dialog starts its command-pump
+worker thread, which idles — no network, credential, or settings access happens before the
+first queued command, and nothing queues one before the one-shot interactive init.
 
 ### 6.4 Old-PJ4 degradation and provider-absent fallback
 
@@ -509,7 +514,12 @@ Explicitly **not** built (v2 components dissolved or #470-supplied): `<replay_so
    (`SessionCache` stores `DatasetId`; missing-disk-file hits evict and refetch — §6.1.)
 7. **#470 progress-surface adoption** in `ParserIngestDriver`/`FetchWorker` — also #470's live
    verification.
-8. **Provider implementation** — headless bind mode (no auto-connect), the
+8. **Provider implementation** (DONE 2026-07-31 — the stage-4 PR stack: single-encoder
+   cache tee + shared `ImportRuntime`; headless one-shot dialog init at first `getDialog()`
+   + hoisted credential resolver; the `pj.descriptor_import.v1` extension with a direct
+   cancellable `FetchWorker::pull(PullRequest)` and promotion-at-completion shared by both
+   paths; live E2E in `make smoke` incl. the §12 cache-vs-CLI `mcapdiff` gate and the §10
+   machine-gated auth remediation hint) — headless bind mode (no auto-connect), the
    `pj.descriptor_import.v1` extension as shipped in SDK 0.20.0: `query_descriptor` and
    `start_import` (the authoring dual path — FetchWorker progressive eager ingest +
    the PR #4 `SessionMcapWriter` tee — driven headlessly by descriptor; the shared-TU and
@@ -577,7 +587,8 @@ Explicitly **not** built (v2 components dissolved or #470-supplied): `<replay_so
   enforcement); cache manager (validated finalization incl. injected short-write, lock
   contention across two processes, eviction-vs-lease, orphan cleanup age threshold,
   corrupt-file-as-miss narrowness); tee (bounded-queue backpressure — **measured**, not assumed;
-  writer-failure cancels fetch); round-trip: cache file `mcapdiff`-equal to a direct CLI
+  writer/tee failure never aborts the fetch — it suppresses promotion only, per §9.6); round-trip:
+  cache file `mcapdiff`-equal to a direct CLI
   download of the same tuple; provider query (no-network assertion) and materialize hermetic
   tests + live gtests against the smoke server; `sendAndWait` cancel regression. `make smoke`
   green at every stage.
@@ -615,7 +626,8 @@ Explicitly **not** built (v2 components dissolved or #470-supplied): `<replay_so
    matching. **Publish the new SDK package and bump the plugin's SDK pin** (DONE
    2026-07-29: the SDK half shipped as **0.20.0** and `plugin/SDK_VERSION` is bumped —
    the provider implementation can now compile).
-4. **Plugin dual-path + provider** — fetch tee re-target (content-addressed + delete-retention
+4. **Plugin dual-path + provider** (DONE 2026-07-31 — the stage-4 PR stack in this repo;
+   see §9.8 for the landed shape) — fetch tee re-target (content-addressed + delete-retention
    + provenance); `SessionCache` DatasetId; headless bind mode; query/import/promote
    implementations.
 5. **End-to-end + docs** — GUI flow, `--layout` flow (incl. progressive miss import), team-
