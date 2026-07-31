@@ -34,6 +34,7 @@
 #include <pj_base/sdk/descriptor_import.hpp>
 #include <pj_base/sdk/plugin_data_api.hpp>
 
+#include "fake_promotion_host.hpp"
 #include "fake_streaming_server.hpp"
 #include "fake_toolbox_host.hpp"
 #include "fetch_worker.hpp"
@@ -113,57 +114,9 @@ struct FakePromotionHost {
   }
 };
 
-// A host whose result callback is genuinely deferred: promote returns true
-// immediately, a worker thread delivers the result only after release().
-struct DeferredPromotionHost {
-  std::mutex mu;
-  std::condition_variable cv;
-  bool release_requested = false;
-  PJ_source_promotion_result_fn stored_cb = nullptr;
-  void* stored_ctx = nullptr;
-  std::thread worker;
-
-  ~DeferredPromotionHost() {
-    release();
-    joinWorker();
-  }
-
-  static bool promoteThunk(void* ctx, const PJ_source_promotion_request_v1_t* /*request*/,
-                           PJ_source_promotion_result_fn result_cb, void* callback_ctx,
-                           PJ_error_t* /*err*/) noexcept {
-    auto* self = static_cast<DeferredPromotionHost*>(ctx);
-    self->stored_cb = result_cb;
-    self->stored_ctx = callback_ctx;
-    self->worker = std::thread([self]() {
-      {
-        std::unique_lock<std::mutex> lock(self->mu);
-        self->cv.wait(lock, [self] { return self->release_requested; });
-      }
-      const char* msg = "promoted late";
-      self->stored_cb(self->stored_ctx, true, PJ_string_view_t{msg, std::char_traits<char>::length(msg)});
-    });
-    return true;
-  }
-
-  void release() {
-    {
-      const std::lock_guard<std::mutex> lock(mu);
-      release_requested = true;
-    }
-    cv.notify_one();
-  }
-  void joinWorker() {
-    if (worker.joinable()) {
-      worker.join();
-    }
-  }
-
-  [[nodiscard]] PJ_source_promotion_host_t view() {
-    static constexpr PJ_source_promotion_host_vtable_t kVtable{
-        1, sizeof(PJ_source_promotion_host_vtable_t), &DeferredPromotionHost::promoteThunk};
-    return PJ_source_promotion_host_t{this, &kVtable};
-  }
-};
+// Deferred-result host hoisted to fake_promotion_host.hpp (shared with the
+// provider suite's outstanding-promotion detach pin).
+using mcap_cloud_test::DeferredPromotionHost;
 
 // One fully-wired headless worker over a given runtime (the direct-pull
 // harness shape; the interactive-path pins ride the cache-tee suite).

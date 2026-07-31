@@ -54,6 +54,7 @@
 #include <pj_base/sdk/settings_store_host.hpp>
 
 #include "descriptor_import_provider.hpp"
+#include "fake_promotion_host.hpp"
 #include "fake_streaming_server.hpp"
 #include "fake_toolbox_host.hpp"
 #include "import_runtime.hpp"
@@ -784,4 +785,52 @@ TEST(McapCloudProviderJob, EmptyWindowCompleteIsEagerOnly) {
   ASSERT_EQ(recorder.terminalCount(), 1u);
   EXPECT_EQ(recorder.terminal(0).first, PJ_DESCRIPTOR_IMPORT_SUCCEEDED_EAGER_ONLY)
       << recorder.terminal(0).second;
+}
+
+// The DETACH branch (runToTerminal's !settled arm — the join-unblockability
+// guarantee): a promotion ACCEPTED but still OUTSTANDING when the cancel
+// lands must NOT block the terminal on on_result — exactly one CANCELLED
+// with the detach wording, delivered promptly. The shared result state
+// outlives the job: releasing the deferred host afterwards settles it
+// cleanly (observable as the SessionCache entry flipping to kPromoted long
+// after the job terminated). Distinct from PostCompleteCancelReportsTruthful-
+// Terminal above, which pins the SETTLED side of the same interleave.
+TEST(McapCloudProviderAbi, OutstandingPromotionAtCancelDetachesCancelled) {
+  FakeStreamingServer server(FakeStreamingServer::Mode::kComplete);
+  ASSERT_TRUE(server.ok());
+  ProviderHarness h("abi-detach");
+  mcap_cloud_test::DeferredPromotionHost promo;  // accepted; never settles until release()
+  h.rt.setPromotionHost(PJ::SourcePromotionHostView(promo.view()));
+
+  JobRecorder recorder;
+  ScopedJob job;
+  // The pull returns kComplete with the promotion accepted-but-unsettled;
+  // the pre-terminal cancel then forces the waitSettled predicate false.
+  h.provider.setPreTerminalHookForTest([&]() {
+    if (job.job.vtable != nullptr) {
+      job.job.vtable->cancel(job.job.ctx);
+    }
+  });
+  ASSERT_TRUE(h.start(queryJson(server.uri()), recorder, job));
+  ASSERT_TRUE(recorder.waitTerminal(std::chrono::seconds(5)))
+      << "the terminal must not wait for the never-settling on_result (detach)";
+  job.job.vtable->join(job.job.ctx);
+
+  ASSERT_EQ(recorder.terminalCount(), 1u);
+  EXPECT_EQ(recorder.terminal(0).first, PJ_DESCRIPTOR_IMPORT_CANCELLED)
+      << recorder.terminal(0).second;
+  EXPECT_NE(recorder.terminal(0).second.find("detached"), std::string::npos)
+      << recorder.terminal(0).second;
+
+  // Settle the shared state cleanly before teardown (ASAN-quiet), and pin
+  // the detached-state-outlives-the-job property: the late ok=true still
+  // lands on the SessionCache entry.
+  promo.release();
+  promo.joinWorker();
+  const PJ::cloud::SessionKey key =
+      PJ::cloud::computeSessionKey(server.uri(), {"a.mcap"}, {"/one"}, {0, 0});
+  auto entry = h.rt.sessionCache().lookup(key, [](const mcap_cloud::CachedSession&) { return true; });
+  ASSERT_TRUE(entry.has_value());
+  EXPECT_EQ(entry->promotion_state, mcap_cloud::PromotionState::kPromoted)
+      << "the detached shared state must settle the entry after the job is gone";
 }
