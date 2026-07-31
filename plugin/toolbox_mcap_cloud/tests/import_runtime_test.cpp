@@ -32,24 +32,16 @@
 
 #include "session_file_cache.hpp"
 #include "source_descriptor.hpp"
+#include "test_support_fs.hpp"
 #include "trusted_origins.hpp"
 
 namespace {
 
 namespace fs = std::filesystem;
 
-struct TempRoot {
-  explicit TempRoot(const std::string& name) {
-    path = fs::temp_directory_path() / ("mcap-cloud-import-runtime-test-" + name);
-    std::error_code ec;
-    fs::remove_all(path, ec);
-    fs::create_directories(path);
-  }
-  ~TempRoot() {
-    std::error_code ec;
-    fs::remove_all(path, ec);
-  }
-  fs::path path;
+// Shared RAII temp-dir base with this suite's unique prefix.
+struct TempRoot : mcap_cloud_test::ScopedTempDir {
+  explicit TempRoot(const std::string& name) : ScopedTempDir("mcap-cloud-import-runtime-test-" + name) {}
 };
 
 mcap_cloud::SourceDescriptor descriptor(const std::string& key) {
@@ -318,13 +310,18 @@ TEST(McapCloudImportRuntime, CacheTeeRequestAbortUnblocksABackpressuredProducer)
   const auto d = descriptor("backpressure.mcap");
   const std::string identity = mcap_cloud::descriptorIdentity(d);
 
+  // Declared BEFORE tee: the writer hook below captures release_writer by
+  // reference and the tee's writer THREAD may still poll it until ~CacheTee
+  // joins — on an early (ASSERT-failure) return, destruction order must keep
+  // the flag alive past the tee.
+  std::atomic<bool> release_writer{false};
+
   mcap_cloud::CacheTee tee(rt);
   std::string error;
   ASSERT_TRUE(tee.begin(identity, &error)) << error;
 
   // Stall the writer thread on its FIRST message until released; shrink the
   // queue so the producer hits backpressure after a couple of enqueues.
-  std::atomic<bool> release_writer{false};
   tee.setQueueCapacityForTest(1);
   tee.setWriterHookForTest([&](const mcap_cloud::DecodedMessage&) {
     while (!release_writer.load()) {
@@ -346,6 +343,23 @@ TEST(McapCloudImportRuntime, CacheTeeRequestAbortUnblocksABackpressuredProducer)
       enqueued.fetch_add(1);
     }
   });
+  // Join guard (PR-1 quality-review nit): an ASSERT failure below would
+  // otherwise unwind past a joinable std::thread (std::terminate). Releases
+  // the stalled writer and aborts the tee first so the guarded join cannot
+  // itself wedge behind the backpressure it is cleaning up. A no-op on the
+  // success path (the thread is already joined by then).
+  struct ProducerJoinGuard {
+    std::atomic<bool>& release_writer;
+    mcap_cloud::CacheTee& tee;
+    std::thread& thread;
+    ~ProducerJoinGuard() {
+      if (thread.joinable()) {
+        release_writer.store(true);
+        tee.requestAbort();
+        thread.join();
+      }
+    }
+  } producer_join_guard{release_writer, tee, producer};
 
   // Wait until the producer is genuinely wedged (progress stalls while the
   // thread is still running: writer holds msg 1 in the hook, the queue holds

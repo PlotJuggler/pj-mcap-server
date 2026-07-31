@@ -32,6 +32,7 @@
 #include "tag_dialog_ui.hpp"
 #include "core/time_format.h"
 #include "aggregate_sessions.h"
+#include "credential_resolve.hpp"
 #include "date_filter.h"
 #include "elide_name.h"
 #include "canonical_fields.h"
@@ -43,7 +44,6 @@
 #include "mcap_cloud_panel_manifest.hpp"
 #include "mcap_cloud_panel_ui.hpp"
 #include "name_filter.h"
-#include "origin_match.hpp"
 #include "query_filter.h"
 #include "server_history.h"
 #include "settings_store.hpp"
@@ -56,19 +56,9 @@ namespace mcap_cloud {
 
 namespace {
 
-struct ServerCredentials {
-  std::string cert_path;
-  std::string api_key;
-  bool allow_insecure = false;
-};
-
 // Cross-platform first-launch default for the Save-MCAP directory field.
 std::string defaultMcapSaveDirectory() {
   return (PJ::sdk::userDataDir() / "mcap_cloud" / "downloads").string();
-}
-
-std::string credentialsSettingsPrefix(const std::string& uri) {
-  return "mcap_cloud/server_cache/" + normalizeServerKey(uri) + "/";
 }
 
 // Per-server persisted gate (customer/site) selection keys. `server_key` is
@@ -78,55 +68,10 @@ std::string gateSettingsPrefix(const std::string& server_key) {
   return "mcap_cloud/gate/" + server_key + "/";
 }
 
-// D6: the bearer token (the SECRET) now lives in the CredentialStore (0600
-// file, libsecret-ready seam), NOT in plaintext SettingsView. The non-secret
-// prefs (cert_path, allow_insecure) stay in SettingsView keyed by the same
-// normalized-URI prefix (Plan D Task 6 note 4). `view` carries the non-secret
-// prefs; `creds` carries the secret token.
-ServerCredentials loadCredentialsForUri(PJ::sdk::SettingsView view, CredentialStore& store, const std::string& uri) {
-  SettingsStore settings(view);
-  const std::string prefix = credentialsSettingsPrefix(uri);
-  ServerCredentials creds;
-  creds.cert_path = settings.getString(prefix + "cert_path");
-  creds.allow_insecure = settings.getBool(prefix + "allow_insecure", false);
-  // The token comes from the secret store; an absent entry leaves api_key empty.
-  if (auto tok = store.get(uri)) {
-    creds.api_key = *tok;
-  }
-  return creds;
-}
-
-void saveCredentialsForUri(PJ::sdk::SettingsView view, CredentialStore& store, const std::string& uri,
-                           const ServerCredentials& creds) {
-  SettingsStore settings(view);
-  const std::string prefix = credentialsSettingsPrefix(uri);
-  settings.setString(prefix + "cert_path", creds.cert_path);
-  settings.setBool(prefix + "allow_insecure", creds.allow_insecure);
-  // The token is the only secret — store it in the CredentialStore.
-  store.set(uri, creds.api_key);
-}
-
-// Load per-server credentials, resolving the token with precedence
-// explicit(env) > stored > none: the MCAP_CLOUD_API_KEY env var wins over the
-// stored token (headless / live-test parity unchanged), then the stored token,
-// then dev-anonymous empty. Mirrors cli_url_resolve's resolveCliToken chain
-// (extended with the STORED tier via resolveStoredToken).
-//
-// ORIGIN BINDING (spec docs/canonical-layout-import.md §7 guard 2): the env
-// token is used IFF MCAP_CLOUD_URL is set AND its parsed origin equals the
-// target's (sameWsOrigin — strict, fail-closed). Without the binding, a
-// hostile layout/import target of a DIFFERENT origin would silently receive
-// the env bearer token. On a non-match the chain simply falls through to the
-// stored per-server token (unchanged).
-ServerCredentials resolveCredentials(PJ::sdk::SettingsView view, CredentialStore& store, const std::string& uri) {
-  ServerCredentials creds = loadCredentialsForUri(view, store, uri);
-  const std::optional<std::string> env_url = PJ::sdk::getEnv("MCAP_CLOUD_URL");
-  const bool env_origin_ok = env_url.has_value() && sameWsOrigin(*env_url, uri);
-  creds.api_key = resolveStoredToken(
-      env_origin_ok ? PJ::sdk::getEnv("MCAP_CLOUD_API_KEY") : std::optional<std::string>{},
-      store.get(uri));
-  return creds;
-}
+// ServerCredentials + loadCredentialsForUri / saveCredentialsForUri /
+// resolveCredentials moved VERBATIM to src/credential_resolve.{hpp,cpp}
+// (stage-4 PR-2, D2 amendment) so PR-3's start_import shares the exact
+// resolution chain. MAIN-THREAD-ONLY — see the header's threading contract.
 
 // ---------------------------------------------------------------------------
 // Info-panel / table formatting helpers (ported from PJ3 data_view_panel.cpp
@@ -557,8 +502,11 @@ McapCloudDialog::McapCloudDialog() : worker_(std::make_unique<FetchWorker>()) {
   };
 
   worker_thread_ = std::thread([this] { workerLoop(); });
-  // Persisted-state restore + auto-connect happen in initFromSettings(), once
-  // the host binds the settings view via setSettings() (during plugin bind()).
+  // Persisted-state restore + auto-connect happen in initFromSettings(), run
+  // once at the FIRST getDialog() via ensureInitFromSettings() — never at
+  // bind time (spec §6.3: a headless provider bind stays network-free). The
+  // worker thread started above idles until then: no network, no credential
+  // access, no settings read happens before a command is queued.
 }
 
 CredentialStore& McapCloudDialog::credentialStore() {
@@ -582,7 +530,23 @@ TrustedOrigins& McapCloudDialog::trustedOrigins() {
 }
 
 void McapCloudDialog::setSettings(PJ::sdk::SettingsView settings) {
+  // STORE-ONLY (stage-4 PR-2, spec §6.3): binding the settings view must not
+  // run the interactive initialization — a headless provider bind() calls
+  // this and has to stay network-free. The persisted-UI restore + auto-
+  // connect run at the first getDialog() via ensureInitFromSettings(); a
+  // re-bind AFTER that swaps the view the dialog reads/writes from here on
+  // but never implicitly reconnects.
   settings_ = settings;
+}
+
+void McapCloudDialog::ensureInitFromSettings() {
+  // ONCE-PER-PLUGIN-LIFETIME latch (D1-as-amended): the first getDialog()
+  // runs the interactive init exactly once; repeated getDialog() calls and
+  // re-binds must never double-connect or re-restore over live UI state.
+  if (init_from_settings_done_) {
+    return;
+  }
+  init_from_settings_done_ = true;
   initFromSettings();
 }
 
@@ -602,8 +566,10 @@ void McapCloudDialog::setImportRuntime(ImportRuntime* runtime) {
 
 void McapCloudDialog::initFromSettings() {
   // Restore persisted UI state and auto-connect to the last server (PJ3
-  // parity). Runs at bind time, before the tick loop or any worker result can
-  // touch state_, so the unlocked access here is safe.
+  // parity). Runs once, on the GUI thread, at the FIRST getDialog() (via
+  // ensureInitFromSettings) — before that no command has ever been posted to
+  // the worker (bind is store-only), so no worker result can be touching
+  // state_ and the unlocked access here is safe.
   SettingsStore settings(settings_);
   std::vector<std::string> history = settings.getStringList("mcap_cloud/server_history");
   if (!history.empty()) {
@@ -642,7 +608,11 @@ void McapCloudDialog::initFromSettings() {
     }
   }
 
-  if (!history.empty()) {
+  // NOTE: `history` itself is moved-from above — test the seeded member. (The
+  // previous `!history.empty()` check silently killed the auto-connect when
+  // 02899ff hoisted the move before this block: a moved-from vector reads
+  // empty, so the whole restore-connect branch became dead code.)
+  if (!state_.server_history.empty()) {
     const std::string uri = state_.uri;
     const ServerCredentials creds = resolveCredentials(settings_, credentialStore(), uri);
     // Same printable-ASCII gate as the explicit Connect handler (PJ3
@@ -692,7 +662,27 @@ void McapCloudDialog::workerLoop() {
       task = std::move(cmd_queue_.front());
       cmd_queue_.pop_front();
     }
-    task();
+    // Exception FIREWALL (adversarial F8): a command that throws (e.g.
+    // std::system_error from thread construction under resource exhaustion
+    // anywhere the FetchWorker paths spawn helpers) previously exited this
+    // worker thread and invoked std::terminate — taking the whole app down
+    // for one failed command. Report through the existing status surface
+    // and keep the pump alive; the failed command's own callbacks already
+    // carry its per-operation error reporting where they ran.
+    try {
+      task();
+      continue;
+    } catch (const std::exception& e) {
+      postEvent([this, message = std::string(e.what())]() {
+        notify(PJ::ToolboxMessageLevel::kError,
+               "MCAP Cloud: internal error in a background command: " + message);
+      });
+    } catch (...) {
+      postEvent([this]() {
+        notify(PJ::ToolboxMessageLevel::kError,
+               "MCAP Cloud: internal error in a background command");
+      });
+    }
   }
 }
 

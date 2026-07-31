@@ -132,7 +132,7 @@ struct DialogState {
   // selection, which change independently and serialize to a few ints.
   bool topic_rows_pushed = false;
   // MRU server history ("mcap_cloud/server_history"): seeded by
-  // initFromSettings at bind time and refreshed on every history write
+  // initFromSettings (first getDialog) and refreshed on every history write
   // (onConnectFinished) — the previous per-call read crossed the plugin->host
   // settings ABI on every widget_data().
   std::vector<std::string> server_history;
@@ -430,14 +430,32 @@ class McapCloudDialog : public PJ::DialogPluginTyped {
   // in-memory trust set and the ledger stay in lockstep.
   void setImportRuntime(ImportRuntime* runtime);
 
-  // Binds the host's `pj.settings.v1` store and restores persisted UI state
-  // (+ auto-connect). Called by the toolbox during bind(). An unbound view
-  // (host omits the optional service) yields defaults gracefully.
+  // Binds the host's `pj.settings.v1` store. STORE-ONLY (stage-4 PR-2, spec
+  // docs/canonical-layout-import.md §6.3): called by the toolbox during
+  // bind(), which must stay network-free for a headless provider bind — the
+  // persisted-UI restore + auto-connect run at the first getDialog() via
+  // ensureInitFromSettings() below. A re-bind after initialization swaps the
+  // stored view (subsequent reads/writes go to the new host store) but never
+  // implicitly reconnects. An unbound view (host omits the optional service)
+  // yields defaults gracefully.
   void setSettings(PJ::sdk::SettingsView settings);
 
+  // One-shot interactive initialization: restore persisted UI state +
+  // auto-connect to the most recent server. Called by the toolbox's
+  // getDialog() — the interactive-only entry point (PJ4 shows the panel only
+  // through it), so a headless provider session never triggers it. Latched
+  // ONCE PER PLUGIN LIFETIME: repeated getDialog() calls and re-binds are
+  // plain borrows/view swaps, never a re-init or reconnect. Residual noted
+  // for §6.3: the dialog CONSTRUCTOR starts the command-pump worker thread,
+  // which idles until a command is queued — no network, credential, or
+  // settings access happens pre-init, so the early thread is not a §6.3
+  // violation.
+  void ensureInitFromSettings();
+
  private:
-  // Restore persisted query/range/server + auto-connect. Runs once when the
-  // settings view is bound, before the tick loop.
+  // Restore persisted query/range/server + auto-connect. Runs once, at the
+  // first getDialog() (see ensureInitFromSettings), before any worker
+  // command exists.
   void initFromSettings();
 
   // `uri` is the URI ACTUALLY CONNECTED (captured at the connect() call site,
@@ -639,6 +657,9 @@ class McapCloudDialog : public PJ::DialogPluginTyped {
   TrustedOrigins& trustedOrigins();
   // Non-owning; see setImportRuntime. nullptr for a dialog-only unit load.
   ImportRuntime* import_runtime_ = nullptr;
+  // ensureInitFromSettings' once-per-plugin-lifetime latch. GUI-thread only
+  // (set inside the first getDialog() call).
+  bool init_from_settings_done_ = false;
   // Toolbox runtime host provider (notifyDataChanged after import + the
   // reportMessage notification bell). Set by the toolbox during bind(); unset
   // for a dialog-only smoke load (notify() then no-ops).

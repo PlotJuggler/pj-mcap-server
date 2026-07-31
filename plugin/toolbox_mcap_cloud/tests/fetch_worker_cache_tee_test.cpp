@@ -43,6 +43,7 @@
 #include "pj_cloud.pb.h"
 #include "session_file_cache.hpp"
 #include "source_descriptor.hpp"
+#include "test_support_fs.hpp"
 #include "trusted_origins.hpp"
 
 namespace {
@@ -50,18 +51,9 @@ namespace {
 namespace fs = std::filesystem;
 using mcap_cloud_test::findFreePort;
 
-struct TempRoot {
-  explicit TempRoot(const std::string& name) {
-    path = fs::temp_directory_path() / ("mcap-cloud-tee-test-" + name);
-    std::error_code ec;
-    fs::remove_all(path, ec);
-    fs::create_directories(path);
-  }
-  ~TempRoot() {
-    std::error_code ec;
-    fs::remove_all(path, ec);
-  }
-  fs::path path;
+// Shared RAII temp-dir base with this suite's unique prefix.
+struct TempRoot : mcap_cloud_test::ScopedTempDir {
+  explicit TempRoot(const std::string& name) : ScopedTempDir("mcap-cloud-tee-test-" + name) {}
 };
 
 constexpr std::uint32_t kTopicId = 1;
