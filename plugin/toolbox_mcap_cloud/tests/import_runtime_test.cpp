@@ -346,6 +346,23 @@ TEST(McapCloudImportRuntime, CacheTeeRequestAbortUnblocksABackpressuredProducer)
       enqueued.fetch_add(1);
     }
   });
+  // Join guard (PR-1 quality-review nit): an ASSERT failure below would
+  // otherwise unwind past a joinable std::thread (std::terminate). Releases
+  // the stalled writer and aborts the tee first so the guarded join cannot
+  // itself wedge behind the backpressure it is cleaning up. A no-op on the
+  // success path (the thread is already joined by then).
+  struct ProducerJoinGuard {
+    std::atomic<bool>& release_writer;
+    mcap_cloud::CacheTee& tee;
+    std::thread& thread;
+    ~ProducerJoinGuard() {
+      if (thread.joinable()) {
+        release_writer.store(true);
+        tee.requestAbort();
+        thread.join();
+      }
+    }
+  } producer_join_guard{release_writer, tee, producer};
 
   // Wait until the producer is genuinely wedged (progress stalls while the
   // thread is still running: writer holds msg 1 in the hook, the queue holds

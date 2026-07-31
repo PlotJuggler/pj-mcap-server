@@ -557,8 +557,11 @@ McapCloudDialog::McapCloudDialog() : worker_(std::make_unique<FetchWorker>()) {
   };
 
   worker_thread_ = std::thread([this] { workerLoop(); });
-  // Persisted-state restore + auto-connect happen in initFromSettings(), once
-  // the host binds the settings view via setSettings() (during plugin bind()).
+  // Persisted-state restore + auto-connect happen in initFromSettings(), run
+  // once at the FIRST getDialog() via ensureInitFromSettings() — never at
+  // bind time (spec §6.3: a headless provider bind stays network-free). The
+  // worker thread started above idles until then: no network, no credential
+  // access, no settings read happens before a command is queued.
 }
 
 CredentialStore& McapCloudDialog::credentialStore() {
@@ -582,7 +585,23 @@ TrustedOrigins& McapCloudDialog::trustedOrigins() {
 }
 
 void McapCloudDialog::setSettings(PJ::sdk::SettingsView settings) {
+  // STORE-ONLY (stage-4 PR-2, spec §6.3): binding the settings view must not
+  // run the interactive initialization — a headless provider bind() calls
+  // this and has to stay network-free. The persisted-UI restore + auto-
+  // connect run at the first getDialog() via ensureInitFromSettings(); a
+  // re-bind AFTER that swaps the view the dialog reads/writes from here on
+  // but never implicitly reconnects.
   settings_ = settings;
+}
+
+void McapCloudDialog::ensureInitFromSettings() {
+  // ONCE-PER-PLUGIN-LIFETIME latch (D1-as-amended): the first getDialog()
+  // runs the interactive init exactly once; repeated getDialog() calls and
+  // re-binds must never double-connect or re-restore over live UI state.
+  if (init_from_settings_done_) {
+    return;
+  }
+  init_from_settings_done_ = true;
   initFromSettings();
 }
 
@@ -602,8 +621,10 @@ void McapCloudDialog::setImportRuntime(ImportRuntime* runtime) {
 
 void McapCloudDialog::initFromSettings() {
   // Restore persisted UI state and auto-connect to the last server (PJ3
-  // parity). Runs at bind time, before the tick loop or any worker result can
-  // touch state_, so the unlocked access here is safe.
+  // parity). Runs once, on the GUI thread, at the FIRST getDialog() (via
+  // ensureInitFromSettings) — before that no command has ever been posted to
+  // the worker (bind is store-only), so no worker result can be touching
+  // state_ and the unlocked access here is safe.
   SettingsStore settings(settings_);
   std::vector<std::string> history = settings.getStringList("mcap_cloud/server_history");
   if (!history.empty()) {
@@ -642,7 +663,11 @@ void McapCloudDialog::initFromSettings() {
     }
   }
 
-  if (!history.empty()) {
+  // NOTE: `history` itself is moved-from above — test the seeded member. (The
+  // previous `!history.empty()` check silently killed the auto-connect when
+  // 02899ff hoisted the move before this block: a moved-from vector reads
+  // empty, so the whole restore-connect branch became dead code.)
+  if (!state_.server_history.empty()) {
     const std::string uri = state_.uri;
     const ServerCredentials creds = resolveCredentials(settings_, credentialStore(), uri);
     // Same printable-ASCII gate as the explicit Connect handler (PJ3

@@ -899,6 +899,53 @@ if(BUILD_TESTING)
            COMMAND toolbox_mcap_cloud_fetch_worker_cache_tee_test)
   set_tests_properties(McapCloudFetchWorkerCacheTeeTest PROPERTIES TIMEOUT 60)
 
+  # Headless one-shot init matrix (stage-4 PR-2, HERMETIC): drives the REAL
+  # McapCloudToolbox (+ its embedded dialog) through a fake service registry
+  # whose settings store points at an in-process fake WS server that counts
+  # connection attempts. Pins spec §6.3: bind() is network-free, the FIRST
+  # getDialog() auto-connects exactly once (once-per-plugin-lifetime latch),
+  # and a re-bind after init swaps the settings view without reconnecting.
+  # Compiles the dialog TU, so it needs the plugin's relaxed warning bar
+  # (vendored query/ + sol2 headers) and the configure-time generated
+  # ui/manifest headers. TIMEOUT 60 turns a wedged worker join into a fast
+  # FAIL.
+  add_executable(toolbox_mcap_cloud_headless_init_test
+    tests/headless_init_test.cpp
+    tests/find_free_port.cpp
+    src/mcap_cloud_toolbox.cpp
+    src/mcap_cloud_dialog.cpp
+    src/parser_ingest_driver.cpp
+    src/fetch_worker.cpp
+    src/backend_connection.cpp
+    src/wire_mapping.cpp
+    src/session_decode.cpp
+    src/session_mcap_writer.cpp
+    ${MCAP_CLOUD_IMPORT_SOURCES}
+    src/settings_store.cpp
+    src/mcap_save_path.cpp
+    src/core/time_format.cpp
+    src/mcap_implementation.cpp
+    ${MCAP_CLOUD_PROTO_SRCS}
+  )
+  target_compile_features(toolbox_mcap_cloud_headless_init_test PRIVATE cxx_std_20)
+  target_compile_options(toolbox_mcap_cloud_headless_init_test PRIVATE
+    "$<${PJ_NOT_MSVC}:-Wall;-Wextra;-Werror;-Wno-conversion;-Wno-unused-parameter;-Wno-unused-function>"
+  )
+  target_include_directories(toolbox_mcap_cloud_headless_init_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/core
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/query
+    ${MCAP_CLOUD_PROTO_OUT_DIR}
+  )
+  target_link_libraries(toolbox_mcap_cloud_headless_init_test PRIVATE
+    plotjuggler_sdk::plugin_sdk
+    fmt::fmt lua::lua sol2::sol2
+    protobuf::libprotobuf ixwebsocket::ixwebsocket nlohmann_json::nlohmann_json
+    zstd::libzstd_static LZ4::lz4_static mcap::mcap GTest::gtest_main
+  )
+  add_test(NAME McapCloudHeadlessInitTest COMMAND toolbox_mcap_cloud_headless_init_test)
+  set_tests_properties(McapCloudHeadlessInitTest PROPERTIES TIMEOUT 60)
+
   add_executable(toolbox_mcap_cloud_parser_ingest_live_test
     tests/parser_ingest_live_test.cpp
     src/parser_ingest_driver.cpp
