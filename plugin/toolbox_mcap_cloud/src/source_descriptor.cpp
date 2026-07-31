@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 #include "source_descriptor.hpp"
 
+#include <algorithm>
 #include <limits>
 #include <nlohmann/json.hpp>
 
@@ -211,6 +212,30 @@ std::optional<SourceDescriptor> parseSourceDescriptor(std::string_view json,
   if (!takeStringArray(obj, "s3_keys", kMaxKeys, &d.s3_keys, error) ||
       !takeStringArray(obj, "topics", kMaxTopics, &d.topics, error)) {
     return std::nullopt;
+  }
+  // The OpenFresh protocol rule (proto s3_keys: ">=1; no empty/duplicate
+  // keys"), enforced at the parse boundary (adversarial F3): an accepted
+  // empty selection previously reached provider code that dereferenced
+  // s3_keys.front() — undefined behavior — and empty/duplicate keys would
+  // only fail deep in the server. topics stays free-form: empty = all union
+  // topics by the wire contract.
+  if (d.s3_keys.empty()) {
+    fail(error, "s3_keys must contain at least one key");
+    return std::nullopt;
+  }
+  {
+    std::vector<std::string> sorted_keys = d.s3_keys;
+    std::sort(sorted_keys.begin(), sorted_keys.end());
+    for (std::size_t i = 0; i < sorted_keys.size(); ++i) {
+      if (sorted_keys[i].empty()) {
+        fail(error, "s3_keys must not contain empty keys");
+        return std::nullopt;
+      }
+      if (i > 0 && sorted_keys[i] == sorted_keys[i - 1]) {
+        fail(error, "s3_keys must not contain duplicate keys (\"" + sorted_keys[i] + "\")");
+        return std::nullopt;
+      }
+    }
   }
   if (!takeNs(obj, "start_ns", &d.start_ns, error) ||
       !takeNs(obj, "end_ns", &d.end_ns, error)) {
