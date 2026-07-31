@@ -33,10 +33,23 @@ class CredentialStore;
 // FetchWorker::connectAsync: the non-secret prefs (cert_path/allow_insecure,
 // persisted in the settings view) + the resolved bearer token (the SECRET,
 // persisted in the CredentialStore — never in plaintext settings).
+// Where the resolved bearer token came from (adversarial F15): an
+// intentional stored EMPTY dev-anonymous token is a PRESENT credential —
+// collapsing "present but empty" and "absent" to api_key.empty() made the
+// AUTH_FAILED remediation hint lie ("no stored credential" with an entry on
+// file). Consumers gate provenance-sensitive behavior on `api_key_source`,
+// never on token bytes.
+enum class TokenSource {
+  kNone = 0,     // no env token honored, no stored entry
+  kEnvironment,  // MCAP_CLOUD_API_KEY (origin-bound) won
+  kStored,       // the CredentialStore entry won (possibly the empty dev token)
+};
+
 struct ServerCredentials {
   std::string cert_path;
   std::string api_key;
   bool allow_insecure = false;
+  TokenSource api_key_source = TokenSource::kNone;  // F15 (resolveCredentials sets it)
 };
 
 // The immutable per-job connection snapshot (the PR-3 handoff type): the

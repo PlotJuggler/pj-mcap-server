@@ -180,3 +180,39 @@ TEST(McapCloudCredentialResolve, ConnectionSnapshotCarriesTheResolvedTuple) {
   EXPECT_EQ(copy.credentials.cert_path, "/snap/ca.pem");
   EXPECT_FALSE(copy.credentials.allow_insecure);
 }
+
+// Adversarial F15: token PROVENANCE — a stored EMPTY dev-anonymous token is
+// kStored (present!), never kNone; a truly absent credential is kNone.
+// Consumers (the §10 auth hint) gate on the source, never on token bytes.
+TEST(McapCloudCredentialResolve, ResolvedTokenCarriesItsProvenance) {
+  Fixture fx;
+  const std::string uri = "ws://prov-host:8080";
+  // Absent everywhere -> kNone.
+  {
+    const auto creds = mcap_cloud::resolveCredentials(fx.view(), fx.store, uri);
+    EXPECT_EQ(creds.api_key_source, mcap_cloud::TokenSource::kNone);
+    EXPECT_TRUE(creds.api_key.empty());
+  }
+  // Stored EMPTY dev-anonymous token -> kStored, still empty bytes.
+  fx.store.set(uri, "");
+  {
+    const auto creds = mcap_cloud::resolveCredentials(fx.view(), fx.store, uri);
+    EXPECT_EQ(creds.api_key_source, mcap_cloud::TokenSource::kStored);
+    EXPECT_TRUE(creds.api_key.empty());
+  }
+  // Stored real token -> kStored.
+  fx.store.set(uri, "stored-token");
+  {
+    const auto creds = mcap_cloud::resolveCredentials(fx.view(), fx.store, uri);
+    EXPECT_EQ(creds.api_key_source, mcap_cloud::TokenSource::kStored);
+    EXPECT_EQ(creds.api_key, "stored-token");
+  }
+  // Origin-bound env token -> kEnvironment.
+  ::setenv("MCAP_CLOUD_URL", uri.c_str(), 1);
+  ::setenv("MCAP_CLOUD_API_KEY", "env-token", 1);
+  {
+    const auto creds = mcap_cloud::resolveCredentials(fx.view(), fx.store, uri);
+    EXPECT_EQ(creds.api_key_source, mcap_cloud::TokenSource::kEnvironment);
+    EXPECT_EQ(creds.api_key, "env-token");
+  }
+}

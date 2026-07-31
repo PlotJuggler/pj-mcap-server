@@ -51,9 +51,20 @@ ServerCredentials resolveCredentials(PJ::sdk::SettingsView view, CredentialStore
   ServerCredentials creds = loadCredentialsForUri(view, store, uri);
   const std::optional<std::string> env_url = PJ::sdk::getEnv("MCAP_CLOUD_URL");
   const bool env_origin_ok = env_url.has_value() && sameWsOrigin(*env_url, uri);
-  creds.api_key = resolveStoredToken(
-      env_origin_ok ? PJ::sdk::getEnv("MCAP_CLOUD_API_KEY") : std::optional<std::string>{},
-      store.get(uri));
+  const std::optional<std::string> env_token =
+      env_origin_ok ? PJ::sdk::getEnv("MCAP_CLOUD_API_KEY") : std::optional<std::string>{};
+  const std::optional<std::string> stored_token = store.get(uri);
+  creds.api_key = resolveStoredToken(env_token, stored_token);
+  // Provenance (adversarial F15): mirror resolveStoredToken's precedence
+  // exactly — explicit(env, non-empty) > stored(INCLUDING a stored empty
+  // dev-anonymous token) > none.
+  if (env_token.has_value() && !env_token->empty()) {
+    creds.api_key_source = TokenSource::kEnvironment;
+  } else if (stored_token.has_value()) {
+    creds.api_key_source = TokenSource::kStored;
+  } else {
+    creds.api_key_source = TokenSource::kNone;
+  }
   return creds;
 }
 
