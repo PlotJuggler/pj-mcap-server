@@ -25,8 +25,11 @@ class FileLock {
   /// a different FileLock) or when the OS call fails. The lock file itself is
   /// never deleted: unlinking a path another process may be about to open
   /// would hand out two "exclusive" locks on different inodes.
+  /// `contended` (optional out, adversarial F9): true when the failure is
+  /// the lock being HELD elsewhere (retry-able), false for any OS error
+  /// (not retry-able) — callers implementing bounded waits must distinguish.
   [[nodiscard]] static std::optional<FileLock> tryExclusive(
-      const std::filesystem::path& path, std::string* error);
+      const std::filesystem::path& path, std::string* error, bool* contended = nullptr);
 
   /// Non-blocking try-acquire of a SHARED (read-lease) advisory lock on
   /// `path`, creating the lock file 0600 if absent. Multiple shared holders

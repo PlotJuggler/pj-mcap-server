@@ -24,7 +24,10 @@ namespace {
 // contend on the same first byte, so shared holders stack and block an
 // exclusive try (and vice versa).
 std::optional<std::intptr_t> tryAcquireHandle(const std::filesystem::path& path, bool exclusive,
-                                              std::string* error) {
+                                              std::string* error, bool* contended = nullptr) {
+  if (contended != nullptr) {
+    *contended = false;
+  }
 #if defined(_WIN32)
   const HANDLE handle =
       ::CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE,
@@ -42,6 +45,9 @@ std::optional<std::intptr_t> tryAcquireHandle(const std::filesystem::path& path,
       LOCKFILE_FAIL_IMMEDIATELY | (exclusive ? LOCKFILE_EXCLUSIVE_LOCK : 0);
   if (::LockFileEx(handle, flags, 0, 1, 0, &overlapped) == 0) {
     ::CloseHandle(handle);
+    if (contended != nullptr) {
+      *contended = true;  // FAIL_IMMEDIATELY: the region is held elsewhere
+    }
     if (error) {
       *error = "lock is held elsewhere: " + path.string();
     }
@@ -60,8 +66,12 @@ std::optional<std::intptr_t> tryAcquireHandle(const std::filesystem::path& path,
   if (::flock(fd, (exclusive ? LOCK_EX : LOCK_SH) | LOCK_NB) != 0) {
     const int flock_errno = errno;
     ::close(fd);
+    const bool held_elsewhere = (flock_errno == EWOULDBLOCK || flock_errno == EAGAIN);
+    if (contended != nullptr) {
+      *contended = held_elsewhere;
+    }
     if (error) {
-      *error = (flock_errno == EWOULDBLOCK || flock_errno == EAGAIN)
+      *error = held_elsewhere
                    ? "lock is held elsewhere: " + path.string()
                    : "flock failed on " + path.string() + ": " +
                          std::error_code(flock_errno, std::generic_category()).message();
@@ -75,8 +85,8 @@ std::optional<std::intptr_t> tryAcquireHandle(const std::filesystem::path& path,
 }  // namespace
 
 std::optional<FileLock> FileLock::tryExclusive(const std::filesystem::path& path,
-                                               std::string* error) {
-  auto handle = tryAcquireHandle(path, /*exclusive=*/true, error);
+                                               std::string* error, bool* contended) {
+  auto handle = tryAcquireHandle(path, /*exclusive=*/true, error, contended);
   if (!handle.has_value()) {
     return std::nullopt;
   }

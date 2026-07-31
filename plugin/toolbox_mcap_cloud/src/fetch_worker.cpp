@@ -162,7 +162,12 @@ bool FetchWorker::datasetExistsInHost(const CachedSession& entry) const {
       // D7: the STABLE dataset id is the existence key (display names collide
       // and mutate); the recorded name doubles as a recycle tiebreak — an id
       // match wearing a different name means the host reused the id for some
-      // OTHER dataset, which is proven-gone for this entry.
+      // OTHER dataset, which is proven-gone for this entry. KEPT under
+      // adversarial F11: SDK 0.20.0 documents NO non-recycling guarantee for
+      // PJ_data_source_handle_t ids (verified — no such contract text in
+      // plugin_data_api.h), so dropping the tiebreak would trade a rare
+      // rename false-miss for a wrong-dataset false-HIT. Rename-induced
+      // misses only cost a refetch.
       if (ds.handle.id == entry.dataset_id) {
         return name == entry.display_name;
       }
@@ -843,6 +848,23 @@ void FetchWorker::pullTopicsAsync(std::vector<std::string> sequence_names, std::
       }
     } else {
       set_tee_cancel_hook(tee.get());
+    }
+  }
+
+  // FAIR admission (adversarial F10): ONE pull at a time, FIFO, acquired
+  // BEFORE any session/connection exists so a queued pull holds no remote
+  // resources while waiting; held (RAII) for the whole pull, including the
+  // on_dataset host-lock release window. Runtime mode only — legacy mode has
+  // a single worker by construction.
+  std::optional<ImportRuntime::AdmissionTicket> admission;
+  if (rt != nullptr) {
+    admission = rt->acquireAdmission(
+        [this]() { return cancel_flag_.load(std::memory_order_relaxed); },
+        std::chrono::milliseconds(50));
+    if (!admission.has_value()) {
+      finish_all_topics(false, "cancelled");
+      finish_all();
+      return;
     }
   }
 

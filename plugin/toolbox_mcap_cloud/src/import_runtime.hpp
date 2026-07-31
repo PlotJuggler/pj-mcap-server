@@ -68,9 +68,12 @@ class ImportRuntime {
   /// toolbox instance (the toolbox DataWriter has no internal mutex).
   [[nodiscard]] std::mutex& hostWriteMutex() { return host_write_mu_; }
 
-  /// Write-through: records into the TrustedOrigins ledger AND the in-memory
+  /// Write-through: records into the TrustedOrigins ledger AND — only after
+  /// the DURABLE ledger write succeeded (adversarial F14) — the in-memory
   /// set. Call on a successful interactive Hello only (spec §7 guard 1).
-  void recordSuccessfulHello(std::string_view uri);
+  /// False = nothing recorded anywhere (transient trust is never held
+  /// silently); the caller surfaces a diagnostic.
+  [[nodiscard]] bool recordSuccessfulHello(std::string_view uri);
   /// Bounded in-memory query (no file I/O — §6.3). False for unparsable URIs.
   [[nodiscard]] bool isTrusted(std::string_view uri) const;
 
@@ -96,6 +99,31 @@ class ImportRuntime {
   /// the SAME identity is registered in THIS process (the cross-process case
   /// is the SessionFileCache MaterializeLock).
   [[nodiscard]] std::optional<MaterializeTicket> tryBeginMaterialize(std::string_view identity);
+
+  // ---- FAIR pull-admission gate (adversarial F10) --------------------------
+  // ONE pull (interactive fetch or provider job) is admitted at a time,
+  // FIFO — acquired BEFORE OpenSession so a queued pull holds no remote
+  // session/inbox resources while waiting, and held across the pull's
+  // on_dataset host-lock release window so the other producer cannot steal
+  // the turn. RAII ticket; cancelable wait (bounded poll against the
+  // caller's cancel predicate).
+  class AdmissionTicket {
+   public:
+    AdmissionTicket(AdmissionTicket&& other) noexcept;
+    AdmissionTicket& operator=(AdmissionTicket&& other) noexcept;
+    AdmissionTicket(const AdmissionTicket&) = delete;
+    AdmissionTicket& operator=(const AdmissionTicket&) = delete;
+    ~AdmissionTicket();
+
+   private:
+    friend class ImportRuntime;
+    explicit AdmissionTicket(ImportRuntime* runtime) : runtime_(runtime) {}
+    ImportRuntime* runtime_ = nullptr;
+  };
+  /// Blocks FIFO until admitted or `cancelled()` returns true (polled every
+  /// `poll`); nullopt = cancelled while waiting.
+  [[nodiscard]] std::optional<AdmissionTicket> acquireAdmission(
+      const std::function<bool()>& cancelled, std::chrono::milliseconds poll);
 
   // ---- CONSERVATIVE-INTERIM dataset-lifetime leases (adversarial F2) -------
   // The runtime retains ONE shared read lease per finalized/served identity
@@ -131,6 +159,18 @@ class ImportRuntime {
 
   mutable std::mutex lease_mu_;
   std::unordered_map<std::string, FileLock> retained_leases_;  // F2 (see above)
+
+  // F10 admission gate: a FIFO queue of waiter records; the releaser hands
+  // the (held) gate to the front waiter directly, so admission order is
+  // arrival order — never mutex-wakeup luck.
+  void releaseAdmission();
+  struct AdmissionWaiter {
+    std::condition_variable cv;
+    bool granted = false;
+  };
+  std::mutex adm_mu_;
+  std::deque<AdmissionWaiter*> adm_queue_;
+  bool adm_held_ = false;
 };
 
 /// One cache-materialization attempt (see the file header). Drive:
@@ -152,7 +192,12 @@ class CacheTee {
   /// partials + LRU; runs BEFORE our own lock so it never self-contends) ->
   /// exclusive MaterializeLock -> delete a lookup()-failing existing file
   /// under the lock (spec §5 corruption policy).
-  [[nodiscard]] bool begin(const std::string& identity, std::string* error);
+  /// `adopted_lock` (adversarial F9): a caller that already performed its
+  /// own bounded cancelable wait on the CROSS-PROCESS materialize lock (the
+  /// provider job) hands it in; begin() then never re-acquires (it would
+  /// self-contend on the sidecar).
+  [[nodiscard]] bool begin(const std::string& identity, std::string* error,
+                           std::optional<SessionFileCache::MaterializeLock> adopted_lock = std::nullopt);
 
   /// Phase 2 (after OpenSession, when SessionInfo is known): free-space check
   /// (estimated_bytes > available at the cache root refuses; 0 skips),
@@ -232,6 +277,7 @@ class CacheTee {
 
   ImportRuntime& runtime_;
   std::string identity_;
+  bool begin_lock_contended_ = false;  // F9 (see beginFailedOnLockContention)
   std::optional<ImportRuntime::MaterializeTicket> ticket_;
   std::optional<SessionFileCache::MaterializeLock> lock_;
   std::filesystem::path partial_path_;

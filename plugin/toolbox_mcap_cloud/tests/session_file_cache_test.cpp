@@ -14,6 +14,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
+#include <cstring>
 #include <fstream>
 #include <string>
 #include <thread>
@@ -546,3 +547,66 @@ TEST(SessionFileCache, StandardHonoursCacheDirOverride) {
   ::unsetenv("MCAP_CLOUD_CACHE_DIR");
 }
 #endif
+
+// Adversarial F13: a forged <digest>.mcap whose footer points at a
+// multi-gigabyte summary span must be refused by raw-footer preflight BEFORE
+// the MCAP summary parser allocates anything — a plain miss, on the GUI
+// thread's fixed query budget. (Sparse file: huge st_size, tiny disk use.)
+TEST(SessionFileCache, ForgedOversizedSummarySpanIsRefusedBeforeParsing) {
+  TempRoot root("forged-summary");
+  mcap_cloud::SessionFileCache cache(root.path);
+  const std::string identity = "mcap-cloud:v1:sha256/128:22222222222222222222222222222222";
+  const std::filesystem::path target = cache.pathFor(identity);
+  {
+    std::ofstream out(target, std::ios::binary);
+    out.write("\x89MCAP0\r\n", 8);  // start magic
+  }
+  // Grow sparsely to ~64 MiB, then write a footer claiming summary_start=8:
+  // span = size - tail - 8 >> the 16 MiB query budget.
+  std::error_code ec;
+  std::filesystem::resize_file(target, 64ull * 1024 * 1024, ec);
+  ASSERT_FALSE(ec);
+  {
+    std::fstream out(target, std::ios::binary | std::ios::in | std::ios::out);
+    // Footer record: op 0x02, len=20 (LE u64), summary_start=8 (LE u64),
+    // summary_offset_start=0, summary_crc=0, then the end magic.
+    unsigned char tail[37] = {0};
+    tail[0] = 0x02;
+    tail[1] = 20;                       // length LE
+    tail[9] = 8;                        // summary_start LE = 8
+    const char magic[8] = {'\x89', 'M', 'C', 'A', 'P', '0', '\r', '\n'};
+    std::memcpy(tail + 29, magic, 8);
+    out.seekp(-37, std::ios::end);
+    out.write(reinterpret_cast<const char*>(tail), sizeof(tail));
+  }
+  std::filesystem::path out_path;
+  EXPECT_FALSE(cache.lookup(identity, &out_path))
+      << "a forged oversized summary span must be a miss (F13)";
+}
+
+// Adversarial F9: cross-process contention is DISTINGUISHABLE from OS
+// failure. Two SessionFileCache instances over one root contend exactly like
+// two processes (flock treats each FileLock's descriptor as an independent
+// holder — see FileLock::tryExclusive's doc).
+TEST(SessionFileCache, MaterializeLockContentionIsDistinguished) {
+  TempRoot root("lock-contention");
+  mcap_cloud::SessionFileCache a(root.path);
+  mcap_cloud::SessionFileCache b(root.path);
+  const std::string identity = "mcap-cloud:v1:sha256/128:33333333333333333333333333333333";
+
+  std::string err;
+  bool contended = true;
+  auto lock_a = a.tryLockForMaterialize(identity, &err, &contended);
+  ASSERT_TRUE(lock_a.has_value()) << err;
+  EXPECT_FALSE(contended);
+
+  auto lock_b = b.tryLockForMaterialize(identity, &err, &contended);
+  EXPECT_FALSE(lock_b.has_value());
+  EXPECT_TRUE(contended) << "held-elsewhere must classify as contention (F9)";
+
+  // A malformed identity is an ERROR, never contention.
+  contended = true;
+  auto bad = b.tryLockForMaterialize("not-an-identity", &err, &contended);
+  EXPECT_FALSE(bad.has_value());
+  EXPECT_FALSE(contended);
+}

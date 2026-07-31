@@ -2661,10 +2661,15 @@ void McapCloudDialog::onConnectFinished(bool ok, std::string uri, std::string st
     // ImportRuntime when bound (write-through: same ledger file + the bounded
     // in-memory set the provider queries); direct ledger only for a
     // runtime-less dialog unit load.
-    if (import_runtime_ != nullptr) {
-      import_runtime_->recordSuccessfulHello(uri);
-    } else {
-      trustedOrigins().recordSuccessfulHello(uri);
+    const bool trust_recorded = (import_runtime_ != nullptr)
+                                    ? import_runtime_->recordSuccessfulHello(uri)
+                                    : trustedOrigins().recordSuccessfulHello(uri);
+    if (!trust_recorded) {
+      // F14: a failed durable write means the origin is NOT trusted anywhere
+      // (no silent transient trust) — say so instead of pretending.
+      notify(PJ::ToolboxMessageLevel::kWarning,
+             "MCAP Cloud: could not persist the trusted-origin ledger — layout imports from "
+             "this server will keep asking for confirmation.");
     }
 
     notify(PJ::ToolboxMessageLevel::kInfo, status);

@@ -70,8 +70,11 @@ class SessionFileCache {
   /// renames over it (deletion policy is the provider flow's).
   [[nodiscard]] bool lookup(std::string_view identity, std::filesystem::path* out);
 
+  /// `contended` (optional out, adversarial F9): true iff the failure is the
+  /// lock being held by ANOTHER holder (any process — retry-able), false for
+  /// OS/identity errors.
   [[nodiscard]] std::optional<MaterializeLock> tryLockForMaterialize(
-      std::string_view identity, std::string* error);
+      std::string_view identity, std::string* error, bool* contended = nullptr);
 
 
   /// Adversarial F2: convert a finalized identity's EXCLUSIVE materialize

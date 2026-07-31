@@ -22,14 +22,19 @@ ImportRuntime::ImportRuntime(SessionFileCache file_cache, TrustedOrigins trusted
   }
 }
 
-void ImportRuntime::recordSuccessfulHello(std::string_view uri) {
+bool ImportRuntime::recordSuccessfulHello(std::string_view uri) {
   const auto key = trustedOriginKey(uri);
   if (!key.has_value()) {
-    return;  // unparsable uri: fail closed, record nothing (ledger does the same)
+    return false;  // unparsable uri: fail closed, record nothing (ledger does the same)
   }
-  trusted_.recordSuccessfulHello(uri);  // write-through to the ledger
+  if (!trusted_.recordSuccessfulHello(uri)) {
+    // F14: the durable write failed — do NOT hold transient in-memory trust
+    // (queries keep answering needs-confirmation); the caller diagnoses.
+    return false;
+  }
   std::lock_guard<std::mutex> lock(trust_mu_);
   trusted_keys_.insert(*key);
+  return true;
 }
 
 bool ImportRuntime::isTrusted(std::string_view uri) const {
@@ -49,6 +54,72 @@ std::optional<ImportRuntime::MaterializeTicket> ImportRuntime::tryBeginMateriali
     return std::nullopt;  // this process is already materializing that identity
   }
   return MaterializeTicket(this, std::move(key));
+}
+
+ImportRuntime::AdmissionTicket::AdmissionTicket(AdmissionTicket&& other) noexcept
+    : runtime_(std::exchange(other.runtime_, nullptr)) {}
+
+ImportRuntime::AdmissionTicket& ImportRuntime::AdmissionTicket::operator=(
+    AdmissionTicket&& other) noexcept {
+  if (this != &other) {
+    if (runtime_ != nullptr) {
+      runtime_->releaseAdmission();
+    }
+    runtime_ = std::exchange(other.runtime_, nullptr);
+  }
+  return *this;
+}
+
+ImportRuntime::AdmissionTicket::~AdmissionTicket() {
+  if (runtime_ != nullptr) {
+    runtime_->releaseAdmission();
+  }
+}
+
+std::optional<ImportRuntime::AdmissionTicket> ImportRuntime::acquireAdmission(
+    const std::function<bool()>& cancelled, std::chrono::milliseconds poll) {
+  std::unique_lock<std::mutex> lock(adm_mu_);
+  if (!adm_held_ && adm_queue_.empty()) {
+    adm_held_ = true;
+    return AdmissionTicket(this);
+  }
+  AdmissionWaiter waiter;
+  adm_queue_.push_back(&waiter);
+  for (;;) {
+    waiter.cv.wait_for(lock, poll);
+    if (waiter.granted) {
+      return AdmissionTicket(this);  // the releaser transferred the held gate
+    }
+    if (cancelled && cancelled()) {
+      // Remove self; a grant racing this cancel is handled by re-checking
+      // granted AFTER unlinking (still under the mutex).
+      for (auto it = adm_queue_.begin(); it != adm_queue_.end(); ++it) {
+        if (*it == &waiter) {
+          adm_queue_.erase(it);
+          break;
+        }
+      }
+      if (waiter.granted) {
+        // The gate was handed to us in the same race window: pass it on.
+        lock.unlock();
+        releaseAdmission();
+        return std::nullopt;
+      }
+      return std::nullopt;
+    }
+  }
+}
+
+void ImportRuntime::releaseAdmission() {
+  std::unique_lock<std::mutex> lock(adm_mu_);
+  if (!adm_queue_.empty()) {
+    AdmissionWaiter* next = adm_queue_.front();
+    adm_queue_.pop_front();
+    next->granted = true;  // the gate stays held — ownership transfers
+    next->cv.notify_one();
+    return;
+  }
+  adm_held_ = false;
 }
 
 void ImportRuntime::retainReadLease(std::string_view identity, FileLock lease) {
@@ -112,7 +183,8 @@ CacheTee::~CacheTee() {
   abortAndCleanup();
 }
 
-bool CacheTee::begin(const std::string& identity, std::string* error) {
+bool CacheTee::begin(const std::string& identity, std::string* error,
+                     std::optional<SessionFileCache::MaterializeLock> adopted_lock) {
   auto fail = [error](std::string message) {
     if (error != nullptr) {
       *error = std::move(message);
@@ -134,11 +206,19 @@ bool CacheTee::begin(const std::string& identity, std::string* error) {
   // ImportRuntime::releaseRetainedLease for why replacement stays safe).
   runtime_.releaseRetainedLease(identity);
 
-  std::string lock_error;
-  lock_ = runtime_.fileCache().tryLockForMaterialize(identity, &lock_error);
-  if (!lock_.has_value()) {
-    ticket_.reset();
-    return fail(lock_error);
+  if (adopted_lock.has_value()) {
+    // F9: a caller (the provider job) already performed its bounded
+    // cancelable wait on the cross-process lock and hands it in — never
+    // re-acquire (self-contention on the sidecar).
+    lock_ = std::move(adopted_lock);
+  } else {
+    std::string lock_error;
+    lock_ = runtime_.fileCache().tryLockForMaterialize(identity, &lock_error,
+                                                       &begin_lock_contended_);
+    if (!lock_.has_value()) {
+      ticket_.reset();
+      return fail(lock_error);
+    }
   }
   partial_path_ = runtime_.fileCache().partialPathFor(*lock_);
 
@@ -173,16 +253,26 @@ bool CacheTee::openWriter(const SessionInfo& info, const std::string& canonical_
     return fail("cache tee not begun");
   }
 
-  // Free-space reserve (spec §5): refuse when the server's pre-flight
-  // estimate exceeds the space available at the cache root. 0 = no estimate
-  // -> skip (never block on an unknown).
+  // Free-space reserve (spec §5, tightened per adversarial F12): the
+  // estimate must fit WITH the configured reserve intact —
+  // available >= estimate + min_free_bytes — and a failing check first
+  // attempts an LRU eviction pass (cleanup skips locked/leased files) and
+  // re-checks. 0 = no estimate -> skip (never block on an unknown; the
+  // byte/duration ceilings bound the actual transfer instead).
   if (estimated_bytes > 0) {
+    const std::uintmax_t needed =
+        static_cast<std::uintmax_t>(estimated_bytes) + runtime_.cacheConfig().min_free_bytes;
     std::error_code space_ec;
-    const fs::space_info space = fs::space(partial_path_.parent_path(), space_ec);
-    if (!space_ec && space.available < estimated_bytes) {
+    fs::space_info space = fs::space(partial_path_.parent_path(), space_ec);
+    if (!space_ec && space.available < needed) {
+      runtime_.fileCache().cleanup(runtime_.cacheConfig());  // eviction attempt first
+      space = fs::space(partial_path_.parent_path(), space_ec);
+    }
+    if (!space_ec && space.available < needed) {
       return fail("insufficient free space for the session cache: need ~" +
-                  std::to_string(estimated_bytes) + " bytes, " +
-                  std::to_string(space.available) + " available at " +
+                  std::to_string(estimated_bytes) + " bytes plus the " +
+                  std::to_string(runtime_.cacheConfig().min_free_bytes) +
+                  "-byte reserve, " + std::to_string(space.available) + " available at " +
                   partial_path_.parent_path().string());
     }
   }

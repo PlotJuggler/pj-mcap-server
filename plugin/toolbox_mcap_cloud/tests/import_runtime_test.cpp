@@ -97,7 +97,7 @@ TEST(McapCloudImportRuntime, TrustSetIsPreloadedAndBounded) {
 
   // Seed the ledger BEFORE the runtime exists (a prior interactive session).
   mcap_cloud::TrustedOrigins seed(config_root.path);
-  seed.recordSuccessfulHello("ws://seeded:8080");
+  ASSERT_TRUE(seed.recordSuccessfulHello("ws://seeded:8080"));
 
   mcap_cloud::ImportRuntime rt = makeRuntime(cache_root, config_root);
   EXPECT_TRUE(rt.isTrusted("ws://seeded:8080"));
@@ -121,7 +121,7 @@ TEST(McapCloudImportRuntime, RecordSuccessfulHelloWritesThrough) {
   mcap_cloud::ImportRuntime rt = makeRuntime(cache_root, config_root);
 
   EXPECT_FALSE(rt.isTrusted("wss://new-server"));
-  rt.recordSuccessfulHello("wss://new-server");
+  ASSERT_TRUE(rt.recordSuccessfulHello("wss://new-server"));
   EXPECT_TRUE(rt.isTrusted("wss://new-server"));
   // Effective-port normalization: the default-port spelling is the same origin.
   EXPECT_TRUE(rt.isTrusted("wss://new-server:443"));
@@ -447,4 +447,55 @@ TEST(McapCloudCacheTee, WriterThreadSpawnFailureIsNonfatal) {
   }
   std::string err;
   EXPECT_TRUE(rt.fileCache().tryLockForMaterialize(identity, &err).has_value()) << err;
+}
+
+// Adversarial F10: the pull-admission gate is FIFO and cancelable — the
+// holder's release hands the gate to the LONGEST-waiting acquirer, and a
+// queued waiter whose cancel predicate fires leaves without disturbing the
+// order.
+TEST(McapCloudImportRuntime, AdmissionGateIsFifoAndCancelable) {
+  TempRoot cache_root("admission-cache");
+  TempRoot config_root("admission-config");
+  mcap_cloud::ImportRuntime rt(mcap_cloud::SessionFileCache(cache_root.path),
+                               mcap_cloud::TrustedOrigins(config_root.path));
+
+  auto first = rt.acquireAdmission({}, std::chrono::milliseconds(5));
+  ASSERT_TRUE(first.has_value());
+
+  std::vector<int> order;
+  std::mutex order_mu;
+  std::atomic<bool> cancel_c{false};
+  std::atomic<int> queued{0};
+
+  auto waiter = [&](int id, std::atomic<bool>* cancel) {
+    queued.fetch_add(1);
+    auto ticket = rt.acquireAdmission(
+        [cancel]() { return cancel != nullptr && cancel->load(); },
+        std::chrono::milliseconds(5));
+    if (ticket.has_value()) {
+      const std::lock_guard<std::mutex> lock(order_mu);
+      order.push_back(id);
+    }
+  };
+  // Deterministic arrival order: start each waiter only after the previous
+  // one is queued (queued count + a settle sleep).
+  std::thread tb([&]() { waiter(2, nullptr); });
+  while (queued.load() < 1) { std::this_thread::sleep_for(std::chrono::milliseconds(1)); }
+  std::this_thread::sleep_for(std::chrono::milliseconds(30));
+  std::thread tc([&]() { waiter(3, &cancel_c); });
+  while (queued.load() < 2) { std::this_thread::sleep_for(std::chrono::milliseconds(1)); }
+  std::this_thread::sleep_for(std::chrono::milliseconds(30));
+  std::thread td([&]() { waiter(4, nullptr); });
+  while (queued.load() < 3) { std::this_thread::sleep_for(std::chrono::milliseconds(1)); }
+  std::this_thread::sleep_for(std::chrono::milliseconds(30));
+
+  cancel_c.store(true);  // the middle waiter leaves the queue
+  tc.join();
+  first.reset();  // release: FIFO hands to 2, then 2's release hands to 4
+  tb.join();
+  td.join();
+
+  ASSERT_EQ(order.size(), 2u);
+  EXPECT_EQ(order[0], 2) << "FIFO: the longest-waiting acquirer is admitted first";
+  EXPECT_EQ(order[1], 4);
 }

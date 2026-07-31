@@ -100,9 +100,71 @@ void touchStamp(const fs::path& file) {
 // the identity is DEFINED as sha256/128 over those exact bytes (see
 // descriptorIdentity), so byte-hashing detects wrong-file substitution and
 // name collisions from the file alone, without a JSON parse here.
+// Fixed query budgets (adversarial F13): lookup() runs on the GUI thread
+// under the SDK's strictly-bounded query contract, but readSummary() parses
+// and allocates according to the file's OWN summary section — a forged
+// <digest>.mcap could carry a multi-gigabyte span. Read the fixed-size
+// footer FIRST with raw I/O and refuse anything whose summary span (or
+// embedded-descriptor record) exceeds the budget BEFORE the MCAP parser
+// ever runs. Legit session summaries are far below these bounds
+// (schemas + channels + chunk indexes; ~hundreds of KiB even for huge
+// sessions); descriptors are <=64 KiB by the parse limit.
+constexpr std::uintmax_t kQuerySummaryBudget = 16ull * 1024 * 1024;
+constexpr std::uint64_t kQueryMetadataBudget = 1ull * 1024 * 1024;
+// MCAP file tail: Footer record (1-byte op 0x02 + 8-byte length + 20-byte
+// payload {summary_start, summary_offset_start, summary_crc}) + 8-byte magic.
+constexpr std::uintmax_t kMcapTailBytes = 29 + 8;
+
+bool summarySpanWithinBudget(const fs::path& path, std::string* error) {
+  std::error_code ec;
+  const std::uintmax_t size = fs::file_size(path, ec);
+  if (ec || size < kMcapTailBytes + 8) {
+    *error = "not a readable MCAP: too small";
+    return false;
+  }
+  std::ifstream in(path, std::ios::binary);
+  if (!in) {
+    *error = "not a readable MCAP: open failed";
+    return false;
+  }
+  unsigned char tail[kMcapTailBytes];
+  in.seekg(static_cast<std::streamoff>(size - kMcapTailBytes));
+  in.read(reinterpret_cast<char*>(tail), sizeof(tail));
+  if (!in) {
+    *error = "not a readable MCAP: footer unreadable";
+    return false;
+  }
+  if (tail[0] != 0x02) {
+    *error = "not a readable MCAP: footer opcode mismatch";
+    return false;
+  }
+  std::uint64_t summary_start = 0;
+  for (int i = 0; i < 8; ++i) {
+    summary_start |= static_cast<std::uint64_t>(tail[9 + i]) << (8 * i);
+  }
+  if (summary_start == 0) {
+    return true;  // no summary — the reader will reject it as unreadable
+  }
+  const std::uintmax_t footer_offset = size - kMcapTailBytes;
+  if (summary_start > footer_offset) {
+    *error = "forged summary offset (past the footer)";
+    return false;
+  }
+  const std::uintmax_t span = footer_offset - summary_start;
+  if (span > kQuerySummaryBudget) {
+    *error = "summary section exceeds the bounded query budget (" +
+             std::to_string(span) + " bytes)";
+    return false;
+  }
+  return true;
+}
+
 bool validateMcap(const fs::path& path, const std::string& hex,
                   const std::optional<SessionFileCache::ExpectedContent>& expected,
                   std::string* error) {
+  if (!summarySpanWithinBudget(path, error)) {
+    return false;  // F13: refuse before the parser allocates anything
+  }
   mcap::McapReader reader;
   mcap::Status status = reader.open(path.string());
   if (!status.ok()) {
@@ -138,6 +200,11 @@ bool validateMcap(const fs::path& path, const std::string& hex,
     reader.close();
     *error = std::string("missing embedded source descriptor (") + kProvenanceName + ")";
     return false;
+  }
+  if (index->second.length > kQueryMetadataBudget) {
+    reader.close();
+    *error = "embedded descriptor record exceeds the bounded query budget";
+    return false;  // F13: descriptors are <=64 KiB; a forged record is not read
   }
   mcap::Record record;
   status = mcap::McapReader::ReadRecord(*reader.dataSource(), index->second.offset, &record);
@@ -266,7 +333,10 @@ bool SessionFileCache::lookup(std::string_view identity, fs::path* out) {
 }
 
 std::optional<SessionFileCache::MaterializeLock> SessionFileCache::tryLockForMaterialize(
-    std::string_view identity, std::string* error) {
+    std::string_view identity, std::string* error, bool* contended) {
+  if (contended != nullptr) {
+    *contended = false;
+  }
   const auto hex = identityHex(identity);
   if (!hex.has_value()) {
     if (error) {
@@ -282,7 +352,7 @@ std::optional<SessionFileCache::MaterializeLock> SessionFileCache::tryLockForMat
   }
   ensureDir0700(root_);
   std::string lock_error;
-  auto lock = FileLock::tryExclusive(root_ / (*hex + ".mcap.lock"), &lock_error);
+  auto lock = FileLock::tryExclusive(root_ / (*hex + ".mcap.lock"), &lock_error, contended);
   if (!lock.has_value()) {
     if (error) {
       *error = "cache materialize lock unavailable: " + lock_error;

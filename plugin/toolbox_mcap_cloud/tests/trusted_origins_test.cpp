@@ -19,6 +19,9 @@
 #include <fstream>
 #include <string>
 #include <system_error>
+#include <atomic>
+#include <thread>
+#include <vector>
 
 namespace fs = std::filesystem;
 
@@ -63,7 +66,7 @@ class TrustedOriginsTest : public ::testing::Test {
 // A recorded origin is trusted; an unrecorded one is not.
 TEST_F(TrustedOriginsTest, RecordedIsTrustedUnrecordedIsNot) {
   auto t = ledger();
-  t.recordSuccessfulHello("ws://host:8080");
+  ASSERT_TRUE(t.recordSuccessfulHello("ws://host:8080"));
   EXPECT_TRUE(t.isTrusted("ws://host:8080"));
   EXPECT_FALSE(t.isTrusted("ws://other:8080"));
   EXPECT_FALSE(t.isTrusted("ws://host:9090"));  // different port = different origin
@@ -73,7 +76,7 @@ TEST_F(TrustedOriginsTest, RecordedIsTrustedUnrecordedIsNot) {
 // the EFFECTIVE port, so default-port spellings of one origin collide.
 TEST_F(TrustedOriginsTest, DefaultPortVariantsAreOneOrigin) {
   auto t = ledger();
-  t.recordSuccessfulHello("wss://h");
+  ASSERT_TRUE(t.recordSuccessfulHello("wss://h"));
   EXPECT_TRUE(t.isTrusted("wss://h:443"));
   EXPECT_TRUE(t.isTrusted("wss://h"));
   // Path/case variants of the same origin also match (parseWsOrigin rules).
@@ -85,7 +88,7 @@ TEST_F(TrustedOriginsTest, DefaultPortVariantsAreOneOrigin) {
 // A fresh ledger instance over the SAME root sees a previously-recorded
 // origin (persistence across "process restart").
 TEST_F(TrustedOriginsTest, PersistsAcrossInstances) {
-  ledger().recordSuccessfulHello("ws://host:8080");
+  ASSERT_TRUE(ledger().recordSuccessfulHello("ws://host:8080"));
   EXPECT_TRUE(ledger().isTrusted("ws://host:8080"));
 }
 
@@ -107,7 +110,7 @@ TEST_F(TrustedOriginsTest, UnparsableUriIsNoop) {
 // than throwing, and a subsequent record recovers (same tolerance the
 // credential store pins for its file).
 TEST_F(TrustedOriginsTest, CorruptedLedgerIsTolerated) {
-  ledger().recordSuccessfulHello("ws://host:8080");
+  ASSERT_TRUE(ledger().recordSuccessfulHello("ws://host:8080"));
 
   const fs::path written = writtenFile();
   ASSERT_FALSE(written.empty()) << "no ledger file was written under " << root_;
@@ -118,7 +121,7 @@ TEST_F(TrustedOriginsTest, CorruptedLedgerIsTolerated) {
   EXPECT_NO_THROW(EXPECT_FALSE(ledger().isTrusted("ws://host:8080")));
 
   // A fresh record replaces the corrupt content.
-  ledger().recordSuccessfulHello("ws://host:8080");
+  ASSERT_TRUE(ledger().recordSuccessfulHello("ws://host:8080"));
   EXPECT_TRUE(ledger().isTrusted("ws://host:8080"));
 }
 
@@ -135,7 +138,7 @@ TEST_F(TrustedOriginsTest, MultipleOriginsAndIdempotentRecord) {
 // The ledger file is created with 0600 perms and its directory with 0700 —
 // same owner-only discipline as the credential store. (POSIX only.)
 TEST_F(TrustedOriginsTest, FilePermissionsAre0600) {
-  ledger().recordSuccessfulHello("ws://host:8080");
+  ASSERT_TRUE(ledger().recordSuccessfulHello("ws://host:8080"));
 
   const fs::path written = writtenFile();
   ASSERT_FALSE(written.empty()) << "no ledger file was written under " << root_;
@@ -151,4 +154,51 @@ TEST_F(TrustedOriginsTest, FilePermissionsAre0600) {
   EXPECT_EQ(dp & fs::perms::group_all, fs::perms::none) << "ledger dir is group-accessible";
   EXPECT_EQ(dp & fs::perms::others_all, fs::perms::none) << "ledger dir is world-accessible";
 #endif
+}
+
+// Adversarial F14: concurrent writers over ONE ledger path (each its own
+// TrustedOrigins instance — the multiprocess-equivalent for the file lock)
+// must never lose an update: the read-modify-write is lock-serialized with a
+// re-read under the lock.
+TEST_F(TrustedOriginsTest, ConcurrentWritersLoseNoUpdates) {
+  constexpr int kThreads = 4;
+  constexpr int kPerThread = 8;
+  std::vector<std::thread> writers;
+  std::atomic<int> failures{0};
+  for (int t = 0; t < kThreads; ++t) {
+    writers.emplace_back([&, t]() {
+      mcap_cloud::TrustedOrigins parallel_ledger(root_);
+      for (int i = 0; i < kPerThread; ++i) {
+        const std::string uri =
+            "ws://host-" + std::to_string(t) + "-" + std::to_string(i) + ":8080";
+        if (!parallel_ledger.recordSuccessfulHello(uri)) {
+          failures.fetch_add(1);
+        }
+      }
+    });
+  }
+  for (auto& w : writers) {
+    w.join();
+  }
+  EXPECT_EQ(failures.load(), 0);
+  EXPECT_EQ(ledger().allOrigins().size(), static_cast<std::size_t>(kThreads * kPerThread))
+      << "a lost update means the read-modify-write was not serialized (F14)";
+}
+
+// Adversarial F14: a write failure returns FALSE (durable-or-false). A
+// read-only root cannot inject it (ensureDir0700 deliberately restores the
+// perms) — squat a DIRECTORY on the ledger path instead: the atomic rename
+// over a directory fails, and there is no direct-overwrite fallback left to
+// paper over it.
+TEST_F(TrustedOriginsTest, WriteFailureReturnsFalse) {
+  auto t = ledger();
+  ASSERT_TRUE(t.recordSuccessfulHello("ws://ok:1"));
+  const fs::path ledger_file = writtenFile();
+  ASSERT_FALSE(ledger_file.empty());
+  std::error_code ec;
+  fs::remove(ledger_file, ec);
+  fs::create_directories(ledger_file / "squat", ec);
+  const bool recorded = t.recordSuccessfulHello("ws://fails:2");
+  EXPECT_FALSE(recorded) << "a failed durable write must report failure (F14)";
+  EXPECT_FALSE(t.isTrusted("ws://fails:2"));
 }

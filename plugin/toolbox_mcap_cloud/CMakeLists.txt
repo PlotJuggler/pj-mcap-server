@@ -1101,6 +1101,7 @@ if(BUILD_TESTING)
     src/origin_match.cpp
     src/credential_store.cpp
     src/server_history.cpp
+    src/core/file_lock.cpp
   )
   target_compile_features(toolbox_mcap_cloud_trusted_origins_test PRIVATE cxx_std_20)
   target_include_directories(toolbox_mcap_cloud_trusted_origins_test PRIVATE
