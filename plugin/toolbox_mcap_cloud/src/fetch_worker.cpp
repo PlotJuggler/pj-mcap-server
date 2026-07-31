@@ -1719,6 +1719,17 @@ PullResult FetchWorker::pull(PullRequest request) {
       finish_cancelled();  // the cancel is the CAUSE, not a symptom
     } else {
       result.error = connect_err.empty() ? "session connect failed" : connect_err;
+      // The §10 remediation hint, MACHINE-gated (never error-text sniffing):
+      // the server rejected the Hello as AUTH_FAILED *and* the resolved
+      // snapshot carried NO credential — missing-credential, not
+      // wrong-credential (a presented-and-rejected key gets no hint: the
+      // stored key is simply wrong, and "no stored credential" would lie).
+      if (session_backend->lastHelloErrorCode() == HelloErrorCode::kAuthFailed &&
+          request.connection.credentials.api_key.empty()) {
+        result.error +=
+            "; no stored credential for this server — connect once in the MCAP Cloud toolbox "
+            "or set MCAP_CLOUD_API_KEY (with MCAP_CLOUD_URL matching this origin)";
+      }
     }
     return result;
   }

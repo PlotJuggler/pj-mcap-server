@@ -78,6 +78,15 @@ class BackendConnection {
   // connect().
   [[nodiscard]] std::optional<ServerVersion> version() const;
 
+  // Machine-readable classification of the server Error that terminated the
+  // LAST Hello handshake (connect() or the resume path's reconnectAndHello()).
+  // kNone when that handshake succeeded OR failed without a server Error frame
+  // (transport drop, timeout, unexpected reply). Reset at the start of every
+  // handshake attempt. Lets the direct pull gate the §10 missing-credential
+  // remediation hint on the CODE, never on error-text sniffing. Same threading
+  // as connect(): worker-thread only, read right after the call returns.
+  [[nodiscard]] HelloErrorCode lastHelloErrorCode() const { return last_hello_error_; }
+
   // The BackendCapabilities (HelloResponse.backend) the server advertised at
   // connect(). nullopt before a successful connect() or when the server omitted
   // the field (has_backend()==false). The dialog/CLI use it for additive UI
@@ -372,6 +381,9 @@ class BackendConnection {
 
   std::unique_ptr<ix::WebSocket> socket_;
   std::optional<ServerVersion> version_;
+  // See lastHelloErrorCode(). Written/read on the worker thread only (the
+  // same single-thread discipline as every public method here).
+  HelloErrorCode last_hello_error_ = HelloErrorCode::kNone;
   // HelloResponse.backend, parsed at connect()/reconnectAndHello(). nullopt when
   // the server omits the field (has_backend()==false).
   std::optional<BackendCaps> backend_caps_;
