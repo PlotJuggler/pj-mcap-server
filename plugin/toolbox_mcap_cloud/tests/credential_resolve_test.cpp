@@ -27,6 +27,7 @@
 
 #include "credential_store.hpp"
 #include "server_history.h"
+#include "test_support_env.hpp"
 #include "test_support_fs.hpp"
 
 namespace {
@@ -43,8 +44,8 @@ struct TempRoot : mcap_cloud_test::ScopedTempDir {
 // from the invoking shell).
 struct EnvGuard {
   EnvGuard() : url(capture("MCAP_CLOUD_URL")), key(capture("MCAP_CLOUD_API_KEY")) {
-    ::unsetenv("MCAP_CLOUD_URL");
-    ::unsetenv("MCAP_CLOUD_API_KEY");
+    mcap_cloud_test::unsetEnvVar("MCAP_CLOUD_URL");
+    mcap_cloud_test::unsetEnvVar("MCAP_CLOUD_API_KEY");
   }
   static std::optional<std::string> capture(const char* name) {
     const char* value = std::getenv(name);
@@ -56,9 +57,9 @@ struct EnvGuard {
   }
   static void restore(const char* name, const std::optional<std::string>& value) {
     if (value.has_value()) {
-      ::setenv(name, value->c_str(), 1);
+      mcap_cloud_test::setEnvVar(name, value->c_str());
     } else {
-      ::unsetenv(name);
+      mcap_cloud_test::unsetEnvVar(name);
     }
   }
   std::optional<std::string> url;
@@ -87,22 +88,22 @@ constexpr const char* kUri = "ws://example.com:8080";
 TEST(McapCloudCredentialResolve, EnvTokenRequiresMatchingEnvUrlOrigin) {
   Fixture fx;
   fx.store.set(kUri, "stored-token");
-  ::setenv("MCAP_CLOUD_API_KEY", "env-token", 1);
+  mcap_cloud_test::setEnvVar("MCAP_CLOUD_API_KEY", "env-token");
 
   // Same origin (path difference is ignored by the origin parse) -> env wins.
-  ::setenv("MCAP_CLOUD_URL", "ws://example.com:8080/some/path", 1);
+  mcap_cloud_test::setEnvVar("MCAP_CLOUD_URL", "ws://example.com:8080/some/path");
   EXPECT_EQ(mcap_cloud::resolveCredentials(fx.view(), fx.store, kUri).api_key, "env-token");
 
   // Different origin -> fail-closed, stored token.
-  ::setenv("MCAP_CLOUD_URL", "ws://other.com:8080", 1);
+  mcap_cloud_test::setEnvVar("MCAP_CLOUD_URL", "ws://other.com:8080");
   EXPECT_EQ(mcap_cloud::resolveCredentials(fx.view(), fx.store, kUri).api_key, "stored-token");
 
   // Different port = different origin.
-  ::setenv("MCAP_CLOUD_URL", "ws://example.com:9090", 1);
+  mcap_cloud_test::setEnvVar("MCAP_CLOUD_URL", "ws://example.com:9090");
   EXPECT_EQ(mcap_cloud::resolveCredentials(fx.view(), fx.store, kUri).api_key, "stored-token");
 
   // MCAP_CLOUD_URL unset -> the env key alone is never released.
-  ::unsetenv("MCAP_CLOUD_URL");
+  mcap_cloud_test::unsetEnvVar("MCAP_CLOUD_URL");
   EXPECT_EQ(mcap_cloud::resolveCredentials(fx.view(), fx.store, kUri).api_key, "stored-token");
 }
 
@@ -120,8 +121,8 @@ TEST(McapCloudCredentialResolve, StoredThenEmptyChainOrder) {
   EXPECT_EQ(mcap_cloud::resolveCredentials(fx.view(), fx.store, kUri).api_key, "stored-token");
 
   // Empty env token with a matching origin -> still the stored one.
-  ::setenv("MCAP_CLOUD_URL", kUri, 1);
-  ::setenv("MCAP_CLOUD_API_KEY", "", 1);
+  mcap_cloud_test::setEnvVar("MCAP_CLOUD_URL", kUri);
+  mcap_cloud_test::setEnvVar("MCAP_CLOUD_API_KEY", "");
   EXPECT_EQ(mcap_cloud::resolveCredentials(fx.view(), fx.store, kUri).api_key, "stored-token");
 }
 
@@ -208,8 +209,8 @@ TEST(McapCloudCredentialResolve, ResolvedTokenCarriesItsProvenance) {
     EXPECT_EQ(creds.api_key, "stored-token");
   }
   // Origin-bound env token -> kEnvironment.
-  ::setenv("MCAP_CLOUD_URL", uri.c_str(), 1);
-  ::setenv("MCAP_CLOUD_API_KEY", "env-token", 1);
+  mcap_cloud_test::setEnvVar("MCAP_CLOUD_URL", uri.c_str());
+  mcap_cloud_test::setEnvVar("MCAP_CLOUD_API_KEY", "env-token");
   {
     const auto creds = mcap_cloud::resolveCredentials(fx.view(), fx.store, uri);
     EXPECT_EQ(creds.api_key_source, mcap_cloud::TokenSource::kEnvironment);

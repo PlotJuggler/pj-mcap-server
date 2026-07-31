@@ -43,6 +43,7 @@
 #include "mcap_cloud_toolbox.hpp"
 #include "parser_ingest_test_support.hpp"
 #include "pj_cloud.pb.h"
+#include "test_support_env.hpp"
 #include "test_support_fs.hpp"
 
 namespace {
@@ -174,10 +175,10 @@ struct HermeticEnv {
         saved_xdg_config(capture("XDG_CONFIG_HOME")),
         saved_url(capture("MCAP_CLOUD_URL")),
         saved_api_key(capture("MCAP_CLOUD_API_KEY")) {
-    ::setenv("MCAP_CLOUD_CACHE_DIR", cache_root.path.string().c_str(), 1);
-    ::setenv("XDG_CONFIG_HOME", config_root.path.string().c_str(), 1);
-    ::unsetenv("MCAP_CLOUD_URL");
-    ::unsetenv("MCAP_CLOUD_API_KEY");
+    mcap_cloud_test::setEnvVar("MCAP_CLOUD_CACHE_DIR", cache_root.path.string().c_str());
+    mcap_cloud_test::setEnvVar("XDG_CONFIG_HOME", config_root.path.string().c_str());
+    mcap_cloud_test::unsetEnvVar("MCAP_CLOUD_URL");
+    mcap_cloud_test::unsetEnvVar("MCAP_CLOUD_API_KEY");
   }
   ~HermeticEnv() {
     restore("MCAP_CLOUD_CACHE_DIR", saved_cache_dir);
@@ -191,9 +192,9 @@ struct HermeticEnv {
   }
   static void restore(const char* name, const std::optional<std::string>& value) {
     if (value.has_value()) {
-      ::setenv(name, value->c_str(), 1);
+      mcap_cloud_test::setEnvVar(name, value->c_str());
     } else {
-      ::unsetenv(name);
+      mcap_cloud_test::unsetEnvVar(name);
     }
   }
   TempRoot cache_root;
