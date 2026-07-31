@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 #include "import_runtime.hpp"
 
+#include <limits>
 #include <system_error>
 #include <utility>
 
@@ -204,6 +205,10 @@ bool CacheTee::begin(const std::string& identity, std::string* error,
   // A retained dataset-lifetime lease (F2) on THIS identity would block our
   // own exclusive materialize lock below — release it first (see
   // ImportRuntime::releaseRetainedLease for why replacement stays safe).
+  // Remember that we dropped one (re-verify R1(b)): a FAILED/cancelled
+  // rematerialization must RESTORE it in abortAndCleanup, or the previous
+  // valid artifact backing a live dataset is left permanently unleased.
+  had_retained_lease_ = runtime_.hasRetainedLease(identity);
   runtime_.releaseRetainedLease(identity);
 
   if (adopted_lock.has_value()) {
@@ -253,26 +258,39 @@ bool CacheTee::openWriter(const SessionInfo& info, const std::string& canonical_
     return fail("cache tee not begun");
   }
 
-  // Free-space reserve (spec §5, tightened per adversarial F12): the
-  // estimate must fit WITH the configured reserve intact —
-  // available >= estimate + min_free_bytes — and a failing check first
-  // attempts an LRU eviction pass (cleanup skips locked/leased files) and
-  // re-checks. 0 = no estimate -> skip (never block on an unknown; the
-  // byte/duration ceilings bound the actual transfer instead).
+  // Free-space reserve + cache budget (spec §5, per adversarial F12 and
+  // re-verify R2): with a nonzero estimate,
+  //   - an estimate larger than the WHOLE cache budget can never fit (R2b);
+  //   - eviction targets max_total_bytes - estimate, so
+  //     current_total + estimate <= max_total_bytes after the pass (R2b;
+  //     locked/leased stragglers may keep it best-effort, matching
+  //     cleanup()'s existing semantics);
+  //   - the reserve check is SATURATING (R2c): an absurd estimate refuses
+  //     instead of overflowing past available >= estimate + min_free_bytes.
+  // 0 = no estimate -> skip (never block on an unknown; the byte/duration
+  // ceilings bound the actual transfer instead).
   if (estimated_bytes > 0) {
-    const std::uintmax_t needed =
-        static_cast<std::uintmax_t>(estimated_bytes) + runtime_.cacheConfig().min_free_bytes;
-    std::error_code space_ec;
-    fs::space_info space = fs::space(partial_path_.parent_path(), space_ec);
-    if (!space_ec && space.available < needed) {
-      runtime_.fileCache().cleanup(runtime_.cacheConfig());  // eviction attempt first
-      space = fs::space(partial_path_.parent_path(), space_ec);
+    const std::uintmax_t est = static_cast<std::uintmax_t>(estimated_bytes);
+    SessionFileCache::Config budget = runtime_.cacheConfig();
+    if (est > budget.max_total_bytes) {
+      return fail("session estimate ~" + std::to_string(estimated_bytes) +
+                  " bytes exceeds the whole cache budget (" +
+                  std::to_string(budget.max_total_bytes) + " bytes)");
     }
+    budget.max_total_bytes -= est;  // evict toward current_total + est <= budget
+    runtime_.fileCache().cleanup(budget);
+    const std::uintmax_t reserve = runtime_.cacheConfig().min_free_bytes;
+    const std::uintmax_t needed =
+        (est > std::numeric_limits<std::uintmax_t>::max() - reserve)
+            ? std::numeric_limits<std::uintmax_t>::max()
+            : est + reserve;
+    std::error_code space_ec;
+    const fs::space_info space = fs::space(partial_path_.parent_path(), space_ec);
     if (!space_ec && space.available < needed) {
       return fail("insufficient free space for the session cache: need ~" +
                   std::to_string(estimated_bytes) + " bytes plus the " +
-                  std::to_string(runtime_.cacheConfig().min_free_bytes) +
-                  "-byte reserve, " + std::to_string(space.available) + " available at " +
+                  std::to_string(reserve) + "-byte reserve, " +
+                  std::to_string(space.available) + " available at " +
                   partial_path_.parent_path().string());
     }
   }
@@ -487,25 +505,41 @@ bool CacheTee::finalize(const std::optional<SessionFileCache::ExpectedContent>& 
   if (!runtime_.fileCache().finalize(*lock_, expected, error)) {
     return false;
   }
-  finalized_ = true;
-  // Adversarial F2: hand the exclusive materialize lock over as a SHARED
-  // dataset-lifetime lease retained by the runtime — without this, another
-  // process's cleanup could unlink the just-published file while a live
-  // (possibly promoted) dataset still lazily re-opens it. The platform
-  // downgrade has a microscopic non-atomic window; on conversion failure —
-  // or if an evictor won that window and the file no longer validates — we
-  // simply proceed lease-less (the pre-F2 behavior).
-  {
-    std::string lease_error;
-    auto lease = SessionFileCache::toSharedLease(std::move(*lock_), &lease_error);
+  finalized_ = true;  // the publish happened: cleanup below must not delete anything
+  // Adversarial F2 + re-verify R1(a): hand the exclusive materialize lock
+  // over as a SHARED dataset-lifetime lease retained by the runtime. The
+  // handoff is LOAD-BEARING, not best-effort: if the platform downgrade
+  // loses its (non-atomic) conversion window — or the post-downgrade
+  // revalidation finds an evictor removed the file — finalize() FAILS, so
+  // callers never record kFinalized, never store the cache identity, and
+  // never promote a missing/unleased path. A downgrade failure with the
+  // file still present leaves a valid-but-unleased artifact behind (a
+  // future lookup may hit it); reporting failure here is the conservative
+  // truth about THIS materialization.
+  std::optional<FileLock> lease;
+  std::string lease_error;
+  if (lease_handoff_fail_for_test_) {
+    lease_error = "injected lease-handoff failure (test seam)";
+    lock_.reset();  // mirror toSharedLease's released-on-failure contract
+  } else {
+    lease = SessionFileCache::toSharedLease(std::move(*lock_), &lease_error);
     lock_.reset();
-    if (lease.has_value()) {
-      std::filesystem::path revalidated;
-      if (runtime_.fileCache().lookup(identity_, &revalidated)) {
-        runtime_.retainReadLease(identity_, std::move(*lease));
-      }
-    }
   }
+  if (!lease.has_value()) {
+    if (error != nullptr) {
+      *error = "cache file published but the read-lease handoff failed (" + lease_error +
+               ") — treating this materialization as failed";
+    }
+    return false;
+  }
+  std::filesystem::path revalidated;
+  if (!runtime_.fileCache().lookup(identity_, &revalidated)) {
+    if (error != nullptr) {
+      *error = "cache file vanished during the lease handoff (evicted in the conversion window)";
+    }
+    return false;
+  }
+  runtime_.retainReadLease(identity_, std::move(*lease));
   return true;
 }
 
@@ -545,6 +579,19 @@ void CacheTee::abortAndCleanup() {
   }
   lock_.reset();    // release the cross-process materialize lock
   ticket_.reset();  // release the in-process registry slot
+  if (!finalized_ && had_retained_lease_) {
+    // R1(b): begin() dropped a live dataset's lifetime lease to take the
+    // exclusive lock; this materialization did NOT publish, so if the
+    // previous artifact still validates, put the lease back (otherwise a
+    // later cleanup could evict a file a live dataset still lazily
+    // re-opens). Must run AFTER lock_ released (shared vs exclusive).
+    std::filesystem::path still_valid;
+    if (runtime_.fileCache().lookup(identity_, &still_valid)) {
+      if (auto lease = runtime_.fileCache().acquireReadLease(identity_, nullptr)) {
+        runtime_.retainReadLease(identity_, std::move(*lease));
+      }
+    }
+  }
 }
 
 }  // namespace mcap_cloud

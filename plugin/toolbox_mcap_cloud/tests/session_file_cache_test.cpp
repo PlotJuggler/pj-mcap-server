@@ -9,12 +9,14 @@
 #include "session_file_cache.hpp"
 
 #include <gtest/gtest.h>
+#include <mcap/reader.hpp>
 #include <mcap/writer.hpp>
 
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
 #include <cstring>
+#include <cstdint>
 #include <fstream>
 #include <string>
 #include <thread>
@@ -609,4 +611,51 @@ TEST(SessionFileCache, MaterializeLockContentionIsDistinguished) {
   auto bad = b.tryLockForMaterialize("not-an-identity", &err, &contended);
   EXPECT_FALSE(bad.has_value());
   EXPECT_FALSE(contended);
+}
+
+// Re-verify R3: capping MetadataIndex.length alone is bypassable — the SDK's
+// ReadRecord re-reads the record size FROM THE FILE at the indexed offset
+// and resizes its buffer to that DECLARED value. Forge: take a VALID cache
+// file and overwrite the metadata record's declared size with a huge value
+// while the index still claims a small length. Pre-fix this drove a
+// multi-exabyte vector resize inside lookup() (length_error/bad_alloc
+// escaping on the GUI thread); post-fix the raw header preflight rejects it
+// as a plain miss.
+TEST(SessionFileCache, ForgedMetadataRecordSizeIsRefusedBeforeAllocation) {
+  TempRoot root("forged-metadata");
+  mcap_cloud::SessionFileCache cache(root.path);
+  const mcap_cloud::SourceDescriptor d = descriptor("forge-meta.mcap");
+  const fs::path file = materialize(cache, d);
+  ASSERT_FALSE(file.empty());
+  const std::string identity = mcap_cloud::descriptorIdentity(d);
+  fs::path ok_path;
+  ASSERT_TRUE(cache.lookup(identity, &ok_path)) << "the un-forged file must be a hit";
+
+  // Locate the provenance metadata record via the reader's own index, then
+  // overwrite its DECLARED size (bytes [offset+1, offset+9)) with 2^62.
+  std::uint64_t record_offset = 0;
+  {
+    mcap::McapReader reader;
+    ASSERT_TRUE(reader.open(file.string()).ok());
+    ASSERT_TRUE(reader.readSummary(mcap::ReadSummaryMethod::NoFallbackScan).ok());
+    const auto it = reader.metadataIndexes().find("mcap_cloud/source_descriptor");
+    ASSERT_NE(it, reader.metadataIndexes().end());
+    record_offset = it->second.offset;
+    reader.close();
+  }
+  {
+    std::fstream out(file, std::ios::binary | std::ios::in | std::ios::out);
+    ASSERT_TRUE(out.is_open());
+    out.seekp(static_cast<std::streamoff>(record_offset + 1));
+    const std::uint64_t huge = std::uint64_t{1} << 62;
+    unsigned char bytes[8];
+    for (int i = 0; i < 8; ++i) {
+      bytes[i] = static_cast<unsigned char>((huge >> (8 * i)) & 0xFF);
+    }
+    out.write(reinterpret_cast<const char*>(bytes), sizeof(bytes));
+  }
+
+  fs::path out_path;
+  EXPECT_FALSE(cache.lookup(identity, &out_path))
+      << "a forged declared record size must be a bounded-preflight miss (R3)";
 }

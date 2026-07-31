@@ -39,6 +39,13 @@ class FileLock {
   [[nodiscard]] static std::optional<FileLock> tryShared(
       const std::filesystem::path& path, std::string* error);
 
+  /// FOLLOW-UP (recorded, re-verify R1): migrate FileLock to fcntl OFD
+  /// locks (F_OFD_SETLK), whose lock CONVERSIONS are atomic — that closes
+  /// downgradeToShared()'s non-atomic window for real. It must be a
+  /// whole-release migration: flock(2) and fcntl locks live in independent
+  /// namespaces, so every acquirer (cache sidecars, ledger lock) has to
+  /// switch in the same release, plus a Windows byte-range equivalent.
+  ///
   /// Convert a HELD EXCLUSIVE lock to SHARED without closing the handle
   /// (the adversarial-F2 finalize handoff). Platform reality: neither
   /// flock(2) nor LockFileEx guarantees an atomic conversion — the old lock

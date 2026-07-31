@@ -206,6 +206,39 @@ bool validateMcap(const fs::path& path, const std::string& hex,
     *error = "embedded descriptor record exceeds the bounded query budget";
     return false;  // F13: descriptors are <=64 KiB; a forged record is not read
   }
+  // Re-verify R3: capping MetadataIndex.length alone is BYPASSABLE —
+  // ReadRecord() re-reads an 8-byte record size FROM THE FILE at the
+  // (attacker-controlled) offset and resizes its buffer to that DECLARED
+  // value (mcap reader.inl), so a small index length can point at a sparse
+  // record declaring a multi-gigabyte payload. Raw-preflight the 9-byte
+  // record header (opcode + declared size) and validate BOTH against the
+  // index claim and the query budget before the parser allocates anything.
+  {
+    std::error_code size_ec;
+    const std::uintmax_t file_bytes = fs::file_size(path, size_ec);
+    unsigned char header[9] = {0};
+    std::ifstream raw(path, std::ios::binary);
+    bool header_ok = !size_ec && raw.is_open() &&
+                     index->second.offset + sizeof(header) <= file_bytes;
+    if (header_ok) {
+      raw.seekg(static_cast<std::streamoff>(index->second.offset));
+      raw.read(reinterpret_cast<char*>(header), sizeof(header));
+      header_ok = static_cast<bool>(raw);
+    }
+    std::uint64_t declared = 0;
+    for (int i = 0; i < 8; ++i) {
+      declared |= static_cast<std::uint64_t>(header[1 + i]) << (8 * i);
+    }
+    // Order matters: the budget check runs before any +9 arithmetic so a
+    // huge declared size can never overflow a later comparison.
+    if (!header_ok || header[0] != static_cast<unsigned char>(mcap::OpCode::Metadata) ||
+        declared > kQueryMetadataBudget || declared + 9 > index->second.length ||
+        index->second.offset + 9 + declared > file_bytes) {
+      reader.close();
+      *error = "embedded descriptor record failed the bounded raw preflight";
+      return false;
+    }
+  }
   mcap::Record record;
   status = mcap::McapReader::ReadRecord(*reader.dataSource(), index->second.offset, &record);
   if (!status.ok()) {

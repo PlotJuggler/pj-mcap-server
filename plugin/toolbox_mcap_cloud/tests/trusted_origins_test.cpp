@@ -202,3 +202,16 @@ TEST_F(TrustedOriginsTest, WriteFailureReturnsFalse) {
   EXPECT_FALSE(recorded) << "a failed durable write must report failure (F14)";
   EXPECT_FALSE(t.isTrusted("ws://fails:2"));
 }
+
+// Re-verify R5: durable-or-false includes the DIRECTORY fsync — a failed
+// dir sync means the rename may not survive a crash, so the write reports
+// failure and (through ImportRuntime) memory is not updated.
+TEST_F(TrustedOriginsTest, DirectoryFsyncFailureReportsFalse) {
+  auto t = ledger();
+  mcap_cloud::testing::setTrustedOriginsDirSyncFailForTest(true);
+  const bool recorded = t.recordSuccessfulHello("ws://dirsync:1");
+  mcap_cloud::testing::setTrustedOriginsDirSyncFailForTest(false);
+  EXPECT_FALSE(recorded) << "a failed directory fsync must report failure (R5)";
+  ASSERT_TRUE(t.recordSuccessfulHello("ws://dirsync:1"))
+      << "the same record must succeed once the dir fsync works again";
+}

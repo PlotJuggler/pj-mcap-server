@@ -241,6 +241,9 @@ class CacheTee {
   void setWriterHookForTest(std::function<void(const DecodedMessage&)> hook) {
     writer_hook_for_test_ = std::move(hook);
   }
+  /// R1(a) seam: force the finalize-time lease handoff to fail (the platform
+  /// downgrade race is not deterministically constructible from outside).
+  void setLeaseHandoffFailForTest(bool fail) { lease_handoff_fail_for_test_ = fail; }
   /// Injectable writer-thread factory (adversarial F8): a test injects a
   /// throwing factory to pin that spawn failure degrades to the documented
   /// NONFATAL tee failure (partial removed, ingest continues) instead of an
@@ -278,6 +281,8 @@ class CacheTee {
   ImportRuntime& runtime_;
   std::string identity_;
   bool begin_lock_contended_ = false;  // F9 (see beginFailedOnLockContention)
+  bool had_retained_lease_ = false;    // R1(b): restore-on-abort bookkeeping
+  bool lease_handoff_fail_for_test_ = false;  // R1(a) seam (see below)
   std::optional<ImportRuntime::MaterializeTicket> ticket_;
   std::optional<SessionFileCache::MaterializeLock> lock_;
   std::filesystem::path partial_path_;

@@ -60,4 +60,9 @@ class TrustedOrigins {
   std::filesystem::path path_;
 };
 
+namespace testing {
+// R5 test-only: force the ledger's directory fsync to report failure.
+void setTrustedOriginsDirSyncFailForTest(bool fail);
+}  // namespace testing
+
 }  // namespace mcap_cloud

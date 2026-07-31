@@ -97,15 +97,30 @@ bool syncLedgerFile(const fs::path& path) {
 #endif
 }
 
-void syncLedgerDir(const fs::path& dir) {
+// R5 test seam: force the directory fsync to report failure (a real dir
+// whose fsync fails is not constructible portably from a test).
+bool g_fail_dir_sync_for_test = false;
+
+// Re-verify R5: durable-or-false includes the DIRECTORY fsync — a rename
+// whose directory entry never reached stable storage can vanish on crash,
+// so an open()/fsync() failure here fails the whole write. Windows has no
+// directory-fsync equivalent (metadata durability rides the NTFS journal);
+// documented no-op success there.
+[[nodiscard]] bool syncLedgerDir(const fs::path& dir) {
+  if (g_fail_dir_sync_for_test) {
+    return false;
+  }
 #if !defined(_WIN32)
   const int fd = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-  if (fd >= 0) {
-    ::fsync(fd);
-    ::close(fd);
+  if (fd < 0) {
+    return false;
   }
+  const bool ok = ::fsync(fd) == 0;
+  ::close(fd);
+  return ok;
 #else
   (void)dir;
+  return true;
 #endif
 }
 
@@ -151,7 +166,9 @@ void syncLedgerDir(const fs::path& dir) {
     return false;
   }
   chmod0600(file);
-  syncLedgerDir(file.parent_path());
+  if (!syncLedgerDir(file.parent_path())) {
+    return false;  // R5: the rename may not survive a crash — not durable
+  }
   return true;
 }
 
@@ -234,5 +251,11 @@ bool TrustedOrigins::isTrusted(std::string_view uri) const {
   }
   return false;
 }
+
+namespace testing {
+void setTrustedOriginsDirSyncFailForTest(bool fail) {
+  g_fail_dir_sync_for_test = fail;
+}
+}  // namespace testing
 
 }  // namespace mcap_cloud

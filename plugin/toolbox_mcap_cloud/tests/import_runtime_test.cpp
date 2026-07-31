@@ -499,3 +499,78 @@ TEST(McapCloudImportRuntime, AdmissionGateIsFifoAndCancelable) {
   EXPECT_EQ(order[0], 2) << "FIFO: the longest-waiting acquirer is admitted first";
   EXPECT_EQ(order[1], 4);
 }
+
+// Re-verify R1(a): the finalize-time lease handoff is LOAD-BEARING — when
+// the downgrade fails (injected; the platform race is not constructible
+// deterministically), finalize() must FAIL so callers never record
+// kFinalized / store the identity / promote an unleased path.
+TEST(McapCloudCacheTee, FinalizeFailsWhenTheLeaseHandoffFails) {
+  TempRoot cache_root("handoff-cache");
+  TempRoot config_root("handoff-config");
+  mcap_cloud::ImportRuntime rt(mcap_cloud::SessionFileCache(cache_root.path),
+                               mcap_cloud::TrustedOrigins(config_root.path));
+  const mcap_cloud::SourceDescriptor d = descriptor("handoff.mcap");
+  const std::string identity = mcap_cloud::descriptorIdentity(d);
+
+  mcap_cloud::CacheTee tee(rt);
+  std::string error;
+  ASSERT_TRUE(tee.begin(identity, &error)) << error;
+  tee.setLeaseHandoffFailForTest(true);
+  ASSERT_TRUE(tee.openWriter(sessionInfo(), mcap_cloud::canonicalSourceDescriptorJson(d), 0, &error))
+      << error;
+  ASSERT_TRUE(tee.enqueue({.topic_id = 11,
+                           .schema_id = 5,
+                           .log_time_ns = 100,
+                           .publish_time_ns = 90,
+                           .payload = std::string(64, 'x')}));
+  ASSERT_TRUE(tee.drainAndClose(&error)) << error;
+  EXPECT_FALSE(tee.finalize(std::nullopt, &error))
+      << "a failed lease handoff must FAIL finalize (R1a)";
+  EXPECT_NE(error.find("handoff"), std::string::npos) << error;
+  EXPECT_FALSE(rt.hasRetainedLease(identity));
+  tee.abortAndCleanup();
+}
+
+// Re-verify R1(b): begin() drops a live dataset's lifetime lease to take the
+// exclusive lock; a FAILED/cancelled rematerialization must RESTORE it when
+// the previous valid artifact still exists.
+TEST(McapCloudCacheTee, AbortedRematerializationRestoresTheDroppedLease) {
+  TempRoot cache_root("restore-cache");
+  TempRoot config_root("restore-config");
+  mcap_cloud::ImportRuntime rt(mcap_cloud::SessionFileCache(cache_root.path),
+                               mcap_cloud::TrustedOrigins(config_root.path));
+  const mcap_cloud::SourceDescriptor d = descriptor("restore.mcap");
+  const std::string identity = mcap_cloud::descriptorIdentity(d);
+
+  // 1) Materialize successfully: the lifetime lease is retained.
+  {
+    mcap_cloud::CacheTee tee(rt);
+    std::string error;
+    ASSERT_TRUE(tee.begin(identity, &error)) << error;
+    ASSERT_TRUE(
+        tee.openWriter(sessionInfo(), mcap_cloud::canonicalSourceDescriptorJson(d), 0, &error))
+        << error;
+    ASSERT_TRUE(tee.enqueue({.topic_id = 11,
+                             .schema_id = 5,
+                             .log_time_ns = 100,
+                             .publish_time_ns = 90,
+                             .payload = std::string(64, 'x')}));
+    ASSERT_TRUE(tee.drainAndClose(&error)) << error;
+    ASSERT_TRUE(tee.finalize(std::nullopt, &error)) << error;
+  }
+  ASSERT_TRUE(rt.hasRetainedLease(identity));
+
+  // 2) A rematerialization begins (dropping the lease for its exclusive
+  //    lock) and then ABORTS: the lease must be back afterwards.
+  {
+    mcap_cloud::CacheTee tee(rt);
+    std::string error;
+    ASSERT_TRUE(tee.begin(identity, &error)) << error;
+    EXPECT_FALSE(rt.hasRetainedLease(identity)) << "begin() must drop the lease for its lock";
+    tee.abortAndCleanup();
+  }
+  EXPECT_TRUE(rt.hasRetainedLease(identity))
+      << "an aborted rematerialization must restore the dropped lease (R1b)";
+  std::filesystem::path still_valid;
+  EXPECT_TRUE(rt.fileCache().lookup(identity, &still_valid));
+}
