@@ -151,16 +151,24 @@ std::shared_ptr<PromotionResult> ImportRuntime::promoteToFileSource(
   }
 
   // Mark pending BEFORE the call: a re-entrant on_result then simply
-  // overwrites kPending with the terminal state.
+  // overwrites kPending with the terminal state. The outstanding counter
+  // (F7 diagnostics) increments before the call and decrements exactly once
+  // when on_result settles (or on synchronous rejection, where it never
+  // runs); the closure holds SHARED ownership of the counter so a settle
+  // after runtime teardown stays safe.
   update_entry(PromotionState::kPending);
+  std::shared_ptr<std::atomic<int>> outstanding = promotions_outstanding_;
+  outstanding->fetch_add(1);
   const PJ::Status status = view->promoteToFileSource(
-      request, [result, update_entry](bool ok, std::string message) {
+      request, [result, update_entry, outstanding](bool ok, std::string message) {
         // [host-callback-thread] — never assume the GUI thread here.
         update_entry(ok ? PromotionState::kPromoted : PromotionState::kEagerOnly);
+        outstanding->fetch_sub(1);
         result->settle(ok, std::move(message));
       });
   if (!status) {
     // Synchronous rejection: on_result will never run.
+    outstanding->fetch_sub(1);
     update_entry(PromotionState::kEagerOnly);
     result->settle(false, status.error());
   }

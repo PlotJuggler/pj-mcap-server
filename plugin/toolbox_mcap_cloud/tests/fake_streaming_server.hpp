@@ -45,6 +45,7 @@ inline constexpr std::uint32_t kFakeSchemaId = 5;
 inline constexpr int kFakeBatches = 3;
 inline constexpr int kFakeMessagesPerBatch = 4;
 inline constexpr std::size_t kFakePayloadBytes = 1024;
+inline constexpr int kFakeProgressFloodFrames = 2000;
 
 // A fake pj_cloud server that ACTUALLY STREAMS a session: Hello ->
 // HelloResponse; OpenSession -> plan (1 topic / 1 schema) then, per mode,
@@ -54,7 +55,16 @@ inline constexpr std::size_t kFakePayloadBytes = 1024;
 // real plan whose selection holds no messages).
 class FakeStreamingServer {
  public:
-  enum class Mode { kComplete, kStallAfterTwoBatches, kEmptyPlan, kCompleteEmpty };
+  enum class Mode {
+    kComplete,
+    kStallAfterTwoBatches,
+    kEmptyPlan,
+    kCompleteEmpty,
+    // kComplete plus a flood of empty Progress control frames BETWEEN the
+    // last batch and the Eos — the F6 shape: bytes beyond the last message
+    // that only a FINAL cumulative ceiling check can observe.
+    kCompleteWithProgressFlood,
+  };
 
   explicit FakeStreamingServer(Mode mode) : mode_(mode), port_(findFreePort()), server_(port_, "127.0.0.1") {
     server_.setOnClientMessageCallback([this](std::shared_ptr<ix::ConnectionState>,
@@ -100,8 +110,9 @@ class FakeStreamingServer {
       if (mode_ == Mode::kEmptyPlan) {
         return;
       }
-      const int batches =
-          (mode_ == Mode::kComplete) ? kFakeBatches : (mode_ == Mode::kCompleteEmpty ? 0 : 2);
+      const int batches = (mode_ == Mode::kComplete || mode_ == Mode::kCompleteWithProgressFlood)
+                              ? kFakeBatches
+                              : (mode_ == Mode::kCompleteEmpty ? 0 : 2);
       std::uint64_t sent = 0;
       for (int b = 0; b < batches; ++b) {
         pj_cloud::v1::ServerMessage frame;
@@ -126,7 +137,16 @@ class FakeStreamingServer {
         }
         send(ws, frame);
       }
-      if (mode_ == Mode::kComplete || mode_ == Mode::kCompleteEmpty) {
+      if (mode_ == Mode::kCompleteWithProgressFlood) {
+        for (int i = 0; i < kFakeProgressFloodFrames; ++i) {
+          pj_cloud::v1::ServerMessage progress_frame;
+          progress_frame.set_subscription_id(7);
+          progress_frame.mutable_progress()->set_messages_sent(static_cast<std::uint64_t>(i));
+          send(ws, progress_frame);
+        }
+      }
+      if (mode_ == Mode::kComplete || mode_ == Mode::kCompleteEmpty ||
+          mode_ == Mode::kCompleteWithProgressFlood) {
         pj_cloud::v1::ServerMessage eos_frame;
         eos_frame.set_subscription_id(7);  // see the batch-frame comment above
         auto* eos = eos_frame.mutable_eos();

@@ -62,6 +62,19 @@ struct DescriptorImportProvider::JobState {
   std::atomic<bool> cancelled{false};
   std::atomic<int> terminal_count{0};
   std::thread worker;
+  // Immutable after startImport (set before out_job is returned): the
+  // worker's id for the self-join guard — reading worker.get_id() during a
+  // concurrent join() would race the join's modification of the thread
+  // object (adversarial F5).
+  std::thread::id worker_id;
+  // join()-state (adversarial F5): the ABI slot is [thread-safe]/idempotent,
+  // but std::thread::join is neither — exactly ONE caller performs the join,
+  // every other caller waits for joined; all errors are swallowed inside the
+  // noexcept boundary.
+  std::mutex join_mu;
+  std::condition_variable join_cv;
+  bool join_in_progress = false;
+  bool joined = false;
 
   // At-most-once gate release (std::binary_semaphore::release on an
   // already-released semaphore is UB) — callable from startImport (the
@@ -302,9 +315,41 @@ void DescriptorImportProvider::jobJoin(void* ctx) noexcept {
   auto* state = static_cast<JobState*>(ctx);
   // ABI: join/destroy must never be called from a job callback (that thread
   // joining itself is deadlock-or-terminate). The host is trusted; this
-  // guard documents the rule and downgrades a violation to a no-op.
-  if (state->worker.joinable() && state->worker.get_id() != std::this_thread::get_id()) {
-    state->worker.join();
+  // guard documents the rule and downgrades a violation to a no-op. The id
+  // read is the IMMUTABLE worker_id member — never worker.get_id(), which
+  // would race a concurrent join()'s modification of the thread object.
+  if (state->worker_id == std::this_thread::get_id()) {
+    return;
+  }
+  // Concurrent-caller safety (adversarial F5): two allowed non-callback
+  // threads may call join() together, but std::thread::join is not
+  // thread-safe — one caller performs the join, the rest wait for `joined`,
+  // and EVERY error stays inside this noexcept boundary (a std::system_error
+  // crossing the vtable slot is std::terminate).
+  try {
+    std::unique_lock<std::mutex> lock(state->join_mu);
+    if (state->joined) {
+      return;
+    }
+    if (state->join_in_progress) {
+      state->join_cv.wait(lock, [state] { return state->joined; });
+      return;
+    }
+    state->join_in_progress = true;
+    lock.unlock();
+    try {
+      if (state->worker.joinable()) {
+        state->worker.join();
+      }
+    } catch (...) {
+      // Swallow: the thread either finished or the join failed; either way
+      // the terminal contract is the run() flow's, not join()'s.
+    }
+    lock.lock();
+    state->joined = true;
+    state->join_cv.notify_all();
+  } catch (...) {
+    // Lock/wait failure: nothing safe left to do inside noexcept.
   }
 }
 
@@ -316,7 +361,10 @@ void DescriptorImportProvider::jobDestroy(void* ctx) noexcept {
   // survivable — the guard only skips the join, and `delete state` below
   // then destroys a still-joinable std::thread member, which is
   // std::terminate. The ABI's "never call join/destroy from a job callback"
-  // rule is load-bearing here, not merely advisory.
+  // rule is load-bearing here, not merely advisory. Likewise destroy racing
+  // a concurrent join()/cancel() on the SAME job is the caller's contract
+  // violation (destroy invalidates ctx); only join-vs-join is made safe
+  // (adversarial F5) because both calls are individually allowed.
   auto* state = static_cast<JobState*>(ctx);
   jobCancel(ctx);
   // Defensive: startImport always releases the gate before returning, but a
@@ -523,6 +571,7 @@ bool DescriptorImportProvider::startImport(const PJ_descriptor_import_start_requ
       PJ::sdk::fillError(out_error, 1, "mcap_cloud", "could not start the import worker thread");
       return false;
     }
+    state->worker_id = state->worker.get_id();  // immutable from here (F5)
 
     // Populate out_job with the worker safely gated; the caller reads it
     // only after this returns.
@@ -530,9 +579,24 @@ bool DescriptorImportProvider::startImport(const PJ_descriptor_import_start_requ
     out_job->vtable = &kJobVtable;
 
     // The explicit post-return START GATE: released only now — after
-    // out_job is fully populated and this thunk is about to return — so no
-    // callback can run before start_import returns (the worker's FIRST
-    // action is start_gate.acquire()).
+    // out_job is fully populated and this thunk is about to return — so the
+    // worker's FIRST action (start_gate.acquire()) cannot proceed earlier.
+    //
+    // RESIDUAL (adversarial F4 — CALLEE-UNFIXABLE): "no callback before
+    // start_import RETURNS" cannot be proven by the callee, because a callee
+    // cannot observe its own completed return: between this release and the
+    // caller resuming after the call there is a window in which the worker
+    // may run a callback. Closing it requires CALLER cooperation — an
+    // SDK/host-side callback gate whose thunks wait until the raw
+    // start_import invocation has returned (recorded as an SDK follow-up).
+    // The SDK's own reference provider has the identical shape: the
+    // FakeImportToolbox start gate is released by the CALLER (the test's
+    // releaseStart()) after startImport returned — see
+    // pj_base/tests/descriptor_import_extension_test.cpp:75-79 ("conforming
+    // ... deterministically, rather than racing a background thread against
+    // the caller") — i.e. the SDK sidesteps the same residual caller-side.
+    // StartReturnStressNoCallbackBeforeReturnedFlag bounds the practical
+    // exposure (N iterations against a caller-side returned flag).
     if (start_gate_probe_) {
       start_gate_probe_();  // test seam: observe the pre-release world
     }

@@ -130,11 +130,12 @@ TeeTerminalOutcome finishCacheTee(
 // a joinable std::thread is std::terminate).
 class HostStopWatchdog {
  public:
-  HostStopWatchdog(ParserIngestDriver& driver, bool active, std::function<void()> on_stop) {
+  HostStopWatchdog(ParserIngestDriver& driver, bool active, std::function<void()> on_stop,
+                   const std::function<std::thread(std::function<void()>)>& factory = {}) {
     if (!active) {
       return;
     }
-    thread_ = std::thread([this, &driver, on_stop = std::move(on_stop)]() {
+    std::function<void()> body = [this, &driver, on_stop = std::move(on_stop)]() {
       while (!done_.load(std::memory_order_relaxed)) {
         if (driver.datasetIngest().isStopRequested()) {
           on_stop();
@@ -142,7 +143,16 @@ class HostStopWatchdog {
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
       }
-    });
+    };
+    // Thread-spawn failure degrades to NO watchdog (adversarial F8): the
+    // per-message isStopRequested check in the download loop remains, so a
+    // host Stop is still honored while messages flow — the watchdog is an
+    // enhancement for stalled streams, never a correctness dependency, and
+    // std::system_error must not escape into the pull.
+    try {
+      thread_ = factory ? factory(std::move(body)) : std::thread(std::move(body));
+    } catch (...) {
+    }
   }
 
   HostStopWatchdog(const HostStopWatchdog&) = delete;
@@ -1279,7 +1289,8 @@ void FetchWorker::pullTopicsAsync(std::vector<std::string> sequence_names, std::
   // direct pull): scoped strictly to the download; stop()ed before the
   // terminal classification and finalize(), so the dataset-ingest view
   // outlives it; the destructor is the exception-safe join.
-  HostStopWatchdog host_stop_watchdog(driver, host_progress_active, [this]() { requestCancel(); });
+  HostStopWatchdog host_stop_watchdog(driver, host_progress_active, [this]() { requestCancel(); },
+                                      watchdog_thread_factory_for_test_);
 
   // Progress throttle: emit pullProgress at most ~10 Hz per topic.
   std::unordered_map<std::uint32_t, std::int64_t> bytes_by_id;
@@ -1809,7 +1820,8 @@ PullResult FetchWorker::pull(PullRequest request) {
             .has_value();
   }
   std::uint64_t transport_messages_seen = 0;
-  HostStopWatchdog host_stop_watchdog(driver, host_progress_active, [this]() { requestCancel(); });
+  HostStopWatchdog host_stop_watchdog(driver, host_progress_active, [this]() { requestCancel(); },
+                                      watchdog_thread_factory_for_test_);
 
   std::chrono::steady_clock::time_point last_host_progress_emit{};
   const auto kProgressInterval = std::chrono::milliseconds(100);
@@ -1859,10 +1871,27 @@ PullResult FetchWorker::pull(PullRequest request) {
   // sample cancel_flag_ exactly once and derive every decision from it.
   const bool cancelled_after_download = cancel_flag_.load(std::memory_order_relaxed);
 
+  // FINAL cumulative ceiling check (adversarial F6): every session frame —
+  // batches, Progress, the terminal Eos, resume-leg control traffic —
+  // counts toward wire bytes, but the per-message check above can only run
+  // while messages flow; bytes arriving AFTER the last message previously
+  // finalized/stored/promoted above budget. stats.wire_bytes_received is
+  // the whole-pull total (spanning resume legs), so one comparison here
+  // closes every control-frame gap; the overage aborts the tee below
+  // (not-complete), suppresses the store/promotion (terminal != kComplete)
+  // and terminals FAILED with the byte cause.
+  if (request.max_transfer_bytes > 0 && !byte_ceiling_exceeded &&
+      stats.wire_bytes_received > request.max_transfer_bytes) {
+    byte_ceiling_exceeded = true;
+  }
+
   if (tee != nullptr) {
-    // No export on the direct pull: nullopt save_paths, inert helpers.
+    // No export on the direct pull: nullopt save_paths, inert helpers. A
+    // final ceiling overage must never finalize (F6) — it rides the same
+    // not-complete input as a cancel.
     const TeeTerminalOutcome terminal = finishCacheTee(
-        *tee, stats, cancelled_after_download, std::nullopt, [](McapSaveResult) {}, []() {},
+        *tee, stats, cancelled_after_download || byte_ceiling_exceeded, std::nullopt,
+        [](McapSaveResult) {}, []() {},
         [](const std::filesystem::path&) {},
         [](const std::filesystem::path&, std::string*) { return true; });
     result.tee_outcome = terminal.outcome;

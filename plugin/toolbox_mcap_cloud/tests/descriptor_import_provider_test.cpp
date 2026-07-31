@@ -860,3 +860,107 @@ TEST(McapCloudProviderAbi, EmptyKeyDescriptorRejectedAtQueryAndStart) {
   EXPECT_EQ(recorder.terminalCount(), 0u);
   EXPECT_EQ(recorder.datasetCount(), 0u);
 }
+
+// Adversarial F5: join() is [thread-safe]/idempotent at the ABI, but
+// std::thread::join is neither — N concurrent joiners must all return after
+// the terminal, with exactly one terminal and no crash.
+TEST(McapCloudProviderAbi, ConcurrentJoinsAreSafe) {
+  FakeStreamingServer server(FakeStreamingServer::Mode::kComplete);
+  ASSERT_TRUE(server.ok());
+  ProviderHarness h("abi-concjoin");
+
+  JobRecorder recorder;
+  ScopedJob job;
+  ASSERT_TRUE(h.start(queryJson(server.uri()), recorder, job));
+
+  std::vector<std::thread> joiners;
+  joiners.reserve(4);
+  for (int i = 0; i < 4; ++i) {
+    joiners.emplace_back([&job]() { job.job.vtable->join(job.job.ctx); });
+  }
+  for (auto& t : joiners) {
+    t.join();
+  }
+  job.job.vtable->join(job.job.ctx);  // idempotent after completion
+
+  ASSERT_EQ(recorder.terminalCount(), 1u);
+  EXPECT_TRUE(recorder.waitTerminal(std::chrono::seconds(1)));
+}
+
+// Adversarial F4 stress: the callee cannot PROVE "no callback before
+// start_import returns" (see the residual comment at the start gate); this
+// bounds the practical exposure — N fast-terminal jobs against a caller-side
+// `returned` flag set immediately after the call, asserting no callback ever
+// observed the flag unset.
+namespace {
+struct StressRecorder {
+  std::atomic<bool> returned{false};
+  std::atomic<int> violations{0};
+  std::atomic<int> terminals{0};
+  static void onDataset(void* ctx, PJ_data_source_handle_t) noexcept {
+    auto* self = static_cast<StressRecorder*>(ctx);
+    if (!self->returned.load(std::memory_order_acquire)) {
+      self->violations.fetch_add(1);
+    }
+  }
+  static void onTerminal(void* ctx, PJ_descriptor_import_outcome_t, PJ_string_view_t) noexcept {
+    auto* self = static_cast<StressRecorder*>(ctx);
+    if (!self->returned.load(std::memory_order_acquire)) {
+      self->violations.fetch_add(1);
+    }
+    self->terminals.fetch_add(1);
+  }
+};
+}  // namespace
+
+TEST(McapCloudProviderAbi, StartReturnStressNoCallbackBeforeReturnedFlag) {
+  ProviderHarness h("abi-startstress");
+  // ws://127.0.0.1:1 — connection refused immediately: each job terminals
+  // FAILED within milliseconds, maximizing gate/return interleaves.
+  const std::string json = queryJson("ws://127.0.0.1:1");
+  PJ_descriptor_import_callbacks_v1_t cbs{};
+  cbs.struct_size = sizeof(cbs);
+  cbs.on_dataset = &StressRecorder::onDataset;
+  cbs.on_terminal = &StressRecorder::onTerminal;
+
+  StressRecorder recorder;
+  int started = 0;
+  for (int i = 0; i < 1000; ++i) {
+    recorder.returned.store(false, std::memory_order_release);
+    PJ_descriptor_import_start_request_v1_t request{};
+    request.struct_size = sizeof(request);
+    request.descriptor_json = PJ_string_view_t{json.data(), json.size()};
+    PJ_joinable_job_t job{};
+    PJ_error_t err{};
+    if (!h.provider.startImport(&request, &cbs, &recorder, &job, &err)) {
+      continue;  // e.g. transient resource issue — not this test's subject
+    }
+    recorder.returned.store(true, std::memory_order_release);
+    ++started;
+    job.vtable->destroy(job.ctx);
+  }
+  EXPECT_GT(started, 0);
+  EXPECT_EQ(recorder.violations.load(), 0)
+      << "a callback observed the caller-side flag unset — the F4 residual fired";
+  EXPECT_EQ(recorder.terminals.load(), started);
+}
+
+// Adversarial F6 at the provider surface: a control-only overage (empty
+// window, ceiling=1) must terminal FAILED naming bytes — never EAGER_ONLY.
+TEST(McapCloudProviderJob, ControlOnlyCeilingOverageFails) {
+  FakeStreamingServer server(FakeStreamingServer::Mode::kCompleteEmpty);
+  ASSERT_TRUE(server.ok());
+  ProviderHarness h("job-ctlceiling");
+
+  JobRecorder recorder;
+  ScopedJob job;
+  ASSERT_TRUE(h.start(queryJson(server.uri()), recorder, job, /*max_transfer_bytes=*/1));
+  ASSERT_TRUE(recorder.waitTerminal(std::chrono::seconds(20)));
+  job.job.vtable->join(job.job.ctx);
+
+  ASSERT_EQ(recorder.terminalCount(), 1u);
+  EXPECT_EQ(recorder.terminal(0).first, PJ_DESCRIPTOR_IMPORT_FAILED)
+      << recorder.terminal(0).second;
+  EXPECT_NE(recorder.terminal(0).second.find("byte"), std::string::npos)
+      << recorder.terminal(0).second;
+}

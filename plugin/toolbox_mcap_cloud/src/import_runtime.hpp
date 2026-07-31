@@ -29,6 +29,7 @@
 // No dialog/Qt dependencies — a future headless caller drives this directly.
 #pragma once
 
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -147,6 +148,13 @@ class ImportRuntime {
   /// thread-safe cache (weak_ptr) — safe even against runtime teardown.
   std::shared_ptr<PromotionResult> promoteToFileSource(const PJ::SourcePromotionRequest& request,
                                                        const SessionKey* cache_key);
+
+  /// Diagnostics-only count of ACCEPTED promotions whose on_result has not
+  /// settled yet (adversarial F7's plugin-side accounting; the
+  /// teardown-deadlock half is already covered by the job DETACH — the
+  /// promotion-shutdown reorder is the PJ4-side fix). The counter is
+  /// shared-owned so a late settle after runtime teardown decrements safely.
+  [[nodiscard]] int outstandingPromotions() const { return promotions_outstanding_->load(); }
 
   /// Write-through: records into the TrustedOrigins ledger AND — only after
   /// the DURABLE ledger write succeeded (adversarial F14) — the in-memory
@@ -405,6 +413,7 @@ class ImportRuntime {
 
   mutable std::mutex promo_mu_;
   std::optional<PJ::SourcePromotionHostView> promotion_host_;
+  std::shared_ptr<std::atomic<int>> promotions_outstanding_ = std::make_shared<std::atomic<int>>(0);
 
   mutable std::mutex trust_mu_;
   std::unordered_set<std::string> trusted_keys_;  // trustedOriginKey shape

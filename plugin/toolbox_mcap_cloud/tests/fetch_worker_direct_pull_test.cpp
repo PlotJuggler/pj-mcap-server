@@ -309,3 +309,77 @@ TEST(McapCloudDirectPull, IncludeLatchedVariantsNeverAliasInTheCache) {
   EXPECT_EQ(server.openSessions(), 2)
       << "a true-latched request must never be served from the false-latched entry (F1)";
 }
+
+// Adversarial F6 (control-only): with ZERO messages (a real plan, empty
+// window) every wire byte is control traffic — no per-message check ever
+// runs, so only the FINAL cumulative check can enforce the ceiling. Must be
+// kFailed with the byte cause, nothing finalized, nothing stored.
+TEST(McapCloudDirectPull, ControlOnlyBytesTripTheCeiling) {
+  FakeStreamingServer server(FakeStreamingServer::Mode::kCompleteEmpty);
+  ASSERT_TRUE(server.ok());
+  TempRoot cache_root("ctlceiling-cache");
+  TempRoot config_root("ctlceiling-config");
+  mcap_cloud::ImportRuntime rt(mcap_cloud::SessionFileCache(cache_root.path),
+                               mcap_cloud::TrustedOrigins(config_root.path));
+
+  PullHarness h;
+  mcap_cloud::PullRequest request = h.request(rt, server.uri());
+  request.max_transfer_bytes = 1;  // the Eos alone exceeds this
+  const auto result = h.worker.pull(std::move(request));
+
+  EXPECT_EQ(result.terminal, mcap_cloud::PullTerminal::kFailed)
+      << "control/EOS bytes above the ceiling must FAIL, never finalize";
+  EXPECT_TRUE(result.byte_ceiling_exceeded);
+  EXPECT_NE(result.error.find("byte"), std::string::npos) << result.error;
+  fs::path unused;
+  EXPECT_FALSE(rt.fileCache().lookup(identityFor(server.uri()), &unused))
+      << "an over-budget session must not finalize the cache";
+  EXPECT_EQ(rt.sessionCache().size(), 0u) << "no entry stored above budget";
+  EXPECT_EQ(result.promotion, nullptr) << "no promotion above budget";
+}
+
+// Adversarial F6 (final frames): a Progress flood BETWEEN the last message
+// and the Eos pushes the cumulative wire bytes over a ceiling the payload
+// bytes were comfortably under — the overage must fail the pull whether a
+// late per-message check or the final check observes it.
+TEST(McapCloudDirectPull, FramesBeyondTheLastMessageTripTheCeiling) {
+  FakeStreamingServer server(FakeStreamingServer::Mode::kCompleteWithProgressFlood);
+  ASSERT_TRUE(server.ok());
+  TempRoot cache_root("floodceiling-cache");
+  TempRoot config_root("floodceiling-config");
+  mcap_cloud::ImportRuntime rt(mcap_cloud::SessionFileCache(cache_root.path),
+                               mcap_cloud::TrustedOrigins(config_root.path));
+
+  PullHarness h;
+  mcap_cloud::PullRequest request = h.request(rt, server.uri());
+  // Above the batches+Eos total (~13.3 KiB incl. framing), far below the
+  // ~2000-frame progress flood on top.
+  request.max_transfer_bytes = 14 * 1024;
+  const auto result = h.worker.pull(std::move(request));
+
+  EXPECT_EQ(result.terminal, mcap_cloud::PullTerminal::kFailed) << result.error;
+  EXPECT_TRUE(result.byte_ceiling_exceeded);
+  fs::path unused;
+  EXPECT_FALSE(rt.fileCache().lookup(identityFor(server.uri()), &unused));
+}
+
+// Adversarial F8 (watchdog half): host-stop-watchdog spawn failure degrades
+// to no-watchdog — the pull completes normally (in-loop stop checks remain).
+TEST(McapCloudDirectPull, WatchdogSpawnFailureIsNonfatal) {
+  FakeStreamingServer server(FakeStreamingServer::Mode::kComplete);
+  ASSERT_TRUE(server.ok());
+  TempRoot cache_root("wdspawn-cache");
+  TempRoot config_root("wdspawn-config");
+  mcap_cloud::ImportRuntime rt(mcap_cloud::SessionFileCache(cache_root.path),
+                               mcap_cloud::TrustedOrigins(config_root.path));
+
+  PullHarness h;
+  h.worker.setWatchdogThreadFactoryForTest([](std::function<void()>) -> std::thread {
+    throw std::system_error(std::make_error_code(std::errc::resource_unavailable_try_again),
+                            "injected watchdog spawn failure");
+  });
+  const auto result = h.worker.pull(h.request(rt, server.uri()));
+  EXPECT_EQ(result.terminal, mcap_cloud::PullTerminal::kComplete)
+      << "watchdog spawn failure must be nonfatal: " << result.error;
+  EXPECT_EQ(result.tee_outcome, mcap_cloud::TeeOutcome::kFinalized) << result.tee_error;
+}

@@ -12,6 +12,7 @@
 #include <pj_base/sdk/plugin_data_api.hpp>
 #include <pj_base/sdk/toolbox_plugin_base.hpp>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -479,6 +480,8 @@ class FetchWorker {
   // SHARED (thread-safe) SessionCache instead so provider jobs and the
   // interactive worker observe one cache (D7).
   SessionCache session_cache_;
+  // F8 test seam (see setWatchdogThreadFactoryForTest).
+  std::function<std::thread(std::function<void()>)> watchdog_thread_factory_for_test_;
   // Existence predicate seam: answers "is this dataset still in the host?".
   // Defaults to a catalogSnapshot()-backed check when a host provider is bound;
   // tests inject a fake. Presence-unknown MUST return false (-> MISS).
@@ -491,6 +494,12 @@ class FetchWorker {
   void setDatasetExistsForTest(SessionCache::ExistencePredicate pred) { dataset_exists_ = std::move(pred); }
   // Test seam: read-only access to the cache (size / inspection in tests).
   [[nodiscard]] const SessionCache& sessionCacheForTest() const { return session_cache_; }
+  // Test seam (adversarial F8): inject a throwing watchdog thread factory to
+  // pin that spawn failure degrades to no-watchdog (in-loop stop checks
+  // remain) instead of an exception escaping the pull.
+  void setWatchdogThreadFactoryForTest(std::function<std::thread(std::function<void()>)> factory) {
+    watchdog_thread_factory_for_test_ = std::move(factory);
+  }
 
  private:
   // The §6.1 memory-hit block of pullTopicsAsync (pure extraction — quality

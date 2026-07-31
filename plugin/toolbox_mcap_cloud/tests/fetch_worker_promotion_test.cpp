@@ -337,3 +337,25 @@ TEST(McapCloudPromotion, MemoryHitWithValidDiskRePromotesWithTheCachedDatasetId)
   h.worker.pullTopicsAsync({"a.mcap"}, "a.mcap", {"/one"}, 0, 0);
   EXPECT_EQ(promo.requestCount(), 2u) << "an already-promoted entry must not re-promote";
 }
+
+// Adversarial F7 (plugin-side accounting): the outstanding-promotion counter
+// tracks accepted-but-unsettled promotions and survives a settle that lands
+// after the initiating pull returned.
+TEST(McapCloudPromotion, OutstandingPromotionCounterTracksTheDeferredSettle) {
+  FakeStreamingServer server(FakeStreamingServer::Mode::kComplete);
+  ASSERT_TRUE(server.ok());
+  TempRoot cache_root("outstanding-cache");
+  TempRoot config_root("outstanding-config");
+  mcap_cloud::ImportRuntime rt(mcap_cloud::SessionFileCache(cache_root.path),
+                               mcap_cloud::TrustedOrigins(config_root.path));
+  DeferredPromotionHost promo;
+  rt.setPromotionHost(PJ::SourcePromotionHostView(promo.view()));
+
+  Harness h;
+  const mcap_cloud::PullResult result = h.worker.pull(h.request(rt, server.uri()));
+  ASSERT_EQ(result.terminal, mcap_cloud::PullTerminal::kComplete) << result.error;
+  EXPECT_EQ(rt.outstandingPromotions(), 1) << "accepted + unsettled";
+  promo.release();
+  promo.joinWorker();
+  EXPECT_EQ(rt.outstandingPromotions(), 0) << "settled";
+}
