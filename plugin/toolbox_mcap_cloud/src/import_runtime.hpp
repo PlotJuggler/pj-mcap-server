@@ -164,6 +164,107 @@ class ImportRuntime {
     unsigned refs = 0;
   };
 
+  /// The distinct, actionable REFUSAL-WHILE-REFERENCED error (round-5 F2).
+  /// Matched verbatim by the provider terminal and the tests.
+  static constexpr const char* kArtifactInUseError =
+      "cache artifact is in use by loaded data — close or reload it, then retry";
+
+  /// Live reference count for `identity` in this runtime's lease registry
+  /// (0 = unreferenced). One atomic registry read.
+  [[nodiscard]] unsigned leaseRefs(std::string_view identity) const;
+
+  /// Round-5 F1: a MOVE-ONLY RAII owner of a lease-drop token. From the
+  /// moment a drop happens, exactly ONE ScopedLeaseDrop owns the obligation
+  /// to restore it; every handoff (provider -> PullRequest -> CacheTee) is a
+  /// noexcept move, and an unwind through ANY owner restores via the
+  /// destructor — stranding is impossible by construction, not by ordering
+  /// care. dismiss() marks the token consumed (a successful finalize);
+  /// restoreNow() restores eagerly at the ordered point (abortAndCleanup,
+  /// before the ticket releases). With round-5 F2's refusal-while-referenced
+  /// in place, production drops are always EMPTY tokens (a referenced
+  /// identity is never materialized); the mechanism stays load-bearing for
+  /// the adopted-token paths and as the structural exception-safety net.
+  class ScopedLeaseDrop {
+   public:
+    ScopedLeaseDrop() = default;
+    ScopedLeaseDrop(ImportRuntime* runtime, std::string identity, LeaseDrop drop) noexcept
+        : runtime_(runtime), identity_(std::move(identity)), drop_(drop) {}
+    ScopedLeaseDrop(ScopedLeaseDrop&& other) noexcept
+        : runtime_(other.runtime_), identity_(std::move(other.identity_)), drop_(other.drop_) {
+      other.runtime_ = nullptr;
+      other.drop_ = LeaseDrop{};
+    }
+    ScopedLeaseDrop& operator=(ScopedLeaseDrop&& other) noexcept {
+      if (this != &other) {
+        restoreNow();
+        runtime_ = other.runtime_;
+        identity_ = std::move(other.identity_);
+        drop_ = other.drop_;
+        other.runtime_ = nullptr;
+        other.drop_ = LeaseDrop{};
+      }
+      return *this;
+    }
+    ScopedLeaseDrop(const ScopedLeaseDrop&) = delete;
+    ScopedLeaseDrop& operator=(const ScopedLeaseDrop&) = delete;
+    ~ScopedLeaseDrop() { restoreNow(); }
+
+    /// Absorb another token's obligation (ADDITION — independent drops
+    /// removed independent reference sets; round-4 R3). noexcept: no
+    /// allocation, just bookkeeping + emptying `other`.
+    void merge(ScopedLeaseDrop&& other) noexcept {
+      if (!other.drop_.had_lease) {
+        other.runtime_ = nullptr;
+        return;
+      }
+      if (!drop_.had_lease) {
+        runtime_ = other.runtime_;
+        identity_ = std::move(other.identity_);
+        drop_ = other.drop_;
+      } else {
+        drop_.refs += other.drop_.refs;  // identities equal by contract
+      }
+      other.runtime_ = nullptr;
+      other.drop_ = LeaseDrop{};
+    }
+
+    /// Restore immediately (idempotent; the token empties).
+    void restoreNow() noexcept {
+      if (runtime_ != nullptr && drop_.had_lease) {
+        runtime_->restoreLease(identity_, drop_);
+      }
+      runtime_ = nullptr;
+      drop_ = LeaseDrop{};
+    }
+    /// Mark consumed (the finalize handoff superseded it) — no restore.
+    void dismiss() noexcept {
+      runtime_ = nullptr;
+      drop_ = LeaseDrop{};
+    }
+    /// Guarantee the eventual restore re-pins at least one reference even if
+    /// nothing was dropped (the revalidate-race arm pins a fresh artifact).
+    void ensureRestoresAtLeastOne(ImportRuntime* runtime, std::string identity) noexcept {
+      if (!drop_.had_lease) {
+        runtime_ = runtime;
+        identity_ = std::move(identity);
+        drop_ = LeaseDrop{true, 1};
+      }
+    }
+    [[nodiscard]] bool hasLease() const noexcept { return drop_.had_lease; }
+    [[nodiscard]] unsigned refs() const noexcept { return drop_.refs; }
+
+   private:
+    ImportRuntime* runtime_ = nullptr;
+    std::string identity_;
+    LeaseDrop drop_;
+  };
+
+  /// The RAII-owning form of dropLeaseForMaterialize (round-5 F1). The
+  /// identity string is built BEFORE the atomic drop, so an allocation
+  /// failure aborts with the lease still retained — after construction every
+  /// step is noexcept.
+  [[nodiscard]] ScopedLeaseDrop dropLeaseForMaterializeScoped(std::string_view identity);
+
   /// Acquire (shared, NON-BLOCKING) + validate + retain for `identity`.
   /// Idempotent/refcounted: an already-retained identity just takes another
   /// reference. False when the lease is unavailable (a cross-process
@@ -278,8 +379,28 @@ class CacheTee {
   /// own bounded cancelable wait on the CROSS-PROCESS materialize lock (the
   /// provider job) hands it in; begin() then never re-acquires (it would
   /// self-contend on the sidecar).
+  ///
+  /// Round-5 F2 — REFUSAL-WHILE-REFERENCED: begin() refuses an identity the
+  /// lease registry still references (kArtifactInUseError). Loaded data
+  /// lazily re-opens the artifact by generation-specific chunk offsets, and
+  /// a rename-over with a logically-equal but byte-different re-encoding
+  /// would silently corrupt those reads; refusing converts that into an
+  /// honest failure. Consequences: the normal flow is unaffected (a
+  /// valid+referenced artifact classifies as a HIT long before
+  /// materialization); the §6.1 vanished-while-referenced refetch still
+  /// serves eagerly but does NOT republish the cache until the references
+  /// die (runtime teardown); the under-lock corruption deletion is never
+  /// reached for a referenced identity. With the refusal in place begin()
+  /// performs NO lease drop of its own — the token member only carries
+  /// adopted tokens, which dissolves the round-4 handoff re-pin controversy
+  /// structurally (the restore path only ever handles a zero-or-adopted
+  /// count).
   [[nodiscard]] bool begin(const std::string& identity, std::string* error,
                            std::optional<SessionFileCache::MaterializeLock> adopted_lock = std::nullopt);
+
+  /// True iff the last begin() failure was the F2 refusal (identity
+  /// referenced by loaded data). Owning thread only.
+  [[nodiscard]] bool beginRefusedInUse() const { return begin_refused_in_use_; }
 
   /// Phase 2 (after OpenSession, when SessionInfo is known): free-space check
   /// (estimated_bytes > available at the cache root refuses; 0 skips),
@@ -330,6 +451,10 @@ class CacheTee {
   void setPreRestoreHookForTest(std::function<void()> hook) {
     pre_restore_hook_for_test_ = std::move(hook);
   }
+  /// Round-5 F1 seam: make begin() throw AFTER its no-throw capture
+  /// prologue — pins that an exception inside begin() cannot strand an
+  /// adopted token (the tee's teardown restores it under the ticket).
+  void setBeginThrowForTest(bool fail) { begin_throw_for_test_ = fail; }
   /// Round-4 R1(a) seam: force begin()'s exclusive-lock acquisition to fail.
   /// The real trigger (an external process winning the microscopic window
   /// between our lease drop and our lock try) is not deterministically
@@ -377,11 +502,19 @@ class CacheTee {
   ImportRuntime& runtime_;
   std::string identity_;
   bool begin_lock_contended_ = false;  // F9 (see beginFailedOnLockContention)
-  ImportRuntime::LeaseDrop lease_drop_{};  // what begin() dropped; abort restores it
   bool lease_handoff_fail_for_test_ = false;  // R1(a) seam (see below)
   bool lock_fail_for_test_ = false;           // round-4 R1(a) seam
+  bool begin_throw_for_test_ = false;         // round-5 F1 seam (see below)
+  bool begin_refused_in_use_ = false;         // round-5 F2 (see beginRefusedInUse)
   std::optional<ImportRuntime::MaterializeTicket> ticket_;
   std::optional<SessionFileCache::MaterializeLock> lock_;
+  // Declared AFTER ticket_/lock_ (round-5 F1): member destruction is reverse
+  // declaration order, so even a destructor-only teardown restores the token
+  // BEFORE the ticket releases — invariant 3 by construction. With the F2
+  // refusal this token is EMPTY in production begin() (a referenced identity
+  // never reaches a drop); it exists for adopted tokens (the PR-3 layer) and
+  // as the structural exception-safety net.
+  ImportRuntime::ScopedLeaseDrop lease_drop_;
   std::filesystem::path partial_path_;
 
   ExclusiveFileSink sink_;

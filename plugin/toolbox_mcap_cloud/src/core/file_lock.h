@@ -39,6 +39,14 @@ class FileLock {
   [[nodiscard]] static std::optional<FileLock> tryShared(
       const std::filesystem::path& path, std::string* error);
 
+  /// FOLLOW-UP (recorded, round-5 F2 option (b)): immutable GENERATION-
+  /// SUFFIXED artifact paths + per-generation leases — each materialization
+  /// writes <digest>.<gen>.mcap and readers pin their own generation, which
+  /// removes rename-over entirely (no refusal needed, cross-process
+  /// referenced identities become first-class) at the cost of a cache-layout
+  /// migration. The refusal-while-referenced rule implemented now is the
+  /// interim.
+  ///
   /// FOLLOW-UP (recorded, re-verify R1): migrate FileLock to fcntl OFD
   /// locks (F_OFD_SETLK), whose lock CONVERSIONS are atomic — that closes
   /// downgradeToShared()'s non-atomic window for real. It must be a

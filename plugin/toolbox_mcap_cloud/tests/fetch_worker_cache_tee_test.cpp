@@ -426,7 +426,15 @@ TEST(McapCloudFetchWorkerCacheTee, MemoryHitWithMissingDiskFileEvictsAndRefetche
   EXPECT_EQ(server.openSessions(), 2)
       << "memory hit + missing disk file must evict and refetch (§6.1), never re-tee from memory";
   EXPECT_EQ(h.served_from_cache, 0);
-  ASSERT_TRUE(rt.fileCache().lookup(identity, &cache_file)) << "refetch re-materializes";
+  // Round-5 F2: the identity is still REFERENCED (pull #1's finalize lease —
+  // a loaded dataset may lazily re-open the vanished file), so the refetch
+  // serves the DATA eagerly but must NOT republish the cache: rematerialize-
+  // while-referenced is refused with the distinct in-use error, converting a
+  // doomed reader's silent wrong reads into an honest failure.
+  EXPECT_EQ(h.tee.outcome, mcap_cloud::TeeOutcome::kFailed);
+  EXPECT_EQ(h.tee.error, mcap_cloud::ImportRuntime::kArtifactInUseError);
+  EXPECT_FALSE(rt.fileCache().lookup(identity, &cache_file))
+      << "no republish while the doomed references live";
 
   const PJ::cloud::SessionKey key =
       PJ::cloud::computeSessionKey(server.uri(), {"a.mcap"}, {"/one"}, {0, 0}, true);

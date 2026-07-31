@@ -3,6 +3,7 @@
 #include "import_runtime.hpp"
 
 #include <limits>
+#include <stdexcept>
 #include <system_error>
 #include <utility>
 
@@ -233,6 +234,19 @@ std::string ImportRuntime::lastLeaseDiagnostic() const {
   return last_lease_diagnostic_;
 }
 
+unsigned ImportRuntime::leaseRefs(std::string_view identity) const {
+  std::lock_guard<std::mutex> lock(lease_mu_);
+  const auto it = retained_leases_.find(std::string(identity));
+  return it == retained_leases_.end() ? 0u : it->second.refs;
+}
+
+ImportRuntime::ScopedLeaseDrop ImportRuntime::dropLeaseForMaterializeScoped(
+    std::string_view identity) {
+  std::string key(identity);  // may throw — the lease is still retained if it does
+  const LeaseDrop drop = dropLeaseForMaterialize(key);
+  return ScopedLeaseDrop(this, std::move(key), drop);  // noexcept from here
+}
+
 bool ImportRuntime::hasRetainedLease(std::string_view identity) const {
   std::lock_guard<std::mutex> lock(lease_mu_);
   return retained_leases_.count(std::string(identity)) > 0;
@@ -297,16 +311,26 @@ bool CacheTee::begin(const std::string& identity, std::string* error,
   if (!ticket_.has_value()) {
     return fail("a materialization of this session is already in progress in this process");
   }
+  if (begin_throw_for_test_) {
+    // Round-5 F1 seam: everything adopted so far is member-owned; a throw
+    // from here must strand nothing (the tee's teardown restores it).
+    throw std::runtime_error("injected begin() failure (test seam)");
+  }
+  // Round-5 F2 — REFUSAL-WHILE-REFERENCED: never rematerialize an identity
+  // that loaded data still references (see the header doc for the full
+  // reasoning). In-process references give the distinct actionable error;
+  // cross-process references surface as ordinary lock contention below (the
+  // shared flock blocks our exclusive — indistinguishable from a remote
+  // materializer at the flock level; the generation-suffixed-artifact
+  // follow-up recorded in file_lock.h would lift that too). begin() performs
+  // NO drop of its own anymore: lease_drop_ only ever carries an ADOPTED
+  // token, so every restore below handles a zero-or-adopted count — which is
+  // what dissolves the rename-over-live-artifact hazard structurally.
+  if (runtime_.leaseRefs(identity) > 0) {
+    begin_refused_in_use_ = true;
+    return fail(ImportRuntime::kArtifactInUseError);
+  }
   runtime_.fileCache().cleanup(runtime_.cacheConfig());
-  // A retained dataset-lifetime lease on THIS identity would block our own
-  // exclusive materialize lock below — drop it. ONE atomic operation that
-  // both releases and reports (invariant 1): a racing memory-hit retain can
-  // no longer be erased without being recorded, which the previous
-  // has-then-release two-step allowed. A FAILED/cancelled rematerialization
-  // restores exactly this token in abortAndCleanup, BEFORE the ticket goes
-  // (invariant 3), or the previous valid artifact backing a live dataset is
-  // left permanently unleased.
-  lease_drop_ = runtime_.dropLeaseForMaterialize(identity);
 
   if (adopted_lock.has_value()) {
     // F9: a caller (the provider job) already performed its bounded
@@ -322,12 +346,16 @@ bool CacheTee::begin(const std::string& identity, std::string* error,
                                                          &begin_lock_contended_);
     }
     if (!lock_.has_value()) {
-      // Round-4 R1(a): do NOT release the ticket here. begin() has already
-      // dropped this identity's lifetime lease, and releasing the ticket
-      // before that lease is restored reopens exactly the ticket-less
-      // restoration window invariant 3 exists to close. The failure returns
+      // Round-4 R1(a): do NOT release the ticket here — the failure returns
       // with the ticket STILL held; the owner destroys/aborts the tee, and
-      // abortAndCleanup restores the lease and only then releases the ticket.
+      // abortAndCleanup restores any ADOPTED token and only then releases
+      // the ticket. Round-5 F2 belt: a reference that landed in the tiny
+      // window between the refusal check and this try gets the distinct
+      // in-use error rather than generic contention.
+      if (begin_lock_contended_ && runtime_.leaseRefs(identity) > 0) {
+        begin_refused_in_use_ = true;
+        return fail(ImportRuntime::kArtifactInUseError);
+      }
       return fail(lock_error);
     }
   }
@@ -666,15 +694,17 @@ bool CacheTee::finalize(const std::optional<SessionFileCache::ExpectedContent>& 
   }
   // Already lease-then-validated: the downgraded lease is held across the
   // revalidation above, so this only records it (invariant 2 satisfied).
-  // Round-4 R3: adopt the FULL count begin() dropped — the documented
-  // semantics are "a materialization drops every reference and restores the
-  // same count", so the prior holders' references must survive a successful
-  // rematerialization exactly as they survive an aborted one. No prior lease
-  // means this materialization is the first holder: 1.
+  // Round-4 R3 + round-5 F2: adopt the full token count when one was
+  // ADOPTED (tests / the PR-3 handoff); in production the F2 refusal means
+  // this materialization ran with ZERO prior references — the token is
+  // empty and the fresh artifact starts at one holder. (The round-4
+  // "re-pin a prior live dataset's count onto a new generation" case is
+  // structurally unreachable now; the count below is asserted zero-or-
+  // adopted by the refusal tests.)
   runtime_.adoptLeaseForLifetime(identity_, std::move(*lease),
-                                 lease_drop_.had_lease ? lease_drop_.refs : 1u);
-  lease_drop_ = ImportRuntime::LeaseDrop{};  // consumed: the abort must not re-restore
-  finalized_ = true;                         // the WHOLE sequence succeeded (R2)
+                                 lease_drop_.hasLease() ? lease_drop_.refs() : 1u);
+  lease_drop_.dismiss();  // consumed: the abort must not re-restore
+  finalized_ = true;      // the WHOLE sequence succeeded (R2)
   return true;
 }
 
@@ -722,11 +752,12 @@ void CacheTee::abortAndCleanup() {
     pre_restore_hook_for_test_();  // F1 seam: the ticket is still held here
   }
   if (!finalized_) {
-    // begin() dropped a live dataset's lifetime lease to take the exclusive
-    // lock and this materialization did NOT publish: put it back
-    // (lease-then-validate, bounded retry, no-op when nothing was dropped).
-    runtime_.restoreLease(identity_, lease_drop_);
-    lease_drop_ = ImportRuntime::LeaseDrop{};
+    // Restore any ADOPTED token (round-5: begin() no longer drops, so with
+    // the F2 refusal this is zero-or-adopted; lease-then-validate + bounded
+    // retry inside restoreLease; no-op when empty).
+    lease_drop_.restoreNow();
+  } else {
+    lease_drop_.dismiss();
   }
   ticket_.reset();  // release the in-process registry slot LAST
 }
