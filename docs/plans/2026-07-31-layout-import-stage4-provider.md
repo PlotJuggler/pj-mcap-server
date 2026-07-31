@@ -233,7 +233,8 @@ unpacked headers to grep).
   terminal exactly-once/result-string lifetimes) + a live test against the smoke
   server (query→import→promote round trip; cache file mcapdiff-equal to a CLI
   download of the same tuple — spec §12).
-- [ ] **T5 — gates + docs.** Full hermetic ctest; `make smoke` (serialize!);
+- [x] **T5 — gates + docs.** (DONE — see PR-4 execution note below.)
+  Original text:  Full hermetic ctest; `make smoke` (serialize!);
   wasm-compile untouched-set check; spec §9.8 checkbox flip + CATALOG untouched;
   README/plugin docs note the provider.
 
@@ -244,3 +245,29 @@ codex-exec + Claude) at PR time.
 **Cross-repo notes:** loader manifest id grounding (D6) reads the sibling
 pj-official-plugins checkout; E2E against the merged PJ4 host lands in stage-5,
 not here.
+
+## Execution record (2026-07-31)
+
+All four stacked PRs implemented on `.worktrees/layout-import-provider`, each through
+implementer + spec review + quality review with fix rounds:
+- PR-1 `feat/import-cache-tee` @ 2687c5c (5 commits): leases + linkage, ImportRuntime +
+  CacheTee, single-encoder tee, quality fixes (cancellable backpressure,
+  predicate-outside-lock, pull extraction).
+- PR-2 `feat/import-headless-init` @ 7bf2c6e (4 commits): one-shot getDialog init —
+  including the 02899ff dead-auto-connect regression FIX (user-visible: auto-connect
+  at first panel open works again) — credential_resolve + ConnectionSnapshot.
+- PR-3 `feat/import-provider` @ e211a62 (6 commits): direct cancellable pull
+  (cancellable WS-open, ceiling⇒FAILED), promotion-at-completion ("mcap-loader" +
+  use_log_time preset), provider extension + jobs (start gate, race⇒FAILED-retry,
+  cancel-wins mid-flight / truthful terminals post-complete, promotion
+  detach-on-cancel, mutation-verified detach pin), ABI adversarial + live tests.
+- PR-4 EXECUTED (`feat/import-e2e`, 3 commits d33654a/7018927/571f592 on e211a62):
+  §10 auth hint machine-gated via BackendConnection::lastHelloErrorCode (hint IFF
+  AUTH_FAILED + empty api_key snapshot; three-way matrix, red-first); smoke step d
+  gains the McapCloudDescriptorImportLive leg + the §12 cache-vs-CLI mcapdiff round
+  trip (MCAP_CLOUD_LIVE_CACHE_COPY hook; 2000/2000 logically equal) — SMOKE PASS,
+  hermetic 55/55; wasm set untouched except wasm_smoke_main.cpp's D7 predicate
+  adaptation; docs: spec §12 stale-text fix, §9.8 + §13-4 DONE, §6.3 as-built +
+  idle-thread residual, README provider section.
+Known infra: the plotjuggler-conan remote is dead (302) and fails fresh ./build.sh —
+disable it permanently. PJ4-side teardown-deadlock reorder still rides the T7 PR.
