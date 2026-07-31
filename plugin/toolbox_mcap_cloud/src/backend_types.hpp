@@ -103,6 +103,20 @@ struct ServerVersion {
   std::string version;  // canonical string, e.g. "0.1.0"
 };
 
+// Machine-readable classification of the server Error frame that terminated a
+// Hello handshake, exposed via BackendConnection::lastHelloErrorCode(). Lets
+// callers gate remediation text on the wire ErrorCode (spec
+// docs/canonical-layout-import.md §10's missing-credential hint) instead of
+// sniffing error strings. A plugin-side mirror (the SessionEos convention) so
+// backend_types consumers stay proto-free; only the code callers actually
+// gate on is distinguished — everything else folds into kOther.
+enum class HelloErrorCode {
+  kNone = 0,    // no server Error at the Hello: success, or a transport/timeout
+                // failure that never produced an Error frame
+  kAuthFailed,  // the server rejected the Hello with ERROR_AUTH_FAILED
+  kOther,       // the server rejected the Hello with any other Error code
+};
+
 // HelloResponse.backend (proto type BackendCapabilities): storage-backend-shaped
 // client hints the server advertises at handshake time. The plugin learns these
 // WITHOUT learning which storage backend (S3 vs GCS) sits behind the server —

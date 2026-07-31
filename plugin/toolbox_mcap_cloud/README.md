@@ -29,6 +29,10 @@ the connector pipeline (server → WebSocket/Protobuf → this plugin).
 - Edits a file's override **tags** (the server keeps an effective-tags view).
 - Survives a mid-download WebSocket drop via reconnect-and-resume; repeat fetches
   of the same selection are served from an in-memory session cache.
+- Implements the `pj.descriptor_import.v1` provider: re-materializes a saved
+  layout's cloud sessions headlessly from its `<materialize>` descriptor —
+  durable session-file cache, trust-gated origins, promotion to a stock
+  file-backed source (see "Descriptor import provider" below).
 
 ## Browse flow: the customer/site gate
 
@@ -202,6 +206,62 @@ the pure resolver in `tools/cli_url_resolve.hpp` and pinned by the
 `McapCloudCliUrlResolveTest` unit test (so `MCAP_CLOUD_URL` is honored when
 `--url` is absent, and `--url` overrides the env).
 
+## Descriptor import provider — `pj.descriptor_import.v1`
+
+The plugin implements the SDK 0.20.0 **descriptor-import extension** (spec:
+`docs/canonical-layout-import.md`), which lets a PJ4 host re-materialize a
+cloud session from the `<materialize>` descriptor a saved layout carries —
+query first, then a headless import job, with **no interactive panel
+involved**:
+
+- **`query_descriptor`** — synchronous and strictly bounded (no network, no
+  lock waits, no credential access): parses/validates the descriptor, always
+  returns the canonical `source_identity` + the planned local cache path,
+  answers `is_materialized` from the **disk-validated** cache only, and
+  reports trust (`trusted` vs `needs_confirmation`) from the in-memory trust
+  set.
+- **`start_import`** — one owned worker thread per job driving a direct,
+  fully cancellable pull (its own single session connection; never the
+  dialog's browse path). Terminals are exactly-once:
+  `SUCCEEDED_PROMOTED` / `SUCCEEDED_EAGER_ONLY` / `FAILED` / `CANCELLED`.
+  A missing credential on an auth-rejected Hello gets a machine-gated
+  remediation hint (never text-sniffed): connect once in the toolbox, or set
+  `MCAP_CLOUD_API_KEY` with a matching `MCAP_CLOUD_URL`.
+
+**Session file cache (the single MCAP encoder).** Every pull — interactive
+Fetch and headless import alike — tees the raw session into a durable,
+request-addressed cache file; exports are byte copies of it. Location:
+`$MCAP_CLOUD_CACHE_DIR`, else `$XDG_CACHE_HOME/mcap_cloud/sessions`, else
+`~/.cache/mcap_cloud/sessions`. Files finalize atomically
+(validate → fsync → rename) with embedded descriptor provenance; **cache
+partials never survive** a cancel or failure (deliberately inverse of the
+export path's keep-the-readable-partial policy). A tee/writer failure never
+aborts the download or the ingest — it only suppresses promotion and is
+reported.
+
+**Trust ledger.** `trusted_origins.json` under `$XDG_CONFIG_HOME/mcap_cloud`
+(else `~/.config/mcap_cloud`), 0600, written **only after a successful
+interactive Hello** — a layout naming an origin you never connected to is
+`needs_confirmation` (GUI prompt) or a per-job failure in non-interactive
+mode. Credentials themselves never ride the descriptor; they resolve at
+import time from the credential store (env token honored only under the
+strict `MCAP_CLOUD_URL` origin binding).
+
+**Promotion contract.** On a complete download with a finalized cache file,
+the job calls the host's optional `pj.source_promotion.v1` service to
+replace the eagerly-ingested dataset with a stock file-backed load of the
+cache file (loader `mcap-loader`, `use_log_time` preset) — that is what
+attaches the source record a later layout save exports. No promotion service
+/ rejected promotion / tee failure ⇒ `SUCCEEDED_EAGER_ONLY`: the eager
+dataset stays usable, it just is not re-saveable as an import source.
+
+**Headless bind semantics.** `bind()` is network-free: the persisted-state
+restore + auto-connect run once at the **first `getDialog()`** (the
+interactive-only entry point), so a host binding the plugin purely as an
+import provider never triggers a connection. The dialog's command-pump
+thread does start at construction, but idles without touching network,
+credentials, or settings.
+
 ## Tests (ctest)
 
 ```bash
@@ -221,7 +281,10 @@ Two modes, gated by `MCAP_CLOUD_LIVE_URL`:
   smoke` harness on `:8081`): everything above plus the live transport/session/
   resume tests against the seeded corpus, asserting exact ground-truth message
   counts (pinned in lockstep with `scripts/smoke.sh` and
-  `tests/backend_connection_live_test.cpp`).
+  `tests/backend_connection_live_test.cpp`), and the live descriptor-import
+  round trip (query → import → materialized hit; `make smoke` additionally
+  `mcapdiff`s the resulting cache file against a direct CLI download of the
+  same tuple).
 
 ## Ingest path — host-delegated parsing
 

@@ -291,6 +291,52 @@ class SilentTcpServer {
   bool ok_ = false;
 };
 
+// A WS server that REJECTS every Hello with a wire Error{code, message} —
+// drives the §10 auth-remediation-hint machine gate (stage-4 PR-4): the hint
+// must key off the terminal Hello ErrorCode (AUTH_FAILED vs anything else),
+// never off error-text sniffing.
+class HelloRejectServer {
+ public:
+  explicit HelloRejectServer(pj_cloud::v1::ErrorCode code,
+                             std::string message = "rejected by fake server")
+      : port_(findFreePort()), server_(port_, "127.0.0.1") {
+    server_.setOnClientMessageCallback([code, message = std::move(message)](
+                                           std::shared_ptr<ix::ConnectionState>, ix::WebSocket& ws,
+                                           const ix::WebSocketMessagePtr& msg) {
+      if (msg->type != ix::WebSocketMessageType::Message) {
+        return;
+      }
+      pj_cloud::v1::ClientMessage request;
+      if (!request.ParseFromString(msg->str) || !request.has_hello()) {
+        return;
+      }
+      pj_cloud::v1::ServerMessage response;
+      response.set_request_id(request.request_id());
+      auto* error = response.mutable_error();
+      error->set_code(code);
+      error->set_message(message);
+      std::string payload;
+      response.SerializeToString(&payload);
+      ws.sendBinary(payload);
+    });
+    auto res = server_.listen();
+    ok_ = res.first;
+    if (ok_) {
+      server_.start();
+    }
+  }
+  ~HelloRejectServer() { server_.stop(); }
+  HelloRejectServer(const HelloRejectServer&) = delete;
+  HelloRejectServer& operator=(const HelloRejectServer&) = delete;
+  [[nodiscard]] bool ok() const { return ok_; }
+  [[nodiscard]] std::string uri() const { return "ws://127.0.0.1:" + std::to_string(port_); }
+
+ private:
+  int port_;
+  ix::WebSocketServer server_;
+  bool ok_ = false;
+};
+
 // A WS server that completes the socket open but never answers the Hello —
 // pins the (wake_on_cancel) Hello wait staying promptly cancellable.
 class SilentHelloServer {

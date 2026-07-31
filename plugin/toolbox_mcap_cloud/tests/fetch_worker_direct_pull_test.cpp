@@ -246,6 +246,103 @@ TEST(McapCloudDirectPull, ByteCeilingExceededFailsWithByteCauseNeverCancelled) {
   EXPECT_EQ(rt.sessionCache().size(), 0u);
 }
 
+// ---------------------------------------------------------------------------
+// The §10 auth remediation hint (stage-4 PR-4): appended to the connect
+// failure IFF the server rejected the Hello with ERROR_AUTH_FAILED AND the
+// resolved connection snapshot carried NO credential (missing-credential).
+// MACHINE-gated on the wire ErrorCode — never on error-text sniffing.
+// ---------------------------------------------------------------------------
+
+namespace {
+constexpr const char* kAuthHintFragment = "no stored credential for this server";
+}  // namespace
+
+TEST(McapCloudDirectPull, HelloAuthRejectionWithoutCredentialAppendsRemediationHint) {
+  mcap_cloud_test::HelloRejectServer server(pj_cloud::v1::ERROR_AUTH_FAILED, "auth denied by fake");
+  ASSERT_TRUE(server.ok());
+  TempRoot cache_root("authhint-cache");
+  TempRoot config_root("authhint-config");
+  mcap_cloud::ImportRuntime rt(mcap_cloud::SessionFileCache(cache_root.path),
+                               mcap_cloud::TrustedOrigins(config_root.path));
+
+  PullHarness h;
+  // The default harness request carries an EMPTY api_key (dev-anonymous
+  // snapshot) — the missing-credential half of the gate.
+  const mcap_cloud::PullResult result = h.worker.pull(h.request(rt, server.uri()));
+
+  EXPECT_EQ(result.terminal, mcap_cloud::PullTerminal::kFailed);
+  // The server's verbatim Error message stays first (never replaced) ...
+  EXPECT_NE(result.error.find("auth denied by fake"), std::string::npos) << result.error;
+  // ... and the §10 remediation hint is APPENDED.
+  EXPECT_NE(result.error.find(kAuthHintFragment), std::string::npos) << result.error;
+  EXPECT_NE(result.error.find("MCAP_CLOUD_API_KEY"), std::string::npos) << result.error;
+}
+
+TEST(McapCloudDirectPull, HelloAuthRejectionWithCredentialGetsNoHint) {
+  mcap_cloud_test::HelloRejectServer server(pj_cloud::v1::ERROR_AUTH_FAILED, "auth denied by fake");
+  ASSERT_TRUE(server.ok());
+  TempRoot cache_root("authcred-cache");
+  TempRoot config_root("authcred-config");
+  mcap_cloud::ImportRuntime rt(mcap_cloud::SessionFileCache(cache_root.path),
+                               mcap_cloud::TrustedOrigins(config_root.path));
+
+  PullHarness h;
+  mcap_cloud::PullRequest request = h.request(rt, server.uri());
+  request.connection.credentials.api_key = "some-stored-but-wrong-key";
+  request.connection.credentials.api_key_source = mcap_cloud::TokenSource::kStored;
+  const mcap_cloud::PullResult result = h.worker.pull(std::move(request));
+
+  // Wrong-credential != missing-credential: a presented-and-rejected key must
+  // NOT claim "no stored credential" (the §10 hint would be a lie here).
+  EXPECT_EQ(result.terminal, mcap_cloud::PullTerminal::kFailed);
+  EXPECT_NE(result.error.find("auth denied by fake"), std::string::npos) << result.error;
+  EXPECT_EQ(result.error.find(kAuthHintFragment), std::string::npos) << result.error;
+}
+
+// Adversarial F15: a stored EMPTY dev-anonymous token is a PRESENT
+// credential (TokenSource::kStored) — an AUTH_FAILED against it must NOT
+// claim "no stored credential" even though the token BYTES are empty. The
+// hint gates on provenance, never on api_key.empty().
+TEST(McapCloudDirectPull, StoredEmptyDevTokenGetsNoHintOnAuthFailure) {
+  mcap_cloud_test::HelloRejectServer server(pj_cloud::v1::ERROR_AUTH_FAILED, "auth denied by fake");
+  ASSERT_TRUE(server.ok());
+  TempRoot cache_root("authdev-cache");
+  TempRoot config_root("authdev-config");
+  mcap_cloud::ImportRuntime rt(mcap_cloud::SessionFileCache(cache_root.path),
+                               mcap_cloud::TrustedOrigins(config_root.path));
+
+  PullHarness h;
+  mcap_cloud::PullRequest request = h.request(rt, server.uri());
+  request.connection.credentials.api_key = "";  // the stored dev-anonymous token
+  request.connection.credentials.api_key_source = mcap_cloud::TokenSource::kStored;
+  const mcap_cloud::PullResult result = h.worker.pull(std::move(request));
+
+  EXPECT_EQ(result.terminal, mcap_cloud::PullTerminal::kFailed);
+  EXPECT_NE(result.error.find("auth denied by fake"), std::string::npos) << result.error;
+  EXPECT_EQ(result.error.find(kAuthHintFragment), std::string::npos)
+      << "a present-but-empty stored credential must not produce the no-credential hint (F15): "
+      << result.error;
+}
+
+TEST(McapCloudDirectPull, NonAuthHelloRejectionGetsNoHint) {
+  mcap_cloud_test::HelloRejectServer server(pj_cloud::v1::ERROR_PROTOCOL_VERSION,
+                                            "protocol too old");
+  ASSERT_TRUE(server.ok());
+  TempRoot cache_root("nonauth-cache");
+  TempRoot config_root("nonauth-config");
+  mcap_cloud::ImportRuntime rt(mcap_cloud::SessionFileCache(cache_root.path),
+                               mcap_cloud::TrustedOrigins(config_root.path));
+
+  PullHarness h;
+  const mcap_cloud::PullResult result = h.worker.pull(h.request(rt, server.uri()));
+
+  // Empty api_key but a NON-auth Hello error: the credential hint would
+  // misdiagnose the failure — machine gate must keep it off.
+  EXPECT_EQ(result.terminal, mcap_cloud::PullTerminal::kFailed);
+  EXPECT_NE(result.error.find("protocol too old"), std::string::npos) << result.error;
+  EXPECT_EQ(result.error.find(kAuthHintFragment), std::string::npos) << result.error;
+}
+
 TEST(McapCloudDirectPull, RequiresRuntimeAndHosts) {
   TempRoot cache_root("guards-cache");
   TempRoot config_root("guards-config");

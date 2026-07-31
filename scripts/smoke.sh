@@ -189,6 +189,11 @@ SMOKE_BUILDER_PID=""
 # Per-run scratch dir for step f's round-trip artifacts. Removed on EVERY exit
 # path (success, fail, signal).
 SMOKE_WORKDIR=""
+# Per-run scratch dir for step d's descriptor-import round-trip artifacts (the
+# live gtest's exported cache file + the direct CLI download it is diffed
+# against). Separate from SMOKE_WORKDIR because step f re-mktemps that one
+# unconditionally. Removed on EVERY exit path.
+SMOKE_IMPORT_WORKDIR=""
 # Set by compute_local_ground_truth (step a) / derive_server_ground_truth
 # (step c); consumed by steps e/f/g/h. Not `readonly` — computed at runtime.
 ACTUAL_FILE_COUNT=""
@@ -233,6 +238,9 @@ cleanup() {
   local rc=$?
   if [[ -n "${SMOKE_WORKDIR}" && -d "${SMOKE_WORKDIR}" ]]; then
     rm -rf "${SMOKE_WORKDIR}"
+  fi
+  if [[ -n "${SMOKE_IMPORT_WORKDIR}" && -d "${SMOKE_IMPORT_WORKDIR}" ]]; then
+    rm -rf "${SMOKE_IMPORT_WORKDIR}"
   fi
   if [[ -n "${SMOKE_SERVER_PID}" ]] && kill -0 "${SMOKE_SERVER_PID}" 2>/dev/null; then
     log "stopping harness server (pid ${SMOKE_SERVER_PID})"
@@ -761,6 +769,37 @@ step_cpp_tests() {
   ( cd "${CTEST_DIR}" && MCAP_CLOUD_LIVE_URL="ws://localhost:${SMOKE_PORT}" \
       ctest --output-on-failure -R McapCloudParserIngestLive ) \
     || fail "cpp: live ctest (McapCloudParserIngestLive) failed"
+
+  log "step d: ctest LIVE descriptor-import provider (McapCloudDescriptorImportLive)"
+  SMOKE_IMPORT_WORKDIR="$(mktemp -d)" || fail "cpp: mktemp -d failed for the import round-trip"
+  local import_cache_copy="${SMOKE_IMPORT_WORKDIR}/import_cache.mcap"
+  ( cd "${CTEST_DIR}" && MCAP_CLOUD_LIVE_URL="ws://localhost:${SMOKE_PORT}" \
+      MCAP_CLOUD_LIVE_CACHE_COPY="${import_cache_copy}" \
+      ctest --output-on-failure -R McapCloudDescriptorImportLive ) \
+    || fail "cpp: live ctest (McapCloudDescriptorImportLive) failed"
+
+  # §12 import round-trip: the provider's finalized CACHE FILE (exported by
+  # the live gtest via MCAP_CLOUD_LIVE_CACHE_COPY) must be mcapdiff-equal to
+  # a DIRECT CLI download of the SAME tuple — the live gtest's descriptor is
+  # exactly (TARGET_KEY, topics=/imu, full range, include_latched=true), so
+  # the CLI leg mirrors it verbatim (--topics /imu --latched, no time range).
+  # This is the cache-is-the-sole-encoder equality gate: the file an import
+  # would promote is what a plain download of that request yields.
+  log "step d: import round-trip (spec §12): cache file vs direct CLI download of the same tuple"
+  [[ -s "${import_cache_copy}" ]] \
+    || fail "roundtrip-import: live import did not export its cache file to ${import_cache_copy}"
+  local import_sdk_cli="${CTEST_DIR}/bin/mcap-cloud-cli"
+  local import_mcapdiff="${SERVER_DIR}/bin/mcapdiff"
+  [[ -x "${import_sdk_cli}" ]]  || fail "roundtrip-import: mcap-cloud-cli missing at ${import_sdk_cli}"
+  [[ -x "${import_mcapdiff}" ]] || fail "roundtrip-import: mcapdiff binary missing at ${import_mcapdiff}"
+  local import_cli_dl="${SMOKE_IMPORT_WORKDIR}/import_cli.mcap"
+  "${import_sdk_cli}" --url "ws://localhost:${SMOKE_PORT}" download "${TARGET_KEY}" \
+      --topics /imu --latched --output "${import_cli_dl}" >/dev/null 2>&1 \
+    || fail "roundtrip-import: direct CLI download of ${TARGET_KEY} (/imu) failed"
+  if ! "${import_mcapdiff}" "${import_cache_copy}" "${import_cli_dl}"; then
+    fail "roundtrip-import: import cache file NOT logically equal to the direct CLI download (mcapdiff above)"
+  fi
+  log "step d: OK import round-trip (§12: cache file == direct CLI download)"
 
   local live_out
   if ! live_out="$(MCAP_CLOUD_LIVE_URL="ws://localhost:${SMOKE_PORT}" "${live_bin}" 2>&1)"; then

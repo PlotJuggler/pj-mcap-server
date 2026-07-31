@@ -87,6 +87,14 @@ std::string formatWireError(const pj_cloud::v1::Error& err) {
   return errorCodeName(err.code());
 }
 
+// Map a Hello-terminating wire Error onto the plugin-side machine-readable
+// classification (backend_types.hpp HelloErrorCode) — shared by connect() and
+// reconnectAndHello() so the two handshake paths can't drift.
+HelloErrorCode classifyHelloError(const pj_cloud::v1::Error& err) {
+  return err.code() == pj_cloud::v1::ERROR_AUTH_FAILED ? HelloErrorCode::kAuthFailed
+                                                       : HelloErrorCode::kOther;
+}
+
 }  // namespace
 
 BackendConnection::BackendConnection(std::string uri, std::string cert_path, std::string api_key, bool allow_insecure)
@@ -379,6 +387,11 @@ bool BackendConnection::connect(std::string* error_out) {
     }
   };
 
+  // Every handshake attempt describes ONLY itself (same rationale as the
+  // backend_caps_/server_caps_ reset below): a stale AUTH_FAILED from a prior
+  // attempt must not survive into a retry that fails differently.
+  last_hello_error_ = HelloErrorCode::kNone;
+
   if (!buildAndOpenSocket(error_out)) {
     return false;
   }
@@ -403,6 +416,7 @@ bool BackendConnection::connect(std::string* error_out) {
   }
 
   if (response.has_error()) {
+    last_hello_error_ = classifyHelloError(response.error());
     set_error(formatWireError(response.error()));
     socket_->stop();
     socket_.reset();
@@ -1131,6 +1145,9 @@ bool BackendConnection::reconnectAndHello(std::string* error_out) {
     socket_->stop();
     socket_.reset();
   }
+  // Same per-attempt reset as connect(): lastHelloErrorCode() describes the
+  // LAST handshake, whichever path ran it.
+  last_hello_error_ = HelloErrorCode::kNone;
   if (!buildAndOpenSocket(error_out)) {
     return false;
   }
@@ -1145,6 +1162,7 @@ bool BackendConnection::reconnectAndHello(std::string* error_out) {
     return false;
   }
   if (response.has_error()) {
+    last_hello_error_ = classifyHelloError(response.error());
     if (error_out != nullptr) {
       *error_out = formatWireError(response.error());
     }
