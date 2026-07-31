@@ -1033,7 +1033,7 @@ TEST(McapCloudProviderJob, ProviderEnvByteCapAppliesWithoutCallerCeiling) {
   ProviderHarness h("job-envcap");
   const std::optional<std::string> saved =
       mcap_cloud_test::HermeticEnv::capture("MCAP_CLOUD_IMPORT_MAX_BYTES");
-  ::setenv("MCAP_CLOUD_IMPORT_MAX_BYTES", "1", 1);
+  mcap_cloud_test::setEnvVar("MCAP_CLOUD_IMPORT_MAX_BYTES", "1");
 
   JobRecorder recorder;
   ScopedJob job;
