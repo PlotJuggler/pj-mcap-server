@@ -24,7 +24,7 @@ by owner and an ended owner yields to another eligible ingest.
 **Tech stack:** PJ4 `pj_app` (Qt6, C++20), gtest via `add_pj_app_gui_test` +
 `layout_import_batch_test`, fake provider harness `pj_app/tests/support/fake_import_provider.h`.
 
-**Status: LOCKED — consult blockers folded in; ready to execute.**
+**Status: EXECUTED — PJ4 PR #500 (2026-07-31/08-01). Execution record in §6.**
 
 ---
 
@@ -265,3 +265,44 @@ continuation), D4/D5/D7 locked (D4 verified through
 D6 amended to mandatory real-surface fake (registry views live for the session lifetime;
 single deterministic tick — the throttle setter is host-concrete-only), plus new D8
 (strip displayed ownership) and D9 (#498 coexistence) with dedicated tests.
+
+## 6. Execution record (2026-07-31/08-01)
+
+Subagent-driven, two-stage review per task (spec then quality), red-first TDD
+throughout. **PJ4 PR #500** (`feat/growing-import-binder`, 6 commits on
+de8c9104/main):
+
+- **Task 1** `5e6521e3` — correlation + per-job cancel: session `JobId`
+  (`Expected<JobId>` startImport) + nonblocking `cancelJob`; batch
+  `activeImportDataset()` + `cancelActiveImportJob()` (keep-partial). Fake gained
+  the `announce-then-block` mode (spec-adjudicated: minimal necessary — the
+  mid-job window is unobservable without a post-announce gate). Spec-compliant;
+  quality approved zero findings.
+- **Task 2** `909cc81f` + review rounds `489ea86f`, `b3ffc727` — strip displayed
+  ownership `{kFile,kInteractiveToolbox,kLayoutBatch}` replacing last-started-wins
+  (arbitration: file > interactive > layout-batch, newest-begin-wins within rank,
+  batch strictly residual); MainWindow batch-scoped SessionManager observers with
+  teardown before every batch reset INCLUDING `~MainWindow` (review round: the
+  dtor-side teardown converted an undocumented declaration-order safety accident
+  into a structural invariant); per-job Stop route; D9 no-fold/no-displace.
+  Quality review's own shuffle verification caught a residual strip-engagement
+  leak beyond its first prescription — fixed and re-verified (seeds 1/42/7).
+- **Task 3** `9138bda1` — ZERO production changes. Real-surface progressive fake
+  (cached bound views; createDataSource → on_dataset(real handle) →
+  createDatasetIngest/progressStart → real write-host rows → ONE tick → gate).
+  Pins: mid-job curve binding through the real chain (headline); D2
+  on_dataset-before-ingestBegan delivery; D4 real promotion transaction with
+  DatasetId/TopicId stability (kSucceededPromoted proven via SourceRecord +
+  no-eager-only-diagnostic — adjudicated stronger than result() sampling);
+  out-of-band pure binder net. Spec reviewer empirically reproduced the red phase
+  by reverting the fake. Quality approved (4 nits recorded, below fix bar).
+- **Task 4** `ea582c52` — comment truth: every future-tense T7 reference in PJ4
+  made present-tense as-built (verified comment-only diff); spec §6.2/§8/§9.3 +
+  stage-3 plan closed in this repo alongside the PR.
+
+Full pj_app ctest 31/31 throughout; binder suite (10 scenarios) shuffle-stable.
+Recorded follow-ups: SDK doc fix — `PJ_toolbox_host_vtable_t` slots tagged
+`[main-thread]` while the engine-locked implementation + production worker-thread
+writes are the sanctioned shape (spec-reviewer-confirmed stale tag, not code);
+Task-3 quality nits N1–N4 (fake epilogue dedup, timer-block dedup, sentinel
+conflation, dual choreography narration) for a future cleanup pass.

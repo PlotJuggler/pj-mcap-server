@@ -305,6 +305,15 @@ not `FileLoader::queueDrained`, provides the drain signal for these jobs — the
 seam already decouples that). This is V2's binder work, pulled into scope by the V3+B
 decision; it is batch-scoped and does not touch the ordinary non-cloud layout-load path.
 Failures are per-job (§10). Import jobs are sequential in v1 of the feature.
+**[AS-BUILT, PJ4 #500]** The binder landed as correlation + observation, not a new
+binder object: `LayoutImportBatch::activeImportDataset()` correlates the job's
+`on_dataset` handle; MainWindow observes `SessionManager`'s ingest signals
+batch-scoped and drives the title-bar strip under an explicit displayed-owner
+arbitration (file > interactive > layout-batch — batch display is strictly
+residual); the strip's Stop cancels ONLY the active job keep-partial
+(`cancelActiveImportJob` / session `cancelJob(JobId)`); mid-import binding rides
+the already-merged retention channel and is pinned through the real host surfaces
+by `main_window_layout_import_binder_test`.
 
 ### 6.3 Provider query — strict contract
 
@@ -466,7 +475,9 @@ Host:
 - **Growing-import binder** (V3+B): the batch-scoped generalization of the progressive
   curve binder to bind against a toolbox import growing under a layout-import job (#470
   publish ticks as growth events; batch drain instead of `queueDrained`). Scoped so ordinary
-  non-cloud layout loads never traverse new code.
+  non-cloud layout loads never traverse new code. **DONE — PJ4 #500** (see the §6.2
+  as-built note: correlation surface + MainWindow observation + strip displayed-owner
+  arbitration + per-job keep-partial Stop).
 
 Explicitly **not** built (v2 components dissolved or #470-supplied): `<replay_sources>`,
 `ReplayRecord` as a separate registry concept, the `ReplayManager` batch coordinator (shrunk to
@@ -621,7 +632,8 @@ Explicitly **not** built (v2 components dissolved or #470-supplied): `<replay_so
    host-visible, the precondition for both authoring UX and import-job binding.
 3. **SDK ABI + host** — the §8 extension + service routing (zero new vtable slots) +
    fake-provider host tests;
-   `LayoutImportBatch` + `LoadTicket`; **growing-import binder** (batch-scoped); source
+   `LayoutImportBatch` + `LoadTicket`; **growing-import binder** (batch-scoped; DONE —
+   PJ4 #500); source
    records + registry (incl. lifecycle hoist); layout rewrite-then-classify; stable-ID loader
    matching. **Publish the new SDK package and bump the plugin's SDK pin** (DONE
    2026-07-29: the SDK half shipped as **0.20.0** and `plugin/SDK_VERSION` is bumped —

@@ -194,12 +194,14 @@ unchanged at `LayoutXml.cpp:77/:546`.
   Trust-gate UI: consolidated confirm prompt (interactive) / fail-with-diagnostic
   (non-interactive). Tests: gui-test per scenario (batch classify matrix, policy
   persistence, per-job failure isolation, cancel, rollback).
-- [ ] **T7 — growing-import binder.** Batch-scoped generalization of the
+- [x] **T7 — growing-import binder.** Batch-scoped generalization of the
   busy-restore flow: `PendingDisplayBinder` + `CatalogModel::itemsAdded` retries run
   while a batch-owned toolbox import grows (#470 publish ticks); the BATCH provides
   the drain signal for its jobs (not `FileLoader::queueDrained`). Ordinary non-cloud
   layout loads must traverse zero new code. Tests: gui-test with a fake provider
-  pushing progressive datasets.
+  pushing progressive datasets. **DONE — PJ4 #500** (own follow-up PR, split out of
+  PR-B during review; consult-amended plan + execution record:
+  `docs/plans/2026-07-31-layout-import-t7-binder.md`).
 
 **PR strategy:** two PJ4 PRs — PR-A = T1–T4 (additive foundations, independently
 mergeable, no behavior change without a `<materialize>` layout except D2's stricter
