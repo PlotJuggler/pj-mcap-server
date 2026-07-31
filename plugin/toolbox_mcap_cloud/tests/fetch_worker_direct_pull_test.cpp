@@ -289,6 +289,7 @@ TEST(McapCloudDirectPull, HelloAuthRejectionWithCredentialGetsNoHint) {
   PullHarness h;
   mcap_cloud::PullRequest request = h.request(rt, server.uri());
   request.connection.credentials.api_key = "some-stored-but-wrong-key";
+  request.connection.credentials.api_key_source = mcap_cloud::TokenSource::kStored;
   const mcap_cloud::PullResult result = h.worker.pull(std::move(request));
 
   // Wrong-credential != missing-credential: a presented-and-rejected key must
@@ -296,6 +297,31 @@ TEST(McapCloudDirectPull, HelloAuthRejectionWithCredentialGetsNoHint) {
   EXPECT_EQ(result.terminal, mcap_cloud::PullTerminal::kFailed);
   EXPECT_NE(result.error.find("auth denied by fake"), std::string::npos) << result.error;
   EXPECT_EQ(result.error.find(kAuthHintFragment), std::string::npos) << result.error;
+}
+
+// Adversarial F15: a stored EMPTY dev-anonymous token is a PRESENT
+// credential (TokenSource::kStored) — an AUTH_FAILED against it must NOT
+// claim "no stored credential" even though the token BYTES are empty. The
+// hint gates on provenance, never on api_key.empty().
+TEST(McapCloudDirectPull, StoredEmptyDevTokenGetsNoHintOnAuthFailure) {
+  mcap_cloud_test::HelloRejectServer server(pj_cloud::v1::ERROR_AUTH_FAILED, "auth denied by fake");
+  ASSERT_TRUE(server.ok());
+  TempRoot cache_root("authdev-cache");
+  TempRoot config_root("authdev-config");
+  mcap_cloud::ImportRuntime rt(mcap_cloud::SessionFileCache(cache_root.path),
+                               mcap_cloud::TrustedOrigins(config_root.path));
+
+  PullHarness h;
+  mcap_cloud::PullRequest request = h.request(rt, server.uri());
+  request.connection.credentials.api_key = "";  // the stored dev-anonymous token
+  request.connection.credentials.api_key_source = mcap_cloud::TokenSource::kStored;
+  const mcap_cloud::PullResult result = h.worker.pull(std::move(request));
+
+  EXPECT_EQ(result.terminal, mcap_cloud::PullTerminal::kFailed);
+  EXPECT_NE(result.error.find("auth denied by fake"), std::string::npos) << result.error;
+  EXPECT_EQ(result.error.find(kAuthHintFragment), std::string::npos)
+      << "a present-but-empty stored credential must not produce the no-credential hint (F15): "
+      << result.error;
 }
 
 TEST(McapCloudDirectPull, NonAuthHelloRejectionGetsNoHint) {

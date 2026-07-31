@@ -1724,8 +1724,12 @@ PullResult FetchWorker::pull(PullRequest request) {
       // snapshot carried NO credential — missing-credential, not
       // wrong-credential (a presented-and-rejected key gets no hint: the
       // stored key is simply wrong, and "no stored credential" would lie).
+      // F15: gate on PROVENANCE, not token bytes — a stored EMPTY
+      // dev-anonymous token is a PRESENT credential (kStored), and telling
+      // that user "no stored credential" would lie; only a genuinely absent
+      // credential (kNone) earns the hint.
       if (session_backend->lastHelloErrorCode() == HelloErrorCode::kAuthFailed &&
-          request.connection.credentials.api_key.empty()) {
+          request.connection.credentials.api_key_source == TokenSource::kNone) {
         result.error +=
             "; no stored credential for this server — connect once in the MCAP Cloud toolbox "
             "or set MCAP_CLOUD_API_KEY (with MCAP_CLOUD_URL matching this origin)";
