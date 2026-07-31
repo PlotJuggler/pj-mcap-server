@@ -302,6 +302,33 @@ fs::path SessionFileCache::partialPathFor(const MaterializeLock& lock) const {
   return lock.partial_;
 }
 
+std::optional<FileLock> SessionFileCache::acquireReadLease(std::string_view identity,
+                                                           std::string* error) {
+  const auto hex = identityHex(identity);
+  if (!hex.has_value()) {
+    if (error) {
+      *error = "invalid descriptor identity (want mcap-cloud:v1:sha256/128:<32 lowercase hex>)";
+    }
+    return std::nullopt;
+  }
+  if (root_.empty()) {
+    if (error) {
+      *error = "cache root is not configured";
+    }
+    return std::nullopt;
+  }
+  ensureDir0700(root_);
+  std::string lock_error;
+  auto lease = FileLock::tryShared(root_ / (*hex + ".mcap.lock"), &lock_error);
+  if (!lease.has_value()) {
+    if (error) {
+      *error = "cache read lease unavailable: " + lock_error;
+    }
+    return std::nullopt;
+  }
+  return lease;
+}
+
 bool SessionFileCache::finalize(const MaterializeLock& lock,
                                 const std::optional<ExpectedContent>& expected,
                                 std::string* error) {

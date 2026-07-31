@@ -16,8 +16,15 @@
 
 namespace mcap_cloud {
 
-std::optional<FileLock> FileLock::tryExclusive(const std::filesystem::path& path,
-                                               std::string* error) {
+namespace {
+
+// Shared try-acquire body for both modes: open/create the 0600 lock file,
+// then take the advisory lock non-blocking. `exclusive` selects LOCK_EX vs
+// LOCK_SH (POSIX) / the LOCKFILE_EXCLUSIVE_LOCK flag (Windows) — both modes
+// contend on the same first byte, so shared holders stack and block an
+// exclusive try (and vice versa).
+std::optional<std::intptr_t> tryAcquireHandle(const std::filesystem::path& path, bool exclusive,
+                                              std::string* error) {
 #if defined(_WIN32)
   const HANDLE handle =
       ::CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE,
@@ -31,15 +38,16 @@ std::optional<FileLock> FileLock::tryExclusive(const std::filesystem::path& path
     return std::nullopt;
   }
   OVERLAPPED overlapped{};
-  if (::LockFileEx(handle, LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
-                   0, 1, 0, &overlapped) == 0) {
+  const DWORD flags =
+      LOCKFILE_FAIL_IMMEDIATELY | (exclusive ? LOCKFILE_EXCLUSIVE_LOCK : 0);
+  if (::LockFileEx(handle, flags, 0, 1, 0, &overlapped) == 0) {
     ::CloseHandle(handle);
     if (error) {
       *error = "lock is held elsewhere: " + path.string();
     }
     return std::nullopt;
   }
-  return FileLock(reinterpret_cast<std::intptr_t>(handle));
+  return reinterpret_cast<std::intptr_t>(handle);
 #else
   const int fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
   if (fd < 0) {
@@ -49,7 +57,7 @@ std::optional<FileLock> FileLock::tryExclusive(const std::filesystem::path& path
     }
     return std::nullopt;
   }
-  if (::flock(fd, LOCK_EX | LOCK_NB) != 0) {
+  if (::flock(fd, (exclusive ? LOCK_EX : LOCK_SH) | LOCK_NB) != 0) {
     const int flock_errno = errno;
     ::close(fd);
     if (error) {
@@ -60,8 +68,28 @@ std::optional<FileLock> FileLock::tryExclusive(const std::filesystem::path& path
     }
     return std::nullopt;
   }
-  return FileLock(static_cast<std::intptr_t>(fd));
+  return static_cast<std::intptr_t>(fd);
 #endif
+}
+
+}  // namespace
+
+std::optional<FileLock> FileLock::tryExclusive(const std::filesystem::path& path,
+                                               std::string* error) {
+  auto handle = tryAcquireHandle(path, /*exclusive=*/true, error);
+  if (!handle.has_value()) {
+    return std::nullopt;
+  }
+  return FileLock(*handle);
+}
+
+std::optional<FileLock> FileLock::tryShared(const std::filesystem::path& path,
+                                            std::string* error) {
+  auto handle = tryAcquireHandle(path, /*exclusive=*/false, error);
+  if (!handle.has_value()) {
+    return std::nullopt;
+  }
+  return FileLock(*handle);
 }
 
 FileLock::FileLock(FileLock&& other) noexcept : handle_(std::exchange(other.handle_, -1)) {}

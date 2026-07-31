@@ -119,6 +119,7 @@ set(MCAP_CLOUD_SOURCES
   src/session_decode.cpp
   src/session_mcap_writer.cpp
   src/session_file_cache.cpp
+  src/source_descriptor.cpp
   src/mcap_save_path.cpp
   src/mcap_implementation.cpp
   src/settings_store.cpp

@@ -96,9 +96,20 @@ class SessionFileCache {
   [[nodiscard]] bool finalize(const MaterializeLock& lock,
                               const std::optional<ExpectedContent>& expected, std::string* error);
 
+  /// SHARED read lease on `identity`'s lock sidecar (spec §5: every live
+  /// cache-backed consumer holds one for the file's whole lifetime — Linux
+  /// unlink-while-open does NOT protect lazy re-opens). While any lease is
+  /// live, cleanup()/eviction and tryLockForMaterialize (both exclusive on
+  /// the same sidecar) fail/skip; leases stack across holders. Pair with
+  /// lookup() — this takes no position on whether the cache file exists.
+  [[nodiscard]] std::optional<FileLock> acquireReadLease(std::string_view identity,
+                                                         std::string* error);
+
   /// Startup/maintenance: remove orphaned partials older than
   /// orphan_partial_age whose lock is free; then LRU-evict unlocked files
   /// (touch-file order) until under max_total_bytes AND min_free_bytes holds.
+  /// Skips any file whose identity lock is busy — a live materialization OR a
+  /// shared read lease (acquireReadLease) both hold that lock.
   void cleanup(const Config& cfg);
 
  private:

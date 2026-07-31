@@ -437,6 +437,78 @@ TEST(SessionFileCache, CleanupEvictsOldestTouchedFirstAndStopsAtCap) {
   EXPECT_TRUE(fs::exists(fs::path(file_new.string() + ".touch")));
 }
 
+// Stage-4 shared read leases (spec §5): a live cache-backed consumer holds a
+// SHARED lease on the identity's lock sidecar for the file's whole lifetime,
+// so eviction (which takes the exclusive lock per victim) must skip it and
+// resume once the lease is released.
+TEST(SessionFileCache, CleanupSkipsSharedLeasedFileAndEvictsAfterRelease) {
+  TempRoot root("lease-evict");
+  mcap_cloud::SessionFileCache cache(root.path);
+  const auto d = descriptor("leased.mcap");
+  const std::string identity = mcap_cloud::descriptorIdentity(d);
+  const fs::path file = materialize(cache, d);
+  ASSERT_TRUE(fs::exists(file));
+
+  std::string error;
+  auto lease = cache.acquireReadLease(identity, &error);
+  ASSERT_TRUE(lease.has_value()) << error;
+
+  // A second shared lease on the SAME identity coexists (read leases stack).
+  std::string error2;
+  auto lease2 = cache.acquireReadLease(identity, &error2);
+  EXPECT_TRUE(lease2.has_value()) << error2;
+
+  mcap_cloud::SessionFileCache::Config cfg;
+  cfg.max_total_bytes = 0;  // evict everything evictable
+  cfg.min_free_bytes = 0;
+  cache.cleanup(cfg);
+  EXPECT_TRUE(fs::exists(file)) << "a shared-leased file must never be evicted";
+
+  // While a shared lease is live, a materialization of the same identity is
+  // refused (the lease holder is reading the file the writer would replace).
+  std::string mat_error;
+  EXPECT_FALSE(cache.tryLockForMaterialize(identity, &mat_error).has_value());
+
+  lease.reset();
+  lease2.reset();
+  cache.cleanup(cfg);
+  EXPECT_FALSE(fs::exists(file)) << "eviction must resume after the lease is released";
+}
+
+TEST(SessionFileCache, ReadLeaseRejectsMalformedIdentity) {
+  TempRoot root("lease-identity");
+  mcap_cloud::SessionFileCache cache(root.path);
+  std::string error;
+  EXPECT_FALSE(cache.acquireReadLease("garbage", &error).has_value());
+  EXPECT_NE(error.find("identity"), std::string::npos) << error;
+}
+
+// FileLock-level shared/exclusive contract (POSIX flock LOCK_SH / Windows
+// LockFileEx without LOCKFILE_EXCLUSIVE_LOCK): shared locks stack; an
+// exclusive try fails while any shared holder is live and succeeds after.
+TEST(SessionFileCache, FileLockSharedExclusiveContract) {
+  TempRoot root("filelock-shared");
+  const fs::path lock_path = root.path / "contract.lock";
+
+  std::string error;
+  auto shared1 = mcap_cloud::FileLock::tryShared(lock_path, &error);
+  ASSERT_TRUE(shared1.has_value()) << error;
+  auto shared2 = mcap_cloud::FileLock::tryShared(lock_path, &error);
+  EXPECT_TRUE(shared2.has_value()) << "shared locks must coexist: " << error;
+
+  EXPECT_FALSE(mcap_cloud::FileLock::tryExclusive(lock_path, &error).has_value())
+      << "exclusive must fail while shared holders are live";
+
+  shared1.reset();
+  shared2.reset();
+  EXPECT_TRUE(mcap_cloud::FileLock::tryExclusive(lock_path, &error).has_value()) << error;
+
+  // And the inverse: an exclusive holder blocks a shared try.
+  auto exclusive = mcap_cloud::FileLock::tryExclusive(lock_path, &error);
+  ASSERT_TRUE(exclusive.has_value()) << error;
+  EXPECT_FALSE(mcap_cloud::FileLock::tryShared(lock_path, &error).has_value());
+}
+
 TEST(SessionFileCache, CleanupSkipsLockedVictims) {
   TempRoot root("lru-locked");
   mcap_cloud::SessionFileCache cache(root.path);
