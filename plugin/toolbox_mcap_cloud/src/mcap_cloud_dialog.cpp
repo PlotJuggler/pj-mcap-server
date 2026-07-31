@@ -44,7 +44,6 @@
 #include "mcap_cloud_panel_manifest.hpp"
 #include "mcap_cloud_panel_ui.hpp"
 #include "name_filter.h"
-#include "origin_match.hpp"
 #include "query_filter.h"
 #include "server_history.h"
 #include "settings_store.hpp"

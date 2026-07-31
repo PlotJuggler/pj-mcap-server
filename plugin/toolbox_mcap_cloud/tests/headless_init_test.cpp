@@ -26,6 +26,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -42,24 +43,16 @@
 #include "mcap_cloud_toolbox.hpp"
 #include "parser_ingest_test_support.hpp"
 #include "pj_cloud.pb.h"
+#include "test_support_fs.hpp"
 
 namespace {
 
 namespace fs = std::filesystem;
 using mcap_cloud_test::findFreePort;
 
-struct TempRoot {
-  explicit TempRoot(const std::string& name) {
-    path = fs::temp_directory_path() / ("mcap-cloud-headless-init-" + name);
-    std::error_code ec;
-    fs::remove_all(path, ec);
-    fs::create_directories(path);
-  }
-  ~TempRoot() {
-    std::error_code ec;
-    fs::remove_all(path, ec);
-  }
-  fs::path path;
+// Shared RAII temp-dir base with this suite's unique prefix.
+struct TempRoot : mcap_cloud_test::ScopedTempDir {
+  explicit TempRoot(const std::string& name) : ScopedTempDir("mcap-cloud-headless-init-" + name) {}
 };
 
 // A fake pj_cloud server that counts CONNECTION ATTEMPTS (Hello messages) and
@@ -169,20 +162,46 @@ struct BindEnv {
 // Hermetic roots: the toolbox constructor resolves the SessionFileCache root
 // (MCAP_CLOUD_CACHE_DIR) and the trust/credential config root (XDG_CONFIG_HOME)
 // from the environment, and initFromSettings' credential resolution reads
-// MCAP_CLOUD_URL / MCAP_CLOUD_API_KEY — pin all four before construction.
+// MCAP_CLOUD_URL / MCAP_CLOUD_API_KEY — pin all four before construction and
+// RESTORE the prior values on destruction (capture/restore mirrors
+// credential_resolve_test's EnvGuard; a bare unsetenv of XDG_CONFIG_HOME
+// would destroy a commonly-set variable for the rest of the process).
 struct HermeticEnv {
-  HermeticEnv() : cache_root("cache"), config_root("config") {
+  HermeticEnv()
+      : cache_root("cache"),
+        config_root("config"),
+        saved_cache_dir(capture("MCAP_CLOUD_CACHE_DIR")),
+        saved_xdg_config(capture("XDG_CONFIG_HOME")),
+        saved_url(capture("MCAP_CLOUD_URL")),
+        saved_api_key(capture("MCAP_CLOUD_API_KEY")) {
     ::setenv("MCAP_CLOUD_CACHE_DIR", cache_root.path.string().c_str(), 1);
     ::setenv("XDG_CONFIG_HOME", config_root.path.string().c_str(), 1);
     ::unsetenv("MCAP_CLOUD_URL");
     ::unsetenv("MCAP_CLOUD_API_KEY");
   }
   ~HermeticEnv() {
-    ::unsetenv("MCAP_CLOUD_CACHE_DIR");
-    ::unsetenv("XDG_CONFIG_HOME");
+    restore("MCAP_CLOUD_CACHE_DIR", saved_cache_dir);
+    restore("XDG_CONFIG_HOME", saved_xdg_config);
+    restore("MCAP_CLOUD_URL", saved_url);
+    restore("MCAP_CLOUD_API_KEY", saved_api_key);
+  }
+  static std::optional<std::string> capture(const char* name) {
+    const char* value = std::getenv(name);
+    return value == nullptr ? std::nullopt : std::optional<std::string>(value);
+  }
+  static void restore(const char* name, const std::optional<std::string>& value) {
+    if (value.has_value()) {
+      ::setenv(name, value->c_str(), 1);
+    } else {
+      ::unsetenv(name);
+    }
   }
   TempRoot cache_root;
   TempRoot config_root;
+  std::optional<std::string> saved_cache_dir;
+  std::optional<std::string> saved_xdg_config;
+  std::optional<std::string> saved_url;
+  std::optional<std::string> saved_api_key;
 };
 
 // True once `count()` reaches `expected` within `timeout`.

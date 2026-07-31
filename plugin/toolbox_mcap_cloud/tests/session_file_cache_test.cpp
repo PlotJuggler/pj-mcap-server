@@ -23,24 +23,16 @@
 
 #include "source_descriptor.hpp"
 #include "session_mcap_writer.hpp"
+#include "test_support_fs.hpp"
 
 namespace {
 
 namespace fs = std::filesystem;
 
-// Private per-test cache root, wiped on both ends.
-struct TempRoot {
-  explicit TempRoot(const std::string& name) {
-    path = fs::temp_directory_path() / ("mcap-cloud-cache-test-" + name);
-    std::error_code ec;
-    fs::remove_all(path, ec);
-    fs::create_directories(path);
-  }
-  ~TempRoot() {
-    std::error_code ec;
-    fs::remove_all(path, ec);
-  }
-  fs::path path;
+// Private per-test cache root, wiped on both ends (shared RAII base, this
+// suite's unique prefix).
+struct TempRoot : mcap_cloud_test::ScopedTempDir {
+  explicit TempRoot(const std::string& name) : ScopedTempDir("mcap-cloud-cache-test-" + name) {}
 };
 
 mcap_cloud::SourceDescriptor descriptor(const std::string& key) {

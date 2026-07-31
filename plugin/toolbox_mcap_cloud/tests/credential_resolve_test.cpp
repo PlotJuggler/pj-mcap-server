@@ -27,23 +27,15 @@
 
 #include "credential_store.hpp"
 #include "server_history.h"
+#include "test_support_fs.hpp"
 
 namespace {
 
 namespace fs = std::filesystem;
 
-struct TempRoot {
-  explicit TempRoot(const std::string& name) {
-    path = fs::temp_directory_path() / ("mcap-cloud-cred-resolve-" + name);
-    std::error_code ec;
-    fs::remove_all(path, ec);
-    fs::create_directories(path);
-  }
-  ~TempRoot() {
-    std::error_code ec;
-    fs::remove_all(path, ec);
-  }
-  fs::path path;
+// Shared RAII temp-dir base with this suite's unique prefix.
+struct TempRoot : mcap_cloud_test::ScopedTempDir {
+  explicit TempRoot(const std::string& name) : ScopedTempDir("mcap-cloud-cred-resolve-" + name) {}
 };
 
 // Save/restore the two env vars the resolver reads, so tests can set them

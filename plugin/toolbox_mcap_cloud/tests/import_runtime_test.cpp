@@ -32,24 +32,16 @@
 
 #include "session_file_cache.hpp"
 #include "source_descriptor.hpp"
+#include "test_support_fs.hpp"
 #include "trusted_origins.hpp"
 
 namespace {
 
 namespace fs = std::filesystem;
 
-struct TempRoot {
-  explicit TempRoot(const std::string& name) {
-    path = fs::temp_directory_path() / ("mcap-cloud-import-runtime-test-" + name);
-    std::error_code ec;
-    fs::remove_all(path, ec);
-    fs::create_directories(path);
-  }
-  ~TempRoot() {
-    std::error_code ec;
-    fs::remove_all(path, ec);
-  }
-  fs::path path;
+// Shared RAII temp-dir base with this suite's unique prefix.
+struct TempRoot : mcap_cloud_test::ScopedTempDir {
+  explicit TempRoot(const std::string& name) : ScopedTempDir("mcap-cloud-import-runtime-test-" + name) {}
 };
 
 mcap_cloud::SourceDescriptor descriptor(const std::string& key) {
@@ -318,13 +310,18 @@ TEST(McapCloudImportRuntime, CacheTeeRequestAbortUnblocksABackpressuredProducer)
   const auto d = descriptor("backpressure.mcap");
   const std::string identity = mcap_cloud::descriptorIdentity(d);
 
+  // Declared BEFORE tee: the writer hook below captures release_writer by
+  // reference and the tee's writer THREAD may still poll it until ~CacheTee
+  // joins — on an early (ASSERT-failure) return, destruction order must keep
+  // the flag alive past the tee.
+  std::atomic<bool> release_writer{false};
+
   mcap_cloud::CacheTee tee(rt);
   std::string error;
   ASSERT_TRUE(tee.begin(identity, &error)) << error;
 
   // Stall the writer thread on its FIRST message until released; shrink the
   // queue so the producer hits backpressure after a couple of enqueues.
-  std::atomic<bool> release_writer{false};
   tee.setQueueCapacityForTest(1);
   tee.setWriterHookForTest([&](const mcap_cloud::DecodedMessage&) {
     while (!release_writer.load()) {
