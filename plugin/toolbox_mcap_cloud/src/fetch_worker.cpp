@@ -274,9 +274,9 @@ bool FetchWorker::datasetExistsInHost(const CachedSession& entry) const {
 
 bool FetchWorker::serveFromMemoryCache(
     ImportRuntime* rt, SessionCache& session_cache, const SessionKey& session_key,
-    const std::string& tee_identity, const std::string& group_name,
-    const std::vector<std::string>& topic_names, const std::string& save_directory,
-    const SessionCache::ExistencePredicate& exists,
+    const std::string& tee_identity, const std::string& descriptor_json,
+    const std::string& group_name, const std::vector<std::string>& topic_names,
+    const std::string& save_directory, const SessionCache::ExistencePredicate& exists,
     const std::function<void(const std::filesystem::path&)>& export_by_copy,
     TeeOutcome* tee_outcome, bool* refetch_after_disk_miss) {
   auto cached = session_cache.lookup(session_key, exists);
@@ -316,6 +316,18 @@ bool FetchWorker::serveFromMemoryCache(
   if (rt != nullptr) {
     session_cache.recordHitCase(session_key, MemoryHitCase::kServedValidDisk);
     *tee_outcome = TeeOutcome::kExistingValid;
+    // §6.1: a memory hit whose disk file exists RE-promotes it (kExistingValid
+    // is the PR-1 signal), keyed on the CACHED stable dataset id — except an
+    // entry already kPromoted (re-promoting an already-file-backed dataset
+    // would only make the host reload the same file; the promoted state IS
+    // the end state a re-promotion seeks). dataset_id==0 (legacy entry)
+    // cannot be promoted — promotion requires a live dataset to replace.
+    if (cached->dataset_id != 0 && cached->promotion_state != PromotionState::kPromoted) {
+      (void)rt->promoteToFileSource(
+          ImportRuntime::makePromotionRequest(cached->dataset_id, tee_identity, disk_file,
+                                              descriptor_json),
+          &session_key);
+    }
   }
   if (pullServedFromCache) {
     pullServedFromCache(group_name);
@@ -851,6 +863,7 @@ void FetchWorker::pullTopicsAsync(std::vector<std::string> sequence_names, std::
   // identity by construction (spec §4).
   constexpr bool kIncludeLatched = true;  // mirrored into params.include_latched below
   std::string canonical_descriptor_json;
+  std::string display_descriptor_json;  // toSourceDescriptorJson — the D6 promotion payload
   if (rt != nullptr) {
     SourceDescriptor descriptor;
     descriptor.version = 1;
@@ -863,6 +876,7 @@ void FetchWorker::pullTopicsAsync(std::vector<std::string> sequence_names, std::
     descriptor.include_latched = kIncludeLatched;
     descriptor.display_name = group_name;
     canonical_descriptor_json = canonicalSourceDescriptorJson(descriptor);
+    display_descriptor_json = toSourceDescriptorJson(descriptor);
     tee_identity = descriptorIdentity(descriptor);
   }
 
@@ -893,9 +907,9 @@ void FetchWorker::pullTopicsAsync(std::vector<std::string> sequence_names, std::
                              ? dataset_exists_
                              : SessionCache::ExistencePredicate(
                                    [this](const CachedSession& entry) { return datasetExistsInHost(entry); });
-    if (serveFromMemoryCache(rt, session_cache, session_key, tee_identity, group_name, topic_names,
-                             save_directory, exists, export_by_copy, &tee_outcome,
-                             &refetch_after_disk_miss)) {
+    if (serveFromMemoryCache(rt, session_cache, session_key, tee_identity, display_descriptor_json,
+                             group_name, topic_names, save_directory, exists, export_by_copy,
+                             &tee_outcome, &refetch_after_disk_miss)) {
       finish_all();
       return;
     }
@@ -1544,6 +1558,29 @@ void FetchWorker::pullTopicsAsync(std::vector<std::string> sequence_names, std::
                                refetch_after_disk_miss);
   }
 
+  // ---- promotion at completion (stage-4 PR-3, D6 — the authoring dual
+  // path, spec §6.1/§9.8): a finalized cache file + a live eager dataset =
+  // hand the artifact to the host to become a stock file-backed source.
+  // AFTER the store above so a re-entrant on_result finds the entry.
+  // Fire-and-forget on this interactive path: the shared result state
+  // (captured by the callback) updates the entry's promotion_state whenever
+  // the host settles; the worker never blocks on it. kFinalized implies a
+  // clean COMPLETE (finishCacheTee), so no extra terminal gating is needed.
+  if (rt != nullptr && tee_outcome == TeeOutcome::kFinalized) {
+    PJ::DatasetId promoted_dataset = 0;
+    {
+      std::lock_guard<std::mutex> lock(fetch_dataset_mu_);
+      promoted_dataset = fetch_dataset_.has_value() ? fetch_dataset_->id : 0;
+    }
+    if (promoted_dataset != 0) {
+      (void)rt->promoteToFileSource(
+          ImportRuntime::makePromotionRequest(promoted_dataset, tee_identity,
+                                              rt->fileCache().pathFor(tee_identity),
+                                              display_descriptor_json),
+          &session_key);
+    }
+  }
+
   finish_all();
 }
 
@@ -1846,14 +1883,28 @@ PullResult FetchWorker::pull(PullRequest request) {
 
   // COMPLETE-only shared SessionCache store (D7) — same suppression rules as
   // the interactive path (decode errors / nothing decodable -> no entry).
+  const PJ::cloud::SessionKey session_key = PJ::cloud::computeSessionKey(
+      request.connection.uri, request.sequence_names, request.topic_names,
+      {request.start_ns, request.end_ns});
   if (result.terminal == PullTerminal::kComplete && total_decode_errors == 0 && driver.hasDecodable()) {
-    const PJ::cloud::SessionKey session_key = PJ::cloud::computeSessionKey(
-        request.connection.uri, request.sequence_names, request.topic_names,
-        {request.start_ns, request.end_ns});
     storeCompletedSessionEntry(rt->sessionCache(), session_key, request.group_name,
                                request.connection.uri, request.topic_names, name_by_id, counts,
                                request.identity, result.tee_outcome,
                                /*refetch_after_disk_miss=*/false);
+  }
+
+  // ---- promotion at completion (D6 — the SAME ImportRuntime hook the
+  // interactive fetch uses). AFTER the store so a re-entrant on_result finds
+  // the entry. The pull does NOT wait: the shared result rides PullResult so
+  // the PR-3 job can wait cancel-aware (or detach), and the absent-service
+  // case comes back already settled EAGER_ONLY-equivalent.
+  if (result.terminal == PullTerminal::kComplete && result.tee_outcome == TeeOutcome::kFinalized &&
+      result.dataset.has_value()) {
+    result.promotion = rt->promoteToFileSource(
+        ImportRuntime::makePromotionRequest(result.dataset->id, request.identity,
+                                            rt->fileCache().pathFor(request.identity),
+                                            request.descriptor_json),
+        &session_key);
   }
 
   return result;

@@ -32,6 +32,7 @@
 #include <vector>
 
 #include <ixwebsocket/IXWebSocketServer.h>
+#include <pj_base/descriptor_import_protocol.h>
 #include <pj_base/plugin_data_api.h>
 #include <pj_base/sdk/plugin_data_api.hpp>
 #include <pj_base/sdk/service_registry.hpp>
@@ -115,6 +116,9 @@ class FakeServiceRegistry {
     return PJ::sdk::ServiceRegistry(PJ_service_registry_t{this, &vtable_});
   }
 
+  // Optionally serve pj.source_promotion.v1 too (the D6 wiring test below).
+  void setPromotionService(PJ_source_promotion_host_t host) { promotion_ = host; }
+
  private:
   static bool getService(void* ctx, PJ_string_view_t name, uint32_t /*min_version*/, PJ_service_t* out,
                          PJ_error_t* err) noexcept {
@@ -132,6 +136,10 @@ class FakeServiceRegistry {
       *out = PJ_service_t{self->settings_.ctx, self->settings_.vtable};
       return true;
     }
+    if (n == PJ_SOURCE_PROMOTION_HOST_SERVICE_V1 && self->promotion_.has_value()) {
+      *out = PJ_service_t{self->promotion_->ctx, self->promotion_->vtable};
+      return true;
+    }
     PJ::sdk::fillError(err, 1, "fake_registry", "service not provided by this fake");
     return false;
   }
@@ -140,6 +148,7 @@ class FakeServiceRegistry {
   PJ_toolbox_host_t write_host_{};
   PJ_toolbox_runtime_host_t runtime_host_{};
   PJ_settings_store_t settings_{};
+  std::optional<PJ_source_promotion_host_t> promotion_;
 };
 
 // One bindable environment: fake hosts + an in-memory settings backend whose
@@ -361,4 +370,50 @@ TEST(McapCloudHeadlessInit, RebindAfterInitUpdatesSettingsViewWithoutReconnect) 
       << "persistState must write through the RE-BOUND settings view";
   EXPECT_FALSE(first_env.backend.contains("mcap_cloud/metadata_query"))
       << "the pre-rebind view must no longer receive writes";
+}
+
+namespace {
+
+// Minimal accepting pj.source_promotion.v1 host for the D6 wiring test.
+struct MinimalPromotionHost {
+  static bool promoteThunk(void*, const PJ_source_promotion_request_v1_t*,
+                           PJ_source_promotion_result_fn result_cb, void* callback_ctx,
+                           PJ_error_t*) noexcept {
+    const char* msg = "promoted";
+    result_cb(callback_ctx, true, PJ_string_view_t{msg, 8});
+    return true;
+  }
+  [[nodiscard]] PJ_source_promotion_host_t view() {
+    static constexpr PJ_source_promotion_host_vtable_t kVtable{
+        1, sizeof(PJ_source_promotion_host_vtable_t), &MinimalPromotionHost::promoteThunk};
+    return PJ_source_promotion_host_t{this, &kVtable};
+  }
+};
+
+}  // namespace
+
+// D6 wiring: bind() resolves the OPTIONAL pj.source_promotion.v1 service into
+// the shared ImportRuntime (get<>, never require<>); absence leaves the
+// runtime promotion-less (every completed materialize EAGER_ONLY-equivalent)
+// and must not fail the bind.
+TEST(McapCloudHeadlessInit, BindResolvesTheOptionalPromotionService) {
+  HermeticEnv env;
+  // Absent service -> bind succeeds, no promotion host.
+  {
+    BindEnv bind_env("");
+    mcap_cloud::McapCloudToolbox toolbox;
+    auto status = toolbox.bind(bind_env.registry());
+    ASSERT_TRUE(status.has_value()) << status.error();
+    EXPECT_FALSE(toolbox.importRuntime().hasPromotionHost());
+  }
+  // Registered service -> the runtime holds the bound view.
+  {
+    BindEnv bind_env("");
+    MinimalPromotionHost promo;
+    bind_env.fake_registry.setPromotionService(promo.view());
+    mcap_cloud::McapCloudToolbox toolbox;
+    auto status = toolbox.bind(bind_env.registry());
+    ASSERT_TRUE(status.has_value()) << status.error();
+    EXPECT_TRUE(toolbox.importRuntime().hasPromotionHost());
+  }
 }

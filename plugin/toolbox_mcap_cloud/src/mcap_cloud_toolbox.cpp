@@ -56,6 +56,13 @@ PJ::Status McapCloudToolbox::bind(PJ::sdk::ServiceRegistry services) {
   // (spec §6.3 — a headless provider bind must stay network-free), so a
   // re-bind after initialization swaps the view without reconnecting.
   dialog_.setSettings(services.get<PJ::sdk::SettingsStoreService>().value_or(PJ::sdk::SettingsView{}));
+  // OPTIONAL pj.source_promotion.v1 (D6): get<>, never require<> — absence
+  // means a host without promotion support, and every completed materialize
+  // is then EAGER_ONLY-equivalent. Bound per plugin instance (the host
+  // derives the provider manifest id from the binding); this instance owns
+  // both the runtime and the bound registry scope, so the view stays alive
+  // while any promotion is outstanding.
+  import_runtime_.setPromotionHost(services.get<PJ::sdk::SourcePromotionHostService>());
   return PJ::okStatus();
 }
 

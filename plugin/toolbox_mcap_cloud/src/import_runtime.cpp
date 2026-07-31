@@ -48,6 +48,125 @@ bool ImportRuntime::isTrusted(std::string_view uri) const {
   return trusted_keys_.count(*key) > 0;
 }
 
+// ---------------------------------------------------------------------------
+// PromotionResult
+// ---------------------------------------------------------------------------
+
+void PromotionResult::settle(bool ok, std::string message) {
+  {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (done_) {
+      return;  // settle-once: the first outcome wins
+    }
+    done_ = true;
+    ok_ = ok;
+    message_ = std::move(message);
+  }
+  cv_.notify_all();
+}
+
+std::optional<bool> PromotionResult::ok() const {
+  std::lock_guard<std::mutex> lock(mu_);
+  if (!done_) {
+    return std::nullopt;
+  }
+  return ok_;
+}
+
+std::string PromotionResult::message() const {
+  std::lock_guard<std::mutex> lock(mu_);
+  return message_;
+}
+
+bool PromotionResult::waitSettled(const std::function<bool()>& cancelled,
+                                  std::chrono::milliseconds poll) const {
+  std::unique_lock<std::mutex> lock(mu_);
+  for (;;) {
+    if (done_) {
+      return true;
+    }
+    if (cancelled && cancelled()) {
+      return false;  // DETACH: the shared state settles whenever on_result fires
+    }
+    cv_.wait_for(lock, poll);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// ImportRuntime promotion hook (D6)
+// ---------------------------------------------------------------------------
+
+void ImportRuntime::setPromotionHost(std::optional<PJ::SourcePromotionHostView> view) {
+  std::lock_guard<std::mutex> lock(promo_mu_);
+  promotion_host_ = std::move(view);
+}
+
+bool ImportRuntime::hasPromotionHost() const {
+  std::lock_guard<std::mutex> lock(promo_mu_);
+  return promotion_host_.has_value() && promotion_host_->valid();
+}
+
+PJ::SourcePromotionRequest ImportRuntime::makePromotionRequest(
+    PJ::DatasetId dataset, const std::string& source_identity, const std::filesystem::path& local_path,
+    const std::string& descriptor_json) {
+  PJ::SourcePromotionRequest request;
+  request.dataset = dataset;
+  request.source_identity = source_identity;
+  request.local_path_utf8 = local_path.string();
+  request.loader_plugin_id = kMcapLoaderPluginId;
+  request.loader_config_json = kMcapLoaderPresetJson;
+  request.descriptor_json = descriptor_json;
+  return request;
+}
+
+std::shared_ptr<PromotionResult> ImportRuntime::promoteToFileSource(
+    const PJ::SourcePromotionRequest& request, const SessionKey* cache_key) {
+  auto result = std::make_shared<PromotionResult>();
+  // The callback closure captures ONLY shared/weak state: the settle-once
+  // result and a weak SessionCache handle. It may run re-entrantly (before
+  // promoteToFileSource returns), on any host thread, or after this runtime
+  // is gone — none of those can touch freed plugin state.
+  const std::optional<SessionKey> key =
+      cache_key != nullptr ? std::optional<SessionKey>(*cache_key) : std::nullopt;
+  std::weak_ptr<SessionCache> weak_cache = session_cache_;
+  auto update_entry = [weak_cache, key](PromotionState state) {
+    if (!key.has_value()) {
+      return;
+    }
+    if (auto cache = weak_cache.lock()) {
+      cache->updatePromotionState(*key, state);
+    }
+  };
+
+  std::optional<PJ::SourcePromotionHostView> view;
+  {
+    std::lock_guard<std::mutex> lock(promo_mu_);
+    view = promotion_host_;
+  }
+  if (!view.has_value() || !view->valid()) {
+    // Absent service: every completed materialize is EAGER_ONLY-equivalent.
+    update_entry(PromotionState::kEagerOnly);
+    result->settle(false, "source promotion service not available (host without promotion support)");
+    return result;
+  }
+
+  // Mark pending BEFORE the call: a re-entrant on_result then simply
+  // overwrites kPending with the terminal state.
+  update_entry(PromotionState::kPending);
+  const PJ::Status status = view->promoteToFileSource(
+      request, [result, update_entry](bool ok, std::string message) {
+        // [host-callback-thread] — never assume the GUI thread here.
+        update_entry(ok ? PromotionState::kPromoted : PromotionState::kEagerOnly);
+        result->settle(ok, std::move(message));
+      });
+  if (!status) {
+    // Synchronous rejection: on_result will never run.
+    update_entry(PromotionState::kEagerOnly);
+    result->settle(false, status.error());
+  }
+  return result;
+}
+
 std::optional<ImportRuntime::MaterializeTicket> ImportRuntime::tryBeginMaterialize(
     std::string_view identity) {
   std::string key(identity);

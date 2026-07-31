@@ -47,6 +47,11 @@ class McapCloudToolbox : public PJ::ToolboxPluginBase {
   // latch semantics.
   PJ_borrowed_dialog_t getDialog() override;
 
+  // The per-instance ImportRuntime (PR-1) — shared by the dialog worker and
+  // the descriptor-import provider; the promotion host (D6) binds onto it.
+  // Exposed for the provider glue and the hermetic wiring tests.
+  [[nodiscard]] ImportRuntime& importRuntime() { return import_runtime_; }
+
  private:
   // Declared BEFORE dialog_ so the runtime outlives the dialog (and its
   // worker thread) on destruction. Standard roots: the user cache dir

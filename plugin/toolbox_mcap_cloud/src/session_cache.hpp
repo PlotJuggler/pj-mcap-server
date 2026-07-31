@@ -78,6 +78,20 @@ enum class MemoryHitCase : std::uint8_t {
   kRefetchedDiskMiss,  // memory hit whose disk file was missing/invalid: evicted + refetched
 };
 
+// State of this entry's pj.source_promotion.v1 transaction (stage-4 PR-3,
+// D6/D7): kPending while an ACCEPTED promotion's on_result is outstanding;
+// kPromoted on ok=true; kEagerOnly for every EAGER_ONLY-equivalent end
+// (service absent, synchronous rejection, async failure — the eager dataset
+// stays usable, no promoted record exists). Updated through
+// SessionCache::updatePromotionState, possibly from the host's promotion
+// callback thread (the cache is thread-safe).
+enum class PromotionState : std::uint8_t {
+  kNone = 0,       // no promotion was ever attempted for this entry
+  kPending,        // accepted; on_result outstanding
+  kPromoted,       // on_result ok=true — the dataset is file-backed with a record
+  kEagerOnly,      // no completed promotion; eager dataset only
+};
+
 // The cached metadata for ONE completed session. Only counts + identity — never
 // the decoded rows (those live in the datastore under display_name).
 struct CachedSession {
@@ -90,6 +104,7 @@ struct CachedSession {
   std::string cache_identity;     // descriptor identity of the durable cache file ("" = none)
   TeeOutcome tee_outcome = TeeOutcome::kNone;
   MemoryHitCase last_hit_case = MemoryHitCase::kNone;
+  PromotionState promotion_state = PromotionState::kNone;  // D6 promotion transaction state
 };
 
 // LRU-by-entry-count cache keyed on SessionKey.hash with full-key equality to
@@ -185,6 +200,24 @@ class SessionCache {
       EntryIter entry_it = *bit;
       if (entry_it->key == key) {
         eraseLocked(entry_it, map_it);
+        return;
+      }
+    }
+  }
+
+  // Record the D6 promotion-transaction state on `key`'s entry (no LRU
+  // effect). No-op when absent — a promotion settling AFTER the entry was
+  // evicted/replaced must never resurrect it. May be called from the host's
+  // promotion callback thread (thread-safe by the internal mutex).
+  void updatePromotionState(const SessionKey& key, PromotionState state) {
+    std::lock_guard<std::mutex> lock(mu_);
+    auto map_it = index_.find(key.hash);
+    if (map_it == index_.end()) {
+      return;
+    }
+    for (EntryIter entry_it : map_it->second) {
+      if (entry_it->key == key) {
+        entry_it->value.promotion_state = state;
         return;
       }
     }

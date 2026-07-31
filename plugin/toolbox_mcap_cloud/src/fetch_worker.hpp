@@ -25,6 +25,7 @@ namespace mcap_cloud {
 
 class CacheTee;
 class ImportRuntime;
+class PromotionResult;
 
 /// Terminal classification of ONE direct pull (the headless import path).
 /// kFailed covers every non-cancel abnormal end, including the
@@ -86,6 +87,13 @@ struct PullResult {
   bool any_decodable = false;               // the eager dataset actually holds rows
   std::uint64_t decode_errors = 0;
   SessionStats stats;
+  /// The D6 promotion-at-completion result (non-null iff the tee finalized
+  /// and a dataset exists — i.e. a promotion was attempted, including the
+  /// settled-immediately absent-service EAGER_ONLY-equivalent). The shared
+  /// state may still be pending when the pull returns (the ABI's normal
+  /// async shape); it outlives the pull, so a caller that stops waiting
+  /// simply detaches.
+  std::shared_ptr<PromotionResult> promotion;
 };
 
 enum class McapSaveStatus {
@@ -476,9 +484,9 @@ class FetchWorker {
   // the pre-stage-4 count-only HIT.
   [[nodiscard]] bool serveFromMemoryCache(
       ImportRuntime* rt, SessionCache& session_cache, const SessionKey& session_key,
-      const std::string& tee_identity, const std::string& group_name,
-      const std::vector<std::string>& topic_names, const std::string& save_directory,
-      const SessionCache::ExistencePredicate& exists,
+      const std::string& tee_identity, const std::string& descriptor_json,
+      const std::string& group_name, const std::vector<std::string>& topic_names,
+      const std::string& save_directory, const SessionCache::ExistencePredicate& exists,
       const std::function<void(const std::filesystem::path&)>& export_by_copy,
       TeeOutcome* tee_outcome, bool* refetch_after_disk_miss);
 
