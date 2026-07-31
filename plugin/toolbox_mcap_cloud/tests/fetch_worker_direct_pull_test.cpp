@@ -129,7 +129,7 @@ TEST(McapCloudDirectPull, CompleteRoundTripFinalizesCacheAndStoresEntry) {
 
   // COMPLETE-only shared SessionCache entry with the stable dataset id (D7).
   const PJ::cloud::SessionKey key =
-      PJ::cloud::computeSessionKey(server.uri(), {"a.mcap"}, {"/one"}, {0, 0});
+      PJ::cloud::computeSessionKey(server.uri(), {"a.mcap"}, {"/one"}, {0, 0}, true);
   auto entry = rt.sessionCache().lookup(key, [](const mcap_cloud::CachedSession&) { return true; });
   ASSERT_TRUE(entry.has_value());
   EXPECT_EQ(entry->dataset_id, 1u);
@@ -269,4 +269,43 @@ TEST(McapCloudDirectPull, RequiresRuntimeAndHosts) {
     EXPECT_EQ(result.terminal, mcap_cloud::PullTerminal::kFailed);
     EXPECT_FALSE(result.error.empty());
   }
+}
+
+// Adversarial F1 at the pull level: two direct pulls differing ONLY in
+// include_latched are DIFFERENT sessions — the second must never be served
+// from the first's memory entry (it opens its own wire session).
+TEST(McapCloudDirectPull, IncludeLatchedVariantsNeverAliasInTheCache) {
+  FakeStreamingServer server(FakeStreamingServer::Mode::kComplete);
+  ASSERT_TRUE(server.ok());
+  TempRoot cache_root("latchalias-cache");
+  TempRoot config_root("latchalias-config");
+  mcap_cloud::ImportRuntime rt(mcap_cloud::SessionFileCache(cache_root.path),
+                               mcap_cloud::TrustedOrigins(config_root.path));
+
+  auto request_with_latched = [&](bool include_latched, PullHarness& h) {
+    mcap_cloud::SourceDescriptor d = mcap_cloud_test::descriptorFor(server.uri());
+    d.include_latched = include_latched;
+    mcap_cloud::PullRequest r;
+    r.connection.uri = server.uri();
+    r.sequence_names = d.s3_keys;
+    r.group_name = d.display_name;
+    r.topic_names = d.topics;
+    r.include_latched = d.include_latched;
+    r.runtime = &rt;
+    r.canonical_descriptor_json = mcap_cloud::canonicalSourceDescriptorJson(d);
+    r.descriptor_json = mcap_cloud::toSourceDescriptorJson(d);
+    r.identity = mcap_cloud::descriptorIdentity(d);
+    return r;
+  };
+
+  PullHarness h1;
+  const auto r1 = h1.worker.pull(request_with_latched(false, h1));
+  ASSERT_EQ(r1.terminal, mcap_cloud::PullTerminal::kComplete) << r1.error;
+  ASSERT_EQ(server.openSessions(), 1);
+
+  PullHarness h2;
+  const auto r2 = h2.worker.pull(request_with_latched(true, h2));
+  ASSERT_EQ(r2.terminal, mcap_cloud::PullTerminal::kComplete) << r2.error;
+  EXPECT_EQ(server.openSessions(), 2)
+      << "a true-latched request must never be served from the false-latched entry (F1)";
 }

@@ -1931,7 +1931,8 @@ PullResult FetchWorker::pull(PullRequest request) {
   // the interactive path (decode errors / nothing decodable -> no entry).
   const PJ::cloud::SessionKey session_key = PJ::cloud::computeSessionKey(
       request.connection.uri, request.sequence_names, request.topic_names,
-      {request.start_ns, request.end_ns});
+      {request.start_ns, request.end_ns}, request.include_latched);  // F1: the descriptor field keys
+
   if (result.terminal == PullTerminal::kComplete && total_decode_errors == 0 && driver.hasDecodable()) {
     storeCompletedSessionEntry(rt->sessionCache(), session_key, request.group_name,
                                request.connection.uri, request.topic_names, name_by_id, counts,

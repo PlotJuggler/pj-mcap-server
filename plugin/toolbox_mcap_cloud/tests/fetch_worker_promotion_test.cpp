@@ -155,7 +155,7 @@ constexpr const char* kExpectedPreset =
 
 mcap_cloud::PromotionState entryPromotionState(mcap_cloud::ImportRuntime& rt, const std::string& uri) {
   const PJ::cloud::SessionKey key =
-      PJ::cloud::computeSessionKey(uri, {"a.mcap"}, {"/one"}, {0, 0});
+      PJ::cloud::computeSessionKey(uri, {"a.mcap"}, {"/one"}, {0, 0}, true);
   auto entry = rt.sessionCache().lookup(key, [](const mcap_cloud::CachedSession&) { return true; });
   return entry.has_value() ? entry->promotion_state : mcap_cloud::PromotionState::kNone;
 }

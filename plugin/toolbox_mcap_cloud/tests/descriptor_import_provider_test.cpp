@@ -263,7 +263,7 @@ TEST(McapCloudProviderQuery, InMemorySessionCacheNeverAnswersMaterialized) {
   const std::string uri = "ws://127.0.0.1:9";
   // Plant an in-memory entry claiming a cache identity — with NO disk file.
   const PJ::cloud::SessionKey key =
-      PJ::cloud::computeSessionKey(uri, {"a.mcap"}, {"/one"}, {0, 0});
+      PJ::cloud::computeSessionKey(uri, {"a.mcap"}, {"/one"}, {0, 0}, true);
   mcap_cloud::CachedSession entry;
   entry.display_name = "a.mcap";
   entry.server_uri = uri;
@@ -828,7 +828,7 @@ TEST(McapCloudProviderAbi, OutstandingPromotionAtCancelDetachesCancelled) {
   promo.release();
   promo.joinWorker();
   const PJ::cloud::SessionKey key =
-      PJ::cloud::computeSessionKey(server.uri(), {"a.mcap"}, {"/one"}, {0, 0});
+      PJ::cloud::computeSessionKey(server.uri(), {"a.mcap"}, {"/one"}, {0, 0}, true);
   auto entry = h.rt.sessionCache().lookup(key, [](const mcap_cloud::CachedSession&) { return true; });
   ASSERT_TRUE(entry.has_value());
   EXPECT_EQ(entry->promotion_state, mcap_cloud::PromotionState::kPromoted)
