@@ -1745,6 +1745,21 @@ PullResult FetchWorker::pull(PullRequest request) {
     return result;
   }
 
+  // Re-verify R2(a): the server's own pre-flight estimate is compared with
+  // the effective byte ceiling BEFORE any byte streams — an import that is
+  // predictably over budget is refused up front rather than billed for a
+  // partial transfer it must then discard.
+  if (request.max_transfer_bytes > 0 &&
+      session_info.estimated_chunk_bytes > request.max_transfer_bytes) {
+    result.terminal = PullTerminal::kFailed;
+    result.byte_ceiling_exceeded = true;
+    result.error = "server pre-flight estimate ~" +
+                   std::to_string(session_info.estimated_chunk_bytes) +
+                   " bytes exceeds the " + std::to_string(request.max_transfer_bytes) +
+                   "-byte transfer ceiling — refused before streaming";
+    return result;  // the tee's RAII cleanup releases locks; nothing was opened
+  }
+
   std::unordered_map<std::uint32_t, std::string> name_by_id;
   for (const auto& t : session_info.topics) {
     name_by_id.emplace(t.topic_id, t.topic_name);
@@ -1842,6 +1857,14 @@ PullResult FetchWorker::pull(PullRequest request) {
   bool byte_ceiling_exceeded = false;
   bool duration_ceiling_exceeded = false;
   const auto download_start = std::chrono::steady_clock::now();
+  // R2(d): arm the hard session deadline so a SILENT/control-only stream
+  // still stops at the duration ceiling (the frame wait is capped to it and
+  // resume never retries past it); the duration latch below classifies.
+  session_backend->setSessionDeadline(
+      request.max_transfer_duration.count() > 0
+          ? std::optional<std::chrono::steady_clock::time_point>(download_start +
+                                                                 request.max_transfer_duration)
+          : std::nullopt);
 
   SessionStats stats = session_backend->downloadSessionResumable(
       session_info, [&](const DecodedMessage& m) -> bool {
@@ -1907,8 +1930,8 @@ PullResult FetchWorker::pull(PullRequest request) {
     byte_ceiling_exceeded = true;
   }
   if (request.max_transfer_duration.count() > 0 && !duration_ceiling_exceeded &&
-      std::chrono::steady_clock::now() - download_start > request.max_transfer_duration) {
-    duration_ceiling_exceeded = true;  // F12: same final-boundary rule as bytes
+      std::chrono::steady_clock::now() - download_start >= request.max_transfer_duration) {
+    duration_ceiling_exceeded = true;  // F12/R2(d): same final-boundary rule as bytes
   }
 
   if (tee != nullptr) {

@@ -217,33 +217,50 @@ PJ_descriptor_import_outcome_t DescriptorImportProvider::JobState::runToTerminal
     // It failed or was cancelled: proceed with a fresh download on our slot.
   }
 
-  // ---- the CROSS-PROCESS materialization gate (adversarial F9) -------------
+  // ---- the CROSS-PROCESS materialization gate (adversarial F9, re-verify
+  // R1(c)) -------------------------------------------------------------------
   // The same bounded cancelable wait + revalidate, now around the OS lock:
   // process B must never classify process A's live materialization as an
-  // ordinary tee failure and open a duplicate network stream. Our own
-  // runtime-retained read lease (F2) would block this exclusive try —
-  // release it first (begin() would do the same; re-materialization is
-  // rename-over safe). A NON-contended failure (OS/writer error) proceeds
-  // lock-less: the tee's begin() surfaces the same failure through the §9.6
-  // nonfatal path.
-  runtime.releaseRetainedLease(identity);
+  // ordinary tee failure and open a duplicate network stream.
+  //
+  // Lease coordination (R1(c)): our own runtime's retained read lease (F2)
+  // contends with this exclusive try, and a CONCURRENT MEMORY HIT can
+  // re-retain one at any moment during the wait — releasing once up front
+  // let the provider wait on ITS OWN runtime's lease until timeout. We hold
+  // the in-process ACTIVE TICKET for this identity (acquired above), so no
+  // other in-process MATERIALIZER can exist; any same-runtime lease observed
+  // mid-wait is therefore a racing memory hit, and it is safe to release it
+  // immediately before EACH attempt. On every abort exit that did not
+  // publish, the lease is RESTORED when the previous artifact still
+  // validates (a live dataset may depend on it).
+  auto restore_lease_if_valid = [this]() {
+    std::filesystem::path still_valid;
+    if (runtime.fileCache().lookup(identity, &still_valid)) {
+      if (auto lease = runtime.fileCache().acquireReadLease(identity, nullptr)) {
+        runtime.retainReadLease(identity, std::move(*lease));
+      }
+    }
+  };
   std::optional<SessionFileCache::MaterializeLock> os_lock;
   {
     bool waited = false;
     const auto os_deadline = std::chrono::steady_clock::now() + lock_timeout;
     for (;;) {
+      runtime.releaseRetainedLease(identity);  // R1(c): before EACH attempt
       std::string lock_error;
       bool contended = false;
       os_lock = runtime.fileCache().tryLockForMaterialize(identity, &lock_error, &contended);
       if (os_lock.has_value() || !contended) {
-        break;
+        break;  // acquired, or a NON-contended OS failure (tee-begin will report it, §9.6)
       }
       waited = true;
       if (isCancelled()) {
+        restore_lease_if_valid();
         *message = "import cancelled";
         return PJ_DESCRIPTOR_IMPORT_CANCELLED;
       }
       if (std::chrono::steady_clock::now() >= os_deadline) {
+        restore_lease_if_valid();
         *message =
             "another process is materializing this session — retry when it completes";
         return PJ_DESCRIPTOR_IMPORT_FAILED;
@@ -253,11 +270,13 @@ PJ_descriptor_import_outcome_t DescriptorImportProvider::JobState::runToTerminal
     if (os_lock.has_value() && waited) {
       // Contended-then-acquired across processes: revalidate, exactly like
       // the in-process race (the same LOCKED v1 decision applies — zero
-      // on_dataset ran here, so only retry-classification is truthful).
+      // on_dataset ran here, so only retry-classification is truthful). The
+      // fresh valid artifact deserves the lifetime lease back.
       std::filesystem::path disk;
       if (runtime.fileCache().lookup(identity, &disk)) {
         os_lock.reset();
         ticket.reset();
+        restore_lease_if_valid();
         *message =
             "session was materialized concurrently by another process — reload to classify it "
             "as a cache hit";
@@ -302,6 +321,13 @@ PJ_descriptor_import_outcome_t DescriptorImportProvider::JobState::runToTerminal
   };
 
   const PullResult res = fetch.pull(std::move(request));
+  if (res.tee_outcome != TeeOutcome::kFinalized) {
+    // R1(c): the pull did not publish (finalize re-retains on success), and
+    // begin()'s own restore-on-abort cannot cover us — the JOB released the
+    // lease, so begin never saw one to remember. Put it back if the previous
+    // artifact still validates.
+    restore_lease_if_valid();
+  }
   if (pre_terminal_hook) {
     pre_terminal_hook();  // test seam: deterministic ceiling-vs-cancel interleave
   }

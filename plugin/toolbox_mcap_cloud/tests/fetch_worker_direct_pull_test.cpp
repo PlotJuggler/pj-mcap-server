@@ -405,3 +405,53 @@ TEST(McapCloudDirectPull, DurationCeilingFailsWithTheDurationCause) {
   fs::path unused;
   EXPECT_FALSE(rt.fileCache().lookup(identityFor(server.uri()), &unused));
 }
+
+// Re-verify R2(a): a server pre-flight estimate above the effective byte
+// ceiling is refused BEFORE any byte streams — zero messages consumed, the
+// refusal names the estimate.
+TEST(McapCloudDirectPull, EstimateAboveTheCeilingIsRefusedBeforeStreaming) {
+  FakeStreamingServer server(FakeStreamingServer::Mode::kComplete);
+  ASSERT_TRUE(server.ok());
+  TempRoot cache_root("estrefuse-cache");
+  TempRoot config_root("estrefuse-config");
+  mcap_cloud::ImportRuntime rt(mcap_cloud::SessionFileCache(cache_root.path),
+                               mcap_cloud::TrustedOrigins(config_root.path));
+
+  PullHarness h;
+  mcap_cloud::PullRequest request = h.request(rt, server.uri());
+  request.max_transfer_bytes = 5000;  // < the advertised 12288-byte estimate
+  const auto result = h.worker.pull(std::move(request));
+
+  EXPECT_EQ(result.terminal, mcap_cloud::PullTerminal::kFailed);
+  EXPECT_TRUE(result.byte_ceiling_exceeded);
+  EXPECT_NE(result.error.find("refused before streaming"), std::string::npos) << result.error;
+  EXPECT_EQ(result.stats.messages_received, 0u) << "nothing may stream after the refusal (R2a)";
+  EXPECT_FALSE(cacheRootHasPartial(cache_root.path));
+}
+
+// Re-verify R2(d): a stream that goes SILENT (no messages, no frames) must
+// still stop AT the duration deadline — the frame wait is capped to it —
+// instead of sitting out the 60 s frame timeout plus resume retries.
+TEST(McapCloudDirectPull, SilentStreamStopsAtTheDurationDeadline) {
+  FakeStreamingServer server(FakeStreamingServer::Mode::kStallAfterTwoBatches);
+  ASSERT_TRUE(server.ok());
+  TempRoot cache_root("silentdl-cache");
+  TempRoot config_root("silentdl-config");
+  mcap_cloud::ImportRuntime rt(mcap_cloud::SessionFileCache(cache_root.path),
+                               mcap_cloud::TrustedOrigins(config_root.path));
+
+  PullHarness h;
+  mcap_cloud::PullRequest request = h.request(rt, server.uri());
+  request.max_transfer_duration = std::chrono::milliseconds(400);
+  const auto start = std::chrono::steady_clock::now();
+  const auto result = h.worker.pull(std::move(request));
+  const auto took =
+      std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start);
+
+  EXPECT_EQ(result.terminal, mcap_cloud::PullTerminal::kFailed) << result.error;
+  EXPECT_TRUE(result.duration_ceiling_exceeded);
+  EXPECT_NE(result.error.find("duration"), std::string::npos) << result.error;
+  EXPECT_LT(took.count(), 3000)
+      << "the deadline must wake the frame wait, not the 60 s frame timeout (R2d)";
+  EXPECT_FALSE(cacheRootHasPartial(cache_root.path));
+}

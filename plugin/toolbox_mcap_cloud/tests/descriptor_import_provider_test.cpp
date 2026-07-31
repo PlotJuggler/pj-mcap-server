@@ -1049,3 +1049,97 @@ TEST(McapCloudProviderJob, ProviderEnvByteCapAppliesWithoutCallerCeiling) {
   EXPECT_NE(recorder.terminal(0).second.find("byte"), std::string::npos)
       << recorder.terminal(0).second;
 }
+
+// Re-verify R1(c): a lease retained on the job's OWN runtime DURING its
+// cross-process wait (a racing memory hit) must not dead-hand the job into
+// its timeout — the release happens before EACH attempt (safe: the job holds
+// the in-process active ticket, so any same-runtime lease is a memory hit,
+// never another materializer).
+TEST(McapCloudProviderJob, SelfLeaseDuringTheLockWaitDoesNotTimeOut) {
+  FakeStreamingServer server(FakeStreamingServer::Mode::kComplete);
+  ASSERT_TRUE(server.ok());
+  ProviderHarness h("job-selflease");
+  h.provider.setLockWaitForTest(std::chrono::milliseconds(20), std::chrono::seconds(10));
+  const std::string identity = identityFor(server.uri());
+
+  mcap_cloud::SessionFileCache other_process(h.cache_root.path);
+  std::string err;
+  auto held = other_process.tryLockForMaterialize(identity, &err);
+  ASSERT_TRUE(held.has_value()) << err;
+
+  JobRecorder recorder;
+  ScopedJob job;
+  ASSERT_TRUE(h.start(queryJson(server.uri()), recorder, job));
+  std::this_thread::sleep_for(std::chrono::milliseconds(120));  // the job is waiting
+
+  // The racing memory hit: a shared lease lands on the JOB'S OWN runtime
+  // mid-wait (shared stacks against the external exclusive? no — acquire it
+  // right after releasing the external lock, in the race window).
+  held.reset();
+  if (auto lease = h.rt.fileCache().acquireReadLease(identity, nullptr)) {
+    h.rt.retainReadLease(identity, std::move(*lease));
+  }
+
+  const auto resume_at = std::chrono::steady_clock::now();
+  ASSERT_TRUE(recorder.waitTerminal(std::chrono::seconds(8)))
+      << "the job must not wait out its own runtime's lease (R1c)";
+  const auto took = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - resume_at);
+  job.job.vtable->join(job.job.ctx);
+
+  ASSERT_EQ(recorder.terminalCount(), 1u);
+  EXPECT_EQ(recorder.terminal(0).first, PJ_DESCRIPTOR_IMPORT_SUCCEEDED_EAGER_ONLY)
+      << recorder.terminal(0).second;
+  EXPECT_LT(took.count(), 5000) << "must proceed promptly, not burn the bounded timeout";
+  fs::path cache_file;
+  EXPECT_TRUE(h.rt.fileCache().lookup(identity, &cache_file));
+}
+
+// Re-verify R1(c): the JOB (not the tee) released the lifetime lease, so on
+// a pull that did NOT publish (tee failure -> EAGER_ONLY) the JOB restores
+// it — otherwise the previous valid artifact stays permanently unleased.
+TEST(McapCloudProviderJob, NonPublishingImportRestoresTheLeaseItReleased) {
+  FakeStreamingServer server(FakeStreamingServer::Mode::kComplete);
+  ASSERT_TRUE(server.ok());
+  ProviderHarness h("job-leaserestore");
+  const std::string identity = identityFor(server.uri());
+
+  // Import #1: publishes + retains the lifetime lease.
+  {
+    JobRecorder recorder;
+    ScopedJob job;
+    ASSERT_TRUE(h.start(queryJson(server.uri()), recorder, job));
+    ASSERT_TRUE(recorder.waitTerminal(std::chrono::seconds(20)));
+    job.job.vtable->join(job.job.ctx);
+  }
+  ASSERT_TRUE(h.rt.hasRetainedLease(identity));
+
+  // Sabotage import #2's tee NON-fatally: squat a directory on the partial
+  // path this process would write (pid-suffixed — predictable in-test), so
+  // openWriter fails and the pull completes tee-less (§9.6, EAGER_ONLY).
+  const std::string hex = identity.substr(identity.size() - 32);
+#ifdef _WIN32
+  const auto own_pid = static_cast<unsigned long>(::GetCurrentProcessId());
+#else
+  const auto own_pid = static_cast<unsigned long>(::getpid());
+#endif
+  const fs::path partial =
+      h.cache_root.path / (hex + ".mcap.partial." + std::to_string(own_pid));
+  std::error_code ec;
+  fs::create_directories(partial / "squat", ec);
+  ASSERT_FALSE(ec);
+
+  JobRecorder recorder;
+  ScopedJob job;
+  ASSERT_TRUE(h.start(queryJson(server.uri()), recorder, job));
+  ASSERT_TRUE(recorder.waitTerminal(std::chrono::seconds(20)));
+  job.job.vtable->join(job.job.ctx);
+  ASSERT_EQ(recorder.terminalCount(), 1u);
+  EXPECT_EQ(recorder.terminal(0).first, PJ_DESCRIPTOR_IMPORT_SUCCEEDED_EAGER_ONLY)
+      << recorder.terminal(0).second;
+
+  EXPECT_TRUE(h.rt.hasRetainedLease(identity))
+      << "a non-publishing import must restore the lease it released (R1c)";
+  fs::path still_valid;
+  EXPECT_TRUE(h.rt.fileCache().lookup(identity, &still_valid));
+}

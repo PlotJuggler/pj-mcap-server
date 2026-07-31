@@ -948,8 +948,42 @@ BackendConnection::FrameLoopResult BackendConnection::runFrameLoop(const Session
       // Keep reading: the server replies with Eos{CANCELLED}, terminating below.
     }
 
+    // R2(d): a silent/control-only stream must still stop AT the session
+    // deadline — check it every iteration and cap the frame wait to the
+    // remaining time so the wait itself cannot sleep past it. The exit is
+    // NON-resumable (like a cancel): the caller's duration latch classifies.
+    auto frame_wait = std::chrono::duration_cast<std::chrono::milliseconds>(kFrameTimeout);
+    if (session_deadline_.has_value()) {
+      const auto now = std::chrono::steady_clock::now();
+      if (now >= *session_deadline_) {
+        send_cancel();
+        stats.eos = SessionEos::Cancelled;  // the pull's duration latch re-classifies
+        finish();
+        result.last_seq = last_seq;
+        return result;
+      }
+      const auto remaining =
+          std::chrono::duration_cast<std::chrono::milliseconds>(*session_deadline_ - now);
+      if (remaining < frame_wait) {
+        frame_wait = remaining;
+      }
+    }
+
     pj_cloud::v1::ServerMessage msg;
-    if (!waitSessionFrame(kFrameTimeout, &msg)) {
+    if (!waitSessionFrame(frame_wait, &msg)) {
+      // R2(d): a wait that ended AT the deadline is a deadline exit, never a
+      // resumable transport drop — reconnect-retrying past the budget would
+      // defeat the ceiling.
+      if (session_deadline_.has_value() &&
+          std::chrono::steady_clock::now() >= *session_deadline_) {
+        if (!cancel_sent) {
+          send_cancel();
+        }
+        stats.eos = SessionEos::Cancelled;  // the pull's duration latch re-classifies
+        finish();
+        result.last_seq = last_seq;
+        return result;
+      }
       // A cancel that woke the wait (empty inbox, socket still up) is NOT a
       // transport drop — do not classify it resumable (which would reconnect a
       // session the user is trying to stop). Send the wire Cancel (if not yet)
@@ -1309,6 +1343,12 @@ SessionStats BackendConnection::downloadSessionResumable(const SessionInfo& info
       continue;
     }
 
+    // R2(d): never resume past the session deadline — the caller's duration
+    // latch classifies the exit.
+    if (session_deadline_.has_value() &&
+        std::chrono::steady_clock::now() >= *session_deadline_) {
+      return finalize(SessionEos::Cancelled, {});
+    }
     // OpenResume with the last fully-delivered seq.
     std::string resume_err;
     bool rejected = false;
