@@ -662,7 +662,27 @@ void McapCloudDialog::workerLoop() {
       task = std::move(cmd_queue_.front());
       cmd_queue_.pop_front();
     }
-    task();
+    // Exception FIREWALL (adversarial F8): a command that throws (e.g.
+    // std::system_error from thread construction under resource exhaustion
+    // anywhere the FetchWorker paths spawn helpers) previously exited this
+    // worker thread and invoked std::terminate — taking the whole app down
+    // for one failed command. Report through the existing status surface
+    // and keep the pump alive; the failed command's own callbacks already
+    // carry its per-operation error reporting where they ran.
+    try {
+      task();
+      continue;
+    } catch (const std::exception& e) {
+      postEvent([this, message = std::string(e.what())]() {
+        notify(PJ::ToolboxMessageLevel::kError,
+               "MCAP Cloud: internal error in a background command: " + message);
+      });
+    } catch (...) {
+      postEvent([this]() {
+        notify(PJ::ToolboxMessageLevel::kError,
+               "MCAP Cloud: internal error in a background command");
+      });
+    }
   }
 }
 
