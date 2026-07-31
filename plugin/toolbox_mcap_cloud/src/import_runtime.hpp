@@ -145,12 +145,36 @@ class CacheTee {
 
   /// Copy `message` into the bounded queue. BLOCKS while the queue is full
   /// (backpressure — a slow disk bounds memory, it never grows it). Returns
-  /// false once the tee has failed (writer error) — the caller drops the tee
-  /// and the ingest continues (§9.6).
+  /// false once the tee has failed (writer error) OR an abort was requested
+  /// (requestAbort — the wait is cancellable cross-thread) — the caller
+  /// drops the tee and the ingest continues (§9.6).
   [[nodiscard]] bool enqueue(const DecodedMessage& message);
 
+  /// Cross-thread abort signal (any thread; e.g. a GUI cancel while the pull
+  /// thread is blocked in enqueue backpressure behind a stalled disk). Both
+  /// CV waits treat it like a failure: the blocked producer returns false
+  /// promptly and the writer thread exits at its next wakeup. NOTE: a write
+  /// already INSIDE a hung disk syscall is not interruptible — the eventual
+  /// abortAndCleanup join still waits that one write out (kernel reality,
+  /// same as the pre-tee inline export write).
+  void requestAbort();
+  /// True once requestAbort was called. Distinguishes a cancel-driven
+  /// enqueue==false (classify kAborted) from a disk failure (kFailed).
+  [[nodiscard]] bool abortRequested() const;
+
+  /// True once the writer thread latched a disk/mcap failure. Used with
+  /// abortRequested() to classify a false enqueue(); also the PR-3 provider
+  /// job's terminal-mapping query surface.
   [[nodiscard]] bool failed() const;
   [[nodiscard]] std::string failureError() const;
+
+  /// Test seams — set BEFORE openWriter (which starts the writer thread):
+  /// shrink the bounded queue / stall the writer deterministically so a test
+  /// can pin a producer genuinely blocked on the backpressure wait.
+  void setQueueCapacityForTest(std::size_t max_messages) { max_queued_messages_ = max_messages; }
+  void setWriterHookForTest(std::function<void(const DecodedMessage&)> hook) {
+    writer_hook_for_test_ = std::move(hook);
+  }
 
   /// Terminal, on the owning thread: close the queue, join the writer thread,
   /// close the MCAP writer (footer+summary) and the sink. After a true
@@ -195,9 +219,14 @@ class CacheTee {
   std::unordered_set<std::uint32_t> enqueued_known_topics_;  // distinct known ids seen
   std::uint64_t enqueued_known_messages_ = 0;
 
-  // Bounded owned-payload queue (queue_mu_ guards everything below).
+  // Bounded owned-payload queue (queue_mu_ guards everything below except
+  // the atomic abort flag, which both CV predicates read so requestAbort can
+  // wake them from ANY thread).
   static constexpr std::size_t kMaxQueuedMessages = 4096;
   static constexpr std::size_t kMaxQueuedBytes = 32ull * 1024 * 1024;
+  std::size_t max_queued_messages_ = kMaxQueuedMessages;  // test seam
+  std::function<void(const DecodedMessage&)> writer_hook_for_test_;
+  std::atomic<bool> abort_requested_{false};
   mutable std::mutex queue_mu_;
   std::condition_variable queue_not_full_;
   std::condition_variable queue_not_empty_;

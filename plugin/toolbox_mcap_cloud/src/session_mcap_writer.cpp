@@ -189,6 +189,10 @@ bool ExclusiveFileSink::open(const std::filesystem::path& path, std::string* err
   std::FILE* stream = ::_fdopen(fd, "wb");
   if (stream == nullptr) {
     ::_close(fd);
+    // Honor the no-file-left-behind promise: the exclusive create above
+    // already made the file (POSIX branch does the same removal).
+    std::error_code remove_ec;
+    std::filesystem::remove(path, remove_ec);
     return fail("could not open stream over '" + path.string() + "'");
   }
 #else

@@ -4,6 +4,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <filesystem>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -20,6 +21,7 @@
 
 namespace mcap_cloud {
 
+class CacheTee;
 class ImportRuntime;
 
 enum class McapSaveStatus {
@@ -83,20 +85,11 @@ class FetchWorker {
   /// CLI-shaped tests): the pre-stage-4 behavior is preserved verbatim.
   void setImportRuntime(ImportRuntime* runtime) { import_runtime_ = runtime; }
 
-  void requestCancel() {
-    cancel_flag_.store(true, std::memory_order_relaxed);
-    // Also signal any in-flight wire session so downloadSession() returns. The
-    // pointer is guarded by cancel_mu_ (NOT a bare atomic): the worker clears it
-    // BEFORE destroying the session backend, all under the same lock, so
-    // cancelSession() can never run against a destroyed object (the prior bare
-    // atomic left a load→call window where the worker could destroy it — a
-    // use-after-free). cancelSession() only sets a flag + notifies, so holding
-    // the leaf lock across it does not block.
-    std::lock_guard<std::mutex> lock(cancel_mu_);
-    if (backend_session_for_cancel_ != nullptr) {
-      backend_session_for_cancel_->cancelSession();
-    }
-  }
+  /// Cross-thread cancel. Signals the in-flight wire session (so
+  /// downloadSession() returns) AND a cache tee blocked in its backpressure
+  /// wait (so the pull thread cannot stay wedged behind a stalled disk).
+  /// Both hooks are published/retired under cancel_mu_ — see the .cpp.
+  void requestCancel();
   void resetCancel() {
     cancel_flag_.store(false, std::memory_order_relaxed);
   }
@@ -252,9 +245,13 @@ class FetchWorker {
   /// Cache-tee outcome for one RUNTIME-mode pull (fires exactly once per
   /// pull when an ImportRuntime is bound, before allFetchesComplete; never
   /// fires in legacy mode). `identity` is the canonical descriptor identity
-  /// the session tees under; `error` is non-empty for kFailed/kAborted. The
-  /// same outcome is recorded on the stored SessionCache entry — PR-3's
-  /// promotion hook keys off it (kFailed suppresses promotion, §9.6).
+  /// the session tees under — but it is EMPTY (with outcome kNone) for the
+  /// exits that abort BEFORE the descriptor is computed (empty selection,
+  /// no host provider, browse never connected), so a consumer (PR-3) must
+  /// never key a map on the identity without checking for "". `error` is
+  /// non-empty for kFailed/kAborted. The same outcome is recorded on the
+  /// stored SessionCache entry — PR-3's promotion hook keys off it (kFailed
+  /// suppresses promotion, §9.6).
   std::function<void(TeeOutcome outcome, std::string identity, std::string error)> teeFinished;
   /// Tag-edit commit result. ok=false carries the verbatim server/transport
   /// error. On ok=true a sequencesReady follows so the dialog refreshes the
@@ -362,6 +359,12 @@ class FetchWorker {
   // requestCancel() from the GUI thread can never dereference a freed object.
   std::mutex cancel_mu_;
   BackendConnection* backend_session_for_cancel_{nullptr};
+  // The pull's live CacheTee, exposed for requestCancel() to free a producer
+  // blocked in the tee's backpressure wait (quality review IMPORTANT-2).
+  // Same lifetime discipline as backend_session_for_cancel_ above: published
+  // after a successful CacheTee::begin, retired UNDER cancel_mu_ before the
+  // owning unique_ptr resets/destroys the tee on every path.
+  CacheTee* tee_for_cancel_{nullptr};
 
   // ---- in-memory SessionCache (Slice 8) ------------------------------------
   // LEGACY-mode instance, owned by the worker. A HIT re-emits the per-topic
@@ -384,6 +387,21 @@ class FetchWorker {
   [[nodiscard]] const SessionCache& sessionCacheForTest() const { return session_cache_; }
 
  private:
+  // The §6.1 memory-hit block of pullTopicsAsync (pure extraction — quality
+  // review IMPORTANT-3). Returns true when the pull was SERVED from the
+  // in-memory cache (caller: finish_all + return); false = miss, continue
+  // with a network fetch. RUNTIME mode applies the disk-validity rules
+  // (valid disk -> serve + export by copy under a shared read lease;
+  // missing/invalid disk -> evict + report refetch); LEGACY mode preserves
+  // the pre-stage-4 count-only HIT.
+  [[nodiscard]] bool serveFromMemoryCache(
+      ImportRuntime* rt, SessionCache& session_cache, const SessionKey& session_key,
+      const std::string& tee_identity, const std::string& group_name,
+      const std::vector<std::string>& topic_names, const std::string& save_directory,
+      const SessionCache::ExistencePredicate& exists,
+      const std::function<void(const std::filesystem::path&)>& export_by_copy,
+      TeeOutcome* tee_outcome, bool* refetch_after_disk_miss);
+
   // Default existence predicate (D7): keyed on the entry's stable dataset_id
   // when recorded (recorded display name as the id-recycle tiebreak), with a
   // name-only fallback for legacy id-less entries. Returns false when no host

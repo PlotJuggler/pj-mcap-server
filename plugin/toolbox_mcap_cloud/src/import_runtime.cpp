@@ -200,25 +200,41 @@ bool CacheTee::openWriter(const SessionInfo& info, const std::string& canonical_
 }
 
 bool CacheTee::enqueue(const DecodedMessage& message) {
+  // Owned copy taken OUTSIDE the lock — the payload copy is the expensive
+  // part and must not extend the critical section.
+  DecodedMessage owned = message;
   std::unique_lock<std::mutex> lock(queue_mu_);
   if (!writer_thread_.joinable()) {
     return false;  // never opened (or already drained/aborted)
   }
   queue_not_full_.wait(lock, [this] {
-    return failed_ || queue_closed_ ||
-           (queue_.size() < kMaxQueuedMessages && queued_bytes_ < kMaxQueuedBytes);
+    return failed_ || queue_closed_ || abort_requested_.load(std::memory_order_relaxed) ||
+           (queue_.size() < max_queued_messages_ && queued_bytes_ < kMaxQueuedBytes);
   });
-  if (failed_ || queue_closed_) {
+  if (failed_ || queue_closed_ || abort_requested_.load(std::memory_order_relaxed)) {
     return false;
   }
-  queued_bytes_ += message.payload.size();
-  queue_.push_back(message);  // owned copy — the wire buffer is recycled by the caller
-  if (known_topic_ids_.count(message.topic_id) > 0) {
+  queued_bytes_ += owned.payload.size();
+  if (known_topic_ids_.count(owned.topic_id) > 0) {
     ++enqueued_known_messages_;
-    enqueued_known_topics_.insert(message.topic_id);
+    enqueued_known_topics_.insert(owned.topic_id);
   }
+  queue_.push_back(std::move(owned));
   queue_not_empty_.notify_one();
   return true;
+}
+
+void CacheTee::requestAbort() {
+  abort_requested_.store(true, std::memory_order_relaxed);
+  // Take the mutex before notifying so a waiter that just evaluated its
+  // predicate cannot sleep through the wakeup.
+  std::lock_guard<std::mutex> lock(queue_mu_);
+  queue_not_full_.notify_all();
+  queue_not_empty_.notify_all();
+}
+
+bool CacheTee::abortRequested() const {
+  return abort_requested_.load(std::memory_order_relaxed);
 }
 
 bool CacheTee::failed() const {
@@ -236,9 +252,12 @@ void CacheTee::writerLoop() {
     DecodedMessage message;
     {
       std::unique_lock<std::mutex> lock(queue_mu_);
-      queue_not_empty_.wait(lock, [this] { return !queue_.empty() || queue_closed_ || failed_; });
-      if (failed_) {
-        return;  // abort: leave the queue; cleanup discards it
+      queue_not_empty_.wait(lock, [this] {
+        return !queue_.empty() || queue_closed_ || failed_ ||
+               abort_requested_.load(std::memory_order_relaxed);
+      });
+      if (failed_ || abort_requested_.load(std::memory_order_relaxed)) {
+        return;  // failure/abort: leave the queue; cleanup discards it
       }
       if (queue_.empty()) {
         return;  // closed + drained
@@ -247,6 +266,9 @@ void CacheTee::writerLoop() {
       queue_.pop_front();
       queued_bytes_ -= message.payload.size();
       queue_not_full_.notify_one();
+    }
+    if (writer_hook_for_test_) {
+      writer_hook_for_test_(message);  // test seam: deterministic drain stall
     }
     std::string write_error;
     if (!writer_.write(message, &write_error)) {

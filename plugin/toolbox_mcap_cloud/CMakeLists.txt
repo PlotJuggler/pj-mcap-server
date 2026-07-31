@@ -261,6 +261,21 @@ target_link_libraries(mcap-cloud-cli PRIVATE
 # ----------------------------------------------------------------------------
 if(BUILD_TESTING)
   find_package(GTest REQUIRED)
+
+  # Sources every FetchWorker-linking test target has needed since the
+  # stage-4 import runtime landed (fetch_worker.cpp references
+  # ImportRuntime/CacheTee, which pull the cache + descriptor + trust units).
+  set(MCAP_CLOUD_IMPORT_SOURCES
+    src/session_file_cache.cpp
+    src/source_descriptor.cpp
+    src/import_runtime.cpp
+    src/trusted_origins.cpp
+    src/origin_match.cpp
+    src/credential_store.cpp
+    src/server_history.cpp
+    src/core/file_lock.cpp
+    src/core/sha256.cpp
+  )
   # The UI well-formedness ctest below shells out to a Python interpreter; on
   # Windows runners `python3` is not reliably on PATH, so resolve it here.
   find_package(Python3 REQUIRED COMPONENTS Interpreter)
@@ -744,15 +759,7 @@ if(BUILD_TESTING)
     tests/session_resume_live_test.cpp
     src/parser_ingest_driver.cpp
     src/fetch_worker.cpp
-    src/session_file_cache.cpp
-    src/source_descriptor.cpp
-    src/import_runtime.cpp
-    src/trusted_origins.cpp
-    src/origin_match.cpp
-    src/credential_store.cpp
-    src/server_history.cpp
-    src/core/file_lock.cpp
-    src/core/sha256.cpp
+    ${MCAP_CLOUD_IMPORT_SOURCES}
     src/backend_connection.cpp
     src/wire_mapping.cpp
     src/session_decode.cpp
@@ -796,15 +803,7 @@ if(BUILD_TESTING)
     tests/fetch_worker_export_contract_test.cpp
     src/parser_ingest_driver.cpp
     src/fetch_worker.cpp
-    src/session_file_cache.cpp
-    src/source_descriptor.cpp
-    src/import_runtime.cpp
-    src/trusted_origins.cpp
-    src/origin_match.cpp
-    src/credential_store.cpp
-    src/server_history.cpp
-    src/core/file_lock.cpp
-    src/core/sha256.cpp
+    ${MCAP_CLOUD_IMPORT_SOURCES}
     src/backend_connection.cpp
     src/wire_mapping.cpp
     src/session_decode.cpp
@@ -837,15 +836,7 @@ if(BUILD_TESTING)
     tests/find_free_port.cpp
     src/parser_ingest_driver.cpp
     src/fetch_worker.cpp
-    src/session_file_cache.cpp
-    src/source_descriptor.cpp
-    src/import_runtime.cpp
-    src/trusted_origins.cpp
-    src/origin_match.cpp
-    src/credential_store.cpp
-    src/server_history.cpp
-    src/core/file_lock.cpp
-    src/core/sha256.cpp
+    ${MCAP_CLOUD_IMPORT_SOURCES}
     src/backend_connection.cpp
     src/wire_mapping.cpp
     src/session_decode.cpp
@@ -887,15 +878,7 @@ if(BUILD_TESTING)
     src/wire_mapping.cpp
     src/session_decode.cpp
     src/session_mcap_writer.cpp
-    src/session_file_cache.cpp
-    src/source_descriptor.cpp
-    src/import_runtime.cpp
-    src/trusted_origins.cpp
-    src/origin_match.cpp
-    src/credential_store.cpp
-    src/server_history.cpp
-    src/core/file_lock.cpp
-    src/core/sha256.cpp
+    ${MCAP_CLOUD_IMPORT_SOURCES}
     src/mcap_save_path.cpp
     src/core/time_format.cpp
     src/mcap_implementation.cpp
@@ -920,15 +903,7 @@ if(BUILD_TESTING)
     tests/parser_ingest_live_test.cpp
     src/parser_ingest_driver.cpp
     src/fetch_worker.cpp
-    src/session_file_cache.cpp
-    src/source_descriptor.cpp
-    src/import_runtime.cpp
-    src/trusted_origins.cpp
-    src/origin_match.cpp
-    src/credential_store.cpp
-    src/server_history.cpp
-    src/core/file_lock.cpp
-    src/core/sha256.cpp
+    ${MCAP_CLOUD_IMPORT_SOURCES}
     src/backend_connection.cpp
     src/wire_mapping.cpp
     src/session_decode.cpp

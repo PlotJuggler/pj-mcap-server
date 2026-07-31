@@ -34,9 +34,12 @@
 //
 // THREADING (D7-amended): the cache is shared per toolbox instance through
 // ImportRuntime — the interactive worker thread and future provider job
-// threads all touch it — so every public method locks an internal mutex (a
-// leaf lock: the existence predicate runs under it and must not call back
-// into the cache). The pre-stage-4 single-worker usage still works unchanged.
+// threads all touch it — so every public method locks an internal mutex.
+// The internal mutex is a TRUE leaf lock by construction: lookup() runs the
+// existence predicate OUTSIDE it (copy entry -> unlock -> run predicate ->
+// relock; the predicate may acquire a host catalog snapshot), so predicate
+// code can never deadlock against the cache or another lock the host holds.
+// The pre-stage-4 single-worker usage still works unchanged.
 #pragma once
 
 #include <cstddef>
@@ -96,7 +99,8 @@ class SessionCache {
  public:
   // Predicate that answers "is this dataset still present in the host
   // catalog?" over the full cached entry (key on entry.dataset_id, D7).
-  // Presence-unknown MUST return false. Runs under the cache's internal lock.
+  // Presence-unknown MUST return false. Runs OUTSIDE the cache's internal
+  // lock (on a copy of the entry) — it may call into the host freely.
   using ExistencePredicate = std::function<bool(const CachedSession& entry)>;
 
   static constexpr std::size_t kDefaultMaxEntries = 8;
@@ -111,32 +115,40 @@ class SessionCache {
   // presence-unknown -> treated as MISS (and the stale entry is NOT evicted, since
   // we cannot prove it gone).
   [[nodiscard]] std::optional<CachedSession> lookup(const SessionKey& key, const ExistencePredicate& exists) {
-    std::lock_guard<std::mutex> lock(mu_);
-    auto map_it = index_.find(key.hash);
-    if (map_it == index_.end()) {
+    // Phase 1 (locked): find the full-key match and COPY it out.
+    std::optional<CachedSession> candidate;
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      if (EntryIter entry_it; findLocked(key, &entry_it)) {
+        candidate = entry_it->value;
+      }
+    }
+    if (!candidate.has_value()) {
       return std::nullopt;
     }
-    // Scan the (tiny) bucket for the full-key match. Each bucket element is an
-    // EntryIter into entries_; dereference twice to reach the Entry.
-    for (auto bit = map_it->second.begin(); bit != map_it->second.end(); ++bit) {
-      EntryIter entry_it = *bit;
-      if (entry_it->key != key) {
-        continue;
-      }
-      // Found the entry. Verify dataset existence in the host.
-      const bool present = exists ? exists(entry_it->value) : false;
-      if (!present) {
-        if (exists) {
-          // Predicate ran and said "gone" -> evict the stale entry.
-          eraseLocked(entry_it, map_it);
-        }
-        return std::nullopt;  // presence-unknown OR proven-gone -> MISS
-      }
-      // Real HIT: promote to MRU and return a copy of the metadata.
-      promoteLocked(entry_it);
-      return entries_.front().value;
+    // Phase 2 (UNLOCKED): run the predicate on the copy — it may call into
+    // the host (catalog snapshot); the cache mutex stays a leaf lock.
+    const bool present = exists ? exists(*candidate) : false;
+    // Phase 3 (relocked): act on the verdict against the CURRENT state — a
+    // racing store/evict may have changed the entry while we were unlocked.
+    std::lock_guard<std::mutex> lock(mu_);
+    EntryIter entry_it;
+    if (!findLocked(key, &entry_it)) {
+      return std::nullopt;  // concurrently evicted either way -> MISS
     }
-    return std::nullopt;
+    if (!present) {
+      if (exists && entry_it->value.dataset_id == candidate->dataset_id &&
+          entry_it->value.display_name == candidate->display_name) {
+        // Predicate ran and said "gone" -> evict, but ONLY the entry we
+        // actually validated: a racing re-store may have replaced it with a
+        // FRESH dataset this verdict knows nothing about.
+        eraseLocked(entry_it, index_.find(key.hash));
+      }
+      return std::nullopt;  // presence-unknown OR proven-gone -> MISS
+    }
+    // Real HIT: promote to MRU and return a copy of the CURRENT metadata.
+    promoteLocked(entry_it);
+    return entries_.front().value;
   }
 
   // Store (or refresh) the COMPLETE-session entry for `key`. Callers MUST only
@@ -207,6 +219,22 @@ class SessionCache {
   };
   using EntryList = std::list<Entry>;
   using EntryIter = EntryList::iterator;
+
+  // Locate the full-key entry (hash bucket scan + full-key equality). Caller
+  // holds mu_. Returns false when absent.
+  [[nodiscard]] bool findLocked(const SessionKey& key, EntryIter* out) {
+    auto map_it = index_.find(key.hash);
+    if (map_it == index_.end()) {
+      return false;
+    }
+    for (EntryIter entry_it : map_it->second) {
+      if (entry_it->key == key) {
+        *out = entry_it;
+        return true;
+      }
+    }
+    return false;
+  }
 
   // Move an entry (by list iterator) to the front of the LRU list, keeping the
   // bucket index iterators valid (splice does not invalidate iterators).

@@ -302,6 +302,82 @@ TEST(McapCloudImportRuntime, CacheTeeBeginDetectsInProcessContention) {
   EXPECT_TRUE(third.begin(identity, &error)) << error;
 }
 
+// IMPORTANT-2 (quality review): the enqueue backpressure wait MUST be
+// cancellable cross-thread. A producer genuinely blocked on a full queue
+// behind a stalled writer (the gated hook stands in for a hung disk) can
+// only be freed by requestAbort() — before the fix, only the writer thread
+// could signal queue_not_full_, so a hung disk wedged the pull thread AND
+// the GUI cancel behind it.
+TEST(McapCloudImportRuntime, CacheTeeRequestAbortUnblocksABackpressuredProducer) {
+  TempRoot cache_root("abort-backpressure-cache");
+  TempRoot config_root("abort-backpressure-config");
+  mcap_cloud::ImportRuntime rt = makeRuntime(cache_root, config_root);
+
+  const auto d = descriptor("backpressure.mcap");
+  const std::string identity = mcap_cloud::descriptorIdentity(d);
+
+  mcap_cloud::CacheTee tee(rt);
+  std::string error;
+  ASSERT_TRUE(tee.begin(identity, &error)) << error;
+
+  // Stall the writer thread on its FIRST message until released; shrink the
+  // queue so the producer hits backpressure after a couple of enqueues.
+  std::atomic<bool> release_writer{false};
+  tee.setQueueCapacityForTest(1);
+  tee.setWriterHookForTest([&](const mcap_cloud::DecodedMessage&) {
+    while (!release_writer.load()) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+  });
+  ASSERT_TRUE(tee.openWriter(sessionInfo(), mcap_cloud::canonicalSourceDescriptorJson(d), 0, &error))
+      << error;
+
+  std::atomic<int> enqueued{0};
+  std::atomic<bool> last_enqueue_ok{true};
+  std::thread producer([&] {
+    for (int i = 0; i < 8; ++i) {
+      const bool ok = tee.enqueue(message(11, 100 + i));
+      last_enqueue_ok.store(ok);
+      if (!ok) {
+        return;  // the abort freed us
+      }
+      enqueued.fetch_add(1);
+    }
+  });
+
+  // Wait until the producer is genuinely wedged (progress stalls while the
+  // thread is still running: writer holds msg 1 in the hook, the queue holds
+  // 1, and the next enqueue blocks on queue_not_full_).
+  const auto stall_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  int last_seen = -1;
+  int stable_polls = 0;
+  while (std::chrono::steady_clock::now() < stall_deadline && stable_polls < 10) {
+    const int now_count = enqueued.load();
+    stable_polls = (now_count == last_seen) ? stable_polls + 1 : 0;
+    last_seen = now_count;
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  }
+  ASSERT_GE(stable_polls, 10) << "producer never stalled — the backpressure precondition failed";
+  ASSERT_LT(last_seen, 8) << "producer finished without ever blocking";
+
+  const auto abort_at = std::chrono::steady_clock::now();
+  tee.requestAbort();
+  producer.join();
+  const auto elapsed = std::chrono::steady_clock::now() - abort_at;
+  EXPECT_LT(elapsed, std::chrono::seconds(2))
+      << "requestAbort must free a backpressured producer promptly";
+  EXPECT_FALSE(last_enqueue_ok.load()) << "the freed enqueue must report the tee dropped";
+
+  // Release the stalled writer so cleanup can join it; the abort path then
+  // deletes the partial and releases both locks.
+  release_writer.store(true);
+  const std::filesystem::path partial = tee.partialPath();
+  tee.abortAndCleanup();
+  EXPECT_FALSE(fs::exists(partial)) << "cache partials never survive an abort";
+  EXPECT_TRUE(rt.tryBeginMaterialize(identity).has_value());
+  EXPECT_TRUE(rt.fileCache().tryLockForMaterialize(identity, &error).has_value()) << error;
+}
+
 // An unusable cache root (a FILE where the directory should be) fails the tee
 // at begin() with a clear error — the caller (fetch) continues tee-less.
 TEST(McapCloudImportRuntime, CacheTeeBeginFailsCleanlyOnUnusableRoot) {

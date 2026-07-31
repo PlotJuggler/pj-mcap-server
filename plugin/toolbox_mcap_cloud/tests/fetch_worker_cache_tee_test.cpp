@@ -324,6 +324,19 @@ TEST(McapCloudFetchWorkerCacheTee, CancelMidDownloadCopiesExportPartialAndDelete
 
   Harness h(rt, server.uri());
   std::thread pull([&] { h.pull(export_dir.path.string()); });
+  // Join guard: an ASSERT failure below would otherwise unwind past a
+  // joinable std::thread (std::terminate). Cancels first so the guarded
+  // join cannot itself hang out the frame timeout.
+  struct PullJoinGuard {
+    mcap_cloud::FetchWorker& worker;
+    std::thread& thread;
+    ~PullJoinGuard() {
+      if (thread.joinable()) {
+        worker.requestCancel();
+        thread.join();
+      }
+    }
+  } pull_join_guard{h.worker, pull};
   const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
   while (h.progress_events.load() == 0 && std::chrono::steady_clock::now() < deadline) {
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
