@@ -188,7 +188,8 @@ unpacked headers to grep).
   tee + export-copy + locks/leases + shared ImportRuntime; PR-2 headless one-shot
   init + shared credential resolver; PR-3 provider ABI/jobs/promotion; PR-4
   live/E2E/docs. The PJ4 promotion-teardown fix precedes PR-3's live integration
-  (rides the T7 PR or its own tiny PJ4 PR).
+  (rides the T7 PR or its own tiny PJ4 PR — it took the latter fork: PJ4 #497,
+  merged 2026-07-31 as commit 77d07fa6).
 - **New scope from consult:** cross-platform shared cache leases (file_lock.h:4
   leaves them to stage 4; datasets outlive headless sessions); pre-materialization
   cleanup/free-space reserve + under-lock corruption deletion + RAII partial guard
@@ -270,4 +271,5 @@ implementer + spec review + quality review with fix rounds:
   adaptation; docs: spec §12 stale-text fix, §9.8 + §13-4 DONE, §6.3 as-built +
   idle-thread residual, README provider section.
 Known infra: the plotjuggler-conan remote is dead (302) and fails fresh ./build.sh —
-disable it permanently. PJ4-side teardown-deadlock reorder still rides the T7 PR.
+disable it permanently. PJ4-side teardown-deadlock reorder SHIPPED separately as
+PJ4 #497 (77d07fa6, merged 2026-07-31) — it does NOT ride the T7 PR.
