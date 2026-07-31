@@ -106,6 +106,48 @@ FileLock::~FileLock() {
   release();
 }
 
+bool FileLock::downgradeToShared(std::string* error) {
+  if (handle_ == -1) {
+    if (error) {
+      *error = "downgrade on a released lock";
+    }
+    return false;
+  }
+#if defined(_WIN32)
+  // No in-place conversion on Windows: unlock, then re-lock shared on the
+  // SAME handle (FAIL_IMMEDIATELY). The window between the two calls is the
+  // documented non-atomicity; on failure the handle is closed (released).
+  const HANDLE handle = reinterpret_cast<HANDLE>(handle_);
+  OVERLAPPED overlapped{};
+  ::UnlockFileEx(handle, 0, 1, 0, &overlapped);
+  OVERLAPPED relock{};
+  if (::LockFileEx(handle, LOCKFILE_FAIL_IMMEDIATELY, 0, 1, 0, &relock) == 0) {
+    ::CloseHandle(handle);
+    handle_ = -1;
+    if (error) {
+      *error = "shared re-lock lost the conversion race";
+    }
+    return false;
+  }
+  return true;
+#else
+  // flock(2): "Converting a lock ... is not guaranteed to be atomic: the
+  // existing lock is first removed, and then a new lock is established" —
+  // with LOCK_NB a concurrent exclusive try can win that window, failing
+  // this call; the lock state is then unknown, so release outright.
+  if (::flock(static_cast<int>(handle_), LOCK_SH | LOCK_NB) != 0) {
+    const int flock_errno = errno;
+    release();
+    if (error) {
+      *error = "shared downgrade lost the conversion race: " +
+               std::error_code(flock_errno, std::generic_category()).message();
+    }
+    return false;
+  }
+  return true;
+#endif
+}
+
 void FileLock::release() {
   if (handle_ == -1) {
     return;

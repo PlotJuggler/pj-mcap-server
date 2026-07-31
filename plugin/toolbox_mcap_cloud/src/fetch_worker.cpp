@@ -234,6 +234,13 @@ bool FetchWorker::serveFromMemoryCache(
   if (rt != nullptr && !save_directory.empty()) {
     export_by_copy(disk_file);  // export = byte copy of the valid cache file
   }
+  // Adversarial F2: the served dataset keeps depending on the disk file
+  // (lazy re-opens) — RETAIN the read lease for the runtime lifetime instead
+  // of dropping it at scope exit (no-op when an identity lease is already
+  // retained, e.g. from the original finalize).
+  if (rt != nullptr && read_lease.has_value()) {
+    rt->retainReadLease(tee_identity, std::move(*read_lease));
+  }
   return true;
 }
 

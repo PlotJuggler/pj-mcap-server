@@ -36,6 +36,15 @@ class FileLock {
   [[nodiscard]] static std::optional<FileLock> tryShared(
       const std::filesystem::path& path, std::string* error);
 
+  /// Convert a HELD EXCLUSIVE lock to SHARED without closing the handle
+  /// (the adversarial-F2 finalize handoff). Platform reality: neither
+  /// flock(2) nor LockFileEx guarantees an atomic conversion — the old lock
+  /// can drop before the new one lands, so a concurrent non-blocking
+  /// exclusive try may slip into that microscopic window. On conversion
+  /// failure the lock is RELEASED and false is returned; the caller must
+  /// revalidate whatever the lock protected and proceed lease-less.
+  [[nodiscard]] bool downgradeToShared(std::string* error);
+
   FileLock(FileLock&& other) noexcept;
   FileLock& operator=(FileLock&& other) noexcept;
   FileLock(const FileLock&) = delete;

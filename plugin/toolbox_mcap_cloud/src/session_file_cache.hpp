@@ -72,6 +72,18 @@ class SessionFileCache {
 
   [[nodiscard]] std::optional<MaterializeLock> tryLockForMaterialize(
       std::string_view identity, std::string* error);
+
+
+  /// Adversarial F2: convert a finalized identity's EXCLUSIVE materialize
+  /// lock into a SHARED read lease WITHOUT closing the underlying handle —
+  /// the exclusive->shared handoff that keeps another process's cleanup from
+  /// unlinking a just-published file that live datasets will lazily re-open.
+  /// The platform conversion has a microscopic non-atomic window (see
+  /// FileLock::downgradeToShared); on failure nullopt is returned with the
+  /// lock RELEASED — the caller revalidates and proceeds lease-less. Call
+  /// only AFTER finalize() succeeded.
+  [[nodiscard]] static std::optional<FileLock> toSharedLease(MaterializeLock&& lock,
+                                                             std::string* error);
   /// The partial path this process must write under `lock`.
   [[nodiscard]] std::filesystem::path partialPathFor(const MaterializeLock& lock) const;
 

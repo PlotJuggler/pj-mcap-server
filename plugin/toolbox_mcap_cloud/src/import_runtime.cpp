@@ -51,6 +51,25 @@ std::optional<ImportRuntime::MaterializeTicket> ImportRuntime::tryBeginMateriali
   return MaterializeTicket(this, std::move(key));
 }
 
+void ImportRuntime::retainReadLease(std::string_view identity, FileLock lease) {
+  std::lock_guard<std::mutex> lock(lease_mu_);
+  const std::string key(identity);
+  if (retained_leases_.count(key) > 0) {
+    return;  // keep the existing lease; the duplicate releases on return
+  }
+  retained_leases_.emplace(key, std::move(lease));
+}
+
+void ImportRuntime::releaseRetainedLease(std::string_view identity) {
+  std::lock_guard<std::mutex> lock(lease_mu_);
+  retained_leases_.erase(std::string(identity));
+}
+
+bool ImportRuntime::hasRetainedLease(std::string_view identity) const {
+  std::lock_guard<std::mutex> lock(lease_mu_);
+  return retained_leases_.count(std::string(identity)) > 0;
+}
+
 void ImportRuntime::endMaterialize(const std::string& identity) {
   std::lock_guard<std::mutex> lock(active_mu_);
   active_identities_.erase(identity);
@@ -110,6 +129,10 @@ bool CacheTee::begin(const std::string& identity, std::string* error) {
     return fail("a materialization of this session is already in progress in this process");
   }
   runtime_.fileCache().cleanup(runtime_.cacheConfig());
+  // A retained dataset-lifetime lease (F2) on THIS identity would block our
+  // own exclusive materialize lock below — release it first (see
+  // ImportRuntime::releaseRetainedLease for why replacement stays safe).
+  runtime_.releaseRetainedLease(identity);
 
   std::string lock_error;
   lock_ = runtime_.fileCache().tryLockForMaterialize(identity, &lock_error);
@@ -361,6 +384,24 @@ bool CacheTee::finalize(const std::optional<SessionFileCache::ExpectedContent>& 
     return false;
   }
   finalized_ = true;
+  // Adversarial F2: hand the exclusive materialize lock over as a SHARED
+  // dataset-lifetime lease retained by the runtime — without this, another
+  // process's cleanup could unlink the just-published file while a live
+  // (possibly promoted) dataset still lazily re-opens it. The platform
+  // downgrade has a microscopic non-atomic window; on conversion failure —
+  // or if an evictor won that window and the file no longer validates — we
+  // simply proceed lease-less (the pre-F2 behavior).
+  {
+    std::string lease_error;
+    auto lease = SessionFileCache::toSharedLease(std::move(*lock_), &lease_error);
+    lock_.reset();
+    if (lease.has_value()) {
+      std::filesystem::path revalidated;
+      if (runtime_.fileCache().lookup(identity_, &revalidated)) {
+        runtime_.retainReadLease(identity_, std::move(*lease));
+      }
+    }
+  }
   return true;
 }
 

@@ -572,3 +572,41 @@ TEST(McapCloudFetchWorkerCacheTee, MemoryHitRequiresMatchingCacheIdentity) {
       << "an identity-mismatched memory entry must refetch, never serve (adversarial F1)";
   EXPECT_EQ(h.served_from_cache, 0);
 }
+
+// Adversarial F2: a finalized cache file is pinned by a runtime-retained
+// SHARED lease (exclusive->shared handoff at finalize) for the toolbox-
+// instance lifetime — an evictor's exclusive try fails, cleanup skips the
+// file even under a zero budget, and the lease dies with the runtime.
+TEST(McapCloudFetchWorkerCacheTee, FinalizedFileIsLeasedForTheRuntimeLifetime) {
+  FakeStreamingServer server(FakeStreamingServer::Mode::kComplete);
+  ASSERT_TRUE(server.ok());
+  TempRoot cache_root("lease-cache");
+  TempRoot config_root("lease-config");
+  const std::string identity = identityFor(server.uri());
+  {
+    mcap_cloud::ImportRuntime rt(mcap_cloud::SessionFileCache(cache_root.path),
+                                 mcap_cloud::TrustedOrigins(config_root.path));
+    Harness h(rt, server.uri());
+    h.pull();
+    ASSERT_EQ(h.tee.outcome, mcap_cloud::TeeOutcome::kFinalized) << h.tee.error;
+
+    EXPECT_TRUE(rt.hasRetainedLease(identity)) << "finalize must retain the shared lease";
+    std::string err;
+    EXPECT_FALSE(rt.fileCache().tryLockForMaterialize(identity, &err).has_value())
+        << "the retained shared lease must block an exclusive (evictor) try";
+
+    // Zero-budget cleanup must SKIP the leased file (the eviction guard).
+    mcap_cloud::SessionFileCache::Config zero;
+    zero.max_total_bytes = 0;
+    zero.min_free_bytes = 0;
+    rt.fileCache().cleanup(zero);
+    fs::path still_there;
+    EXPECT_TRUE(rt.fileCache().lookup(identity, &still_there))
+        << "cleanup must never evict a leased file";
+  }
+  // Runtime destroyed -> lease released: a fresh evictor CAN lock now.
+  mcap_cloud::SessionFileCache fresh(cache_root.path);
+  std::string err;
+  EXPECT_TRUE(fresh.tryLockForMaterialize(identity, &err).has_value())
+      << "the lease must die with the runtime: " << err;
+}

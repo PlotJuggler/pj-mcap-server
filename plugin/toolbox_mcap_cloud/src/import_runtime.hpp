@@ -38,6 +38,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <unordered_map>
 #include <unordered_set>
 
 #include "backend_types.hpp"
@@ -96,6 +97,23 @@ class ImportRuntime {
   /// is the SessionFileCache MaterializeLock).
   [[nodiscard]] std::optional<MaterializeTicket> tryBeginMaterialize(std::string_view identity);
 
+  // ---- CONSERVATIVE-INTERIM dataset-lifetime leases (adversarial F2) -------
+  // The runtime retains ONE shared read lease per finalized/served identity
+  // for the TOOLBOX-INSTANCE lifetime, so another process's cleanup/eviction
+  // (exclusive on the same sidecar) can never unlink a cache file that live
+  // datasets may lazily re-open (a promoted source's loader cold-reads
+  // chunks long after finalize). Per-dataset release requires a host
+  // dataset-DELETION callback the SDK does not expose yet — recorded as an
+  // SDK follow-up; until then leases die with the runtime (destructor).
+  // A duplicate retain for an identity keeps the EXISTING lease.
+  void retainReadLease(std::string_view identity, FileLock lease);
+  /// Drop the retained lease for `identity`: a re-materialization must be
+  /// able to take the exclusive lock on its own sidecar (CacheTee::begin
+  /// calls this; rename-over replacement is safe for already-open handles —
+  /// only lazy re-opens observe the new file, exactly as before F2).
+  void releaseRetainedLease(std::string_view identity);
+  [[nodiscard]] bool hasRetainedLease(std::string_view identity) const;
+
  private:
   void endMaterialize(const std::string& identity);
 
@@ -110,6 +128,9 @@ class ImportRuntime {
 
   std::mutex active_mu_;
   std::unordered_set<std::string> active_identities_;
+
+  mutable std::mutex lease_mu_;
+  std::unordered_map<std::string, FileLock> retained_leases_;  // F2 (see above)
 };
 
 /// One cache-materialization attempt (see the file header). Drive:

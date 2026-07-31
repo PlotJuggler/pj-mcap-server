@@ -298,6 +298,15 @@ std::optional<SessionFileCache::MaterializeLock> SessionFileCache::tryLockForMat
   return MaterializeLock(std::move(*lock), *hex, std::move(partial));
 }
 
+std::optional<FileLock> SessionFileCache::toSharedLease(MaterializeLock&& lock,
+                                                        std::string* error) {
+  FileLock held = std::move(lock.lock_);
+  if (!held.downgradeToShared(error)) {
+    return std::nullopt;  // released; the caller proceeds lease-less
+  }
+  return held;
+}
+
 fs::path SessionFileCache::partialPathFor(const MaterializeLock& lock) const {
   return lock.partial_;
 }
