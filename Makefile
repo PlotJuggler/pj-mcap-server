@@ -103,10 +103,17 @@ matrix:
 # docs/source-descriptor-vectors.json bound live against the deterministic
 # seeded corpus, DSO staging with provenance (cloud plugin + mcap-loader +
 # ros-parser rebuilt on the pinned SDK), and a plotjuggler4 --validate-plugins
-# pre-flight. The gui-test and shipped-binary legs are Task 3/4 stubs (logged
-# SKIPPED-pending). Serialized against `make smoke` via a shared flock
+# pre-flight. It then runs the two REAL legs: the live PJ4 gui-test
+# main_window_layout_import_e2e_test (5 scenarios; a SKIPPED test fails the
+# harness) and 3 shipped-binary `plotjuggler4 --layout --exit-after-layout
+# --dump-diagnostics` legs (cold / warm-zero-network / EAGER_ONLY), each in its
+# own XDG sandbox. NEEDS a PJ4 build carrying the stage-5 flags + gui-test —
+# point E2E_PJ4_BUILD at it if it is not ~/ws_plotjuggler/PJ4/build. Post-mortem
+# artifacts (dumps, logs, provenance) are kept in /tmp/pj-e2e-layout-artifacts/.
+# Serialized against `make smoke` via a shared flock
 # (/tmp/pj-cloud-harness.lock). Prints E2E-LAYOUT-IMPORT PASS / FAIL.
-# `bash scripts/e2e-layout-import.sh --dry-run` prints the plan touching nothing.
+# `bash scripts/e2e-layout-import.sh --dry-run` prints the plan touching nothing;
+# `--help` documents the environment overrides.
 e2e-layout:
 	bash scripts/e2e-layout-import.sh
 

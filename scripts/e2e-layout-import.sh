@@ -15,6 +15,28 @@
 #     process-group teardown via setsid),
 #   - Minio is started if down but NEVER `docker compose down`ed here.
 #
+# It proves, live and end to end:
+#   a-g  bring-up: shared Go tools, deterministic corpus in its own bucket, a
+#        one-shot Python catalog build, the read-only server on :8082, the
+#        frozen vectors bound to the served corpus, the three REAL DSOs staged
+#        with provenance, and plotjuggler4's own --validate-plugins pre-flight;
+#   h    the LIVE PJ4 gui-test (main_window_layout_import_e2e_test): a real
+#        MainWindow offscreen against this server through the staged DSOs —
+#        cold promotion with a live progressive witness, the literal GUI
+#        save/load flow warm + zero-network, EAGER_ONLY in-process, the trust
+#        gate, and the three-way catalog-equality signature. The harness sets
+#        the live env, so a SKIPPED test is a GATING BUG and FAILS the run;
+#   i    the SHIPPED binary: three `plotjuggler4 --layout --exit-after-layout
+#        --dump-diagnostics` legs in private XDG sandboxes — (1) cold, which
+#        must promote (artifact materialized, zero layout-import failure ids,
+#        curves resolved); (2) warm, the same layout in the same sandbox, which
+#        must touch NO network (pj_cloud_sessions_total and
+#        pj_cloud_ws_connections_total unchanged, artifact mtime unchanged);
+#        (3) EAGER_ONLY with a REGULAR FILE as the cache root, which must
+#        report `layout-import-eager-only` and materialize nothing. Leg 1 runs
+#        FIRST on purpose: it is the baseline that proves the parsers decode,
+#        without which a decode failure could masquerade as the EAGER result.
+#
 # A COMMON harness flock (/tmp/pj-cloud-harness.lock, shared with smoke.sh)
 # serializes this script against `make smoke` — both rebuild server/bin, both
 # poke Minio, and neither tolerates a loaded machine well. We WAIT (with a
@@ -36,10 +58,15 @@
 # rev, SDK version, sha256) — functional, not bureaucratic: PJ4 #491 actively
 # rejects incompatible plugins, so an unrecorded stale DSO is a debugging trap.
 #
-# The gtest leg and the shipped-binary legs are Task 3/4 STUBS for now, logged
-# as SKIPPED-pending; everything up to and including bring-up, vector-fixture
-# binding, DSO staging + provenance, and the --validate-plugins pre-flight runs
-# for real today.
+# Post-mortem artifacts (provenance record, every diagnostic dump, the gtest
+# log + JSON, the server/builder logs) are copied OUT of the per-run scratch
+# into /tmp/pj-e2e-layout-artifacts/<timestamp>/ (override: E2E_ARTIFACT_DIR)
+# on EVERY exit path — the scratch itself is always removed.
+#
+# The corpus in s3://e2e-layout is seeded ONCE and left in place. It is the
+# decode oracle for both legs, so after a gen-ci-fixtures/genmcap change you
+# must EMPTY the bucket to force a reseed — a stale corpus surfaces as
+# unresolved curves (the harness says so in the failure message).
 #
 # Final line is exactly one of:
 #   E2E-LAYOUT-IMPORT PASS
@@ -78,9 +105,27 @@ if [[ -z "${REQUIRED_SDK_VERSION}" ]]; then
 fi
 readonly REQUIRED_SDK_VERSION
 
-# Sibling checkouts (overridable for other machines).
-readonly PJ4_APP="${E2E_PJ4_APP:-${HOME}/ws_plotjuggler/PJ4/build/pj_app/plotjuggler4}"
+# Sibling checkouts (overridable for other machines). BOTH PJ4 halves — the
+# shipped binary and the live gui-test — come from ONE build tree, so that the
+# staged DSOs meet the same ABI on both sides; E2E_PJ4_BUILD moves the whole
+# pair (e.g. to a PJ4 worktree's build/), the two per-binary overrides exist
+# for odd layouts only.
+readonly PJ4_BUILD="${E2E_PJ4_BUILD:-${HOME}/ws_plotjuggler/PJ4/build}"
+readonly PJ4_APP="${E2E_PJ4_APP:-${PJ4_BUILD}/pj_app/plotjuggler4}"
+readonly PJ4_GUI_TEST="${E2E_PJ4_GUI_TEST:-${PJ4_BUILD}/pj_app/main_window_layout_import_e2e_test}"
 readonly OFFICIAL_PLUGINS_ROOT="${E2E_OFFICIAL_PLUGINS:-${HOME}/ws_plotjuggler/pj-official-plugins}"
+
+# Kept post-mortem artifacts (survive the scratch teardown). Declaration split
+# from assignment (SC2155), as with the SDK pin above.
+ARTIFACT_DIR="${E2E_ARTIFACT_DIR:-}"
+if [[ -z "${ARTIFACT_DIR}" ]]; then
+  ARTIFACT_DIR="/tmp/pj-e2e-layout-artifacts/$(date +%Y%m%d-%H%M%S)"
+fi
+readonly ARTIFACT_DIR
+
+# The gui-test's scenario count — a live run must report exactly this many
+# tests, all PASSED (a SKIP means the live gating broke; see step h).
+readonly GUI_TEST_EXPECTED_TESTS=5
 
 # ── harness identity (:8082, own bucket; shares ONLY the Minio daemon) ───────
 readonly E2E_PORT=8082
@@ -101,13 +146,34 @@ readonly VECTOR_CASE_MAIN="e2e-8082-main-cold-warm"
 readonly VECTOR_CASE_EAGER="e2e-8082-eager-leg"
 readonly VECTOR_CASE_TRUST="e2e-8082-trust-leg"
 
-# Until the PJ4 PR carrying --dump-diagnostics / --exit-after-layout is merged
-# AND the Task 3/4 legs below are implemented, their absence downgrades to a
-# loud SKIPPED-pending (the legs that need them are stubs anyway). Flip the
-# default to 1 (or export E2E_REQUIRE_PJ4_FLAGS=1) when Task 4 lands the
-# shipped-binary legs — from then on a PJ4 build without the flags must
-# fail-fast, not skip.
-readonly REQUIRE_PJ4_FLAGS="${E2E_REQUIRE_PJ4_FLAGS:-0}"
+# The stage-5 PJ4 build (--dump-diagnostics + --exit-after-layout + the live
+# gui-test binary) is a HARD requirement now that steps h/i are real: without
+# it there is no gate left to run, so preflight fail-fasts. Set
+# E2E_REQUIRE_PJ4_FLAGS=0 to downgrade to a loud SKIPPED-pending instead —
+# only useful while bisecting the bring-up steps on a machine whose PJ4 build
+# predates the stage-5 PR.
+readonly REQUIRE_PJ4_FLAGS="${E2E_REQUIRE_PJ4_FLAGS:-1}"
+
+# The layout-import FAILURE diagnostic ids (PJ4 MainWindow + ImportRuntime).
+# Any of these in a leg's dump is a hard failure. Deliberately excludes the
+# non-failure ids: `layout-import-eager-only` (a degradation each leg asserts
+# for explicitly) and the `...-unresolved-curves*` pair (asserted separately
+# as the decode oracle).
+readonly LAYOUT_IMPORT_FAILURE_IDS=(
+  layout-import-untrusted
+  layout-import-refused
+  layout-import-query-failed
+  layout-import-query-invalid
+  layout-import-descriptor-invalid
+  layout-import-job-failed
+  layout-import-job-start-failed
+  layout-import-load-failed
+  layout-import-load-rejected
+  layout-import-provider-unavailable
+  layout-import-size-limit
+  layout-import-materialized-missing
+  layout-import-cancelled
+)
 
 # ── go toolchain on PATH (per project context) ───────────────────────────────
 export PATH="$HOME/.local/go/bin:$HOME/go/bin:$PATH"
@@ -119,6 +185,9 @@ E2E_SERVER_PID=""
 # restored by cleanup() even if the rebuild crashes mid-way.
 OFFICIAL_SDK_BAK=""
 PJ4_FLAGS_PRESENT=""
+# Set by run_layout_leg for its caller (exit code + diagnostic dump path).
+E2E_LEG_RC=0
+E2E_LEG_DUMP=""
 
 log()  { printf '[e2e-layout] %s\n' "$*"; }
 E2E_VERDICT=""
@@ -132,11 +201,26 @@ restore_official_sdk_version() {
   fi
 }
 
+# keep_artifacts — copy the post-mortem set (provenance, diagnostic dumps,
+# gtest log/JSON, leg logs, server/builder logs, the authored layouts) out of
+# the doomed scratch. Runs from cleanup(), so it must survive ANY exit path
+# and never fail the run itself. The server config is deliberately NOT copied
+# (it carries the Minio credentials).
+keep_artifacts() {
+  [[ -n "${E2E_SCRATCH}" && -d "${E2E_SCRATCH}" ]] || return 0
+  mkdir -p "${ARTIFACT_DIR}" 2>/dev/null || return 0
+  find "${E2E_SCRATCH}" -maxdepth 1 -type f \
+       \( -name '*.log' -o -name '*.json' -o -name '*.txt' -o -name '*.xml' \) \
+       -exec cp -f {} "${ARTIFACT_DIR}/" \; 2>/dev/null || true
+  log "post-mortem artifacts kept in ${ARTIFACT_DIR}"
+}
+
 # cleanup — reap the harness server's PROCESS GROUP, restore the
-# official-plugins SDK_VERSION if a temp-edit was in flight, remove the whole
-# per-run scratch (db/WAL/SHM, config, logs, staged extensions, sandboxes) and
-# print the verdict LAST (smoke's B1 final-line contract). Minio and the
-# seeded e2e-layout bucket are deliberately LEFT ALONE.
+# official-plugins SDK_VERSION if a temp-edit was in flight, preserve the
+# post-mortem artifacts, remove the whole per-run scratch (db/WAL/SHM, config,
+# logs, staged extensions, sandboxes) and print the verdict LAST (smoke's B1
+# final-line contract). Minio and the seeded e2e-layout bucket are
+# deliberately LEFT ALONE.
 cleanup() {
   local rc=$?
   restore_official_sdk_version
@@ -149,6 +233,8 @@ cleanup() {
     done
     kill -9 -- "-${E2E_SERVER_PID}" 2>/dev/null || kill -9 "${E2E_SERVER_PID}" 2>/dev/null || true
   fi
+  # AFTER the server is reaped, so its log is complete in the kept copy.
+  keep_artifacts
   if [[ -n "${E2E_SCRATCH}" && -d "${E2E_SCRATCH}" ]]; then
     rm -rf "${E2E_SCRATCH}"
   fi
@@ -236,9 +322,20 @@ dry_run() {
                 each with provenance: source repo, git rev, SDK version, sha256
   validate      ${PJ4_APP}
                 --validate-plugins \${scratch}/extensions + --expect-plugin for all three
-  PJ4 flags     --dump-diagnostics / --exit-after-layout probed via --help
-                (REQUIRE_PJ4_FLAGS=${REQUIRE_PJ4_FLAGS}; absent => $( [[ "${REQUIRE_PJ4_FLAGS}" == "1" ]] && echo "preflight FAIL" || echo "SKIPPED-pending warning" ))
-  stubs         gtest leg (Task 3) and shipped-binary legs (Task 4): SKIPPED-pending
+  PJ4 surface   --dump-diagnostics / --exit-after-layout probed via --help, plus
+                ${PJ4_GUI_TEST}
+                (REQUIRE_PJ4_FLAGS=${REQUIRE_PJ4_FLAGS}; absent => $( [[ "${REQUIRE_PJ4_FLAGS}" == "1" ]] && echo "preflight FAIL" || echo "steps h/i SKIPPED-pending" ))
+  step h        the live gui-test, env MCAP_CLOUD_E2E_{URL,EXTENSIONS,VECTORS} +
+                QT_QPA_PLATFORM=offscreen; expects ${GUI_TEST_EXPECTED_TESTS} tests, all PASSED
+                (a SKIPPED test FAILS the harness — the env is set, so a skip is a gating bug)
+  step i        3 shipped-binary legs, each offscreen in its own XDG sandbox under
+                \${scratch}/legs/ (trust ledger pre-seeded, update-check/telemetry off):
+                  cold  ${VECTOR_CASE_MAIN}: exit 0 + artifact + clean dump
+                  warm  same layout/sandbox: exit 0 + pj_cloud_{sessions,ws_connections}_total
+                        unchanged + artifact mtime unchanged
+                  eager ${VECTOR_CASE_EAGER} with MCAP_CLOUD_CACHE_DIR=<a REGULAR FILE>:
+                        exit 0 + layout-import-eager-only + nothing materialized
+  artifacts     ${ARTIFACT_DIR} (dumps, gtest log+JSON, leg logs, provenance, layouts)
   verdict       E2E-LAYOUT-IMPORT PASS / E2E-LAYOUT-IMPORT FAIL: <step>
 EOF
   exit 0
@@ -284,15 +381,21 @@ preflight() {
   help_out="$(timeout 15s "${PJ4_APP}" --help 2>&1 || true)"
   grep -q -- '--validate-plugins' <<<"${help_out}" \
     || preflight_fail "plotjuggler4 lacks --validate-plugins (unexpectedly old build?)"
-  if grep -q -- '--dump-diagnostics' <<<"${help_out}" \
-     && grep -q -- '--exit-after-layout' <<<"${help_out}"; then
+  # The stage-5 acceptance surface: BOTH flags (step i's only observation
+  # channel) AND the live gui-test binary (step h) must exist, or there is no
+  # gate left to run.
+  local missing=""
+  grep -q -- '--dump-diagnostics' <<<"${help_out}" || missing+=" --dump-diagnostics"
+  grep -q -- '--exit-after-layout' <<<"${help_out}" || missing+=" --exit-after-layout"
+  [[ -x "${PJ4_GUI_TEST}" ]] || missing+=" ${PJ4_GUI_TEST}"
+  if [[ -z "${missing}" ]]; then
     PJ4_FLAGS_PRESENT=1
   else
     PJ4_FLAGS_PRESENT=0
     if [[ "${REQUIRE_PJ4_FLAGS}" == "1" ]]; then
-      preflight_fail "PJ4 PR not merged/built yet: plotjuggler4 --help lacks --dump-diagnostics/--exit-after-layout (the stage-5 PJ4 PR half A)"
+      preflight_fail "PJ4 build at ${PJ4_BUILD} lacks the stage-5 acceptance surface (missing:${missing}) — build the layout-import stage-5 PJ4 branch, or point E2E_PJ4_BUILD at a build tree that has it"
     fi
-    log "WARNING: PJ4 PR not merged/built yet — plotjuggler4 --help lacks --dump-diagnostics/--exit-after-layout; the shipped-binary legs stay SKIPPED-pending"
+    log "WARNING: PJ4 build at ${PJ4_BUILD} lacks the stage-5 acceptance surface (missing:${missing}); steps h and i stay SKIPPED-pending (E2E_REQUIRE_PJ4_FLAGS=0)"
   fi
 
   # :8082 must be free (matrix.sh's historical port; it fail-fasts today, but a
@@ -608,28 +711,337 @@ step_validate_plugins() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Step h [TODO — Task 3]: the live gui-test leg. Runs the PJ4
-# main_window_layout_import_e2e_test (real MainWindow offscreen, the staged
-# DSOs, this live :8082 server) with the live env set — a SKIPPED gtest FAILS
-# the harness once implemented (smoke's pattern).
+# Step h: the live gui-test leg (§1 E1a). Runs the PJ4
+# main_window_layout_import_e2e_test — a real MainWindow offscreen, the staged
+# DSOs, this live :8082 server — with the live env set. Because the harness
+# SETS that env, a SKIPPED test can only mean the live gating broke, so a skip
+# FAILS the harness (smoke's pattern). The binary builds its OWN private XDG
+# sandbox internally (a QTemporaryDir installed before QApplication), so this
+# leg needs no sandbox of its own.
 # ─────────────────────────────────────────────────────────────────────────────
 step_gtest_leg() {
-  log "step h: SKIPPED-pending — Task 3 (PJ4 live gui-test main_window_layout_import_e2e_test) not implemented yet"
+  if [[ "${PJ4_FLAGS_PRESENT}" != "1" ]]; then
+    log "step h: SKIPPED-pending — the PJ4 stage-5 acceptance surface is absent (E2E_REQUIRE_PJ4_FLAGS=0)"
+    return 0
+  fi
+  log "step h: live gui-test $(basename "${PJ4_GUI_TEST}") (${GUI_TEST_EXPECTED_TESTS} scenarios, live env)"
+  local glog="${E2E_SCRATCH}/gtest-e2e.log" gjson="${E2E_SCRATCH}/gtest-e2e.json" rc=0
+  env QT_QPA_PLATFORM=offscreen \
+      MCAP_CLOUD_E2E_URL="ws://localhost:${E2E_PORT}" \
+      MCAP_CLOUD_E2E_EXTENSIONS="${E2E_SCRATCH}/extensions" \
+      MCAP_CLOUD_E2E_VECTORS="${VECTORS_JSON}" \
+      timeout 1200s "${PJ4_GUI_TEST}" "--gtest_output=json:${gjson}" \
+      >"${glog}" 2>&1 || rc=$?
+  if [[ ! -f "${gjson}" ]]; then
+    log "----- gui-test log (tail) -----"; tail -n 40 "${glog}" || true
+    fail "gtest: ${PJ4_GUI_TEST} wrote no JSON report (exit ${rc}; crash?) — log kept in ${ARTIFACT_DIR}"
+  fi
+  # Distinguish PASSED / FAILED / SKIPPED from the machine-readable report: a
+  # skip is invisible in the process exit code but is a GATING BUG here.
+  local summary
+  # 2>&1: the assertion detail rides sys.exit()'s stderr message.
+  summary="$(E2E_EXPECTED_TESTS="${GUI_TEST_EXPECTED_TESTS}" python3 - "${gjson}" 2>&1 <<'PY'
+import json, os, sys
+
+report = json.load(open(sys.argv[1]))
+expected = int(os.environ["E2E_EXPECTED_TESTS"])
+passed, failed, skipped = [], [], []
+for suite in report.get("testsuites", []):
+    for case in suite.get("testsuite", []):
+        name = f"{suite.get('name', '?')}.{case.get('name', '?')}"
+        if case.get("result") == "SKIPPED" or case.get("status") == "NOTRUN":
+            skipped.append(name)
+        elif case.get("failures"):
+            failed.append(name)
+        else:
+            passed.append(name)
+problems = []
+if skipped:
+    problems.append(
+        "SKIPPED (the harness set the live env, so a skip means the live gating "
+        "broke): " + ", ".join(skipped))
+if failed:
+    problems.append("FAILED: " + ", ".join(failed))
+total = len(passed) + len(failed) + len(skipped)
+if total != expected:
+    problems.append(f"ran {total} test(s), expected {expected} (scenario added/removed?)")
+if problems:
+    sys.exit("; ".join(problems))
+print(f"{len(passed)}/{expected} scenarios passed")
+PY
+)" || fail "gtest: ${summary:-live gui-test assertions failed} (exit ${rc}; full log in ${ARTIFACT_DIR})"
+  (( rc == 0 )) || fail "gtest: ${PJ4_GUI_TEST} exited ${rc} despite a clean JSON report (log in ${ARTIFACT_DIR})"
+  log "step h: OK (${summary})"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Step i [TODO — Task 4]: the shipped-binary legs — plotjuggler4 --layout
-# --exit-after-layout --dump-diagnostics for the cold / warm / EAGER / trust
-# scenarios (frozen vector identities above), asserting diagnostic IDs, the
-# reconstructed artifact, and the zero-network Prometheus counters
-# (pj_cloud_sessions_total / pj_cloud_ws_connections_total).
+# The shipped-binary legs (step i) and their helpers.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# make_sandbox NAME — a private XDG sandbox under the run scratch, pre-seeded
+# with (a) the trust ledger for this harness's origin (the legs are not a
+# trust-gate test — the gui-test owns that scenario — so they start trusted),
+# and (b) a QSettings file that turns the app's startup update-check and
+# telemetry ping OFF, so a leg touches no network but its own. Prints the
+# sandbox root.
+make_sandbox() {
+  local sandbox="${E2E_SCRATCH}/legs/$1"
+  mkdir -p "${sandbox}"/{config,cache,data,home} "${sandbox}/config/mcap_cloud" \
+           "${sandbox}/config/PlotJuggler"
+  printf '{"v":1,"origins":["ws://localhost:%s"]}\n' "${E2E_PORT}" \
+    > "${sandbox}/config/mcap_cloud/trusted_origins.json"
+  # Keys are written in QSettings' own INI escaping (':' -> %3A) — that is the
+  # exact form the app round-trips, so it can never mis-read them.
+  cat > "${sandbox}/config/PlotJuggler/PlotJuggler4.conf" <<'EOF'
+[General]
+Preferences%3A%3Acheck_updates_on_startup=false
+Preferences%3A%3Asend_anonymous_stats=false
+EOF
+  printf '%s\n' "${sandbox}"
+}
+
+# write_leg_layout CASE TOPIC FIELD ARTIFACT OUT — hand-author the layout a
+# production save would have written for one FROZEN vector case: a
+# source-bound document with one topic/field curve and one <materialize>
+# stanza whose provider/identity are attributes and whose descriptor bytes are
+# the vector's `canonical` string VERBATIM in CDATA (§1 E4a — never
+# re-serialized here; the vectors are the independent witness of the
+# cross-repo canonicalizer). PJ4 never cross-checks the embedded identity, so
+# it must come from the vector, not from us.
+write_leg_layout() {
+  local case_name="$1" topic="$2" field="$3" artifact="$4" out="$5"
+  python3 - "${VECTORS_JSON}" "${case_name}" "${topic}" "${field}" "${artifact}" "${out}" <<'PY'
+import json, sys
+from xml.sax.saxutils import quoteattr
+
+vectors_path, case_name, topic, field, artifact, out = sys.argv[1:7]
+cases = {c["name"]: c for c in json.load(open(vectors_path))["cases"]}
+if case_name not in cases:
+    sys.exit(f"vector case {case_name!r} not in {vectors_path}")
+case = cases[case_name]
+canonical, identity = case["canonical"], case["identity"]
+if "]]>" in canonical:
+    sys.exit(f"{case_name}: canonical bytes contain ']]>' — needs the split-CDATA form")
+with open(out, "w", encoding="utf-8") as fh:
+    fh.write(
+        '<root pj4_version="4" binding="source">\n'
+        ' <tabbed_widget parent="main_window">\n'
+        '  <Tab id="t1" containers="1">\n'
+        '   <Container>\n'
+        '    <DockArea id="a1" name="View">\n'
+        '     <plot id="plot1" mode="TimeSeries">\n'
+        f'      <curve topic={quoteattr(topic)} field={quoteattr(field)}/>\n'
+        '     </plot>\n'
+        '    </DockArea>\n'
+        '   </Container>\n'
+        '  </Tab>\n'
+        ' </tabbed_widget>\n'
+        ' <previouslyLoaded_Datafiles>\n'
+        f'  <fileInfo filename={quoteattr(artifact)}>\n'
+        f'   <materialize provider="mcap-cloud" identity={quoteattr(identity)}>'
+        f'<![CDATA[{canonical}]]></materialize>\n'
+        '  </fileInfo>\n'
+        ' </previouslyLoaded_Datafiles>\n'
+        '</root>\n')
+print(identity)
+PY
+}
+
+# identity_hex CASE — the vector identity's trailing hex (the cache artifact's
+# basename).
+identity_hex() {
+  python3 - "${VECTORS_JSON}" "$1" <<'PY'
+import json, sys
+cases = {c["name"]: c for c in json.load(open(sys.argv[1]))["cases"]}
+print(cases[sys.argv[2]]["identity"].rsplit(":", 1)[-1])
+PY
+}
+
+# scrape_counter NAME — one Prometheus counter off the live server's /metrics.
+scrape_counter() {
+  local body
+  body="$(curl -fsS -m 10 "http://localhost:${E2E_PORT}/metrics")" || return 1
+  awk -v n="$1" '$1 == n { print $2; found = 1 } END { exit found ? 0 : 1 }' <<<"${body}"
+}
+
+# run_layout_leg LABEL SANDBOX LAYOUT [ENV=VAL ...] — one shipped-binary run:
+# the REAL plotjuggler4, offscreen, in its own XDG sandbox, over the staged
+# DSOs, quitting at the restore-settlement boundary with a failure-aware exit
+# code. Sets E2E_LEG_RC / E2E_LEG_DUMP for the caller (never fails by itself —
+# every leg words its own failure).
+run_layout_leg() {
+  local label="$1" sandbox="$2" layout="$3"; shift 3
+  local log="${E2E_SCRATCH}/leg-${label}.log"
+  E2E_LEG_DUMP="${E2E_SCRATCH}/dump-${label}.json"
+  E2E_LEG_RC=0
+  env "$@" \
+      QT_QPA_PLATFORM=offscreen \
+      HOME="${sandbox}/home" \
+      XDG_CONFIG_HOME="${sandbox}/config" \
+      XDG_CACHE_HOME="${sandbox}/cache" \
+      XDG_DATA_HOME="${sandbox}/data" \
+      timeout 900s "${PJ4_APP}" --nosplash \
+      --plugin-dir "${E2E_SCRATCH}/extensions" \
+      --layout "${layout}" \
+      --exit-after-layout --exit-after-layout-timeout 300 \
+      --dump-diagnostics "${E2E_LEG_DUMP}" \
+      >"${log}" 2>&1 || E2E_LEG_RC=$?
+}
+
+# check_dump LABEL DUMP EXPECT_EAGER — assert on diagnostic IDs (never on
+# message text, §1 E2). Hard-fails on ANY layout-import failure id and on
+# `layout-import-unresolved-curves` (the drain-time id — the decode oracle:
+# the curve only resolves if the real ros-parser decoded the corpus);
+# EXPECT_EAGER 1/0 requires the presence/absence of `layout-import-eager-only`.
+check_dump() {
+  local label="$1" dump="$2" expect_eager="$3" out=""
+  # 2>&1: the assertion detail rides sys.exit()'s stderr message.
+  out="$(E2E_FAILURE_IDS="${LAYOUT_IMPORT_FAILURE_IDS[*]}" \
+         python3 - "${dump}" "${expect_eager}" 2>&1 <<'PY'
+import json, os, sys
+
+dump_path, expect_eager = sys.argv[1], sys.argv[2] == "1"
+try:
+    doc = json.load(open(dump_path))
+except Exception as exc:                       # noqa: BLE001 - reported verbatim
+    sys.exit(f"unreadable diagnostic dump {dump_path}: {exc}")
+if doc.get("version") != 1:
+    sys.exit(f"unexpected diagnostic dump version {doc.get('version')!r} (want 1)")
+records = doc.get("records", [])
+failure_ids = set(os.environ["E2E_FAILURE_IDS"].split())
+problems = []
+
+hits = [r for r in records if r.get("id") in failure_ids]
+if hits:
+    problems.append("layout-import failure diagnostic(s): " + "; ".join(
+        f"{r.get('id')} [{r.get('level')}] {r.get('message')}" for r in hits))
+
+unresolved = [r for r in records if r.get("id") == "layout-import-unresolved-curves"]
+if unresolved:
+    problems.append(
+        "curves stayed unresolved after the import drained — the layout's curve did "
+        "not bind to decoded data (stale corpus in the e2e-layout bucket? empty it "
+        "to force a reseed; or a parser DSO that cannot decode it): " + "; ".join(
+            r.get("message", "") for r in unresolved))
+
+eager = sum(1 for r in records if r.get("id") == "layout-import-eager-only")
+if expect_eager and eager == 0:
+    problems.append(
+        "no layout-import-eager-only diagnostic — the broken cache root did NOT "
+        "degrade the import to EAGER_ONLY (ids seen: " +
+        ", ".join(sorted({r.get("id", "") for r in records})) + ")")
+if not expect_eager and eager:
+    problems.append(f"unexpected layout-import-eager-only x{eager} — this leg must PROMOTE")
+
+if problems:
+    sys.exit(" | ".join(problems))
+print(f"{len(records)} diagnostic record(s), no failure ids, curves resolved" +
+      (f", eager-only x{eager}" if expect_eager else ""))
+PY
+)" || fail "leg ${label}: ${out} (dump kept in ${ARTIFACT_DIR})"
+  log "  leg ${label}: ${out}"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Step i: the shipped-binary legs (§1 E1b, E4b, E4c). Three runs of the REAL
+# plotjuggler4 with `--layout --exit-after-layout --dump-diagnostics`, each in
+# its own private XDG sandbox:
+#   1 cold  — must PROMOTE: exit 0, the cache artifact materialized, a clean
+#             dump. This is the BASELINE that proves the parsers decode; it
+#             runs first on purpose (see leg 3).
+#   2 warm  — the SAME layout in the SAME sandbox: exit 0, and ZERO network —
+#             pj_cloud_sessions_total and pj_cloud_ws_connections_total
+#             unchanged across the run, artifact mtime unchanged.
+#   3 EAGER — a fresh sandbox and a REGULAR FILE as the cache root, so
+#             <file>/<digest>.lock fails non-contended => the tee is dropped
+#             (§9.6) => EAGER_ONLY: exit 0, `layout-import-eager-only` in the
+#             dump, and NO artifact anywhere.
 # ─────────────────────────────────────────────────────────────────────────────
 step_shipped_legs() {
-  if [[ "${PJ4_FLAGS_PRESENT}" == "1" ]]; then
-    log "step i: SKIPPED-pending — Task 4 (shipped-binary cold/warm/EAGER/trust legs) not implemented yet"
-  else
-    log "step i: SKIPPED-pending — Task 4 not implemented AND the PJ4 flags (--dump-diagnostics/--exit-after-layout) are absent (PJ4 PR not merged/built yet)"
+  if [[ "${PJ4_FLAGS_PRESENT}" != "1" ]]; then
+    log "step i: SKIPPED-pending — the PJ4 stage-5 acceptance surface is absent (E2E_REQUIRE_PJ4_FLAGS=0)"
+    return 0
   fi
+  log "step i: shipped-binary legs (cold / warm / EAGER_ONLY) with ${PJ4_APP}"
+
+  # ---- leg 1: cold ---------------------------------------------------------
+  local main_sandbox main_layout main_hex main_artifact
+  main_sandbox="$(make_sandbox main)"
+  main_hex="$(identity_hex "${VECTOR_CASE_MAIN}")" || fail "legs: cannot read the ${VECTOR_CASE_MAIN} identity"
+  main_artifact="${main_sandbox}/cache/mcap_cloud/sessions/${main_hex}.mcap"
+  main_layout="${E2E_SCRATCH}/layout-cold.pj4.xml"
+  write_leg_layout "${VECTOR_CASE_MAIN}" "/imu" "linear_acceleration/x" \
+      "${main_artifact}" "${main_layout}" >/dev/null \
+    || fail "legs: cannot author the cold layout from vector ${VECTOR_CASE_MAIN}"
+  [[ ! -e "${main_artifact}" ]] || fail "legs: cold leg needs a fresh sandbox but ${main_artifact} already exists"
+
+  run_layout_leg cold "${main_sandbox}" "${main_layout}"
+  (( E2E_LEG_RC == 0 )) || {
+    log "----- cold leg log (tail) -----"; tail -n 40 "${E2E_SCRATCH}/leg-cold.log" || true
+    fail "leg cold: plotjuggler4 --exit-after-layout exited ${E2E_LEG_RC} (1 = load failed, 2 = timeout, 64 = usage; artifacts in ${ARTIFACT_DIR})"
+  }
+  [[ -f "${main_artifact}" ]] \
+    || fail "leg cold: the promoted import materialized no artifact at ${main_artifact}"
+  check_dump cold "${E2E_LEG_DUMP}" 0
+  local artifact_stamp_before
+  artifact_stamp_before="$(stat -c '%Y %s' "${main_artifact}")"
+  log "  leg cold: OK (exit 0, artifact $(stat -c '%s' "${main_artifact}") bytes)"
+
+  # ---- leg 2: warm (zero network) -----------------------------------------
+  local sessions_before conns_before sessions_after conns_after
+  sessions_before="$(scrape_counter pj_cloud_sessions_total)" \
+    || fail "leg warm: cannot scrape pj_cloud_sessions_total from :${E2E_PORT}/metrics"
+  conns_before="$(scrape_counter pj_cloud_ws_connections_total)" \
+    || fail "leg warm: cannot scrape pj_cloud_ws_connections_total from :${E2E_PORT}/metrics"
+
+  run_layout_leg warm "${main_sandbox}" "${main_layout}"
+  (( E2E_LEG_RC == 0 )) || {
+    log "----- warm leg log (tail) -----"; tail -n 40 "${E2E_SCRATCH}/leg-warm.log" || true
+    fail "leg warm: plotjuggler4 --exit-after-layout exited ${E2E_LEG_RC} (artifacts in ${ARTIFACT_DIR})"
+  }
+  sessions_after="$(scrape_counter pj_cloud_sessions_total)" \
+    || fail "leg warm: cannot re-scrape pj_cloud_sessions_total"
+  conns_after="$(scrape_counter pj_cloud_ws_connections_total)" \
+    || fail "leg warm: cannot re-scrape pj_cloud_ws_connections_total"
+  [[ "${sessions_before}" == "${sessions_after}" ]] \
+    || fail "leg warm: pj_cloud_sessions_total moved ${sessions_before} -> ${sessions_after} — the warm load opened a SESSION instead of reading the cache"
+  [[ "${conns_before}" == "${conns_after}" ]] \
+    || fail "leg warm: pj_cloud_ws_connections_total moved ${conns_before} -> ${conns_after} — the warm load CONNECTED instead of reading the cache"
+  [[ "$(stat -c '%Y %s' "${main_artifact}")" == "${artifact_stamp_before}" ]] \
+    || fail "leg warm: the cache artifact was rewritten (mtime/size changed) — not a cache hit"
+  check_dump warm "${E2E_LEG_DUMP}" 0
+  log "  leg warm: OK (exit 0, zero network: sessions=${sessions_after} ws_connections=${conns_after} unchanged, artifact untouched)"
+
+  # ---- leg 3: EAGER_ONLY (the pinned §10 requirement, shipped binary) ------
+  local eager_sandbox eager_layout eager_hex eager_artifact eager_cache_file
+  eager_sandbox="$(make_sandbox eager)"
+  eager_hex="$(identity_hex "${VECTOR_CASE_EAGER}")" || fail "legs: cannot read the ${VECTOR_CASE_EAGER} identity"
+  eager_artifact="${eager_sandbox}/cache/mcap_cloud/sessions/${eager_hex}.mcap"
+  eager_layout="${E2E_SCRATCH}/layout-eager.pj4.xml"
+  write_leg_layout "${VECTOR_CASE_EAGER}" "/imu" "linear_acceleration/x" \
+      "${eager_artifact}" "${eager_layout}" >/dev/null \
+    || fail "legs: cannot author the eager layout from vector ${VECTOR_CASE_EAGER}"
+  # The lever: a REGULAR FILE as the cache root (a read-only DIRECTORY does
+  # NOT work — the cache chmods its root 0700 before locking).
+  eager_cache_file="${eager_sandbox}/cache-root-as-file"
+  printf 'not a directory\n' > "${eager_cache_file}"
+
+  run_layout_leg eager "${eager_sandbox}" "${eager_layout}" \
+      MCAP_CLOUD_CACHE_DIR="${eager_cache_file}"
+  (( E2E_LEG_RC == 0 )) || {
+    log "----- eager leg log (tail) -----"; tail -n 40 "${E2E_SCRATCH}/leg-eager.log" || true
+    fail "leg eager: plotjuggler4 --exit-after-layout exited ${E2E_LEG_RC}; EAGER_ONLY is a USABLE outcome and must still settle 0. The cold leg passed, so the parsers decode — this is a real regression, not a corpus problem (artifacts in ${ARTIFACT_DIR})"
+  }
+  check_dump eager "${E2E_LEG_DUMP}" 1
+  [[ ! -e "${eager_artifact}" ]] \
+    || fail "leg eager: an artifact appeared at ${eager_artifact} — EAGER_ONLY must materialize NOTHING"
+  [[ -f "${eager_cache_file}" ]] \
+    || fail "leg eager: the regular-file cache root at ${eager_cache_file} is gone — the cache must never replace it"
+  [[ ! -e "${eager_cache_file}/${eager_hex}.mcap" ]] \
+    || fail "leg eager: an artifact appeared under the broken cache root"
+  log "  leg eager: OK (exit 0, layout-import-eager-only reported, nothing materialized)"
+
+  log "step i: OK (3/3 shipped-binary legs)"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -637,8 +1049,21 @@ main() {
   if [[ "${1:-}" == "--dry-run" ]]; then
     dry_run
   elif [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
-    sed -n '2,21p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
-    printf '\nUsage: %s [--dry-run]\n' "$0"
+    # The whole leading comment block, verbatim: from line 2 up to (not
+    # including) its closing rule. Derived, never a hardcoded line range — the
+    # header grows every time a leg does.
+    awk 'NR == 2 { next } NR > 2 && /^# ─/ { exit } NR > 2' "${BASH_SOURCE[0]}" \
+      | sed 's/^# \{0,1\}//'
+    printf '\nUsage: %s [--dry-run]\n\n' "$0"
+    printf 'Environment:\n'
+    printf '  E2E_PJ4_BUILD           PJ4 build tree for BOTH the shipped binary and the\n'
+    printf '                          live gui-test (default %s)\n' "${HOME}/ws_plotjuggler/PJ4/build"
+    printf '  E2E_PJ4_APP             override just the plotjuggler4 binary\n'
+    printf '  E2E_PJ4_GUI_TEST        override just the gui-test binary\n'
+    printf '  E2E_OFFICIAL_PLUGINS    pj-official-plugins checkout (loader + parser DSOs)\n'
+    printf '  E2E_ARTIFACT_DIR        kept post-mortem artifacts (default /tmp/pj-e2e-layout-artifacts/<timestamp>)\n'
+    printf '  E2E_REQUIRE_PJ4_FLAGS   1 (default) = a PJ4 build without the stage-5 flags/gui-test\n'
+    printf '                          fails preflight; 0 = downgrade steps h/i to SKIPPED-pending\n'
     exit 0
   elif [[ -n "${1:-}" ]]; then
     printf 'unknown argument: %s (only --dry-run is supported)\n' "$1" >&2
@@ -657,7 +1082,9 @@ main() {
   # (cleanup guards an empty E2E_SCRATCH).
   trap cleanup EXIT
   E2E_SCRATCH="$(mktemp -d /tmp/pj-e2e-layout.XXXXXX)"
+  mkdir -p "${ARTIFACT_DIR}"
   log "stage-5 layout-import E2E harness starting (repo ${REPO_ROOT}, scratch ${E2E_SCRATCH})"
+  log "PJ4 build ${PJ4_BUILD} · post-mortem artifacts -> ${ARTIFACT_DIR}"
 
   step_build_tools
   step_seed
