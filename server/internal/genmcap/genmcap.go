@@ -290,10 +290,24 @@ func Write(w io.Writer, spec FileSpec) error {
 	}
 
 	// One schema+channel per topic. IDs are 1-based and stable in topic order.
+	// realFns[ti] non-nil = this topic's payloads come from the real-CDR table
+	// (ros2payloads.go) instead of the legacy synthetic bytes; explicit
+	// SchemaData / PayloadFn overrides always win.
+	realFns := make([]func(idx, targetBytes int) []byte, len(spec.Topics))
 	for ti, t := range spec.Topics {
 		schemaID := uint16(ti + 1)
 		channelID := uint16(ti + 1)
 		schemaData := []byte(t.SchemaName) // synthetic default — non-empty, deterministic
+		if t.SchemaData == nil && t.PayloadFn == nil && t.SchemaEnc == "ros2msg" {
+			// Known ros2msg types decode for REAL through parser_ros: real
+			// concatenated .msg schema text + real CDR payloads (deterministic,
+			// padded toward PayloadBytes so volume properties survive). Counts,
+			// times, keys and chunking are untouched — see ros2payloads.go.
+			if realSchema, fn, ok := realRos2Payload(t.SchemaName); ok {
+				schemaData = realSchema
+				realFns[ti] = fn
+			}
+		}
 		if t.SchemaData != nil {
 			schemaData = t.SchemaData // real concatenated .msg text when provided
 		}
@@ -338,6 +352,9 @@ func Write(w io.Writer, spec FileSpec) error {
 				continue
 			}
 			msgData := payload(ti, c.idx, psize)
+			if realFns[ti] != nil {
+				msgData = realFns[ti](c.idx, psize)
+			}
 			if spec.Topics[ti].PayloadFn != nil {
 				msgData = spec.Topics[ti].PayloadFn(c.idx)
 			}
