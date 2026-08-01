@@ -2,7 +2,12 @@
 
 *Descriptor-backed layout import via materializable cached files.*
 
-**Status:** DRAFT v3.6 — the **V3+B variant is adopted** (user decision 2026-07-28 after a
+**Status:** IMPLEMENTED (2026-08-01) — merged across SDK 0.20.0, this repo's plugin
+stages 1–4, and PJ4 #490/#492/#497/#500; only the stage-5 cross-repo live E2E run
+remains. **This document is the DESIGN RECORD** (rationale, lineage, rejected
+alternatives); the as-built reference an implementer should read first is
+`docs/layout-import-architecture.md`. Design lineage: v3.6 — the **V3+B variant is
+adopted** (user decision 2026-07-28 after a
 three-way V2 / V3.2 / V3+B comparison): cache-miss import reuses the authoring dual path
 (progressive eager ingest + cache tee → promotion), so **plots grow during every download,
 in every mode**. Incorporates: the v3 Codex pass (21 findings), the ImportJob-timing

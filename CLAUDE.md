@@ -58,6 +58,27 @@ schema/IPC changes MUST update it.
   before they're locked; milestone boundaries get adversarial review (Codex + Claude —
   this caught ~35 real defects across the M6 tail).
 
+## Canonical layout import: CODE-COMPLETE (2026-08-01)
+
+The second major feature arc after the catalog migration: a `.pj4.xml` layout that
+auto-reconnects and re-downloads an exact cloud session — request-addressed cache
+(`$XDG_CACHE_HOME/mcap_cloud/sessions/<sha256-128>.mcap`), `pj.descriptor_import.v1`
+provider in the plugin, source promotion + growing-import binder in PJ4. Merged across
+three repos: SDK 0.20.0 · this repo PRs #4/#11/#14/#15/#18–#21 (ImportRuntime,
+single-encoder cache tee, headless init, provider, live E2E legs in smoke) · PJ4
+#490/#492/#497/#500 (LayoutImportBatch + rewrite-then-classify, promotion host,
+teardown reorder, strip/Stop/mid-import binding). Remaining: the stage-5 cross-repo
+live E2E run + docs closure.
+
+**READ `docs/layout-import-architecture.md` BEFORE touching any of this** — it is the
+as-built reference (component map across the three repos, runtime flows, and the
+invariant list I-1…I-16: sole-encoder cache, refusal-while-referenced leases,
+`on_dataset`/`on_terminal` ABI contract, delivery-order guarantee, strict in-place
+promotion, teardown orders, strip displayed-owner arbitration, trust write-through,
+loader pin, zero-new-code for non-cloud loads). The design record with full rationale
+is `docs/canonical-layout-import.md`; the per-stage execution records live in
+`docs/plans/2026-07-*-layout-*.md`.
+
 Implementation history (Slices 1–16 + migration narrative): `docs/history.md` —
 provenance, not instructions.
 
@@ -262,6 +283,10 @@ Arrow ingest (`src/arrow_ingest.*`) → raw-record forwarding to host MessagePar
 ## Documents (read in this order)
 
 **Current plans (in `docs/` — the up-to-date forward work):**
+- `docs/layout-import-architecture.md` — the LIVE as-built reference for the
+  canonical layout import feature (cross-repo component map, runtime flows,
+  invariants I-1…I-16). The layout-import analog of `CATALOG_CONTRACT.md`: any
+  change touching the import/promotion/cache surfaces MUST keep it true.
 - `docs/CATALOG_CONTRACT.md` — the LIVE cross-language contract (schema v3,
   publish/reopen §9, tag IPC §10, single-writer lock §11; byte-identical copy in
   `mcap_catalog/` — always update both). (The executed auryn catalog-migration plan
