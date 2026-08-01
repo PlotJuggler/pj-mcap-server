@@ -92,6 +92,19 @@
 # ─────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
+# ── shared harness lock (stage-5 §1 E3) ─────────────────────────────────────
+# smoke.sh and scripts/e2e-layout-import.sh take ONE machine-wide flock so the
+# two harnesses never interleave (both rebuild server/bin, both poke the shared
+# Minio daemon, and neither tolerates a loaded machine). WAIT with a message —
+# serialization, not exclusion. FD 200 is held for the whole run and released
+# on any exit; cleanup() reaps every child, so the lock cannot leak past a run.
+readonly HARNESS_LOCK="/tmp/pj-cloud-harness.lock"
+exec 200>"${HARNESS_LOCK}"
+if ! flock -n 200; then
+  printf '[smoke] waiting for the shared harness lock %s (another smoke/e2e run is active)...\n' "${HARNESS_LOCK}"
+  flock 200
+fi
+
 # ── structural identifiers (generator-derived NAMES, never counts) ──────────
 # Hive dimension literals gen-ci-fixtures.go hardcodes (hiveKeyFor).
 readonly HIVE_CUSTOMER="test"

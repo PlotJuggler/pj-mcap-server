@@ -1,5 +1,5 @@
 .PHONY: all proto build test race lint integration bench bench-storage docker clean \
-        smoke matrix ci-integration server-start server-stop
+        smoke matrix ci-integration e2e-layout server-start server-stop
 
 # This repo root IS the pj-cloud root (per CLAUDE.md): the Go module lives in
 # server/ and the canonical wire schema in proto/.
@@ -95,6 +95,20 @@ smoke:
 # legs, each mcapdiff-verified. Prints MATRIX PASS / MATRIX FAIL. See scripts/matrix.sh.
 matrix:
 	bash scripts/matrix.sh
+
+# e2e-layout: the stage-5 cross-repo live E2E gate for the canonical layout
+# import (docs/plans/2026-08-01-layout-import-stage5-e2e.md). Separate from and
+# smaller than smoke: its OWN server on :8082 + OWN `e2e-layout` bucket (shares
+# only the Minio daemon), frozen :8082 descriptor vectors from
+# docs/source-descriptor-vectors.json bound live against the deterministic
+# seeded corpus, DSO staging with provenance (cloud plugin + mcap-loader +
+# ros-parser rebuilt on the pinned SDK), and a plotjuggler4 --validate-plugins
+# pre-flight. The gui-test and shipped-binary legs are Task 3/4 stubs (logged
+# SKIPPED-pending). Serialized against `make smoke` via a shared flock
+# (/tmp/pj-cloud-harness.lock). Prints E2E-LAYOUT-IMPORT PASS / FAIL.
+# `bash scripts/e2e-layout-import.sh --dry-run` prints the plan touching nothing.
+e2e-layout:
+	bash scripts/e2e-layout-import.sh
 
 # ci-integration: the LOCAL driver for the CI {s3,gcs} integration legs — the
 # SAME test (`-tags=ci_integration` over internal/ws, invoking the Python
