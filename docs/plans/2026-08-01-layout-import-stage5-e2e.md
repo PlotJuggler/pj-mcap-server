@@ -1,7 +1,9 @@
 # Stage-5 — Cross-Repo Live E2E + Docs Closure (v2, consult-amended)
 
 > **For agentic workers:** REQUIRED SUB-SKILL: superpowers:subagent-driven-development.
-> **Status: LOCKED** — Codex consult 019fbc46-5c29-7b42-8564-577608674d85 (2026-08-01)
+> **Status: EXECUTED (2026-08-01)** — all five tasks landed; PJ4 PR #501 +
+> this repo's companion stage-5 PR. Execution record in §6.
+> Planning provenance: Codex consult 019fbc46-5c29-7b42-8564-577608674d85 (2026-08-01)
 > returned 8 blocking corrections on v1; ALL folded in below. §5 is the verdict record.
 
 **Goal:** prove the shipped canonical-layout-import stack end-to-end with REAL parts —
@@ -170,3 +172,91 @@ with failure-aware exit; screenshot never the oracle; all three
 — `file_dialog_test` technique), E7 amended (runbook content list; enumerated
 closure; PR routing incl. official-plugins provenance — the checked-out tree is
 SDK-pinned 0.18.0, binaries not acceptable on version strings alone).
+
+## 6. Execution record (2026-08-01)
+
+Subagent-driven, two-stage review per task (spec then quality). Two PRs:
+**PJ4 #501** `feat/layout-import-e2e` (on `853dc1bf`/main) and this repo's
+companion stage-5 branch `feat/layout-e2e-legs`.
+
+- **Task 1 — the two flags (PJ4).** `18e3d9ac` (`--dump-diagnostics` +
+  `--exit-after-layout`, red-first), review rounds `1b987103` (early-diagnostic
+  capture, `EX_USAGE`=64 codes, narrowed quit drain) and `3c3b82a0` (the dump's
+  top level became a **versioned envelope** `{"version":1,"records":[…]}` — done
+  now-or-never, while zero consumers existed; plus `Qt::UniqueConnection`,
+  QTimer-range clamping, scenario-scoped receiver contexts).
+  `LayoutExitWatch`: 0 committed / 1 settled-without-commit / 2 timeout.
+- **Task 2 — vectors + fixtures + harness skeleton (this repo).** `60b928b`:
+  three frozen `e2e-8082-*` descriptor vector cases (verified red against a
+  corrupted identity), `scripts/e2e-layout-import.sh` + `make e2e-layout` on
+  `:8082` with its own bucket/DB/scratch, the common harness flock added to BOTH
+  scripts, vector↔corpus binding, provenance-recorded DSO staging (incl. the
+  SDK_VERSION temp-edit+restore rebuild of `data_load_mcap`/`parser_ros`), and
+  `--validate-plugins`. Review round `fee8096` (trap-before-mktemp, preserved
+  rebuild log, stale-`.so` guard, SDK-pin fail-fast, flock FD hygiene `200>&-`).
+- **Task 3 — the live gui-test (PJ4).** `fb96c25a`:
+  `main_window_layout_import_e2e_test` / `MainWindowLayoutImportE2ETest`, five
+  scenarios (cold + progressive witness + promotion · the literal Save/Load
+  `QAction` GUI flow with the modal automated and the "Bind to this data source"
+  default asserted, then unload → warm zero-network · EAGER_ONLY via the
+  regular-file cache root · trust fresh-miss refusal then ledger-seeded success ·
+  the three-way catalog-equality signature), live-gated on the harness env, with
+  a private XDG sandbox installed before `QApplication`. Quality round `1e426e5b`
+  (ledger restored in TearDown; the vacuous "no artifact under the broken root"
+  check — every stat below a regular file is ENOTDIR — replaced with one that can
+  actually fail).
+  **PRODUCTION BUG FOUND** by this task's first full run:
+  `DataSourceRuntimeHost::cbEnsureParserBinding` always `createTopic`'d, so a
+  promotion through a **delegated-ingest** loader (`data_load_mcap`) renumbered
+  every scalar `TopicId` and every bound curve silently vanished at the replace
+  boundary — invisible offline because mock loaders use the direct-write API,
+  which already reuses by name. Fixed in `da6f3369` (reuse the dataset's existing
+  same-named topic; observed live: `/imu` bound as topic:3, re-minted as topic:5,
+  curve count 0 after promotion → stable at topic:3 with the curve surviving),
+  hardened in `49a8593f` (scan + create + mirror now run under the engine lock —
+  `getTopicStorage()` does not lock — with two engines taken
+  deferred-then-`std::lock` in the direct-write sibling's order, plus two offline
+  regression pins verified RED against the reverted hunk).
+- **Task 4 — the shipped-binary legs (this repo).** `f42feb0`: step h (the live
+  gtest leg, parsing `--gtest_output=json` so a SKIP fails the harness — the
+  process exit code cannot see one) and step i (cold / warm / EAGER legs of the
+  real `plotjuggler4` in private XDG sandboxes, asserting the 13-id failure set +
+  `layout-import-unresolved-curves` as a decode oracle + the two Prometheus
+  counters + artifact mtime), `E2E_REQUIRE_PJ4_FLAGS` defaulted to 1, the
+  kept-artifacts dir, and a derived `--help`. Three negative controls each failed
+  loudly (writable cache root ⇒ no eager-only; unbindable curve topic ⇒
+  unresolved-curves; unset gui-test env ⇒ 5 skipped at gtest exit 0).
+  **Second production-adjacent fix:** `18b0017` — the synthetic corpus wrote
+  bare-type-name schema text and garbage payloads, which every payload-agnostic
+  oracle in this repo had always accepted; the real parser stack rejected whole
+  files ("Missing ROSType in library"), so no curve could ever bind. Now real
+  concatenated `.msg` schema text + real XCDR1 payloads for Clock / Imu /
+  Odometry / LaserScan / TFMessage, with keys, counts, ranges and chunking
+  untouched. Offline net added in `146a5aa` (`TestRealRos2Payloads_WireShape`:
+  encapsulation prefix, golden encoded lengths, padding contract, full resolver
+  coverage; mutation-checked). *Operator consequence:* buckets seeded with the
+  OLD corpus must be emptied once.
+- **Task 5 — runbook + docs closure (this repo).** `docs/layout-sharing-runbook.md`
+  (what a shared layout embeds, the §7 leakage warning verbatim + the
+  never-commit-a-real-layout rule, trust bootstrap, cache/purge/sidecars, the GUI
+  and headless flows with exit codes + the diagnostic-id table, the zero-network
+  metrics, the pinned-DSO matrix, harness operation) plus the §4 closure list:
+  spec Status/§12/§13-5, architecture doc header/§4 I-8/§5/§6, `CLAUDE.md`,
+  `README.md`, the `smoke.sh` flock note, and this record.
+
+**Gate results:** `E2E-LAYOUT-IMPORT PASS` (step h 5/5 gui-test scenarios, step i
+3/3 shipped-binary legs) on the combined branches; `make smoke` SMOKE PASS;
+`go test ./internal/genmcap` + the server unit suite green; PJ4 `pj_app` ctest
+35/35 and the full tree green modulo two pre-existing `extension_manager_test`
+staged-update failures that reproduce identically on untouched main.
+
+**Deviations:** none material. §4 item 10 (the PJ4 `pj_app/CLAUDE.md` pointer to
+the architecture doc) did **not** ride PR #501 — it was already open when the
+docs closure ran, so it is deferred to a tiny PJ4 follow-up PR.
+
+**Recorded follow-ups** (also in `docs/layout-import-architecture.md` §6): the
+five non-blocking PJ4 #501 quality findings — chiefly moving the two offline
+parser-binding pins into `StreamParserSwapTest` and hoisting a `lockEnginePair`
+helper shared with the direct-write sibling; and the `pj-official-plugins`
+`SDK_VERSION` bump 0.18.0 → 0.20.0 (the harness temp-edit is a workaround, not a
+fix).

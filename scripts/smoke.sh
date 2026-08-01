@@ -47,6 +47,10 @@
 # Minio bucket — it owns a dedicated bucket (SMOKE_BUCKET below) that it wipes
 # and reseeds at the start of every run.
 #
+# It shares ONE machine-wide flock with scripts/e2e-layout-import.sh (the
+# cross-repo layout-import gate) so the two harnesses serialize rather than
+# collide over server/bin and the shared Minio daemon — see HARNESS_LOCK below.
+#
 # Final line is exactly one of:
 #   SMOKE PASS
 #   SMOKE FAIL: <step>
