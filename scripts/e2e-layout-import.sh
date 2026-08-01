@@ -67,8 +67,16 @@ readonly PLUGIN_SO="${PLUGIN_BUILD_DIR}/bin/libtoolbox_mcap_cloud_plugin.so"
 readonly PLUGIN_MANIFEST="${PLUGIN_BUILD_DIR}/bin/toolbox_mcap_cloud_plugin.pjmanifest.json"
 
 # The SDK version every staged DSO must be built against — read live from this
-# repo's pin (never hardcoded; CLAUDE.md convention).
-readonly REQUIRED_SDK_VERSION="$(tr -d '[:space:]' < "${REPO_ROOT}/plugin/SDK_VERSION")"
+# repo's pin (never hardcoded; CLAUDE.md convention). Declaration split from
+# assignment (SC2155) and fail-fast: an unreadable/empty pin would otherwise
+# ride silently into every later SDK comparison and garble their messages.
+REQUIRED_SDK_VERSION="$(tr -d '[:space:]' < "${REPO_ROOT}/plugin/SDK_VERSION" 2>/dev/null || true)"
+if [[ -z "${REQUIRED_SDK_VERSION}" ]]; then
+  printf 'E2E-LAYOUT-IMPORT PREFLIGHT FAIL: cannot read the SDK pin from %s\n' \
+      "${REPO_ROOT}/plugin/SDK_VERSION" >&2
+  exit 2
+fi
+readonly REQUIRED_SDK_VERSION
 
 # Sibling checkouts (overridable for other machines).
 readonly PJ4_APP="${E2E_PJ4_APP:-${HOME}/ws_plotjuggler/PJ4/build/pj_app/plotjuggler4}"
@@ -405,9 +413,12 @@ storage:
     secret_key: ${E2E_S3_SECRET_KEY}
 EOF
   : > "${slog}"
+  # 200>&- : do NOT let the server's process group inherit the shared harness
+  # flock FD — a SIGKILL'd script would otherwise leave the surviving group
+  # holding the lock and the next smoke/e2e run blocked forever.
   ( cd "${SERVER_DIR}" && exec env -u PJ_CLOUD_TOKEN setsid ./bin/pj-cloud-server \
       -config "${config}" -listen ":${E2E_PORT}" -db "${E2E_SCRATCH}/catalog.db" \
-      -allow-anonymous >>"${slog}" 2>&1 ) &
+      -allow-anonymous >>"${slog}" 2>&1 200>&- ) &
   E2E_SERVER_PID=$!
   if ! wait_http "http://localhost:${E2E_PORT}/health" 60; then
     log "----- server log (tail) -----"; tail -n 40 "${slog}" || true
@@ -470,15 +481,20 @@ PY
   log "step e: OK"
 }
 
-# rebuild_official_plugin PLUGIN — build one official plugin against
+# rebuild_official_plugin PLUGIN STALE_SO — build one official plugin against
 # REQUIRED_SDK_VERSION by temp-editing that repo's SDK_VERSION (the per-plugin
 # conanfile reads it live) and ALWAYS restoring it — nothing is committed
 # there. On failure this is a hard fail: staging the checkout's older-SDK
 # binaries silently is exactly what the provenance discipline forbids.
 rebuild_official_plugin() {
-  local plugin="$1"
+  local plugin="$1" stale_so="$2"
   local sdk_file="${OFFICIAL_PLUGINS_ROOT}/SDK_VERSION"
   local blog="${E2E_SCRATCH}/official-${plugin}-build.log"
+  # Drop any prior .so FIRST: a SIGKILL between conan-install (which already
+  # writes the new-SDK version file) and the link step must never leave a
+  # stale binary that the next run's skip-path would stage with a lying
+  # sdk=<new> provenance.
+  rm -f "${stale_so}"
   log "step f: rebuilding ${plugin} against SDK ${REQUIRED_SDK_VERSION} (SDK_VERSION temp-edit; log ${blog})"
   cp "${sdk_file}" "${sdk_file}.e2e-bak"
   OFFICIAL_SDK_BAK="${sdk_file}.e2e-bak"
@@ -487,8 +503,12 @@ rebuild_official_plugin() {
   ( cd "${OFFICIAL_PLUGINS_ROOT}" && ./build.sh "${plugin}" ) >>"${blog}" 2>&1 || rc=$?
   restore_official_sdk_version
   if (( rc != 0 )); then
-    log "----- ${plugin} build log (tail) -----"; tail -n 30 "${blog}" || true
-    fail "dso: ${plugin} rebuild against SDK ${REQUIRED_SDK_VERSION} FAILED (exit ${rc}) — likely SDK API drift; NOT staging the checkout's older-SDK binaries. Full log kept at ${blog} until teardown; report BLOCKED with the tail above."
+    # Preserve the FULL log outside the scratch (teardown deletes the scratch
+    # milliseconds after this message; a C++ template error never fits a tail).
+    local kept_log="/tmp/pj-e2e-layout-${plugin}-build.log"
+    mv -f "${blog}" "${kept_log}" 2>/dev/null || kept_log="${blog}"
+    log "----- ${plugin} build log (tail) -----"; tail -n 30 "${kept_log}" || true
+    fail "dso: ${plugin} rebuild against SDK ${REQUIRED_SDK_VERSION} FAILED (exit ${rc}) — likely SDK API drift; NOT staging the checkout's older-SDK binaries. Full log kept at ${kept_log}; report BLOCKED with its contents."
   fi
 }
 
@@ -506,7 +526,7 @@ stage_official_dso() {
     && built_sdk="$(sed -n 's/.*PACKAGE_VERSION "\([^"]*\)".*/\1/p' "${verfile}" | head -n1)"
   if [[ ! -f "${so}" || "${built_sdk}" != "${REQUIRED_SDK_VERSION}" ]]; then
     log "step f: ${plugin} needs a rebuild (so present: $([[ -f ${so} ]] && echo yes || echo no), built SDK: ${built_sdk:-none}, need ${REQUIRED_SDK_VERSION})"
-    rebuild_official_plugin "${plugin}"
+    rebuild_official_plugin "${plugin}" "${so}"
     built_sdk="$(sed -n 's/.*PACKAGE_VERSION "\([^"]*\)".*/\1/p' "${verfile}" | head -n1)"
   fi
   [[ -f "${so}" ]] || fail "dso: ${so} still missing after rebuild"
@@ -617,7 +637,7 @@ main() {
   if [[ "${1:-}" == "--dry-run" ]]; then
     dry_run
   elif [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
-    sed -n '2,15p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '2,21p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
     printf '\nUsage: %s [--dry-run]\n' "$0"
     exit 0
   elif [[ -n "${1:-}" ]]; then
@@ -633,8 +653,10 @@ main() {
   fi
 
   preflight
-  E2E_SCRATCH="$(mktemp -d /tmp/pj-e2e-layout.XXXXXX)"
+  # Trap FIRST: even a mktemp failure must still print the verdict line
+  # (cleanup guards an empty E2E_SCRATCH).
   trap cleanup EXIT
+  E2E_SCRATCH="$(mktemp -d /tmp/pj-e2e-layout.XXXXXX)"
   log "stage-5 layout-import E2E harness starting (repo ${REPO_ROOT}, scratch ${E2E_SCRATCH})"
 
   step_build_tools
