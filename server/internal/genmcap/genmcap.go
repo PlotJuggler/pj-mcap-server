@@ -298,14 +298,27 @@ func Write(w io.Writer, spec FileSpec) error {
 		schemaID := uint16(ti + 1)
 		channelID := uint16(ti + 1)
 		schemaData := []byte(t.SchemaName) // synthetic default — non-empty, deterministic
-		if t.SchemaData == nil && t.PayloadFn == nil && t.SchemaEnc == "ros2msg" {
+		if t.SchemaEnc == "ros2msg" {
 			// Known ros2msg types decode for REAL through parser_ros: real
 			// concatenated .msg schema text + real CDR payloads (deterministic,
 			// padded toward PayloadBytes so volume properties survive). Counts,
 			// times, keys and chunking are untouched — see ros2payloads.go.
+			//
+			// The two overrides are gated SEPARATELY on purpose. A spec that
+			// supplies only PayloadFn still gets the real SCHEMA text: the
+			// bare-type-name default is what makes parser_ros fail with
+			// "Missing ROSType in library", and mcap-loader then refuses the
+			// WHOLE file — a trap a custom-payload spec must not fall into.
+			// (No shipped spec is in that shape today: gen-3d-fixture pairs
+			// every PayloadFn with its own SchemaData, so this changes zero
+			// fixture bytes.)
 			if realSchema, fn, ok := realRos2Payload(t.SchemaName); ok {
-				schemaData = realSchema
-				realFns[ti] = fn
+				if t.SchemaData == nil {
+					schemaData = realSchema
+				}
+				if t.PayloadFn == nil {
+					realFns[ti] = fn
+				}
 			}
 		}
 		if t.SchemaData != nil {

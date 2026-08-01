@@ -414,3 +414,79 @@ func TestDeterministic_WithMetadata(t *testing.T) {
 		t.Fatal("non-deterministic output with embedded metadata")
 	}
 }
+
+// TestRealRos2Payloads_WireShape pins the ros2msg CDR encoders OFFLINE.
+//
+// These encoders are the only thing standing between a synthetic fixture and
+// "Missing ROSType in library" in the real PJ4 parser stack — and every other
+// assertion in this package (and in smoke, and in the CLI round-trips) is
+// payload-AGNOSTIC: message bytes are only ever compared to themselves. A
+// broken encoder therefore stays invisible to Go CI and only surfaces in a
+// cross-repo live GUI run (scripts/e2e-layout-import.sh). This test closes
+// that gap without linking the C++ parser: the encapsulation prefix and the
+// exact encoded length are precisely what the alignment math gets wrong.
+//
+// The golden lengths are MEASURED values at targetBytes=0 (no frame_id
+// padding); they do not depend on idx (every field is fixed-width and the
+// frame_id strings are constant). A deliberate change to a message's field
+// set must update them.
+func TestRealRos2Payloads_WireShape(t *testing.T) {
+	const idx = 7
+	cases := []struct {
+		schemaName string
+		goldenLen  int
+	}{
+		{"rosgraph_msgs/msg/Clock", 12},
+		{"sensor_msgs/msg/Imu", 324},
+		{"nav_msgs/msg/Odometry", 724},
+		{"sensor_msgs/msg/LaserScan", 124},
+		{"tf2_msgs/msg/TFMessage", 100},
+	}
+	for _, tc := range cases {
+		t.Run(tc.schemaName, func(t *testing.T) {
+			schema, fn, ok := realRos2Payload(tc.schemaName)
+			if !ok {
+				t.Fatalf("realRos2Payload(%q): not in the table", tc.schemaName)
+			}
+			if len(schema) == 0 {
+				t.Fatalf("realRos2Payload(%q): empty schema text", tc.schemaName)
+			}
+			payload := fn(idx, 0)
+			// (a) XCDR1 little-endian encapsulation header. parser_ros reads
+			// this first; a wrong prefix mis-selects endianness/version and
+			// every field after it decodes as garbage.
+			if want := []byte{0x00, 0x01, 0x00, 0x00}; !bytes.HasPrefix(payload, want) {
+				t.Fatalf("encapsulation prefix = % x, want % x", payload[:min(4, len(payload))], want)
+			}
+			// (b) the alignment math, pinned.
+			if len(payload) != tc.goldenLen {
+				t.Fatalf("encoded length = %d, want %d (field set or alignment changed)", len(payload), tc.goldenLen)
+			}
+			// Padding is best-effort but must never SHRINK a message below
+			// its natural size (padFrame only grows frame_id).
+			if padded := fn(idx, tc.goldenLen+256); len(padded) < tc.goldenLen {
+				t.Fatalf("padded length %d < natural %d", len(padded), tc.goldenLen)
+			}
+		})
+	}
+
+	// (c) every ros2msg topic the shipped corpus generates must resolve to a
+	// real schema + encoder — an unresolved one silently falls back to the
+	// bare-type-name schema that mcap-loader rejects outright.
+	for _, spec := range DefaultSpecs() {
+		for _, topic := range spec.Topics {
+			if topic.SchemaEnc != "ros2msg" || topic.SchemaData != nil || topic.PayloadFn != nil {
+				continue
+			}
+			if _, _, ok := realRos2Payload(topic.SchemaName); !ok {
+				t.Errorf("%s topic %s: SchemaName %q has no real payload encoder — the fixture would carry a bare type-name schema",
+					spec.Key, topic.Topic, topic.SchemaName)
+			}
+		}
+	}
+
+	// An unknown type must NOT resolve (the legacy synthetic fallback path).
+	if _, _, ok := realRos2Payload("not_a_pkg/msg/Nope"); ok {
+		t.Fatal("realRos2Payload resolved an unknown type")
+	}
+}

@@ -59,9 +59,18 @@ func (c *cdr) str(s string) {
 func (c *cdr) header(sec int32, nsec uint32, frame string) { c.i32(sec); c.u32(nsec); c.str(frame) }
 
 // padFrame returns a frame_id padded with 'x' so the finished message lands
-// close to targetBytes (best-effort; alignment may add a few bytes). natural
-// is the encoded size with the UNPADDED frame — padding grows the frame_id
-// string in place, so the delta is exactly the pad length.
+// close to targetBytes. `natural` is the encoded size with the UNPADDED
+// frame; a targetBytes at or below it returns the base frame unchanged.
+//
+// BEST-EFFORT, and the pad length is NOT the size delta: the field after
+// frame_id is 8-aligned (float64 / a nested Header), so growing the string
+// shifts that alignment and the finished message can absorb some pad bytes or
+// overshoot by up to 7. Measured worst case across all four padded types is 7
+// bytes, i.e. the finished size lands within ±8 of targetBytes (e.g.
+// tfPayload(0, 302) -> 300, imuPayload(0, 4096) -> 4100,
+// odometryPayload(0, 4096) -> 4092). Callers must treat PayloadBytes as a
+// volume knob, never as an exact size — genmcap_test's golden lengths pin the
+// UNPADDED sizes for exactly that reason.
 func padFrame(base string, natural, targetBytes int) string {
 	if targetBytes <= natural {
 		return base
