@@ -9,9 +9,12 @@ preserve. It is the layout-import analog of `CATALOG_CONTRACT.md`: keep it as-bu
 - The **design record** (why it is shaped this way, rejected alternatives, lineage
   v1→v3.6) is `docs/canonical-layout-import.md` — read that for rationale, this for
   reality.
-- The **execution records** (per-stage plans, Codex consult verdicts, review arcs)
-  are `docs/plans/2026-0[78]-*-layout-*.md` (stages 1–5) — provenance, not
-  instructions.
+- The **per-stage plan docs** (stages 1–5, each carrying its execution record,
+  Codex consult verdict and review arc) were removed from the tree once the
+  feature shipped, per the repo convention that executed plans live in git
+  history rather than in `docs/plans/`. Recover with
+  `git log --diff-filter=D --oneline -- 'docs/plans/*layout*'` if the design
+  record for a stage is ever needed.
 - Merged as: SDK 0.20.0 · plugin stages 1–4 (this repo PRs #4, #11, #14, #15,
   #18–#21) · PJ4 host #470/#464 (pre-existing surfaces) + #490 (foundations),
   #492 (import pipeline), #497 (teardown reorder), #500 (growing-import binder),

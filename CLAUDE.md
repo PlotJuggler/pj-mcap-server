@@ -85,8 +85,11 @@ invariant list I-1…I-16: sole-encoder cache, refusal-while-referenced leases,
 `on_dataset`/`on_terminal` ABI contract, delivery-order guarantee, strict in-place
 promotion, teardown orders, strip displayed-owner arbitration, trust write-through,
 loader pin, zero-new-code for non-cloud loads). The design record with full rationale
-is `docs/canonical-layout-import.md`; the per-stage execution records live in
-`docs/plans/2026-0[78]-*-layout-*.md` (stages 1–5, each with its execution record).
+is `docs/canonical-layout-import.md`, and the sharing/operations runbook is
+`docs/layout-sharing-runbook.md`. The per-stage plan docs (stages 1–5, each with
+its execution record and Codex consult verdict) were REMOVED once the feature
+shipped, per the repo convention — recover them from git history if the design
+record for a particular stage is ever needed.
 
 Implementation history (Slices 1–16 + migration narrative): `docs/history.md` —
 provenance, not instructions.

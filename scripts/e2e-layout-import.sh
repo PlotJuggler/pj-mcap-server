@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────────────────
 # e2e-layout-import.sh — the stage-5 cross-repo live E2E gate for the canonical
-# layout import (docs/plans/2026-08-01-layout-import-stage5-e2e.md, §1 E3/E4).
+# layout import. As-built reference: docs/layout-import-architecture.md;
+# operations: docs/layout-sharing-runbook.md.
 #
 # SEPARATE from scripts/smoke.sh and deliberately smaller: it proves the SHIPPED
 # layout-import stack (real plotjuggler4, real plugin DSOs over the real ABI,
