@@ -47,6 +47,10 @@
 # Minio bucket — it owns a dedicated bucket (SMOKE_BUCKET below) that it wipes
 # and reseeds at the start of every run.
 #
+# It shares ONE machine-wide flock with scripts/e2e-layout-import.sh (the
+# cross-repo layout-import gate) so the two harnesses serialize rather than
+# collide over server/bin and the shared Minio daemon — see HARNESS_LOCK below.
+#
 # Final line is exactly one of:
 #   SMOKE PASS
 #   SMOKE FAIL: <step>
@@ -91,6 +95,19 @@
 # re-derived together.
 # ─────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
+
+# ── shared harness lock (stage-5 §1 E3) ─────────────────────────────────────
+# smoke.sh and scripts/e2e-layout-import.sh take ONE machine-wide flock so the
+# two harnesses never interleave (both rebuild server/bin, both poke the shared
+# Minio daemon, and neither tolerates a loaded machine). WAIT with a message —
+# serialization, not exclusion. FD 200 is held for the whole run and released
+# on any exit; cleanup() reaps every child, so the lock cannot leak past a run.
+readonly HARNESS_LOCK="/tmp/pj-cloud-harness.lock"
+exec 200>"${HARNESS_LOCK}"
+if ! flock -n 200; then
+  printf '[smoke] waiting for the shared harness lock %s (another smoke/e2e run is active)...\n' "${HARNESS_LOCK}"
+  flock 200
+fi
 
 # ── structural identifiers (generator-derived NAMES, never counts) ──────────
 # Hive dimension literals gen-ci-fixtures.go hardcodes (hiveKeyFor).
@@ -420,7 +437,7 @@ start_builder_daemon() {
       AWS_REGION="${SMOKE_S3_REGION}" AWS_DEFAULT_REGION="${SMOKE_S3_REGION}" \
       "${VENV_PY}" -m mcap_catalog_builder --source s3 --s3-bucket "${SMOKE_BUCKET}" --no-watch \
       --tag-socket "${TAG_SOCKET}" --db "${SMOKE_DB}" --rescan-interval "${RESCAN_INTERVAL}" \
-      --log-level INFO >>"${logfile}" 2>&1 ) &
+      --log-level INFO >>"${logfile}" 2>&1 200>&- ) &
   SMOKE_BUILDER_PID=$!
 }
 
@@ -628,7 +645,7 @@ step_server() {
   ( cd "${SERVER_DIR}" && exec env -u PJ_CLOUD_TOKEN ./bin/pj-cloud-server \
       -config "${SMOKE_CONFIG}" -listen ":${SMOKE_PORT}" -db "${SMOKE_DB}" \
       -tag-ipc-socket "${TAG_SOCKET}" -allow-anonymous \
-      >>"${SMOKE_LOG}" 2>&1 ) &
+      >>"${SMOKE_LOG}" 2>&1 200>&- ) &
   SMOKE_SERVER_PID=$!
 
   if ! wait_http "http://localhost:${SMOKE_PORT}/health" 60; then
@@ -1085,7 +1102,7 @@ step_restart_persistence() {
   ( cd "${SERVER_DIR}" && exec env -u PJ_CLOUD_TOKEN ./bin/pj-cloud-server \
       -config "${SMOKE_CONFIG}" -listen ":${SMOKE_PORT}" -db "${SMOKE_DB}" \
       -tag-ipc-socket "${TAG_SOCKET}" -allow-anonymous \
-      >>"${SMOKE_LOG2}" 2>&1 ) &
+      >>"${SMOKE_LOG2}" 2>&1 200>&- ) &
   SMOKE_SERVER_PID=$!
   if ! wait_http "http://localhost:${SMOKE_PORT}/health" 60; then
     log "----- restart server log (tail) -----"; tail -n 40 "${SMOKE_LOG2}" || true

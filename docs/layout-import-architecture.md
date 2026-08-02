@@ -1,7 +1,8 @@
 # Layout Import — As-Built Architecture Reference
 
 **Status: LIVE reference (2026-08-01).** The canonical layout import feature is
-code-complete and merged across three repos. This document describes what EXISTS —
+SHIPPED — merged across three repos and verified end to end by the stage-5
+cross-repo live E2E gate. This document describes what EXISTS —
 the component map, the runtime flows, and the invariants any future change must
 preserve. It is the layout-import analog of `CATALOG_CONTRACT.md`: keep it as-built.
 
@@ -9,11 +10,17 @@ preserve. It is the layout-import analog of `CATALOG_CONTRACT.md`: keep it as-bu
   v1→v3.6) is `docs/canonical-layout-import.md` — read that for rationale, this for
   reality.
 - The **execution records** (per-stage plans, Codex consult verdicts, review arcs)
-  are `docs/plans/2026-07-*-layout-*.md` — provenance, not instructions.
+  are `docs/plans/2026-0[78]-*-layout-*.md` (stages 1–5) — provenance, not
+  instructions.
 - Merged as: SDK 0.20.0 · plugin stages 1–4 (this repo PRs #4, #11, #14, #15,
   #18–#21) · PJ4 host #470/#464 (pre-existing surfaces) + #490 (foundations),
-  #492 (import pipeline), #497 (teardown reorder), #500 (growing-import binder).
-  Remaining: the stage-5 cross-repo live E2E run + its docs closure.
+  #492 (import pipeline), #497 (teardown reorder), #500 (growing-import binder),
+  #501 (stage-5: the two headless flags + the live gui-test) · this repo's
+  stage-5 companion PR (the `make e2e-layout` gate, the frozen `:8082`
+  descriptor vectors, `docs/layout-sharing-runbook.md`).
+- The **sharing / operations runbook** (what a shared layout embeds, the trust
+  bootstrap, cache purge, the headless flow + diagnostic-id table, the pinned-DSO
+  matrix, how to run the gate) is `docs/layout-sharing-runbook.md`.
 
 ## 1. What the feature is
 
@@ -124,7 +131,15 @@ are test-pinned.
   misattribute under concurrent interactive imports).
 - **I-8 Promotion is strict in-place replacement.** `replace_dataset_id` +
   `require_replacement`; `DatasetId`/`TopicId` survive `beginRefill`; a commit
-  that fails to preserve the target id is rejected. `accepted != succeeded`;
+  that fails to preserve the target id is rejected. **The refill must reuse the
+  dataset's existing same-named topic on EVERY ingest route** — the direct-write
+  route (`WriteCore::ensureTopic`) and the object route always did; the scalar
+  *parser-binding* route (`DataSourceRuntimeHost::cbEnsureParserBinding`)
+  unconditionally minted a new topic until PJ4 #501, so a delegated-ingest
+  loader (`data_load_mcap`) renumbered every scalar `TopicId` at the replace
+  boundary and every bound curve silently vanished. Offline suites missed it
+  because their mock loaders use the direct-write API; the stage-5 live E2E
+  caught it. `accepted != succeeded`;
   the result callback is exactly-once and may be re-entrant, on any thread.
   PROMOTED means result ok=true; EAGER_ONLY covers everything short of that
   (including failed promotion with a usable dataset) and always emits its
@@ -183,14 +198,48 @@ are test-pinned.
   `support/layout_import_gui_support.h`. The binder suite's
   `ProgressiveImportBindsCurveMidJobThroughRealHostSurfaces` is the feature's
   headline pin.
+- **Cross-repo live E2E (the stage-5 gate):** `scripts/e2e-layout-import.sh`
+  (`make e2e-layout`) — its own server on `:8082` over its own `e2e-layout`
+  bucket, three REAL DSOs staged with provenance and rebuilt against
+  `plugin/SDK_VERSION`, then two halves off that one staged set: PJ4's
+  `main_window_layout_import_e2e_test` (`MainWindowLayoutImportE2ETest`, five
+  live-gated scenarios — a SKIPPED test FAILS the harness) and three shipped
+  `plotjuggler4 --layout --exit-after-layout --dump-diagnostics` legs (cold /
+  warm / EAGER). Scenario identities are the frozen `e2e-8082-*` cases in
+  `docs/source-descriptor-vectors.json`, consumed byte-verbatim. Operator guide:
+  `docs/layout-sharing-runbook.md` (§10 for the harness, §7 for the
+  diagnostic-id table).
+- **Corpus decodability:** `server/internal/genmcap/genmcap_test.go`'s
+  `TestRealRos2Payloads_WireShape` pins the synthetic corpus's ROS 2 CDR
+  encoders (XCDR1 encapsulation prefix, per-type golden encoded lengths,
+  padding never shrinking a message, full schema-resolver coverage). Every other
+  count/round-trip oracle in this repo is payload-AGNOSTIC, so a broken encoder
+  was invisible until the real PJ4 parser stack ran against it — these pins are
+  the offline net for that blind spot.
 - Windows CI note: tests mutate env only through
   `tests/test_support_env.hpp` (`setEnvVar`/`unsetEnvVar`) — raw
   `setenv`/`unsetenv` is a hard MSVC compile error.
 
 ## 6. Known gaps and recorded follow-ups
 
-- **Stage-5 cross-repo live E2E** (in progress): real app + real plugin + real
-  server; must show the §10 EAGER_ONLY diagnostic actually firing.
+- **Stage-5 cross-repo live E2E — DONE (2026-08-01).** Real app + real plugin +
+  real server, both halves off one staged DSO set; the §10 EAGER_ONLY diagnostic
+  is shown firing in the shipped binary (step i leg 3) AND in-process (gui-test
+  scenario 3). See §5. It found one real production bug on its first full run
+  (the delegated-ingest TopicId renumbering fixed in PJ4 #501 — see I-8).
+- **PJ4 #501 quality findings (5, non-blocking).** Chiefly: move the two offline
+  parser-binding regression pins from
+  `pj_runtime/tests/data_source_runtime_host_object_ingest_test.cpp` into
+  `StreamParserSwapTest` (`..._stream_swap_test.cpp`), where the sibling
+  binding-reuse cases already live, and hoist the deferred two-engine lock in
+  `DataSourceRuntimeHost::cbEnsureParserBinding` into a `lockEnginePair` helper
+  shared with the direct-write sibling (`WriteCore::ensureTopic` /
+  `lockWriteEngines`) so the two paths cannot drift out of lock order.
+- **`pj-official-plugins` SDK pin bump.** That checkout's `SDK_VERSION` is still
+  `0.18.0` while PJ4 and this repo's plugin are on `0.20.0`. The E2E harness
+  temp-edits it, rebuilds `data_load_mcap` + `parser_ros` against the pinned SDK,
+  records provenance, and always restores the file — a workaround, not a fix.
+  Moving the upstream pin is a separate `pj-official-plugins` PR.
 - SDK doc fix: `PJ_toolbox_host_vtable_t` write slots are tagged `[main-thread]`
   but the engine-locked implementation + production worker-thread writes are the
   sanctioned shape — stale tag, not code.

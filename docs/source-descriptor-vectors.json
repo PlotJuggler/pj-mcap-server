@@ -1,5 +1,5 @@
 {
-  "comment": "Cross-repo contract: canonical serialization + identity vectors for the source descriptor (docs/canonical-layout-import.md §4). PJ4-side tests must consume this file byte-identically. Regenerating requires bumping the descriptor version.",
+  "comment": "Cross-repo contract: canonical serialization + identity vectors for the source descriptor (docs/canonical-layout-import.md §4). PJ4-side tests must consume this file byte-identically. Regenerating requires bumping the descriptor version. The e2e-8082-* cases are the FROZEN stage-5 live-E2E scenario identities (docs/plans/2026-08-01-layout-import-stage5-e2e.md §1 E4a): scripts/e2e-layout-import.sh consumes their descriptor bytes + identities VERBATIM, and their s3_keys/topics/time ranges MUST keep matching the deterministic gen-ci-fixtures -hive -hive-big corpus the harness seeds into the e2e-layout bucket.",
   "cases": [
     { "name": "minimal-whole-range-all-topics",
       "descriptor": {"v":1,"kind":"mcap-cloud-session","server_uri":"ws://localhost:8080","s3_keys":["a.mcap"],"topics":[],"start_ns":"0","end_ns":"0","include_latched":true,"display_name":"A"},
@@ -12,6 +12,18 @@
     { "name": "display-name-does-not-change-identity",
       "descriptor": {"v":1,"kind":"mcap-cloud-session","server_uri":"wss://mcap.example.com","s3_keys":["k.mcap"],"topics":["/a"],"start_ns":"5","end_ns":"9","include_latched":false,"display_name":"RENAMED"},
       "canonical": "{\"end_ns\":\"9\",\"include_latched\":false,\"kind\":\"mcap-cloud-session\",\"s3_keys\":[\"k.mcap\"],\"server_uri\":\"wss://mcap.example.com\",\"start_ns\":\"5\",\"topics\":[\"/a\"],\"v\":1}",
-      "identity": "mcap-cloud:v1:sha256/128:d9d979cff7534cee367d460097f2a133" }
+      "identity": "mcap-cloud:v1:sha256/128:d9d979cff7534cee367d460097f2a133" },
+    { "name": "e2e-8082-main-cold-warm",
+      "descriptor": {"v":1,"kind":"mcap-cloud-session","server_uri":"ws://localhost:8082","s3_keys":["customer=test/customer_site=lab/robot=r1/source=synthetic/date=2026-06-24/ci_synth_big.mcap"],"topics":[],"start_ns":"0","end_ns":"0","include_latched":true,"display_name":"E2E main cold+warm (:8082)"},
+      "canonical": "{\"end_ns\":\"0\",\"include_latched\":true,\"kind\":\"mcap-cloud-session\",\"s3_keys\":[\"customer=test/customer_site=lab/robot=r1/source=synthetic/date=2026-06-24/ci_synth_big.mcap\"],\"server_uri\":\"ws://localhost:8082\",\"start_ns\":\"0\",\"topics\":[],\"v\":1}",
+      "identity": "mcap-cloud:v1:sha256/128:bcdd03f8e5ce7f8c38e5e0aba55a8c11" },
+    { "name": "e2e-8082-eager-leg",
+      "descriptor": {"v":1,"kind":"mcap-cloud-session","server_uri":"ws://localhost:8082","s3_keys":["customer=test/customer_site=lab/robot=r1/source=synthetic/date=2026-06-22/ci_synth_a.mcap"],"topics":["/clock","/imu"],"start_ns":"0","end_ns":"0","include_latched":true,"display_name":"E2E eager-only leg (:8082)"},
+      "canonical": "{\"end_ns\":\"0\",\"include_latched\":true,\"kind\":\"mcap-cloud-session\",\"s3_keys\":[\"customer=test/customer_site=lab/robot=r1/source=synthetic/date=2026-06-22/ci_synth_a.mcap\"],\"server_uri\":\"ws://localhost:8082\",\"start_ns\":\"0\",\"topics\":[\"/clock\",\"/imu\"],\"v\":1}",
+      "identity": "mcap-cloud:v1:sha256/128:233d6cc276afa3c22d8958f68cd04a4b" },
+    { "name": "e2e-8082-trust-leg",
+      "descriptor": {"v":1,"kind":"mcap-cloud-session","server_uri":"ws://localhost:8082","s3_keys":["customer=test/customer_site=lab/robot=r1/source=synthetic/date=2026-06-22/ci_synth_c.mcap"],"topics":[],"start_ns":"3000100000000","end_ns":"3000400000000","include_latched":false,"display_name":"E2E trust leg (:8082)"},
+      "canonical": "{\"end_ns\":\"3000400000000\",\"include_latched\":false,\"kind\":\"mcap-cloud-session\",\"s3_keys\":[\"customer=test/customer_site=lab/robot=r1/source=synthetic/date=2026-06-22/ci_synth_c.mcap\"],\"server_uri\":\"ws://localhost:8082\",\"start_ns\":\"3000100000000\",\"topics\":[],\"v\":1}",
+      "identity": "mcap-cloud:v1:sha256/128:036abe494beb9188d84fe43dea0104e8" }
   ]
 }

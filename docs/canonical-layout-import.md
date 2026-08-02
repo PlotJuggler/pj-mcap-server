@@ -2,9 +2,12 @@
 
 *Descriptor-backed layout import via materializable cached files.*
 
-**Status:** IMPLEMENTED (2026-08-01) — merged across SDK 0.20.0, this repo's plugin
-stages 1–4, and PJ4 #490/#492/#497/#500; only the stage-5 cross-repo live E2E run
-remains. **This document is the DESIGN RECORD** (rationale, lineage, rejected
+**Status:** SHIPPED (2026-08-01) — merged across SDK 0.20.0, this repo's plugin
+stages 1–4, and PJ4 #490/#492/#497/#500, and **verified end to end by the stage-5
+cross-repo live E2E run** (PJ4 #501 — the two headless flags + the live gui-test —
+plus this repo's companion stage-5 PR: the `scripts/e2e-layout-import.sh` gate, the
+frozen `:8082` descriptor vectors, and `docs/layout-sharing-runbook.md`).
+**This document is the DESIGN RECORD** (rationale, lineage, rejected
 alternatives); the as-built reference an implementer should read first is
 `docs/layout-import-architecture.md`. Design lineage: v3.6 — the **V3+B variant is
 adopted** (user decision 2026-07-28 after a
@@ -618,8 +621,30 @@ Explicitly **not** built (v2 components dissolved or #470-supplied): `<replay_so
   failed promotion; **catalog equality** between an authored-and-promoted dataset and an
   import-loaded one — semantic equality, not just `mcapdiff`); stable-ID + name-fallback loader
   matching.
-- **Matrix pin:** `data_load_mcap` (and parser set) version pinned in the E2E matrix — import
-  has a runtime dependency on a compatible loader.
+  **Catalog equality — CLOSED (2026-08-01)** by `MainWindowLayoutImportE2ETest` scenario 5
+  (PJ4 #501): a dataset-ID-normalized signature — scalar `(topic, field_path, logical_type,
+  row_count, range)` + object `(topic, object_type, normalized_metadata, count, range)` —
+  compared THREE ways (the complete eager dataset captured at the replace boundary == the
+  promoted dataset == a later warm stock load), plus `DatasetId`/`TopicId` stability across
+  the replace and bound-curve survival. Topics+counts alone would have been near-tautological.
+- **Matrix pin — CLOSED (2026-08-01):** rather than pinning a version string,
+  `scripts/e2e-layout-import.sh` **rebuilds** `data_load_mcap` (`mcap-loader`) and
+  `parser_ros` (`ros-parser`) against this repo's `plugin/SDK_VERSION` and records
+  per-DSO provenance (`id=version`, sdk, source repo, git rev, sha256) into the kept-artifacts
+  dir, then gates on `plotjuggler4 --validate-plugins` with an `--expect-plugin` entry for all
+  three. Manifest version strings alone were rejected as insufficient evidence of ABI
+  compatibility. Operator-facing description: `docs/layout-sharing-runbook.md` §9.
+- **Live cross-repo E2E (stage 5, 2026-08-01):** `make e2e-layout`
+  (`scripts/e2e-layout-import.sh`) — a real `plotjuggler4`, the real plugin DSOs over the real
+  ABI, a live server on `:8082` over a deterministic corpus in its own bucket, with the
+  scenario identities taken VERBATIM from frozen `e2e-8082-*` cases in
+  `docs/source-descriptor-vectors.json`. Two halves off ONE staged DSO set: the live PJ4
+  gui-test (5 scenarios — cold promotion with a live progressive witness, the literal GUI
+  save/reload flow warm + zero-network, `layout-import-eager-only` in-process, the trust gate,
+  catalog equality; a SKIPPED test FAILS the harness) and three shipped-binary
+  `--layout --exit-after-layout --dump-diagnostics` legs (cold / warm / EAGER) asserting
+  diagnostic **ids**, the artifact, and the `pj_cloud_sessions_total` /
+  `pj_cloud_ws_connections_total` zero-network witnesses.
 
 ## 13. Build order (cross-repo hazards resolved)
 
@@ -647,8 +672,16 @@ Explicitly **not** built (v2 components dissolved or #470-supplied): `<replay_so
    see §9.8 for the landed shape) — fetch tee re-target (content-addressed + delete-retention
    + provenance); `SessionCache` DatasetId; headless bind mode; query/import/promote
    implementations.
-5. **End-to-end + docs** — GUI flow, `--layout` flow (incl. progressive miss import), team-
-   sharing runbook (metadata/path leakage note), pinned-loader matrix, live coverage.
+5. **End-to-end + docs** (DONE 2026-08-01 — the stage-5 cross-repo live E2E: PJ4 #501
+   ships `--dump-diagnostics` + `--exit-after-layout` and the live
+   `MainWindowLayoutImportE2ETest`; this repo ships `scripts/e2e-layout-import.sh`
+   (`make e2e-layout`), the frozen `:8082` descriptor vectors, and
+   `docs/layout-sharing-runbook.md`) — GUI flow (automated as gui-test scenario 2, not a
+   manual checklist), `--layout` flow (incl. progressive miss import — scenario 1 carries
+   the live progressive witness), team-sharing runbook (metadata/path leakage note —
+   runbook §2, quoted verbatim from §7), pinned-loader matrix (runbook §9: the loader and
+   parser DSOs are REBUILT against the pinned SDK and provenance-recorded per run), live
+   coverage (5 gui-test scenarios + 3 shipped-binary legs).
 
 ## 14. References
 

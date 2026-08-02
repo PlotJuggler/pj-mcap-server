@@ -210,8 +210,12 @@ the pure resolver in `tools/cli_url_resolve.hpp` and pinned by the
 
 The plugin implements the SDK 0.20.0 **descriptor-import extension** (spec:
 `docs/canonical-layout-import.md`), which lets a PJ4 host re-materialize a
-cloud session from the `<materialize>` descriptor a saved layout carries —
-query first, then a headless import job, with **no interactive panel
+cloud session from the `<materialize>` descriptor a saved layout carries.
+*(User/ops-facing guide to the same feature — sharing policy, trust bootstrap,
+cache purge, the headless flow and its diagnostic ids:
+`docs/layout-sharing-runbook.md`.)*
+
+Query first, then a headless import job, with **no interactive panel
 involved**:
 
 - **`query_descriptor`** — synchronous and strictly bounded (no network, no

@@ -58,7 +58,7 @@ schema/IPC changes MUST update it.
   before they're locked; milestone boundaries get adversarial review (Codex + Claude —
   this caught ~35 real defects across the M6 tail).
 
-## Canonical layout import: CODE-COMPLETE (2026-08-01)
+## Canonical layout import: SHIPPED — verified end-to-end (2026-08-01)
 
 The second major feature arc after the catalog migration: a `.pj4.xml` layout that
 auto-reconnects and re-downloads an exact cloud session — request-addressed cache
@@ -66,9 +66,18 @@ auto-reconnects and re-downloads an exact cloud session — request-addressed ca
 provider in the plugin, source promotion + growing-import binder in PJ4. Merged across
 three repos: SDK 0.20.0 · this repo PRs #4/#11/#14/#15/#18–#21 (ImportRuntime,
 single-encoder cache tee, headless init, provider, live E2E legs in smoke) · PJ4
-#490/#492/#497/#500 (LayoutImportBatch + rewrite-then-classify, promotion host,
-teardown reorder, strip/Stop/mid-import binding). Remaining: the stage-5 cross-repo
-live E2E run + docs closure.
+#490/#492/#497/#500/#501 (LayoutImportBatch + rewrite-then-classify, promotion host,
+teardown reorder, strip/Stop/mid-import binding, the stage-5 headless flags + live
+gui-test). **Stage 5 is DONE:** `make e2e-layout` proves the shipped stack cross-repo
+(see the harness section below), and it found one real production bug on its first
+full run — the delegated-ingest scalar `TopicId` renumbering at the promotion replace
+boundary (PJ4 #501; invariant I-8).
+
+**Sharing/ops guide: `docs/layout-sharing-runbook.md`** — what a shared `.pj4.xml`
+embeds (and the §7 metadata/path-leakage warning), the trust-ledger bootstrap, cache
+location/purge, the headless `--layout --exit-after-layout --dump-diagnostics` flow
+with its exit codes + diagnostic-id table, the pinned-DSO matrix, and how to run the
+gate. Point users there, not at the design record.
 
 **READ `docs/layout-import-architecture.md` BEFORE touching any of this** — it is the
 as-built reference (component map across the three repos, runtime flows, and the
@@ -77,7 +86,7 @@ invariant list I-1…I-16: sole-encoder cache, refusal-while-referenced leases,
 promotion, teardown orders, strip displayed-owner arbitration, trust write-through,
 loader pin, zero-new-code for non-cloud loads). The design record with full rationale
 is `docs/canonical-layout-import.md`; the per-stage execution records live in
-`docs/plans/2026-07-*-layout-*.md`.
+`docs/plans/2026-0[78]-*-layout-*.md` (stages 1–5, each with its execution record).
 
 Implementation history (Slices 1–16 + migration narrative): `docs/history.md` —
 provenance, not instructions.
@@ -287,6 +296,12 @@ Arrow ingest (`src/arrow_ingest.*`) → raw-record forwarding to host MessagePar
   canonical layout import feature (cross-repo component map, runtime flows,
   invariants I-1…I-16). The layout-import analog of `CATALOG_CONTRACT.md`: any
   change touching the import/promotion/cache surfaces MUST keep it true.
+- `docs/layout-sharing-runbook.md` — the LIVE user/ops runbook for sharing layouts
+  that re-download their data: what a shared `.pj4.xml` embeds (+ the verbatim §7
+  metadata/path-leakage warning and the never-commit-a-real-layout rule), the
+  trusted-origin bootstrap, cache location/purge/sidecars, the headless flow with
+  exit codes + the diagnostic-id table, the zero-network metrics, the pinned-DSO
+  matrix, and how to run `make e2e-layout`.
 - `docs/CATALOG_CONTRACT.md` — the LIVE cross-language contract (schema v3,
   publish/reopen §9, tag IPC §10, single-writer lock §11; byte-identical copy in
   `mcap_catalog/` — always update both). (The executed auryn catalog-migration plan
@@ -342,6 +357,26 @@ slice done.** The harness proves the whole pipeline without the GUI:
   **Prereq:** the builder venv at `~/.venvs/pj-catalog` (bootstrap:
   `python3 -m venv ~/.venvs/pj-catalog && ~/.venvs/pj-catalog/bin/pip install
   boto3==1.43.40 google-cloud-storage==3.12.0 mcap==1.4.0 watchdog==6.0.0`).
+- `make e2e-layout` (= `scripts/e2e-layout-import.sh`): the **cross-repo layout-import
+  gate** — separate from and smaller than smoke. Its OWN server on **:8082** + OWN
+  `e2e-layout` bucket + OWN catalog DB in a per-run `mktemp -d` (Minio is SHARED, started
+  if down, **never** composed down). Stages three REAL DSOs with provenance (this repo's
+  cloud plugin + `data_load_mcap`/`parser_ros` **rebuilt** against `plugin/SDK_VERSION` —
+  the official-plugins checkout is still pinned 0.18.0, temp-edited and always restored),
+  gates them through `plotjuggler4 --validate-plugins`, then runs BOTH halves off that one
+  set: PJ4's live `main_window_layout_import_e2e_test` (5 scenarios; a **SKIPPED test FAILS
+  the harness**) and 3 shipped-binary `--layout --exit-after-layout --dump-diagnostics`
+  legs (cold/warm/EAGER). Final line `E2E-LAYOUT-IMPORT PASS` / `FAIL: <step>`;
+  preflight problems exit 2. **Requires a PJ4 build carrying the stage-5 surface**
+  (`--dump-diagnostics`, `--exit-after-layout`, the gui-test binary) — default
+  `~/ws_plotjuggler/PJ4/build`, move both halves together with `E2E_PJ4_BUILD`.
+  Shares ONE machine-wide flock (`/tmp/pj-cloud-harness.lock`) with `smoke.sh` — it
+  WAITS, never fails. **Bucket-wipe rule:** `s3://e2e-layout` is seeded once and left in
+  place, so after any `gen-ci-fixtures`/`internal/genmcap` change you must EMPTY the
+  bucket to force a reseed (a stale corpus shows up as `layout-import-unresolved-curves`).
+  Post-mortem artifacts land in `/tmp/pj-e2e-layout-artifacts/<timestamp>/`.
+  `--dry-run` prints the plan touching nothing. Operator guide:
+  `docs/layout-sharing-runbook.md` §10.
 - `scripts/ci-integration.sh` (needs `PJ_CI_BUILDER_PYTHON=~/.venvs/pj-catalog/bin/python3`):
   the local mirror of the CI integration legs — Python builder `--once` over both
   `{s3, gcs}` emulator legs + the `scripts/sabotage-check.sh` quarantine red-team.

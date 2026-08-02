@@ -17,6 +17,7 @@ session — with reconnect-resume and a repeat-fetch cache.
 | `plugin/toolbox_mcap_cloud/` | Cloud connector toolbox plugin + `mcap-cloud-cli` (builds standalone) |
 | `infra/minio/` | Local S3 (Minio) — development storage endpoint |
 | `scripts/smoke.sh` | `make smoke` — end-to-end regression gate |
+| `scripts/e2e-layout-import.sh` | `make e2e-layout` — cross-repo layout-import gate (real PlotJuggler + real plugins + live server) |
 | `arch/` | Design spec and implementation plans |
 
 The backend is a **two-process system**: the Python builder (`mcap_catalog/`)
@@ -124,5 +125,26 @@ site. `mcap-cloud-cli list` stays unfiltered.
 See `plugin/toolbox_mcap_cloud/README.md` for the full flag/environment table,
 the certificate-discovery order, and the gated browse-flow details.
 
+## Shareable layouts that re-download their data
+
+A PlotJuggler layout saved from a cloud fetch can embed **how to obtain that
+session again** — server, MCAP keys, topic subset, time window — so opening the
+layout (in the GUI or with `plotjuggler --layout`, no prompts) re-creates the exact
+session: instantly from a local cache artifact when present, otherwise by
+re-downloading while the plots grow. **No credentials are ever embedded**; each
+machine resolves its own, and an origin must be connected to once interactively
+before a layout may import from it.
+
+- **`docs/layout-sharing-runbook.md`** — the user/ops guide: what a shared layout
+  does and does not contain (including the metadata/path-leakage warning **read this
+  before sharing**), the one-time trust bootstrap, the cache and how to purge it, the
+  headless flow with its exit codes and diagnostic-id table, and how to run the gate.
+- **`docs/layout-import-architecture.md`** — the engineering reference: cross-repo
+  component map, runtime flows, and the invariants any change must preserve.
+
+## Regression gates
+
 Run the full regression gate: `make smoke`. It generates and seeds its own
 synthetic corpus; see `scripts/RUNBOOK.md` for its additional tooling prerequisites.
+`make e2e-layout` additionally proves the layout-import stack cross-repo against a
+real PlotJuggler build (see the runbook above for its prerequisites).

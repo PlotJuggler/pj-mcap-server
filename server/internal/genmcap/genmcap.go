@@ -290,10 +290,37 @@ func Write(w io.Writer, spec FileSpec) error {
 	}
 
 	// One schema+channel per topic. IDs are 1-based and stable in topic order.
+	// realFns[ti] non-nil = this topic's payloads come from the real-CDR table
+	// (ros2payloads.go) instead of the legacy synthetic bytes; explicit
+	// SchemaData / PayloadFn overrides always win.
+	realFns := make([]func(idx, targetBytes int) []byte, len(spec.Topics))
 	for ti, t := range spec.Topics {
 		schemaID := uint16(ti + 1)
 		channelID := uint16(ti + 1)
 		schemaData := []byte(t.SchemaName) // synthetic default — non-empty, deterministic
+		if t.SchemaEnc == "ros2msg" {
+			// Known ros2msg types decode for REAL through parser_ros: real
+			// concatenated .msg schema text + real CDR payloads (deterministic,
+			// padded toward PayloadBytes so volume properties survive). Counts,
+			// times, keys and chunking are untouched — see ros2payloads.go.
+			//
+			// The two overrides are gated SEPARATELY on purpose. A spec that
+			// supplies only PayloadFn still gets the real SCHEMA text: the
+			// bare-type-name default is what makes parser_ros fail with
+			// "Missing ROSType in library", and mcap-loader then refuses the
+			// WHOLE file — a trap a custom-payload spec must not fall into.
+			// (No shipped spec is in that shape today: gen-3d-fixture pairs
+			// every PayloadFn with its own SchemaData, so this changes zero
+			// fixture bytes.)
+			if realSchema, fn, ok := realRos2Payload(t.SchemaName); ok {
+				if t.SchemaData == nil {
+					schemaData = realSchema
+				}
+				if t.PayloadFn == nil {
+					realFns[ti] = fn
+				}
+			}
+		}
 		if t.SchemaData != nil {
 			schemaData = t.SchemaData // real concatenated .msg text when provided
 		}
@@ -338,6 +365,9 @@ func Write(w io.Writer, spec FileSpec) error {
 				continue
 			}
 			msgData := payload(ti, c.idx, psize)
+			if realFns[ti] != nil {
+				msgData = realFns[ti](c.idx, psize)
+			}
 			if spec.Topics[ti].PayloadFn != nil {
 				msgData = spec.Topics[ti].PayloadFn(c.idx)
 			}
