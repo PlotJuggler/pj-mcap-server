@@ -230,22 +230,32 @@ are test-pinned.
   is shown firing in the shipped binary (step i leg 3) AND in-process (gui-test
   scenario 3). See §5. It found one real production bug on its first full run
   (the delegated-ingest TopicId renumbering fixed in PJ4 #501 — see I-8).
-- **PJ4 #501 quality findings (5, non-blocking).** Chiefly: move the two offline
-  parser-binding regression pins from
+- **PJ4 #501 quality findings — DONE (2026-08-02, PJ4 #502).** The two offline
+  parser-binding regression pins moved from
   `pj_runtime/tests/data_source_runtime_host_object_ingest_test.cpp` into
-  `StreamParserSwapTest` (`..._stream_swap_test.cpp`), where the sibling
-  binding-reuse cases already live, and hoist the deferred two-engine lock in
-  `DataSourceRuntimeHost::cbEnsureParserBinding` into a `lockEnginePair` helper
-  shared with the direct-write sibling (`WriteCore::ensureTopic` /
-  `lockWriteEngines`) so the two paths cannot drift out of lock order.
-- **`pj-official-plugins` SDK pin bump.** That checkout's `SDK_VERSION` is still
-  `0.18.0` while PJ4 and this repo's plugin are on `0.20.0`. The E2E harness
-  temp-edits it, rebuilds `data_load_mcap` + `parser_ros` against the pinned SDK,
-  records provenance, and always restores the file — a workaround, not a fix.
-  Moving the upstream pin is a separate `pj-official-plugins` PR.
-- SDK doc fix: `PJ_toolbox_host_vtable_t` write slots are tagged `[main-thread]`
-  but the engine-locked implementation + production worker-thread writes are the
-  sanctioned shape — stale tag, not code.
+  `StreamParserSwapTest` (`..._stream_swap_test.cpp`), beside the sibling
+  binding-reuse cases (and re-verified RED after the move — a relocated pin that
+  no longer bites is worse than no pin). The deferred two-engine lock in
+  `DataSourceRuntimeHost::cbEnsureParserBinding` is hoisted into
+  `PJ::lockEnginePair` (`pj_datastore/include/pj_datastore/engine.hpp`), shared
+  with the direct-write sibling (`WriteCore::ensureTopic` / `lockWriteEngines`),
+  so the two ingest routes that mint or mirror topics cannot drift out of lock
+  order. `pj_app/CLAUDE.md` also gained a pointer to this document.
+- **`pj-official-plugins` SDK pin bump — RESOLVED UPSTREAM (2026-08-02).**
+  `origin/main` now carries `SDK_VERSION` `0.20.0`, matching PJ4 and this repo's
+  plugin. **A local checkout may still be behind** (as of this writing the one on
+  this machine reads `0.18.0`, 7 commits back), so the E2E harness keeps its
+  temp-edit → rebuild `data_load_mcap` + `parser_ros` → restore dance. That is no
+  longer a workaround for an upstream gap: it is what makes the gate independent
+  of whatever revision the local checkout happens to sit on, and it is a no-op
+  once the checkout is current. Staging pre-built binaries stays refused.
+- **SDK doc fix — DONE (2026-08-02, `plotjuggler_sdk` #162).**
+  `PJ_toolbox_host_vtable_t`'s implemented slots are retagged `[stream-thread]`:
+  the write/catalog slots hold the engine lock for the whole call, the object
+  slots go through `ObjectStore`'s own mutexes, and `toolbox_mosaico` already
+  drives the vtable from its fetch worker. Not `[thread-safe]` — one shared error
+  buffer per host object means one thread at a time. The two unimplemented
+  ABI-appended tail slots keep a conservative `[main-thread]` tag.
 - Dataset lifecycle/rollback ABI (one consolidated design): host deletion
   callback for per-dataset lease release (plugin side) + eager-dataset-with-
   rollback for progressive toolboxes (pj-official-plugins #240's known
