@@ -209,7 +209,17 @@ local codebases first. Do not guess SDK/plugin APIs — read the real headers.
 > `plotjuggler_sdk-cloud/`). The connector plugin builds **standalone** at
 > `plugin/toolbox_mcap_cloud/` against the SDK Conan package (**0.20.0** — built on
 > this machine 2026-07-29 from the `v0.20.0` tag via
-> `~/ws_plotjuggler/plotjuggler_sdk-cloud/.worktrees/v0.20.0`). The ONLY
+> `~/ws_plotjuggler/plotjuggler_sdk-cloud/.worktrees/v0.20.0`).
+> **SDK repo caveat [2026-08-02]:** the canonical SDK repo is
+> **`PlotJuggler/plotjuggler_sdk`** (the `upstream` remote) — that is where every SDK
+> PR lands (#160 = the 0.20.0 descriptor-import release, #161, #162).
+> `plotjuggler_sdk-cloud` (the `origin` remote of the local checkout) is a **stale
+> fork with zero merged PRs**; its `main` sits ~42 commits back at #119. Branch and
+> PR against `upstream`, and note `gh` resolves to `upstream` by default here.
+> The local `v0.20.0` tag (`4e7e14d`) is also one commit behind upstream's `v0.20.0`
+> (`3a63fe3`) — upstream re-pointed the tag to include #161 (dialog list per-item
+> disable / selection-mode) the day after this machine's package was built. Clean
+> ancestor, no divergence; rebuild the Conan package only if you need that API. The ONLY
 > directory `mcap_catalog/` is VENDORED (formerly the only submodule). Prose below that mentions `PJ4/` as a
 > submodule or SDK 0.8.1 is a stale reference-reading aid — the fork/vendoring history
 > lives in `docs/history.md`. Paths below were verified 2026-06-04 on the original
@@ -364,8 +374,10 @@ slice done.** The harness proves the whole pipeline without the GUI:
   gate** — separate from and smaller than smoke. Its OWN server on **:8082** + OWN
   `e2e-layout` bucket + OWN catalog DB in a per-run `mktemp -d` (Minio is SHARED, started
   if down, **never** composed down). Stages three REAL DSOs with provenance (this repo's
-  cloud plugin + `data_load_mcap`/`parser_ros` **rebuilt** against `plugin/SDK_VERSION` —
-  the official-plugins checkout is still pinned 0.18.0, temp-edited and always restored),
+  cloud plugin + `data_load_mcap`/`parser_ros` **rebuilt** against `plugin/SDK_VERSION`,
+  whose `SDK_VERSION` file is temp-edited and ALWAYS restored — upstream `main` is on
+  0.20.0 since 2026-08-02, but a local checkout is often behind, so the gate never
+  trusts it),
   gates them through `plotjuggler4 --validate-plugins`, then runs BOTH halves off that one
   set: PJ4's live `main_window_layout_import_e2e_test` (5 scenarios; a **SKIPPED test FAILS
   the harness**) and 3 shipped-binary `--layout --exit-after-layout --dump-diagnostics`

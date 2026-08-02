@@ -355,13 +355,16 @@ Before the DSOs are used, `plotjuggler4 --validate-plugins <dir>` runs with an
 `--expect-plugin <id>=<version>` entry for **all three** (the validator also
 rejects loaded-but-*unexpected* plugins).
 
-**Standing caveat (recorded follow-up):** the `pj-official-plugins` checkout's
-own `SDK_VERSION` is pinned at **0.18.0**, while PJ4 and this repo's plugin are
-on **0.20.0**. The harness therefore temp-edits that file, rebuilds the loader
-and parser against 0.20.0, records the result, and **always restores the file**
-(nothing is committed there). Staging the checkout's pre-built 0.18.0 binaries is
-explicitly refused. Moving the upstream pin to 0.20.0 is a separate
-`pj-official-plugins` PR and a recorded follow-up, not a harness workaround.
+**Standing caveat:** the harness never trusts the `pj-official-plugins`
+checkout's own `SDK_VERSION`. It temp-edits that file to this repo's
+`plugin/SDK_VERSION`, rebuilds the loader and parser against it, records the
+result, and **always restores the file** (nothing is committed there). Staging
+the checkout's pre-built binaries is explicitly refused.
+
+`pj-official-plugins` `origin/main` has carried **0.20.0** since 2026-08-02, so
+on a current checkout the temp-edit is a no-op. It stays because a local
+checkout is frequently behind — the one on this machine still reads **0.18.0** —
+and the gate must be independent of whatever revision it happens to sit on.
 
 ---
 
