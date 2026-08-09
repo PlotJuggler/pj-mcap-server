@@ -496,6 +496,12 @@
        <property name="clearButtonEnabled"><bool>true</bool></property>
       </widget>
      </item>
+     <item>
+      <widget class="QPushButton" name="buttonBrowseSaveDir">
+       <property name="text"><string>Browse...</string></property>
+       <property name="toolTip"><string>Choose the MCAP output directory</string></property>
+      </widget>
+     </item>
     </layout>
    </item>
 
