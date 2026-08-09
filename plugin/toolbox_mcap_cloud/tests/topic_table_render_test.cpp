@@ -23,6 +23,7 @@
 #include <string>
 
 #include "mcap_cloud_dialog.hpp"
+#include "vocab_select.hpp"
 #include "test_support_env.hpp"
 
 namespace {
@@ -83,23 +84,31 @@ TEST(TopicTableRender, ToggleDoesNotDisableTheWidget) {
 // The browse gate is what keeps a 43k-row site listing off the wire until the
 // user has narrowed to one robot. A regression that lets the gate through on a
 // partial selection would re-open exactly the download this feature removed.
+// REVIEW DEFECT (Fable, verified): the first version of this test was VACUOUS.
+// A fresh dialog is kDisconnected, so the hint reads "Connect to a server…",
+// the `find("Select customer")` guard failed, and the EXPECT never ran — the
+// exact double-if pattern that lets a test report success without asserting
+// anything. Assert on the pure function directly instead: it is what produces
+// the pill, and it cannot be short-circuited by dialog state.
 TEST(TopicTableRender, GateHintAsksForAllThreeLevels) {
+  const std::string hint =
+      mcap_cloud::gateHintText(mcap_cloud::GatePhase::kNeedsSelection, /*total_files=*/8781595,
+                               /*site_count=*/162);
+  ASSERT_FALSE(hint.empty()) << "kNeedsSelection must produce a pill";
+  EXPECT_NE(hint.find("customer"), std::string::npos) << hint;
+  EXPECT_NE(hint.find("site"), std::string::npos) << hint;
+  EXPECT_NE(hint.find("robot"), std::string::npos)
+      << "the gate hint no longer asks for a robot: " << hint
+      << " — if robot stopped being a required gate level, a whole site's file list "
+         "crosses the wire again";
+
+  // And the dialog must actually render that pill when it is in that phase, so
+  // the widget name stays wired.
   HermeticEnv env("mcap-cloud-topic-render-gate");
   mcap_cloud::McapCloudDialog dialog;
-
   const auto wd = renderDialog(dialog);
-  // The pill is the user-facing statement of what the gate requires. It is a
-  // pure function of GatePhase (vocab_select.hpp), so its text is the cheapest
-  // observable proof that robot is still a required level.
-  if (wd.contains("gateHintLabel") && wd["gateHintLabel"].contains("label")) {
-    const std::string hint = wd["gateHintLabel"]["label"].get<std::string>();
-    if (hint.find("Select customer") != std::string::npos) {
-      EXPECT_NE(hint.find("robot"), std::string::npos)
-          << "the gate hint no longer mentions robot: " << hint
-          << " — if robot stopped being a required gate level, a whole site's file "
-             "list crosses the wire again";
-    }
-  }
+  ASSERT_TRUE(wd.contains("gateHintLabel"))
+      << "the gate pill widget is not rendered at all; the hint text above would never be seen";
 }
 
 }  // namespace

@@ -13,6 +13,7 @@
 // other test while being very visible to a user watching rows arrive.
 #include <gtest/gtest.h>
 
+#include <set>
 #include <string>
 #include <vector>
 
@@ -40,6 +41,19 @@ struct McapCloudDialogSweepAccess {
   // against that cache.
   static void render(McapCloudDialog& d) { (void)d.widget_data(); }
   static void sort(McapCloudDialog& d) { d.sortSequencesLocked(); }
+  static void setGate(McapCloudDialog& d, const char* c, const char* si, const char* r) {
+    d.state_.gate_customer = c; d.state_.gate_site = si; d.state_.gate_robot = r;
+  }
+  static std::string robot(McapCloudDialog& d) { return d.state_.gate_robot; }
+  static std::string site(McapCloudDialog& d) { return d.state_.gate_site; }
+  static void beginGate(McapCloudDialog& d) { (void)d.beginGateRequestLocked(GatePhase::kNeedsSelection); }
+  static void seedRowMaps(McapCloudDialog& d) {
+    d.state_.seq_view_cache.row_to_keys["stale-label"] = {"stale-key.mcap"};
+    d.state_.seq_view_cache.prev_row_to_keys["older-label"] = {"older-key.mcap"};
+  }
+  static bool rowMapsEmpty(McapCloudDialog& d) {
+    return d.state_.seq_view_cache.row_to_keys.empty() && d.state_.seq_view_cache.prev_row_to_keys.empty();
+  }
 };
 
 namespace {
@@ -114,6 +128,56 @@ TEST(SweepIncremental, AppendRefusesWhenItCannotBeCorrect) {
   collide.push_back(base.front());
   EXPECT_FALSE(Access::append(d, collide, base.size()))
       << "append must refuse a display-name collision instead of producing duplicate labels";
+}
+
+// REVIEW DEFECT (both reviewers, blocking): the collision preflight checked each
+// new candidate against the ALREADY-HELD labels but not against the other
+// candidates in the SAME batch.
+//
+// shortenSequenceName deliberately drops the `date=` segment, so two files that
+// differ only by date collapse to one display label — and a single server page
+// routinely spans a date boundary. Both rows would then carry identical column-0
+// text, which IS the PanelEngine selection identity, so clicking the second
+// resolves to the FIRST: wrong topics, and a Download that silently fetches the
+// wrong recording.
+TEST(SweepIncremental, AppendRefusesAWithinBatchDisplayCollision) {
+  mcap_cloud_test::HermeticEnv env("mcap-cloud-sweep-tail-collision");
+  const auto base = corpus(40);
+
+  McapCloudDialog d;
+  {
+    auto copy = base;
+    Access::populate(d, copy);
+  }
+
+  // Two NEW rows differing ONLY by date= — neither collides with anything
+  // already held, but they collide with each other.
+  std::vector<SequenceInfo> grown = base;
+  for (const char* date : {"2026-07-13", "2026-07-14"}) {
+    SequenceInfo s;
+    s.name = std::string("customer=dexory/customer_site=nashvillee/robot=arri-182/source=rosbox/date=") +
+             date + "/rosbox_light_twin.mcap";
+    s.min_ts_ns = 1752999000000000000LL;
+    s.max_ts_ns = s.min_ts_ns + 500;
+    s.total_size_bytes = 2200000;
+    grown.push_back(std::move(s));
+  }
+
+  EXPECT_FALSE(Access::append(d, grown, base.size()))
+      << "append accepted two rows whose display labels collide WITHIN the appended batch. "
+         "Column-0 text is the selection identity, so the table would carry two identical "
+         "labels and a click on the second would resolve to the first file.";
+
+  // And the fallback must actually produce unique labels.
+  {
+    auto copy = grown;
+    Access::populate(d, copy);
+  }
+  const auto& disp = Access::displays(d);
+  std::set<std::string> unique(disp.begin(), disp.end());
+  EXPECT_EQ(unique.size(), disp.size())
+      << "the full-populate fallback must yield unique display labels (it falls back to the "
+         "full key on collision)";
 }
 
 // The stable prefix is what authorizes the view cache to extend rather than
@@ -209,6 +273,31 @@ TEST(SweepIncremental, ClickResolvesCorrectlyAfterASort) {
     EXPECT_EQ(sel[0], names[idx])
         << "after sorting, display/name vectors are no longer parallel — clicks resolve to the wrong file";
   }
+}
+
+// REVIEW DEFECT: a gate transition must drop BOTH row->keys generations.
+//
+// A label still on screen from a previous gate — or a previous SERVER — must
+// never resolve to that gate's keys. Before the fix the maps survived
+// beginGateRequestLocked, leaving a window where a click could return keys
+// belonging to a site the user had already navigated away from.
+TEST(SweepIncremental, GateTransitionInvalidatesBothRowKeyMaps) {
+  mcap_cloud_test::HermeticEnv env("mcap-cloud-gate-invalidate");
+  const auto all = corpus(40);
+
+  McapCloudDialog d;
+  {
+    auto copy = all;
+    Access::populate(d, copy);
+  }
+  Access::render(d);           // builds the view cache
+  Access::seedRowMaps(d);      // simulate an AGGREGATE generation having been built
+  ASSERT_FALSE(Access::rowMapsEmpty(d)) << "precondition: the maps must be non-empty";
+
+  Access::beginGate(d);
+  EXPECT_TRUE(Access::rowMapsEmpty(d))
+      << "a gate transition left a row->keys map behind: a label from the previous gate/server "
+         "could still resolve to that gate's file keys";
 }
 
 }  // namespace

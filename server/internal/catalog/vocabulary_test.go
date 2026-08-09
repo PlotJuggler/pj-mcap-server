@@ -544,6 +544,34 @@ func TestGetVocabulary_LeanOmitsUnreadSections(t *testing.T) {
 		}
 	}
 
+	// REVIEW DEFECT (both reviewers): OmitSiteRobotCounts was never asserted, so
+	// ignoring it entirely — silently restoring two of the four whole-table scans
+	// this option exists to remove — would have passed. Assert the counts are
+	// actually zero, and require the FULL response to carry non-zero ones first so
+	// the assertion cannot be vacuous.
+	sawNonZeroLeafCount := false
+	for i := range full.Customers {
+		for j := range full.Customers[i].Sites {
+			if full.Customers[i].Sites[j].FileCount > 0 {
+				sawNonZeroLeafCount = true
+			}
+			if lean.Customers[i].Sites[j].FileCount != 0 {
+				t.Fatalf("OmitSiteRobotCounts ignored: site %q still reports %d files",
+					lean.Customers[i].Sites[j].Name, lean.Customers[i].Sites[j].FileCount)
+			}
+			for k := range full.Customers[i].Sites[j].Robots {
+				if lean.Customers[i].Sites[j].Robots[k].FileCount != 0 {
+					t.Fatalf("OmitSiteRobotCounts ignored: robot %q still reports %d files",
+						lean.Customers[i].Sites[j].Robots[k].Name,
+						lean.Customers[i].Sites[j].Robots[k].FileCount)
+				}
+			}
+		}
+	}
+	if !sawNonZeroLeafCount {
+		t.Fatal("fixture has no non-zero site counts: the OmitSiteRobotCounts assertion would be vacuous")
+	}
+
 	// The omitted sections must be gone. If the fixture has none of a section to
 	// begin with, the assertion would be vacuous — require the FULL response to
 	// carry it first, so this test can actually fail.
