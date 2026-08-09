@@ -39,6 +39,11 @@ import (
 // CatalogHandler answers the catalog RPCs against the SQLite store.
 type CatalogHandler struct {
 	Store *catalog.Store
+	// VocabCache memoizes GetVocabulary per (catalog revision, scoping options).
+	// Injected from the process-lifetime ws.Handler: this struct is constructed
+	// PER RPC, so a cache owned here would never hit. nil is allowed (tests that
+	// build a bare handler) and falls back to computing directly.
+	VocabCache *catalog.VocabularyCache
 }
 
 // ── generation-bound pagination cursors ──────────────────────────────────────
@@ -271,8 +276,6 @@ func (h *CatalogHandler) GetFile(ctx context.Context, req *pb.GetFileRequest) (*
 // meaningful together with the token (echoed back via
 // ListFilesRequest.expected_catalog_generation).
 func (h *CatalogHandler) GetVocabulary(ctx context.Context, req *pb.GetVocabularyRequest) (*pb.GetVocabularyResponse, error) {
-	lease := h.Store.Acquire()
-	defer lease.Release()
 	// Scoping is OPT-IN and additive: an old client sends an empty request, every
 	// flag reads false, and it gets the full legacy response. A picker-only client
 	// switches off the sections it never maps, which removes three whole-table
@@ -282,11 +285,26 @@ func (h *CatalogHandler) GetVocabulary(ctx context.Context, req *pb.GetVocabular
 		OmitTagFacets:       req.GetOmitTagFacets(),
 		OmitSiteRobotCounts: req.GetOmitSiteRobotCounts(),
 	}
-	v, err := catalog.GetVocabularyDB(ctx, lease.DB(), opts)
+	// Served from the revision-keyed cache when possible. Uncached this is a
+	// whole-catalog aggregation (2.54 s full / 0.43 s picker-only at 8.8M files)
+	// that used to run on EVERY call — the reason browse latency depended on
+	// whether anyone had browsed recently. VocabCache may be nil in tests that
+	// construct a bare CatalogHandler; fall back to computing directly.
+	var v *catalog.Vocabulary
+	var gen []byte
+	var err error
+	if h.VocabCache != nil {
+		v, gen, err = h.VocabCache.Get(ctx, h.Store, opts)
+	} else {
+		lease := h.Store.Acquire()
+		gen = lease.Generation()
+		v, err = catalog.GetVocabularyDB(ctx, lease.DB(), opts)
+		lease.Release()
+	}
 	if err != nil {
 		return nil, fmt.Errorf("vocabulary: %w", err)
 	}
-	resp := &pb.GetVocabularyResponse{CatalogGeneration: lease.Generation()}
+	resp := &pb.GetVocabularyResponse{CatalogGeneration: gen}
 	for _, c := range v.Customers {
 		pc := &pb.DimCustomer{Id: c.ID, Name: c.Name, FileCount: c.FileCount}
 		for _, st := range c.Sites {
@@ -382,15 +400,18 @@ func fileSummaryToProto(s catalog.FileSummary) *pb.FileSummary {
 // overlaid by tags_effective (effective tags WIN on collision — see file header).
 func flatMetadata(s catalog.FileSummary) map[string]string {
 	out := map[string]string{
+		// s3_key IS duplicated here — FileSummary.s3_key carries it too, at ~98 B
+		// per file (22.6% of the uncompressed listing at 32k files). Dropping it
+		// was TRIED AND REVERTED, and the client does NOT re-derive it: this map
+		// is the documented client-ingest contract, caps.go advertises "s3_key"
+		// as a query-assist key the Lua filter can reference, and
+		// TestFlatMetadata_EffectiveTagsOverlayDerived pins it. Removing the
+		// emission would therefore silently break that filter unless a
+		// client-side re-derive ships FIRST. Measured trade at 32k files:
+		// deterministic marshaling alone already takes the wire from 1,111 KB to
+		// 512 KB; also dropping s3_key reaches 354 KB. Not worth breaking a
+		// documented contract for 158 KB — revisit under a protocol version bump.
 		"s3_key":        s.S3Key,
-		// NOTE: "s3_key" duplication experiment (kept emitted for now). It is the largest
-		// per-file field and FileSummary.s3_key already carries it, so sending it
-		// again in this map duplicated ~21% of the uncompressed listing payload
-		// (measured: 32k files, 15.16 MB -> the s3_key entry alone is ~98 B/file).
-		// The client re-derives it into user_metadata from FileSummary.s3_key
-		// (wire_mapping.cpp), so the flat-map contract the Lua filter and the
-		// query assist see is unchanged — and it re-adds it only if absent, so a
-		// tags_effective override named "s3_key" still wins.
 		"size_bytes":    strconv.FormatInt(s.SizeBytes, 10),
 		"message_count": strconv.FormatUint(s.MessageCount, 10),
 		"topic_count":   strconv.FormatUint(uint64(s.TopicCount), 10),

@@ -108,6 +108,11 @@ type Handler struct {
 	// behind a slow catalog RPC on the single pinned read connection failed
 	// outright as "no response to handshake". Refreshed by StartCapsRefresh.
 	caps *catalog.CapsSnapshot
+	// vocabCache memoizes GetVocabulary per (catalog revision, scoping options).
+	// It lives HERE, on the process-lifetime Handler: catalogHandler() builds a
+	// fresh CatalogHandler per RPC, so a cache owned there would have a 100% miss
+	// rate while looking entirely correct.
+	vocabCache *catalog.VocabularyCache
 	// authToken is the single shared bearer token. Empty => DEV ANONYMOUS mode
 	// (no Hello credential check; every client is accepted with a warning).
 	authToken string
@@ -157,14 +162,15 @@ func (h *Handler) SetResponseCompression(cfg config.ResponseCompressionConfig) e
 // enables dev anonymous mode.
 func NewHandler(store *catalog.Store, authToken string, log *slog.Logger) *Handler {
 	return &Handler{store: store, log: log, authToken: authToken, auth: newAuthenticator(authToken),
-		caps: catalog.NewCapsSnapshot()}
+		caps: catalog.NewCapsSnapshot(), vocabCache: catalog.NewVocabularyCache(vocabCacheStaleWindow)}
 }
 
 // NewHandlerWithSession builds a WS handler with the session/streaming subsystem
 // wired in. The SessionDeps.Store should resolve files against the same catalog.
 func NewHandlerWithSession(store *catalog.Store, authToken string, log *slog.Logger, sess *SessionDeps) *Handler {
 	return &Handler{store: store, log: log, authToken: authToken, auth: newAuthenticator(authToken), sess: sess,
-		metrics: sess.Metrics, caps: catalog.NewCapsSnapshot()}
+		metrics: sess.Metrics, caps: catalog.NewCapsSnapshot(),
+		vocabCache: catalog.NewVocabularyCache(vocabCacheStaleWindow)}
 }
 
 // newAuthenticator returns a bearer-token ClientAuthenticator for a non-empty
@@ -635,7 +641,18 @@ func (c *connState) handleHello(reqID uint64, hello *pb.Hello) {
 	})
 }
 
-func (c *connState) catalogHandler() *CatalogHandler { return &CatalogHandler{Store: c.h.store} }
+// vocabCacheStaleWindow: how long a SAME-GENERATION vocabulary may be served
+// while a refresh runs behind the caller. The builder commits continuously, so
+// after any idle period the revision has usually moved; without a stale window
+// the next browse would miss exactly when it matters — which is the stall this
+// cache exists to remove. Bounded so a newly ingested site cannot stay invisible
+// indefinitely, and a stale hit always kicks off a refresh, so in practice
+// staleness is one refresh cycle rather than the full window.
+const vocabCacheStaleWindow = 5 * time.Minute
+
+func (c *connState) catalogHandler() *CatalogHandler {
+	return &CatalogHandler{Store: c.h.store, VocabCache: c.h.vocabCache}
+}
 
 func (c *connState) handleListFiles(ctx context.Context, reqID uint64, req *pb.ListFilesRequest) {
 	// Clamp the limit before handing off (the store also clamps, but logging the
