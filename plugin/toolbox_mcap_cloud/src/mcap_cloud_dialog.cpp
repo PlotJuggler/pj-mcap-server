@@ -1029,6 +1029,7 @@ std::string McapCloudDialog::widget_data() {
                      cache.query_text == state_.query_text && cache.date_from_ns == state_.date_from_ns &&
                      cache.date_to_ns == state_.date_to_ns;
     if (!cache_hit) {
+      const auto rebuild_t0 = std::chrono::steady_clock::now();
       std::vector<FilterSequence> filter_seqs;
       filter_seqs.reserve(state_.sequences.size());
       for (const auto& rec : state_.sequences) {
@@ -1120,7 +1121,16 @@ std::string McapCloudDialog::widget_data() {
           const std::string& display = i < state_.seq_display_names.size() ? state_.seq_display_names[i] : rec.name;
           rows.push_back({display, dateOnly(rec.max_ts_ns), formatBytes(rec.total_size_bytes)});
           row_keys.push_back({rec.name});
-          row_to_keys.emplace(display, std::vector<std::string>{rec.name});
+          // NO row_to_keys entry in file mode. Populating it is 43k string-keyed
+          // hash insertions (each allocating a key copy, a vector, and a string)
+          // — MEASURED at 48% of the entire rebuild (200 ms -> 103 ms at 43k
+          // rows) — and it is redundant here: `display` is seq_display_names[i]
+          // and the sole key is sequences[i].name, a 1:1 index correspondence.
+          // onSelectionChanged resolves through those parallel vectors instead:
+          // O(rows) on a USER CLICK (~1 ms at 43k) rather than O(rows)
+          // allocations on every render. Aggregate mode still builds the map —
+          // its labels are synthesized (with dedup suffixes) and map to N keys,
+          // so no such correspondence exists.
         }
         visible = file_visible;  // 1:1 row==file in this mode
       }
@@ -1143,6 +1153,10 @@ std::string McapCloudDialog::widget_data() {
       cache.query_text = state_.query_text;
       cache.date_from_ns = state_.date_from_ns;
       cache.date_to_ns = state_.date_to_ns;
+      // Feeds the progressive-render throttle: how long this rebuild took bounds
+      // how often a listing sweep may trigger the next one.
+      last_rebuild_ms_ =
+          std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - rebuild_t0).count();
     }
 
     // Heavy-key gating: rows/headers only when the cache was rebuilt this tick
@@ -2510,9 +2524,10 @@ std::uint64_t McapCloudDialog::beginGateRequestLocked(GatePhase next_phase) {
   state_.sequence_names.clear();
   progressive_seqs_.clear();
   // A new sweep must always render its first page immediately, not wait out
-  // whatever is left of the PREVIOUS sweep's 150 ms progressive-render window
+  // whatever is left of the PREVIOUS sweep's progressive-render window
   // (see onGatePageReady / last_progressive_render_'s header comment).
   last_progressive_render_ = {};
+  last_rebuild_ms_ = 0.0;
   ++state_.seq_epoch;
   clearSelectionStateLocked();
   // Reset the sequence-level date filter to "All" (unbounded): dateFilterMatches
@@ -2584,6 +2599,17 @@ bool McapCloudDialog::onSelectionChanged(std::string_view widget_name, const std
           // would silently empty the Topics panel).
           it = prev_row_to_keys.find(display);
           if (it == prev_row_to_keys.end()) {
+            // File mode populates NO map (see the rebuild's comment): resolve
+            // through the parallel display->name vectors. Linear, but this runs
+            // per user click, not per render.
+            const auto& names = state_.seq_display_names;
+            const auto pos = std::find(names.begin(), names.end(), display);
+            if (pos != names.end()) {
+              const auto idx = static_cast<std::size_t>(pos - names.begin());
+              if (idx < state_.sequence_names.size()) {
+                state_.selected_sequences.push_back(state_.sequence_names[idx]);
+              }
+            }
             continue;
           }
         }
@@ -2931,8 +2957,17 @@ void McapCloudDialog::onGatePageReady(std::uint64_t request_id, std::vector<Sequ
   // lost — they are still in progressive_seqs_ and render on the next
   // qualifying page, or (if this was the last page) via the always-authoritative
   // onGateListFinished -> onSequencesReady repopulate at the end of the sweep.
+  // ADAPTIVE window: max(150 ms, 3x the last rebuild). A FIXED 150 ms window
+  // was shorter than a large listing's rebuild (~150 ms at 43k rows, measured),
+  // so rebuilds queued back-to-back and the GUI thread never drained events for
+  // the whole sweep. Scaling off the measured cost caps rebuild duty at ~1/3, so
+  // the panel stays responsive; skipped pages are NOT lost (they stay in
+  // progressive_seqs_ and render on the next qualifying page, or via the
+  // authoritative end-of-sweep repopulate).
   const auto now = std::chrono::steady_clock::now();
-  if (reset || now - last_progressive_render_ >= std::chrono::milliseconds(150)) {
+  const auto window = std::chrono::milliseconds(
+      std::max<std::int64_t>(150, static_cast<std::int64_t>(3.0 * last_rebuild_ms_)));
+  if (reset || now - last_progressive_render_ >= window) {
     populateSequencesLocked(progressive_seqs_, /*seed_dates=*/false);
     sortSequencesLocked();
     last_progressive_render_ = now;

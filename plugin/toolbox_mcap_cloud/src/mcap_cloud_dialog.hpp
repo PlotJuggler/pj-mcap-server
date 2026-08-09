@@ -633,6 +633,13 @@ class McapCloudDialog : public PJ::DialogPluginTyped {
   // regardless of whether the last progressive page rendered. GUI-thread only,
   // same as progressive_seqs_ above (no lock needed).
   std::chrono::steady_clock::time_point last_progressive_render_{};
+  // Duration of the last seqTable view-cache rebuild (widget_data). The
+  // progressive-render throttle scales its window off this: at 43k rows a
+  // rebuild costs ~150 ms, so the old FIXED 150 ms window let a large sweep
+  // trigger rebuilds back-to-back and saturate the GUI thread for its whole
+  // duration — the panel read as frozen. GUI-thread only, no lock (same as
+  // last_progressive_render_).
+  double last_rebuild_ms_ = 0.0;
 
   std::thread worker_thread_;
   std::unique_ptr<FetchWorker> worker_;
