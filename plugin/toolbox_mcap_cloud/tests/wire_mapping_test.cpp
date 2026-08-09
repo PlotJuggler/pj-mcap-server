@@ -250,3 +250,46 @@ TEST(WireMapping, EmptyGetVocabularyResponseMapsToEmptyVocabularyInfo) {
 }
 
 }  // namespace
+
+// ---- Vocabulary scoping (picker-only) --------------------------------------
+
+// The browse picker asks the server to SKIP sources, tag facets, and the
+// per-site/per-robot counts (BackendConnection::VocabScope::kPickerOnly), which
+// removes three whole-table GROUP BY scans plus the facet scan from the one RPC
+// the browse UI blocks on. That is only safe if the mapper depends on NONE of
+// the omitted fields — this pins that: a lean response (tree present, omitted
+// sections empty, leaf counts zero) must still map to a fully usable picker.
+TEST(WireMapping, LeanVocabularyStillMapsAUsablePickerTree) {
+  pj_cloud::v1::GetVocabularyResponse response;
+  response.set_catalog_generation("gen-lean");
+
+  auto* customer = response.add_customers();
+  customer->set_id(11);
+  customer->set_name("dexory");
+  customer->set_file_count(8781595);  // customer counts are NEVER omitted
+  auto* site = customer->add_sites();
+  site->set_id(21);
+  site->set_name("nashvillee");
+  site->set_file_count(0);  // omit_site_robot_counts => zero, not absent
+  auto* robot = site->add_robots();
+  robot->set_id(31);
+  robot->set_name("arri-182");
+  robot->set_file_count(0);
+  // sources and tags deliberately left EMPTY (omit_sources / omit_tag_facets).
+
+  const auto vocab = mcap_cloud::mapGetVocabularyResponse(response);
+
+  EXPECT_EQ(vocab.generation, "gen-lean");
+  ASSERT_EQ(vocab.customers.size(), 1u);
+  EXPECT_EQ(vocab.customers[0].name, "dexory");
+  // The summary hint reads customer counts — the one count that must survive.
+  EXPECT_EQ(vocab.totalFiles(), 8781595u);
+  ASSERT_EQ(vocab.customers[0].sites.size(), 1u);
+  EXPECT_EQ(vocab.customers[0].sites[0].name, "nashvillee");
+  // Robots are load-bearing since the gate requires customer+site+ROBOT: a lean
+  // response must still carry them or the third gate level cannot be populated.
+  ASSERT_EQ(vocab.customers[0].sites[0].robots.size(), 1u);
+  EXPECT_EQ(vocab.customers[0].sites[0].robots[0].name, "arri-182");
+  EXPECT_EQ(vocab.customers[0].sites[0].robots[0].id, 31u);
+  EXPECT_EQ(vocab.totalRobots(), 1u);
+}

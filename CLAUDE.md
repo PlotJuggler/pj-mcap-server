@@ -54,6 +54,11 @@ schema/IPC changes MUST update it.
   customer+site selection fed by `GetVocabulary`, server-filtered (`ListFiles`) and
   progressively rendered, persisted per server -- the executed plan doc was removed
   once it landed (recover from git history if the design record is ever needed).
+  **Extended to customer+site+ROBOT (2026-08-09)**: robot was a client-side filter
+  applied AFTER downloading a whole site's listing, even though the server had
+  accepted `FileFilter.robot_id` and shipped robot nodes since M3. It is now a
+  required third gate level sending `robot_id`, so the narrowing happens
+  server-side and a 43k-row site listing never crosses the wire unasked.
 - **Team rule:** technical decisions are cross-checked with a standing Codex instance
   before they're locked; milestone boundaries get adversarial review (Codex + Claude —
   this caught ~35 real defects across the M6 tail).
@@ -143,6 +148,23 @@ doubt, but don't relitigate the decision itself.
   even at the fastest level); transport-level config `server.response_compression`,
   distinct from the session `body_zstd_level`. WS permessage-deflate stays OFF at
   both ends (it would double-compress the batch frames).
+- **Catalog RPC responses are marshaled DETERMINISTICALLY** before compression
+  (`marshalForCompression`, `internal/ws/compress.go`). `ListFilesResponse.metadata`
+  is a protobuf map with ~8 derived keys per file; Go randomizes map iteration, so
+  plain `proto.Marshal` emitted identical key sets at different offsets in every
+  file and defeated ZSTD's cross-file matching. Measured on a 32k-file listing:
+  1,111,112 B -> 512,385 B on the wire from the SAME 15,163,143 marshaled bytes
+  (13.6x -> 29.6x). Only the compression path is deterministic — raw frames are
+  never compressed (permessage-deflate is off at both ends), so ordering buys
+  nothing there. Pinned by `deterministic_marshal_test.go`.
+- **`Hello` NEVER touches SQLite.** Capabilities come from `catalog.CapsSnapshot`,
+  an `atomic.Pointer` value republished by `Handler.StartCapsRefresh` (immediate
+  pass at startup, then a 60s ticker). Deriving them per handshake meant a
+  connect could queue behind a slow catalog RPC on the single pinned read
+  connection and fail as "no response to handshake" — reproduced on demand
+  against a 2.5 GB catalog with a cold page cache. Do NOT add a freshness check
+  on the request path: any revision probe needs that same connection and
+  reintroduces the coupling. Pinned by `hello_availability_test.go`.
 - **GCS change-detect identity = `Generation` (decimal string) + `Updated`** — never
   MD5/CRC32C — slotted into the existing `(etag,size,last_modified)` triple with
   zero indexer/schema change.
@@ -181,6 +203,17 @@ doubt, but don't relitigate the decision itself.
 - **`.ui` files must stay ASCII** (the build hex-embeds them) — PanelEngine's widget
   whitelist has no `QTreeWidget` binding, so any hierarchy UI is a prefix-filter
   combo, not a tree.
+- **`src/query/*.h` must NEVER be reachable from a header that a `<windows.h>`
+  translation unit includes** — `query/token.h` declares a global-scope
+  `enum class TokenType`, and the Windows SDK declares `TokenType` as an
+  ENUMERATOR (`winnt.h`, `_TOKEN_INFORMATION_CLASS`). A non-type name hides a
+  type name, so once `<windows.h>` is seen first, `TokenType type;` fails under
+  MSVC with "unknown override specifier" — never a redefinition error, which is
+  why it reads as nonsense. `mcap_cloud_dialog.hpp` therefore FORWARD-DECLARES
+  `FilterSequence` instead of including `query_filter.h`; including it broke
+  `tests/headless_init_test.cpp` (ixwebsocket pulls in windows.h) and only the
+  `plugin (windows-x64)` CI job caught it — linux and every local build are
+  green. Keep query includes in `.cpp` files.
 - **Ground truth for the C++ live gtests comes from a deterministic synthetic Hive
   corpus** (`gen-ci-fixtures -hive -hive-big` + `gen-3d-fixture`); `make smoke`
   derives everything else (counts, topics) at runtime via `mcaptopics` — never
@@ -469,16 +502,23 @@ cd plugin/toolbox_mcap_cloud \
   && cmake -B build -DCMAKE_TOOLCHAIN_FILE=build/conan_toolchain.cmake -DCMAKE_BUILD_TYPE=Release \
   && cmake --build build -j"$(nproc)"   # -> plugin/toolbox_mcap_cloud/build/bin/
 
-# Run PJ4 — ALWAYS the CLOUD-FORK app (the sibling checkout ~/ws_plotjuggler/PJ4-cloud;
-# its run.sh auto-loads plugins from its sibling pj-official-plugins build dir). NEVER
-# the PRISTINE upstream PJ4 checkout: it carries NONE of the host-side changes (SDK
-# tail slots, RangeSlider markers, widget bindings, …) — the plugin .so still loads
-# there, so plugin features appear while host features silently vanish, which looks
-# like "nothing changed".
-cd ~/ws_plotjuggler/PJ4-cloud && ./run.sh
-# After a host edit: rebuild the fork app (./build.sh in PJ4-cloud) and commit to its
-# `cloud` branch. After a connector edit: rebuild plugin/toolbox_mcap_cloud (this
-# repo's root ./build.sh does it and re-stages the .so).
+# Run PJ4 — the app is ~/ws_plotjuggler/PJ4 (branch `main`).
+#
+# [CORRECTED 2026-08-09] This block used to insist on a `~/ws_plotjuggler/PJ4-cloud`
+# fork and to say the pristine upstream checkout must NEVER be used. That directory
+# DOES NOT EXIST on this machine, so the instruction sent agents to a dead path. The
+# host-side changes it was protecting (SDK tail slots, RangeSlider markers, widget
+# bindings) were upstreamed, so plain PJ4 carries them.
+#
+# Point it at this repo's plugin build dir explicitly (this is how the running
+# instance was launched, verified 2026-08-09):
+cd ~/ws_plotjuggler/PJ4 && ./run.sh
+#   or: ~/ws_plotjuggler/PJ4/build/pj_app/plotjuggler4 \
+#         --plugin-dir <this-repo>/plugin/toolbox_mcap_cloud/build/bin/
+# After a host edit: rebuild PJ4 (./build.sh there). After a connector edit: rebuild
+# plugin/toolbox_mcap_cloud (this repo's root ./build.sh does it and re-stages the
+# .so). NOTE: ~/ws_plotjuggler/PJ4/appimage_plugins/ holds a STALE staged copy that
+# the --plugin-dir launch above does not use.
 ```
 
 ### Once implementation lands in this repo (per the plans)
@@ -545,15 +585,32 @@ estimates (`estimated_chunk_bytes`, `approximate_messages`).
 
 ## Working conventions
 
-- **A PR is NOT ready until the documentation audit passes**: before declaring any
-  branch/PR done, double-check that every document and instruction it touches the
-  truth of is up to date — the affected `README.md`s, the `CLAUDE.md`s (root +
-  `mcap_catalog/`), `CATALOG_CONTRACT.md` (BOTH byte-identical copies — verify with
-  `cmp`), the deploy runbooks (`server/deploy/`, `docs/ec2-deploy.md`,
-  `docs/gce-deploy-smoke.md`), CLI `--help` texts, and any design doc whose Status
-  header the PR advances. Grep the docs for the behavior you changed (flag names,
-  intervals, event/ack semantics, file paths) rather than trusting memory — the
-  2026-07-30 event-discovery PR found seven stale spots this way.
+- **A PR is NOT ready until the documentation audit passes — this is a MERGE GATE,
+  not a reminder.** Every document whose truth the PR changes must be updated in
+  the SAME PR. Run this before asking for review, and state in the PR body that
+  you did:
+
+  1. **Grep for the behaviour you changed**, never trust memory: flag names, RPC
+     names, field names, intervals, thresholds, file paths, measured numbers. A
+     doc that states a measurement your PR invalidates is a stale doc.
+  2. **Walk the fixed list**: the affected `README.md`s (INCLUDING
+     `plugin/toolbox_mcap_cloud/README.md` — its browse-flow section describes
+     user-visible behaviour and is easy to forget), the `CLAUDE.md`s (root +
+     `mcap_catalog/`), `CATALOG_CONTRACT.md` (BOTH copies — verify with `cmp`),
+     `proto/pj_cloud.proto`'s message comments, the deploy runbooks
+     (`server/deploy/`, `docs/ec2-deploy.md`, `docs/gce-deploy-smoke.md`), CLI
+     `--help` text, and any `docs/` design doc whose claims the PR falsifies.
+  3. **A claim you contradicted must be corrected, not just avoided.** If a doc
+     asserts something now false, fix it in place with a dated note rather than
+     leaving it for a reader to trip over. If a doc is right and the CODE drifted,
+     say so explicitly — that is the more dangerous direction.
+  4. **New invariants get recorded in "Decisions & pins" above**, naming the test
+     that enforces them, so the next reader can check rather than trust.
+
+  Evidence this gate is load-bearing: the 2026-07-30 event-discovery PR found
+  seven stale spots this way, and the 2026-08-09 browse-perf PR shipped with the
+  plugin README still documenting the old customer+site gate until an adversarial
+  review caught it — the earlier, softer wording of this rule did not.
 - The plans are written **for agentic execution**: each starts with a required
   sub-skill (`superpowers:subagent-driven-development` or `superpowers:executing-plans`) and
   uses `- [ ]` checkboxes for task tracking. Follow that workflow when implementing them, and

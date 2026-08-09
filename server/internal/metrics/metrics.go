@@ -56,7 +56,13 @@ type Metrics struct {
 	CatalogBuildID            prometheus.Gauge
 	CatalogLastBuildTimestamp prometheus.Gauge // unix seconds of the last build
 	CatalogFilesScanned       prometheus.Gauge
-	CatalogFilesFailed        prometheus.Gauge
+	// VocabularyRequests / VocabularyComputations: the cache's hit rate. Without
+	// both, a regression that silently disables caching is invisible — every test
+	// stays green and only browse latency changes. computations/requests is the
+	// miss rate; it should fall to near zero once a catalog is warm.
+	VocabularyRequests     prometheus.Counter
+	VocabularyComputations prometheus.Counter
+	CatalogFilesFailed     prometheus.Gauge
 
 	// Catalog atomic-publish reopen accounting (catalog-migration §6.2a): the
 	// reader-side half of the swap protocol (CATALOG_CONTRACT.md §9). Reopens
@@ -131,6 +137,12 @@ func New() *Metrics {
 		CatalogLastBuildTimestamp: prometheus.NewGauge(
 			prometheus.GaugeOpts{Name: "pj_cloud_catalog_last_build_timestamp_seconds", Help: "Unix time of the last completed catalog build."},
 		),
+		VocabularyRequests: prometheus.NewCounter(
+			prometheus.CounterOpts{Name: "pj_cloud_vocabulary_requests_total",
+				Help: "GetVocabulary requests served (cache hits + misses)."}),
+		VocabularyComputations: prometheus.NewCounter(
+			prometheus.CounterOpts{Name: "pj_cloud_vocabulary_computations_total",
+				Help: "Times the GetVocabulary aggregation actually ran (cache misses + background refreshes)."}),
 		CatalogFilesScanned: prometheus.NewGauge(
 			prometheus.GaugeOpts{Name: "pj_cloud_catalog_files_scanned", Help: "Files seen by the last catalog build."},
 		),
@@ -163,6 +175,7 @@ func New() *Metrics {
 		m.BytesSentTotal, m.MessagesSentTotal, m.FetchedBytesTotal,
 		m.ChunkIndexWarmedTotal, m.ChunkIndexWarmSkipped, m.ChunkIndexWarmErrors,
 		m.CatalogBuildID, m.CatalogLastBuildTimestamp, m.CatalogFilesScanned, m.CatalogFilesFailed,
+		m.VocabularyRequests, m.VocabularyComputations,
 		m.CatalogReopensTotal, m.CatalogReopenFailuresTotal,
 		m.TagIPCForwardsTotal, m.TagIPCFailuresTotal,
 		m.WSResponseCompressInputBytes, m.WSResponseCompressOutputBytes,

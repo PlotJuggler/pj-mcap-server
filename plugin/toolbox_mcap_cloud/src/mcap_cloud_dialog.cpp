@@ -226,10 +226,12 @@ std::string sessionLabel(const mcap_cloud::AggSession& s) {
 // (server-filtered, fed from GetVocabulary — filter_customer /
 // filter_customer_site, which share basicPane's grid but stay visible in
 // Advanced mode; resolved in onIndexChanged and populated in
-// getWidgetData()); only robot/source remain as client-side equality filters
-// applied on top of the already gate-scoped result set.
-const std::array<std::pair<const char*, const char*>, 2> kLocalBasicFilterKeys = {{
-    {"robot", "Robot"},
+// getWidgetData()); ROBOT joined them there too (2026-08-09) — it is the
+// cheapest dimension that shrinks the file listing, and the server has always
+// accepted it (FileFilter.robot_id -> `f.robot_id = ?`), so filtering by robot
+// AFTER downloading a whole site was backwards. Only source remains a
+// client-side equality filter applied on top of the gate-scoped result set.
+const std::array<std::pair<const char*, const char*>, 1> kLocalBasicFilterKeys = {{
     {"source", "Source"},
 }};
 
@@ -607,6 +609,12 @@ void McapCloudDialog::initFromSettings() {
       state_.basic_filter[key] = value;
     }
   }
+  // Robot left kLocalBasicFilterKeys for the browse gate (2026-08-09), so the
+  // loop above no longer reads its legacy global key. Drop it for the same
+  // reason customer/site are dropped below: a downgrade must not resurrect a
+  // local equality filter that would silently hide rows the gate already
+  // scoped. Unconditional remove — absent keys are a no-op.
+  settings.remove("mcap_cloud/basic_filter/robot");
 
   // NOTE: `history` itself is moved-from above — test the seeded member. (The
   // previous `!history.empty()` check silently killed the auto-connect when
@@ -757,6 +765,42 @@ bool McapCloudDialog::loadConfig(std::string_view config_json) {
   return true;
 }
 
+// visibleForLocked — THE definition of "which of these rows pass the current
+// filters". Both the full view-cache rebuild and the incremental extend call it,
+// so they cannot disagree about what visible means. They previously carried two
+// copies of this logic, and a divergence would have been near-invisible: the
+// authoritative end-of-sweep repopulate always takes the rebuild path, so a
+// filter honoured in only one branch produces wrong rows ONLY while a sweep is
+// in flight. Caller must hold state_.mu.
+std::vector<int> McapCloudDialog::visibleForLocked(const std::vector<FilterSequence>& seqs) {
+  FilterParams params;
+  params.name_filter = state_.seq_filter;
+  params.name_regex = state_.seq_filter_regex;
+  // The metadata query applies ONLY on the Advanced tab; on Basic the Lua query
+  // is ignored. Name + date filters always apply in both modes.
+  params.query_text = state_.filter_tab == 1 ? state_.query_text : std::string{};
+  params.date_from_ns = state_.date_from_ns;
+  params.date_to_ns = state_.date_to_ns;
+  // Advanced -> the Lua query, fed the epoch-cached canonical schema for
+  // shorthand expansion (it filters only by canonical fields, never by
+  // MCAP-content stats). Basic -> the dropdown equality filters on the S3 fields.
+  ensureQuerySchemaLocked();
+  std::vector<int> visible = computeVisibleSequences(seqs, params, state_.query_schema);
+  if (state_.filter_tab == 0 && !state_.basic_filter.empty()) {
+    std::vector<int> narrowed;
+    narrowed.reserve(visible.size());
+    for (int idx : visible) {
+      // seqs[idx].metadata already holds the parsed canonical fields — no second
+      // key parse.
+      if (matchesBasicFilter(seqs[static_cast<std::size_t>(idx)].metadata, state_.basic_filter)) {
+        narrowed.push_back(idx);
+      }
+    }
+    visible = std::move(narrowed);
+  }
+  return visible;
+}
+
 std::string McapCloudDialog::widget_data() {
   std::lock_guard<std::mutex> lock(state_.mu);
   PJ::WidgetData wd;
@@ -769,6 +813,13 @@ std::string McapCloudDialog::widget_data() {
   const bool save_dir_enabled = state_.save_mcap && !state_.fetch_active;
   wd.setEnabled("saveDirectory", save_dir_enabled);
   wd.setEnabled("labelSaveDirectory", save_dir_enabled);
+  // Directory chooser for the export path. The plugin stays Qt-free: the picker
+  // declaration is a widget_data key the HOST acts on (PanelEngine runs
+  // QFileDialog::getExistingDirectory and posts the result back as
+  // onFolderSelected) — the plugin never touches Qt. Re-declared every tick
+  // because PanelEngine resolves the picker against the cached previous view.
+  wd.setFolderPicker("buttonBrowseSaveDir", "Browse...", "Select MCAP output directory");
+  wd.setEnabled("buttonBrowseSaveDir", save_dir_enabled);
   wd.setEnabled("checkSaveMcap", !state_.fetch_active);
 
   // PJ3 parity: combo always lists the MRU history + the default server pin.
@@ -1008,45 +1059,66 @@ std::string McapCloudDialog::widget_data() {
     // widget_data() runs every host tick, and the per-sequence filter + metadata
     // copies are too heavy to redo at 20Hz on the GUI thread.
     auto& cache = state_.seq_view_cache;
-    const bool cache_hit = cache.valid && cache.aggregate == state_.aggregate && cache.filter_tab == state_.filter_tab &&
-                     cache.basic_filter == state_.basic_filter && cache.seq_epoch == state_.seq_epoch &&
-                     cache.seq_filter == state_.seq_filter && cache.seq_filter_regex == state_.seq_filter_regex &&
-                     cache.query_text == state_.query_text && cache.date_from_ns == state_.date_from_ns &&
-                     cache.date_to_ns == state_.date_to_ns;
-    if (!cache_hit) {
+    const bool filters_match = cache.valid && cache.filter_tab == state_.filter_tab &&
+                               cache.basic_filter == state_.basic_filter &&
+                               cache.seq_filter == state_.seq_filter &&
+                               cache.seq_filter_regex == state_.seq_filter_regex &&
+                               cache.query_text == state_.query_text &&
+                               cache.date_from_ns == state_.date_from_ns &&
+                               cache.date_to_ns == state_.date_to_ns;
+    const bool cache_hit = filters_match && cache.aggregate == state_.aggregate &&
+                           cache.seq_epoch == state_.seq_epoch;
+    // INCREMENTAL EXTEND: during a progressive sweep only new rows arrive, so
+    // when every filter input is unchanged and the previously built rows are
+    // still a valid prefix (seq_stable_prefix, set only by appendSequencesLocked)
+    // the cache can append the tail instead of rebuilding all N rows. This is
+    // what stops a sweep being O(rows x windows) — at 43k rows over ~15 render
+    // windows the full rebuild dominated the whole sweep.
+    //
+    // File mode only: aggregate re-sessionizes every file, so an append can
+    // change EARLIER rows (a new file extends the last session's span/label).
+    // filters_match is the SHARED half of cache_hit (everything except the epoch);
+    // stating it once stops a newly added filter input from being wired into the
+    // hit test but not the extend test, which would append a tail filtered by the
+    // NEW inputs onto a prefix filtered by the OLD ones.
+    const bool can_extend = !cache_hit && filters_match && !state_.aggregate && !cache.aggregate &&
+                            state_.seq_stable_prefix > 0 &&
+                            state_.seq_stable_prefix == cache.rows.size() &&
+                            state_.sequences.size() > state_.seq_stable_prefix;
+    if (can_extend) {
+      const auto extend_t0 = std::chrono::steady_clock::now();
+      // Only the appended tail needs filtering; the prefix's verdicts already
+      // sit in cache.visible and cannot change (its rows and inputs are fixed).
+      std::vector<FilterSequence> tail;
+      tail.reserve(state_.sequences.size() - state_.seq_stable_prefix);
+      for (std::size_t i = state_.seq_stable_prefix; i < state_.sequences.size(); ++i) {
+        const auto& rec = state_.sequences[i];
+        tail.push_back({rec.name, rec.min_ts_ns, rec.max_ts_ns, canonicalFilterFields(rec.name)});
+      }
+      const std::vector<int> tail_visible = visibleForLocked(tail);
+      for (std::size_t i = state_.seq_stable_prefix; i < state_.sequences.size(); ++i) {
+        const auto& rec = state_.sequences[i];
+        const std::string& display = i < state_.seq_display_names.size() ? state_.seq_display_names[i] : rec.name;
+        cache.rows.push_back({display, dateOnly(rec.max_ts_ns), formatBytes(rec.total_size_bytes)});
+        cache.row_keys.push_back({rec.name});
+      }
+      for (int idx : tail_visible) {  // tail-relative -> absolute row index
+        cache.visible.push_back(static_cast<int>(state_.seq_stable_prefix) + idx);
+      }
+      cache.seq_epoch = state_.seq_epoch;
+      last_rebuild_ms_ =
+          std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - extend_t0).count();
+      // NB: no seq_rows_pushed reset needed — the push gate is
+      // `!cache_hit || !seq_rows_pushed`, and cache_hit is false on every path
+      // that reaches here.
+    } else if (!cache_hit) {
+      const auto rebuild_t0 = std::chrono::steady_clock::now();
       std::vector<FilterSequence> filter_seqs;
       filter_seqs.reserve(state_.sequences.size());
       for (const auto& rec : state_.sequences) {
         filter_seqs.push_back({rec.name, rec.min_ts_ns, rec.max_ts_ns, canonicalFilterFields(rec.name)});
       }
-      FilterParams params;
-      params.name_filter = state_.seq_filter;
-      params.name_regex = state_.seq_filter_regex;
-      // The metadata query applies ONLY on the Advanced tab; on Basic the Lua
-      // query is ignored. Name + date filters always apply in both modes.
-      params.query_text = state_.filter_tab == 1 ? state_.query_text : std::string{};
-      params.date_from_ns = state_.date_from_ns;
-      params.date_to_ns = state_.date_to_ns;
-      // Per-file visible set (indices into state_.sequences): name + date + the
-      // active tab's metadata filter. Advanced -> the Lua query (computed by the
-      // shared helper, fed the epoch-cached canonical schema for shorthand
-      // expansion — the Advanced query filters only by the canonical fields,
-      // never by MCAP-content stats). Basic -> the dropdown equality filters
-      // on the S3 fields.
-      ensureQuerySchemaLocked();
-      std::vector<int> file_visible = computeVisibleSequences(filter_seqs, params, state_.query_schema);
-      if (state_.filter_tab == 0 && !state_.basic_filter.empty()) {
-        std::vector<int> narrowed;
-        narrowed.reserve(file_visible.size());
-        for (int idx : file_visible) {
-          // filter_seqs[idx].metadata already holds the parsed canonical fields
-          // for this record — no second key parse.
-          if (matchesBasicFilter(filter_seqs[static_cast<std::size_t>(idx)].metadata, state_.basic_filter)) {
-            narrowed.push_back(idx);
-          }
-        }
-        file_visible = std::move(narrowed);
-      }
+      const std::vector<int> file_visible = visibleForLocked(filter_seqs);
 
       std::vector<std::vector<std::string>> rows;
       std::vector<std::vector<std::string>> row_keys;
@@ -1105,7 +1177,16 @@ std::string McapCloudDialog::widget_data() {
           const std::string& display = i < state_.seq_display_names.size() ? state_.seq_display_names[i] : rec.name;
           rows.push_back({display, dateOnly(rec.max_ts_ns), formatBytes(rec.total_size_bytes)});
           row_keys.push_back({rec.name});
-          row_to_keys.emplace(display, std::vector<std::string>{rec.name});
+          // NO row_to_keys entry in file mode. Populating it is 43k string-keyed
+          // hash insertions (each allocating a key copy, a vector, and a string)
+          // — MEASURED at 48% of the entire rebuild (200 ms -> 103 ms at 43k
+          // rows) — and it is redundant here: `display` is seq_display_names[i]
+          // and the sole key is sequences[i].name, a 1:1 index correspondence.
+          // onSelectionChanged resolves through those parallel vectors instead:
+          // O(rows) on a USER CLICK (~1 ms at 43k) rather than O(rows)
+          // allocations on every render. Aggregate mode still builds the map —
+          // its labels are synthesized (with dedup suffixes) and map to N keys,
+          // so no such correspondence exists.
         }
         visible = file_visible;  // 1:1 row==file in this mode
       }
@@ -1128,6 +1209,10 @@ std::string McapCloudDialog::widget_data() {
       cache.query_text = state_.query_text;
       cache.date_from_ns = state_.date_from_ns;
       cache.date_to_ns = state_.date_to_ns;
+      // Feeds the progressive-render throttle: how long this rebuild took bounds
+      // how often a listing sweep may trigger the next one.
+      last_rebuild_ms_ =
+          std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - rebuild_t0).count();
     }
 
     // Heavy-key gating: rows/headers only when the cache was rebuilt this tick
@@ -1157,15 +1242,15 @@ std::string McapCloudDialog::widget_data() {
     wd.setChecked("radioFilterBasic", state_.filter_tab == 0);
     wd.setChecked("radioFilterAdvanced", state_.filter_tab == 1);
     // basicPane holds all four filter rows in ONE grid so the combo columns
-    // align. Customer/Site are the MANDATORY browse gate, so the pane stays
-    // visible in Advanced mode and only the Robot/Source rows are hidden —
-    // otherwise an Advanced-mode user with no restored site could never pass
-    // the gate. Their grid rows collapse to zero height once both the label
-    // and the combo in them are hidden.
+    // align. Customer/Site/Robot are the MANDATORY browse gate, so the pane
+    // stays visible in Advanced mode and only the Source row is hidden —
+    // otherwise an Advanced-mode user with no restored selection could never
+    // pass the gate. Its grid row collapses to zero height once both the label
+    // and the combo in it are hidden.
     const bool basic_mode = state_.filter_tab == 0;
     wd.setVisible("basicPane", true);
-    wd.setVisible("labelRobot", basic_mode);
-    wd.setVisible("filter_robot", basic_mode);
+    wd.setVisible("labelRobot", true);
+    wd.setVisible("filter_robot", true);
     wd.setVisible("labelSource", basic_mode);
     wd.setVisible("filter_source", basic_mode);
     wd.setVisible("advancedPane", state_.filter_tab == 1);
@@ -1201,25 +1286,26 @@ std::string McapCloudDialog::widget_data() {
     // unselected (either no vocabulary yet, or the persisted/typed name isn't in
     // this vocabulary).
     {
-      int customer_idx = -1, site_idx = -1;
+      const auto index_of = [](const std::vector<std::string>& items, const std::string& sel) {
+        for (std::size_t i = 0; i < items.size(); ++i) {
+          if (items[i] == sel) {
+            return static_cast<int>(i);
+          }
+        }
+        return -1;
+      };
       const auto& customers = state_.gate_customer_items;
       const auto& sites = state_.gate_site_items;
-      for (std::size_t i = 0; i < customers.size(); ++i) {
-        if (customers[i] == state_.gate_customer) {
-          customer_idx = static_cast<int>(i);
-          break;
-        }
-      }
-      for (std::size_t i = 0; i < sites.size(); ++i) {
-        if (sites[i] == state_.gate_site) {
-          site_idx = static_cast<int>(i);
-          break;
-        }
-      }
+      const auto& robots = state_.gate_robot_items;
       wd.setItems("filter_customer", customers);
-      wd.setCurrentIndex("filter_customer", customer_idx);
+      wd.setCurrentIndex("filter_customer", index_of(customers, state_.gate_customer));
       wd.setItems("filter_customer_site", sites);
-      wd.setCurrentIndex("filter_customer_site", site_idx);
+      wd.setCurrentIndex("filter_customer_site", index_of(sites, state_.gate_site));
+      // Robot is the third gate level, fed from GetVocabulary like the other
+      // two — NOT from the loaded rows, which is the point: the robot must be
+      // choosable BEFORE any file list has been transferred.
+      wd.setItems("filter_robot", robots);
+      wd.setCurrentIndex("filter_robot", index_of(robots, state_.gate_robot));
     }
 
     // (The D8 "Folder:" prefix combo was removed 2026-07-12: with Hive keys the
@@ -1316,8 +1402,10 @@ std::string McapCloudDialog::widget_data() {
     std::vector<int> disabled;
     for (size_t i = 0; i < state_.topic_names.size(); ++i) {
       const auto& name = state_.topic_names[i];
+      // All mode: every row is inert (the mode already selects everything).
       // Custom mode: a zero-count row is not selectable (nothing to download).
-      if (!state_.topics_all && i < state_.topic_infos.size() && state_.topic_infos[i].message_count == 0) {
+      if (state_.topics_all ||
+          (i < state_.topic_infos.size() && state_.topic_infos[i].message_count == 0)) {
         disabled.push_back(static_cast<int>(i));
       }
       if (nameMatches(name, state_.topic_filter, state_.topic_filter_regex)) {
@@ -1347,10 +1435,15 @@ std::string McapCloudDialog::widget_data() {
     }
     wd.setChecked("radioTopicsAll", state_.topics_all);
     wd.setChecked("radioTopicsCustom", !state_.topics_all);
-    // In All mode the table is inert — the mode already selects everything.
-    wd.setEnabled("topicTable", !state_.topics_all);
+    // The table stays ENABLED in both modes. Disabling the QTableWidget itself
+    // also disables its scrollbars and wheel/keyboard handling, which made a
+    // long topic list unbrowsable in All mode (a 174-topic robot showed only the
+    // first screenful, with a dead scrollbar). Inertness is expressed per-row
+    // instead: disabled_rows clears ItemIsEnabled|ItemIsSelectable on each item,
+    // so All mode is still read-only but remains scrollable and sortable.
+    wd.setEnabled("topicTable", true);
     wd.setVisibleRows("topicTable", visible);
-    wd.setDisabledRows("topicTable", state_.topics_all ? std::vector<int>{} : disabled);
+    wd.setDisabledRows("topicTable", disabled);
     if (!state_.topic_selected_rows.empty()) {
       wd.setSelectedRows("topicTable", state_.topic_selected_rows);
     }
@@ -1688,7 +1781,7 @@ bool McapCloudDialog::onClicked(std::string_view widget_name) {
     // NEVER fetched unfiltered: with both gate names already chosen, re-sweep
     // the same site; otherwise re-fetch the vocabulary (mirrors a fresh
     // connect's gate entry point).
-    std::string customer, site;
+    std::string customer, site, robot;
     std::uint64_t id = 0;
     bool has_selection = false;
     {
@@ -1696,18 +1789,24 @@ bool McapCloudDialog::onClicked(std::string_view widget_name) {
       if (!state_.connected || state_.connecting || state_.fetch_active) {
         return true;
       }
-      has_selection = !state_.gate_customer.empty() && !state_.gate_site.empty();
+      // All THREE gate levels are required before a listing is re-issued; a
+      // partial selection falls through to a vocabulary refresh instead.
+      has_selection =
+          !state_.gate_customer.empty() && !state_.gate_site.empty() && !state_.gate_robot.empty();
       if (has_selection) {
         customer = state_.gate_customer;
         site = state_.gate_site;
+        robot = state_.gate_robot;
         id = beginGateRequestLocked(GatePhase::kListLoading);
       } else {
         id = beginGateRequestLocked(GatePhase::kVocabularyLoading);
       }
     }
     if (has_selection) {
-      notify(PJ::ToolboxMessageLevel::kInfo, fmt::format("Refreshing {}/{}…", customer, site));
-      postCommand([w = worker_.get(), id, customer, site] { w->listSequencesFilteredAsync(id, customer, site); });
+      notify(PJ::ToolboxMessageLevel::kInfo, fmt::format("Refreshing {}/{}/{}…", customer, site, robot));
+      postCommand([w = worker_.get(), id, customer, site, robot] {
+        w->listSequencesFilteredAsync(id, customer, site, robot);
+      });
     } else {
       notify(PJ::ToolboxMessageLevel::kInfo, "Refreshing catalog…");
       postCommand([w = worker_.get(), id] { w->fetchVocabularyAsync(id); });
@@ -2049,6 +2148,20 @@ bool McapCloudDialog::onClicked(std::string_view widget_name) {
   return false;
 }
 
+bool McapCloudDialog::onFolderSelected(std::string_view widget_name, std::string_view path) {
+  // The host ran the directory chooser for buttonBrowseSaveDir (declared as a
+  // folder picker in widget_data) and hands back the chosen path. An empty path
+  // means the user cancelled — leave the configured directory untouched. The
+  // next render tick pushes the new value into the saveDirectory line edit and
+  // re-opens the Download gate, and saveConfig() persists it.
+  if (widget_name != "buttonBrowseSaveDir" || path.empty()) {
+    return false;
+  }
+  std::lock_guard<std::mutex> lock(state_.mu);
+  state_.save_directory = std::string(path);
+  return true;
+}
+
 bool McapCloudDialog::onToggled(std::string_view widget_name, bool checked) {
   if (widget_name == "allowInsecure") {
     std::lock_guard<std::mutex> lock(state_.mu);
@@ -2267,9 +2380,11 @@ bool McapCloudDialog::onIndexChanged(std::string_view widget_name, int index) {
       if (new_customer == state_.gate_customer) {
         return true;  // no-op re-pick
       }
-      // A new customer invalidates any site pick made under the OLD one.
+      // A new customer invalidates any site pick made under the OLD one, and
+      // with it the robot (robots are scoped to a site).
       state_.gate_customer = new_customer;
       state_.gate_site.clear();
+      state_.gate_robot.clear();
       refreshGateComboItemsLocked();  // the site list is scoped to the new customer
       server_key = state_.active_server_key;
       (void)beginGateRequestLocked(GatePhase::kNeedsSelection);  // clears the old site's rows immediately
@@ -2278,11 +2393,13 @@ bool McapCloudDialog::onIndexChanged(std::string_view widget_name, int index) {
     const std::string prefix = gateSettingsPrefix(server_key);
     settings.setString(prefix + "customer", new_customer);
     settings.remove(prefix + "site");
+    settings.remove(prefix + "robot");
     return true;
   }
   if (widget_name == "filter_customer_site") {
     std::string new_site;
     std::string customer;
+    std::string robot;
     std::string server_key;
     std::uint64_t id = 0;
     {
@@ -2302,15 +2419,65 @@ bool McapCloudDialog::onIndexChanged(std::string_view widget_name, int index) {
         return true;  // no-op re-pick
       }
       state_.gate_site = new_site;
-      refreshGateComboItemsLocked();  // same customer/site list, new selection
+      // A site pick no longer starts a listing: robot is the third mandatory
+      // level, so the sequence table stays empty until it is chosen. A site
+      // with exactly ONE robot auto-selects it (mirrors autoSelectCustomer) —
+      // making the user pick from a one-item list is pure friction.
+      state_.gate_robot = autoSelectRobot(*state_.vocabulary, state_.gate_customer, new_site);
+      refreshGateComboItemsLocked();  // rescopes the robot list to the new site
       customer = state_.gate_customer;
+      robot = state_.gate_robot;
+      server_key = state_.active_server_key;
+      id = beginGateRequestLocked(robot.empty() ? GatePhase::kNeedsSelection : GatePhase::kListLoading);
+    }
+    SettingsStore settings(settings_);
+    const std::string prefix = gateSettingsPrefix(server_key);
+    settings.setString(prefix + "site", new_site);
+    if (robot.empty()) {
+      settings.remove(prefix + "robot");
+      return true;  // wait for the robot pick — nothing is listed yet
+    }
+    settings.setString(prefix + "robot", robot);
+    notify(PJ::ToolboxMessageLevel::kInfo, fmt::format("Loading {}/{}/{}…", customer, new_site, robot));
+    postCommand([w = worker_.get(), id, customer, new_site, robot] {
+      w->listSequencesFilteredAsync(id, customer, new_site, robot);
+    });
+    return true;
+  }
+  if (widget_name == "filter_robot") {
+    // The third gate level. This is the pick that finally authorizes a file
+    // listing, and it narrows it SERVER-side via ListFilter.robot_id.
+    std::string new_robot;
+    std::string customer;
+    std::string site;
+    std::string server_key;
+    std::uint64_t id = 0;
+    {
+      std::lock_guard<std::mutex> lock(state_.mu);
+      if (!state_.connected || !state_.vocabulary) {
+        return true;
+      }
+      const std::vector<std::string> robots =
+          robotNamesFor(*state_.vocabulary, state_.gate_customer, state_.gate_site);
+      if (index < 0 || index >= static_cast<int>(robots.size())) {
+        return true;  // out of range -- vocabulary changed under us; ignore
+      }
+      new_robot = robots[static_cast<std::size_t>(index)];
+      if (new_robot == state_.gate_robot) {
+        return true;  // no-op re-pick
+      }
+      state_.gate_robot = new_robot;
+      customer = state_.gate_customer;
+      site = state_.gate_site;
       server_key = state_.active_server_key;
       id = beginGateRequestLocked(GatePhase::kListLoading);
     }
     SettingsStore settings(settings_);
-    settings.setString(gateSettingsPrefix(server_key) + "site", new_site);
-    notify(PJ::ToolboxMessageLevel::kInfo, fmt::format("Loading {}/{}…", customer, new_site));
-    postCommand([w = worker_.get(), id, customer, new_site] { w->listSequencesFilteredAsync(id, customer, new_site); });
+    settings.setString(gateSettingsPrefix(server_key) + "robot", new_robot);
+    notify(PJ::ToolboxMessageLevel::kInfo, fmt::format("Loading {}/{}/{}…", customer, site, new_robot));
+    postCommand([w = worker_.get(), id, customer, site, new_robot] {
+      w->listSequencesFilteredAsync(id, customer, site, new_robot);
+    });
     return true;
   }
   // Basic-tab metadata dropdowns (filter_<field>, robot/source only — see
@@ -2411,11 +2578,23 @@ std::uint64_t McapCloudDialog::beginGateRequestLocked(GatePhase next_phase) {
   // next one, then issues the new request id and supersedes in-flight sweeps.
   state_.sequences.clear();
   state_.sequence_names.clear();
+  // The derived companions of `sequences` must die with it. Leaving them was
+  // benign only by accident (can_append separately requires a non-empty
+  // vector) — an invariant upheld by an unrelated clause in another function
+  // is not an invariant.
+  state_.seq_display_names.clear();
+  state_.seq_display_counts.clear();
+  state_.seq_stable_prefix = 0;
   progressive_seqs_.clear();
   // A new sweep must always render its first page immediately, not wait out
-  // whatever is left of the PREVIOUS sweep's 150 ms progressive-render window
+  // whatever is left of the PREVIOUS sweep's progressive-render window
   // (see onGatePageReady / last_progressive_render_'s header comment).
   last_progressive_render_ = {};
+  last_rebuild_ms_ = 0.0;
+  // Drop BOTH row->keys generations: a label still on screen from the previous
+  // gate (or a previous SERVER) must never resolve to that gate's keys.
+  state_.seq_view_cache.row_to_keys.clear();
+  state_.seq_view_cache.prev_row_to_keys.clear();
   ++state_.seq_epoch;
   clearSelectionStateLocked();
   // Reset the sequence-level date filter to "All" (unbounded): dateFilterMatches
@@ -2436,6 +2615,7 @@ bool McapCloudDialog::gateRequestStaleLocked(std::uint64_t request_id) const {
 void McapCloudDialog::refreshGateComboItemsLocked() {
   state_.gate_customer_items.clear();
   state_.gate_site_items.clear();
+  state_.gate_robot_items.clear();
   if (!state_.vocabulary) {
     return;
   }
@@ -2444,6 +2624,7 @@ void McapCloudDialog::refreshGateComboItemsLocked() {
     state_.gate_customer_items.push_back(c.name);
   }
   state_.gate_site_items = siteNamesFor(*state_.vocabulary, state_.gate_customer);
+  state_.gate_robot_items = robotNamesFor(*state_.vocabulary, state_.gate_customer, state_.gate_site);
 }
 
 bool McapCloudDialog::onSelectionChanged(std::string_view widget_name, const std::vector<std::string>& selected) {
@@ -2476,7 +2657,33 @@ bool McapCloudDialog::onSelectionChanged(std::string_view widget_name, const std
       // so selecting one aggregated session == selecting all its chunks.
       const auto& row_to_keys = state_.seq_view_cache.row_to_keys;
       const auto& prev_row_to_keys = state_.seq_view_cache.prev_row_to_keys;
+      // File mode builds NO row_to_keys (see the rebuild's comment): resolution
+      // goes through the parallel display->name vectors instead. Build the index
+      // ONCE per selection event rather than scanning per selected label — an
+      // extended selection delivers the whole selection every time, so a
+      // per-label std::find was O(selected x rows): ~430M string compares for
+      // 10k rows selected out of 43k, on the GUI thread.
+      std::unordered_map<std::string, std::size_t> display_index;
+      const bool file_mode_lookup = row_to_keys.empty() && !state_.seq_display_names.empty();
+      if (file_mode_lookup) {
+        display_index.reserve(state_.seq_display_names.size());
+        for (std::size_t i = 0; i < state_.seq_display_names.size(); ++i) {
+          display_index.emplace(state_.seq_display_names[i], i);
+        }
+      }
       for (const std::string& display : selected) {
+        // FILE MODE FIRST. The previous rebuild's map is consulted only as a
+        // fallback, and it can still hold AGGREGATE labels from before a mode
+        // toggle; resolving against it ahead of the current view could hand back
+        // a stale session's N keys for what is now a single file.
+        if (file_mode_lookup) {
+          if (auto hit = display_index.find(display); hit != display_index.end()) {
+            if (hit->second < state_.sequence_names.size()) {
+              state_.selected_sequences.push_back(state_.sequence_names[hit->second]);
+            }
+            continue;
+          }
+        }
         auto it = row_to_keys.find(display);
         if (it == row_to_keys.end()) {
           // The click was harvested against a label from the PREVIOUS rebuild
@@ -2620,6 +2827,10 @@ void McapCloudDialog::onConnectFinished(bool ok, std::string uri, std::string st
       if (new_server_key != state_.active_server_key) {
         state_.gate_customer.clear();
         state_.gate_site.clear();
+        // Robot is the THIRD gate level and is equally per-server: leaving it set
+        // let server A's robot silently browse on server B whenever both happen
+        // to carry that robot name, defeating B's own persisted choice.
+        state_.gate_robot.clear();
       }
       state_.active_server_key = new_server_key;
       gate_request_id = beginGateRequestLocked(GatePhase::kVocabularyLoading);
@@ -2679,7 +2890,7 @@ void McapCloudDialog::onConnectFinished(bool ok, std::string uri, std::string st
 }
 
 void McapCloudDialog::onVocabularyReady(std::uint64_t request_id, VocabularyInfo vocab, bool recovery) {
-  std::string customer, site;
+  std::string customer, site, robot;
   std::uint64_t id = 0;
   {
     std::lock_guard<std::mutex> lock(state_.mu);
@@ -2702,12 +2913,14 @@ void McapCloudDialog::onVocabularyReady(std::uint64_t request_id, VocabularyInfo
       return;
     }
 
-    // Resolve the (customer, site) selection: an already-set in-session choice
-    // wins outright (e.g. a reconnect to the same server), else the per-server
-    // persisted values, else auto-select (exactly one customer).
+    // Resolve the (customer, site, robot) selection: an already-set in-session
+    // choice wins outright (e.g. a reconnect to the same server), else the
+    // per-server persisted values, else auto-select (exactly one customer, or
+    // exactly one robot under the resolved site).
     customer = state_.gate_customer;
     site = state_.gate_site;
-    if (customer.empty() || site.empty()) {
+    robot = state_.gate_robot;
+    if (customer.empty() || site.empty() || robot.empty()) {
       SettingsStore settings(settings_);
       const std::string prefix = gateSettingsPrefix(state_.active_server_key);
       if (customer.empty()) {
@@ -2715,6 +2928,9 @@ void McapCloudDialog::onVocabularyReady(std::uint64_t request_id, VocabularyInfo
       }
       if (site.empty()) {
         site = settings.getString(prefix + "site");
+      }
+      if (robot.empty()) {
+        robot = settings.getString(prefix + "robot");
       }
     }
     if (customer.empty()) {
@@ -2757,22 +2973,42 @@ void McapCloudDialog::onVocabularyReady(std::uint64_t request_id, VocabularyInfo
       // both and let kNeedsSelection below start the picker over clean.
       customer.clear();
       site.clear();
-    } else if (!customer.empty() && !site.empty() && !resolveGateFilter(vocab, customer, site)) {
-      // The customer IS known but the pair still doesn't resolve (a rebuild
-      // renamed/removed the site, or this was a stale persisted/migrated
-      // pick): keep the customer, drop only the site.
-      site.clear();
+      robot.clear();
+    } else if (!customer.empty() && !site.empty()) {
+      const std::vector<std::string> sites = siteNamesFor(vocab, customer);
+      if (std::find(sites.begin(), sites.end(), site) == sites.end()) {
+        // The customer IS known but the SITE is gone (a rebuild renamed/removed
+        // it, or this was a stale persisted/migrated pick): keep the customer,
+        // drop the site and — since robots are site-scoped — the robot too.
+        site.clear();
+        robot.clear();
+      }
+    }
+    // With customer+site settled, settle the robot against THIS vocabulary. A
+    // retired robot must not silently widen the query to the whole site, so an
+    // unresolvable one is dropped back to "needs selection" rather than ignored.
+    if (!customer.empty() && !site.empty()) {
+      if (robot.empty()) {
+        robot = autoSelectRobot(vocab, customer, site);
+      } else if (!resolveGateFilter(vocab, customer, site, robot)) {
+        robot.clear();
+      }
+    } else {
+      robot.clear();
     }
     state_.gate_customer = customer;
     state_.gate_site = site;
-    refreshGateComboItemsLocked();  // customer/site (hence the site list) just resolved
-    if (customer.empty() || site.empty()) {
+    state_.gate_robot = robot;
+    refreshGateComboItemsLocked();  // customer/site/robot (hence their lists) just resolved
+    if (customer.empty() || site.empty() || robot.empty()) {
       state_.gate_phase = GatePhase::kNeedsSelection;
       return;
     }
     id = beginGateRequestLocked(GatePhase::kListLoading);
   }
-  postCommand([w = worker_.get(), id, customer, site] { w->listSequencesFilteredAsync(id, customer, site); });
+  postCommand([w = worker_.get(), id, customer, site, robot] {
+    w->listSequencesFilteredAsync(id, customer, site, robot);
+  });
 }
 
 void McapCloudDialog::onVocabularyFailed(std::uint64_t request_id) {
@@ -2807,10 +3043,42 @@ void McapCloudDialog::onGatePageReady(std::uint64_t request_id, std::vector<Sequ
   // lost — they are still in progressive_seqs_ and render on the next
   // qualifying page, or (if this was the last page) via the always-authoritative
   // onGateListFinished -> onSequencesReady repopulate at the end of the sweep.
+  // ADAPTIVE window: max(150 ms, 3x the last rebuild). A FIXED 150 ms window
+  // was shorter than a large listing's rebuild (~150 ms at 43k rows, measured),
+  // so rebuilds queued back-to-back and the GUI thread never drained events for
+  // the whole sweep. Scaling off the measured cost caps rebuild duty at ~1/3, so
+  // the panel stays responsive; skipped pages are NOT lost (they stay in
+  // progressive_seqs_ and render on the next qualifying page, or via the
+  // authoritative end-of-sweep repopulate).
   const auto now = std::chrono::steady_clock::now();
-  if (reset || now - last_progressive_render_ >= std::chrono::milliseconds(150)) {
-    populateSequencesLocked(progressive_seqs_, /*seed_dates=*/false);
-    sortSequencesLocked();
+  const auto window = std::chrono::milliseconds(
+      std::max<std::int64_t>(150, static_cast<std::int64_t>(3.0 * last_rebuild_ms_)));
+  if (reset || now - last_progressive_render_ >= window) {
+    // Append-only fast path: a sweep only ever grows the list, so when no sort
+    // is active (a sort would reorder every row) extend the existing state
+    // instead of rebuilding it. Falls back to the full path whenever append
+    // cannot apply — a display-name collision, or state that is not a clean
+    // prefix of what arrived.
+    // The sort is DEFERRED for the duration of the sweep. Sorting per window
+    // costs a full reorder plus a second display-name derive, and — worse — it
+    // destroys the append invariant the incremental view-cache extend depends
+    // on, forcing a full N-row rebuild every window (the O(rows x windows)
+    // blowup that froze the panel). Rows therefore fill in ARRIVAL order while
+    // loading and snap to sorted order when the sweep ends; server keyset order
+    // is Hive-key order, so for the sorted-by-Name default the visible
+    // difference is slight. Correctness is unaffected: onGateListFinished ->
+    // onSequencesReady always repopulates + sorts authoritatively.
+    // `reset` marks a NEW generation (a server-side rebuild restarted the sweep
+    // from page one). state_.sequences still holds the OLD generation's rows, so
+    // appending would glue a new-generation tail onto a stale prefix — the exact
+    // duplication this function's `reset` handling above exists to prevent.
+    // Never append across that boundary; fall through to the full replace.
+    const bool can_append =
+        !reset && !state_.sequences.empty() && state_.sequences.size() < progressive_seqs_.size();
+    if (!can_append || !appendSequencesLocked(progressive_seqs_, state_.sequences.size())) {
+      populateSequencesLocked(progressive_seqs_, /*seed_dates=*/false);
+      sortSequencesLocked();
+    }
     last_progressive_render_ = now;
   }
 }
@@ -2841,6 +3109,11 @@ void McapCloudDialog::onGateListFinished(FetchWorker::GateListResult result) {
         // user back to kNeedsSelection instead of showing a stale/empty list.
         const std::string missing = state_.gate_site.empty() ? state_.gate_customer : state_.gate_site;
         state_.gate_site.clear();
+        // Robots are scoped to a site, so a site that no longer resolves leaves
+        // the robot meaningless. Keeping it produced an internally inconsistent
+        // gate: the pill asks for a site while a robot from the dead generation
+        // is still selected.
+        state_.gate_robot.clear();
         state_.gate_phase = GatePhase::kNeedsSelection;
         notify_warning = true;
         warning = fmt::format("'{}' is no longer available in the catalog — pick another site", missing);
@@ -3169,7 +3442,8 @@ void McapCloudDialog::rebuildSeqDisplayLocked() {
   // stripped, date= segment dropped).
   std::vector<std::string> candidates;
   candidates.reserve(state_.sequence_names.size());
-  std::unordered_map<std::string, int> counts;
+  std::unordered_map<std::string, int>& counts = state_.seq_display_counts;
+  counts.clear();
   for (const std::string& key : state_.sequence_names) {
     std::string disp = shortenSequenceName(key);
     ++counts[disp];
@@ -3187,25 +3461,108 @@ void McapCloudDialog::rebuildSeqDisplayLocked() {
   }
 }
 
+namespace {
+// SequenceInfo -> SequenceRecord, and the running [min,max] span. Shared by
+// populateSequencesLocked and appendSequencesLocked: the conversion used to be
+// duplicated verbatim, so a 7th SequenceRecord field would have been silently
+// dropped for APPENDED rows only — invisible until a user scrolled past the
+// first page, and papered over by the authoritative end-of-sweep repopulate.
+SequenceRecord toRecord(const SequenceInfo& s) {
+  SequenceRecord rec;
+  rec.name = s.name;
+  rec.min_ts_ns = s.min_ts_ns;
+  rec.max_ts_ns = s.max_ts_ns;
+  rec.total_size_bytes = s.total_size_bytes;
+  // The backend's user_metadata is unordered_map; the ported PJ3 Lua engine
+  // wants std::map<..., std::less<>>.
+  for (const auto& kv : s.user_metadata) {
+    rec.metadata.emplace(kv.first, kv.second);
+  }
+  rec.tags = s.tags;  // effective tags with the override bit (tag editor)
+  return rec;
+}
+
+void widenSpan(const SequenceInfo& s, std::int64_t& gmin, std::int64_t& gmax) {
+  if (s.min_ts_ns > 0 && (gmin == 0 || s.min_ts_ns < gmin)) {
+    gmin = s.min_ts_ns;
+  }
+  if (s.max_ts_ns > gmax) {
+    gmax = s.max_ts_ns;
+  }
+}
+}  // namespace
+
+bool McapCloudDialog::appendSequencesLocked(const std::vector<SequenceInfo>& seqs, std::size_t from) {
+  if (from > seqs.size() || state_.sequences.size() != from) {
+    return false;  // not a clean append onto what we already hold
+  }
+  // Derive the new rows' display names FIRST: a candidate that collides with an
+  // existing display forces the earlier row to fall back to its full key, which
+  // is a global re-derive. Bail out and let the caller do a full populate — rare,
+  // because a candidate keeps the (unique) leaf filename.
+  const std::size_t added = seqs.size() - from;
+  std::vector<std::string> new_displays;
+  new_displays.reserve(added);
+  // Two checks, both required. A candidate may collide with an ALREADY-HELD
+  // label, or with another candidate in THIS SAME tail — the latter happens
+  // whenever two newly arrived keys differ only by their `date=` segment, which
+  // shortenSequenceName deliberately strips. Missing the second check produced
+  // two rows sharing one display label, and since column-0 text IS the selection
+  // identity, clicking either one resolved to the FIRST: Topics, Download and
+  // tag edits would silently target the wrong recording.
+  std::unordered_set<std::string> tail_seen;
+  tail_seen.reserve(added);
+  for (std::size_t i = from; i < seqs.size(); ++i) {
+    std::string cand = shortenSequenceName(seqs[i].name);
+    if (state_.seq_display_counts.find(cand) != state_.seq_display_counts.end() ||
+        !tail_seen.insert(cand).second) {
+      return false;  // collision (existing OR intra-tail): needs the global two-pass derive
+    }
+    new_displays.push_back(std::move(cand));
+  }
+
+  // Grow with HEADROOM, not exactly. reserve(seqs.size()) leaves capacity == size
+  // after each append, so the next page reallocates and moves the entire prefix —
+  // over 86 pages that is ~1.87M element moves per vector (measured 81.8 ms vs
+  // 31.8 ms for the record vector alone). Doubling restores push_back's amortized
+  // O(1) across the sweep.
+  const auto grow = [&](auto& v) {
+    if (v.capacity() < seqs.size()) {
+      v.reserve(std::max(seqs.size(), v.capacity() * 2));
+    }
+  };
+  grow(state_.sequences);
+  grow(state_.sequence_names);
+  grow(state_.seq_display_names);
+  std::int64_t gmin = state_.global_min_ts_ns;
+  std::int64_t gmax = state_.global_max_ts_ns;
+  for (std::size_t i = from; i < seqs.size(); ++i) {
+    const auto& s = seqs[i];
+    SequenceRecord rec = toRecord(s);
+    state_.sequence_names.push_back(rec.name);
+    state_.sequences.push_back(std::move(rec));
+    ++state_.seq_display_counts[new_displays[i - from]];
+    state_.seq_display_names.push_back(std::move(new_displays[i - from]));
+    widenSpan(s, gmin, gmax);
+  }
+  state_.global_min_ts_ns = gmin;
+  state_.global_max_ts_ns = gmax;
+  // Everything before `from` kept its row and its position: the view cache may
+  // extend itself rather than rebuild.
+  state_.seq_stable_prefix = from;
+  ++state_.seq_epoch;
+  return true;
+}
+
 void McapCloudDialog::populateSequencesLocked(std::vector<SequenceInfo>& seqs, bool seed_dates) {
+  // A full rebuild replaces every row: the view cache may assume nothing.
+  state_.seq_stable_prefix = 0;
   state_.sequences.clear();
   state_.sequence_names.clear();
   state_.sequences.reserve(seqs.size());
   state_.sequence_names.reserve(seqs.size());
-  for (auto& s : seqs) {
-    SequenceRecord rec;
-    rec.name = s.name;
-    rec.min_ts_ns = s.min_ts_ns;
-    rec.max_ts_ns = s.max_ts_ns;
-    rec.total_size_bytes = s.total_size_bytes;
-    // The backend's user_metadata is std::unordered_map<string, string>;
-    // convert into the std::map<string, string, std::less<>> used by the
-    // ported PJ3 Lua engine.
-    for (const auto& kv : s.user_metadata) {
-      rec.metadata.emplace(kv.first, kv.second);
-    }
-    // Effective tags with the override bit (tag editor reads this).
-    rec.tags = s.tags;
+  for (const auto& s : seqs) {
+    SequenceRecord rec = toRecord(s);
     state_.sequence_names.push_back(rec.name);
     state_.sequences.push_back(std::move(rec));
   }
@@ -3216,13 +3573,8 @@ void McapCloudDialog::populateSequencesLocked(std::vector<SequenceInfo>& seqs, b
   // 29/04/2016 → 08/04/2020). "All" filter ⇒ the span passes every sequence.
   std::int64_t gmin = 0;
   std::int64_t gmax = 0;
-  for (const auto& s : state_.sequences) {
-    if (s.min_ts_ns > 0 && (gmin == 0 || s.min_ts_ns < gmin)) {
-      gmin = s.min_ts_ns;
-    }
-    if (s.max_ts_ns > gmax) {
-      gmax = s.max_ts_ns;
-    }
+  for (const auto& s : seqs) {
+    widenSpan(s, gmin, gmax);
   }
   state_.global_min_ts_ns = gmin;
   state_.global_max_ts_ns = gmax;
@@ -3286,6 +3638,7 @@ void McapCloudDialog::sortSequencesLocked() {
     }
   }
   std::sort(state_.seq_selected_rows.begin(), state_.seq_selected_rows.end());
+  state_.seq_stable_prefix = 0;  // order changed: no row keeps its position
   ++state_.seq_epoch;  // row order changed → invalidate the seqTable view cache
 }
 

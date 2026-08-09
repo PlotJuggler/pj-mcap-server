@@ -16,7 +16,7 @@ the connector pipeline (server → WebSocket/Protobuf → this plugin).
 - Connects to a PJ Cloud server over a single WebSocket multiplexing catalog RPCs
   and bounded-horizon session streaming (incremental download, not wall-clock
   playback).
-- Browses the catalog through a required customer/site gate (see "Browse
+- Browses the catalog through a required customer/site/robot gate (see "Browse
   flow" below), then lists that site's sequences (cloud MCAP files), their
   topics, time ranges, sizes, and metadata/tags; supports a Lua metadata
   query filter over the loaded rows.
@@ -34,42 +34,64 @@ the connector pipeline (server → WebSocket/Protobuf → this plugin).
   durable session-file cache, trust-gated origins, promotion to a stock
   file-backed source (see "Descriptor import provider" below).
 
-## Browse flow: the customer/site gate
+## Browse flow: the customer/site/robot gate
 
 Connecting to a production server does **not** fetch the file list -- a real
 catalog can hold tens of thousands of files, and pulling all of them up front
 made the browse table sit blank for a long time. Instead:
 
 - On connect the plugin fetches only the **filter vocabulary**
-  (`GetVocabulary`): a customer -> site tree with a per-node file count and a
-  catalog generation. Nothing else loads yet.
-- The **Customer** and **Site** combos are the first two rows of the Basic
-  filter grid (above Robot/Source, sharing their column alignment), and they
-  stay visible in **Advanced** mode too — only the Robot/Source rows hide with
-  the mode swap, so the mandatory gate is always reachable. The customer combo
-  auto-selects when the vocabulary has exactly one customer; otherwise the user
-  must pick one. No recordings load until a customer AND a site are both
-  chosen.
-- Picking a site issues a **server-filtered** `ListFiles` request
-  (`FileFilter.customer_id`/`site_id`, with the vocabulary's generation echoed
-  on the first page) and renders it **progressively** -- the table fills in
-  as pages arrive rather than only after the whole sweep completes.
-- The (customer, site) selection persists **per server**, keyed by the
+  (`GetVocabulary`): a customer -> site -> robot tree with per-node file counts
+  and a catalog generation. Nothing else loads yet. The request is **scoped**
+  (`omit_sources` / `omit_tag_facets` / `omit_site_robot_counts`) to exactly what
+  the picker renders — the server then skips three whole-table `GROUP BY` scans
+  and the tag-facet scan. Measured against an 8.8M-file catalog: 2544 ms full vs
+  428 ms scoped, and the server caches the result per catalog revision so
+  repeat browses are ~0 ms.
+- The **Customer**, **Site** and **Robot** combos are the first three rows of the
+  Basic filter grid, and all three stay visible in **Advanced** mode too — only
+  the Source row hides with the mode swap, so the mandatory gate is always
+  reachable. Customer auto-selects when the vocabulary has exactly one; robot
+  auto-selects when the chosen site has exactly one. **No recordings load until
+  customer, site AND robot are all chosen.**
+- Picking the robot issues a **server-filtered** `ListFiles` request
+  (`FileFilter.customer_id`/`site_id`/`robot_id`, with the vocabulary's
+  generation echoed on the first page) and renders it **progressively** -- the
+  table fills in as pages arrive rather than only after the whole sweep
+  completes. Rows arrive in server order during the sweep and re-sort when it
+  finishes; deferring the sort is what lets each page be appended instead of
+  rebuilding every row (measured 2800 ms -> 700 ms at 43k rows).
+- Robot became a gate level on 2026-08-09. It used to be a CLIENT-side filter
+  applied after downloading a whole site's listing — 43,310 rows in the view
+  that prompted the change — even though the server had accepted
+  `FileFilter.robot_id` and shipped robot nodes since M3.
+- The (customer, site, robot) selection persists **per server**, keyed by the
   canonical `ws://`/`wss://` server URI: a returning user reconnects straight
-  into their last site. A one-shot migration seeds this from the old global
-  filter settings the first time, then clears them.
-- The robot/source combos, the date filter (default **All**), the free-text
-  name filter, and the Lua/Advanced query are UNCHANGED: they keep narrowing
-  the rows already loaded for the selected site, client-side.
+  into their last robot. A one-shot migration seeds customer/site from the old
+  global filter settings the first time, then clears them.
+- The source combo, the date filter (default **All**), the free-text name
+  filter, and the Lua/Advanced query are UNCHANGED: they keep narrowing the rows
+  already loaded for the selected robot, client-side.
 - The old "(any)/(any)" merged-all-sites view is removed by design --
-  browsing is always scoped to one customer + site.
-- `mcap-cloud-cli` is unaffected: `list` still returns the full, unfiltered
-  catalog (there is no gate on the CLI).
+  browsing is always scoped to one customer + site + robot.
+- `mcap-cloud-cli list` is unfiltered by default, which is not usable against a
+  large catalog (8.8M files is millions of rows over the wire). Pass
+  `--customer/--site/--robot` — all three, mirroring the GUI gate — to scope it.
+  `mcap-cloud-cli vocab [--lean]` times the vocabulary RPC and prints the tree.
 
 Measured on a real 25,550-file catalog: the vocabulary fetch takes 167 ms; a
 473-file site loads completely in 147 ms; a 14,480-file site shows its first
 rows in 127 ms and completes in 3.7 s. The previous unfiltered browse of the
 whole catalog took about 11.9 s with a blank table the entire time.
+
+> **[SUPERSEDED 2026-08-09 — those sweep times are no longer representative.]**
+> At the far larger scale that prompted the robot gate (8.8M files, 74 customers
+> / 162 sites / 275 robots) the numbers are: vocabulary **2544 ms full / 428 ms
+> scoped**, and ~0 ms once the server's per-revision cache is warm; a 43,310-row
+> listing renders in **~700 ms** (was 2800 ms before the sweep became
+> incremental); the catalog listing costs **~512 KB** on the wire per 32,000
+> files (was 1,111 KB before deterministic marshaling). Re-measure before quoting
+> any figure here.
 
 Empty-state pill (one message shown at a time, in the table's grid cell, so
 the state is always explicit): disconnected; vocabulary loading (silent);

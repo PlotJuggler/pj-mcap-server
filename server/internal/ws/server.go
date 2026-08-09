@@ -103,6 +103,16 @@ const tagIPCKeyGoneMessage = "file no longer present in the catalog (it may have
 type Handler struct {
 	store *catalog.Store
 	log   *slog.Logger
+	// caps publishes the Hello BackendCapabilities so the handshake never touches
+	// SQLite. ONE per process (not per connection): a handshake that queued
+	// behind a slow catalog RPC on the single pinned read connection failed
+	// outright as "no response to handshake". Refreshed by StartCapsRefresh.
+	caps *catalog.CapsSnapshot
+	// vocabCache memoizes GetVocabulary per (catalog revision, scoping options).
+	// It lives HERE, on the process-lifetime Handler: catalogHandler() builds a
+	// fresh CatalogHandler per RPC, so a cache owned there would have a 100% miss
+	// rate while looking entirely correct.
+	vocabCache *catalog.VocabularyCache
 	// authToken is the single shared bearer token. Empty => DEV ANONYMOUS mode
 	// (no Hello credential check; every client is accepted with a warning).
 	authToken string
@@ -151,13 +161,20 @@ func (h *Handler) SetResponseCompression(cfg config.ResponseCompressionConfig) e
 // NewHandler builds a catalog-only WS handler (no streaming). authToken == ""
 // enables dev anonymous mode.
 func NewHandler(store *catalog.Store, authToken string, log *slog.Logger) *Handler {
-	return &Handler{store: store, log: log, authToken: authToken, auth: newAuthenticator(authToken)}
+	return &Handler{store: store, log: log, authToken: authToken, auth: newAuthenticator(authToken),
+		caps: catalog.NewCapsSnapshot(), vocabCache: catalog.NewVocabularyCache(vocabCacheStaleWindow)}
 }
 
 // NewHandlerWithSession builds a WS handler with the session/streaming subsystem
 // wired in. The SessionDeps.Store should resolve files against the same catalog.
 func NewHandlerWithSession(store *catalog.Store, authToken string, log *slog.Logger, sess *SessionDeps) *Handler {
-	return &Handler{store: store, log: log, authToken: authToken, auth: newAuthenticator(authToken), sess: sess, metrics: sess.Metrics}
+	// Delegate rather than restate: every process-lifetime field added to Handler
+	// would otherwise have to be added in both constructors, and forgetting the
+	// catalog-only one yields a nil cache/snapshot at runtime.
+	h := NewHandler(store, authToken, log)
+	h.sess = sess
+	h.metrics = sess.Metrics
+	return h
 }
 
 // newAuthenticator returns a bearer-token ClientAuthenticator for a non-empty
@@ -168,6 +185,54 @@ func newAuthenticator(token string) authn.ClientAuthenticator {
 		return nil
 	}
 	return authn.NewBearerToken(token)
+}
+
+// RefreshCaps recomputes and republishes the Hello capabilities once,
+// synchronously. This is the ONLY place Hello's values touch the catalog, and it
+// is never called from the handshake path — StartCapsRefresh drives it at
+// startup and on a ticker. Exposed so a caller that must serve real values
+// immediately (tests; any embedder) can do the startup refresh deterministically
+// instead of racing the loop.
+func (h *Handler) RefreshCaps(ctx context.Context) error {
+	return h.caps.Refresh(ctx, h.store)
+}
+
+// StartCapsRefresh keeps the published Hello capabilities fresh, OFF the
+// handshake path, on a ticker until ctx is cancelled. It does NOT do a first
+// pass — the caller owns that, because only the caller knows whether it can
+// afford to wait (see RefreshCaps).
+//
+// The interval is far tighter than these values actually move — the metadata-key
+// vocabulary changes only when the builder ingests a brand-new tag key — and
+// costs one cheap query per interval against the shared read connection, versus
+// two queries per handshake before.
+//
+// A failure is logged and the last-good value is kept: stale capabilities are
+// strictly better than a handshake that cannot complete.
+func (h *Handler) StartCapsRefresh(ctx context.Context, interval time.Duration) {
+	if interval <= 0 {
+		interval = 60 * time.Second
+	}
+	// Pure ticker: NO immediate pass. Both callers already do their own first
+	// refresh (main.go bounded-synchronously before serving, newWSTestServer
+	// synchronously so assertions are deterministic), and doing it here as well
+	// ran two full `SELECT DISTINCT key FROM tags_effective` + hierarchy probes
+	// back to back on the single pinned read connection at exactly the moment the
+	// first clients connect — the contention this change set exists to remove.
+	go func() {
+		t := time.NewTicker(interval)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				if err := h.RefreshCaps(ctx); err != nil {
+					h.log.Warn("ws: capability refresh failed; keeping last-good", "err", err)
+				}
+			}
+		}
+	}()
 }
 
 // SetTagIPC wires the D2 tag-edit IPC forwarder into the handler (see the
@@ -542,21 +607,20 @@ func (c *connState) handleHello(reqID uint64, hello *pb.Hello) {
 	// HelloResponse below is NOT allowlisted, so it always goes raw regardless.
 	c.conn.setAcceptEncoding(clientAcceptsZstd(hello))
 
-	// BackendCapabilities are DERIVED LIVE from the catalog (Plan D Task 8), not
-	// hardcoded: the metadata-key vocabulary is the constant derived keys UNION the
+	// BackendCapabilities are still DERIVED from the catalog (Plan D Task 8) —
+	// the metadata-key vocabulary is the constant derived keys UNION the
 	// catalog's distinct effective-tag keys, and supports_file_hierarchy is true
-	// iff any indexed OBJECT key bears a '/'. The flat S3 nissan corpus thus
-	// reports hierarchy=false + the derived-key vocabulary (the C++ B3 live test's
-	// ground truth). BackendCaps pins ONE db handle for both queries (B1) so a
-	// catalog swap between them cannot advertise a mixed-generation view. A query
-	// error is non-fatal: fall back to the stable derived floor / no-hierarchy so
-	// a transient DB hiccup never blocks connect.
-	ctx := context.Background()
-	vocab, hierarchy, err := catalog.BackendCaps(ctx, c.h.store)
-	if err != nil {
-		c.h.log.Warn("ws: backend-capabilities derive failed; using derived floor", "err", err)
-		vocab, hierarchy = catalog.DerivedMetadataKeys(), false
-	}
+	// iff any indexed OBJECT key bears a '/'. But they are NO LONGER derived
+	// HERE: this used to run two live queries per handshake against the single
+	// pinned read connection (readonly.go's C1 pin), so a handshake arriving
+	// while a slow catalog RPC held that connection starved and the client gave
+	// up with "no response to handshake" (measured 2026-08-09: GetVocabulary at
+	// 40.7 s on an 8.78M-file catalog, concurrent connects failing).
+	//
+	// The values now come from a snapshot the server republishes on a ticker
+	// (StartCapsRefresh) — a pure atomic load, so connect can never queue behind
+	// catalog work. A degraded start serves the derived-key floor.
+	vocab, hierarchy := c.h.caps.Get()
 
 	c.conn.SendPriority(&pb.ServerMessage{
 		RequestId: reqID,
@@ -584,7 +648,18 @@ func (c *connState) handleHello(reqID uint64, hello *pb.Hello) {
 	})
 }
 
-func (c *connState) catalogHandler() *CatalogHandler { return &CatalogHandler{Store: c.h.store} }
+// vocabCacheStaleWindow: how long a SAME-GENERATION vocabulary may be served
+// while a refresh runs behind the caller. The builder commits continuously, so
+// after any idle period the revision has usually moved; without a stale window
+// the next browse would miss exactly when it matters — which is the stall this
+// cache exists to remove. Bounded so a newly ingested site cannot stay invisible
+// indefinitely, and a stale hit always kicks off a refresh, so in practice
+// staleness is one refresh cycle rather than the full window.
+const vocabCacheStaleWindow = 5 * time.Minute
+
+func (c *connState) catalogHandler() *CatalogHandler {
+	return &CatalogHandler{Store: c.h.store, VocabCache: c.h.vocabCache, Metrics: c.h.metrics}
+}
 
 func (c *connState) handleListFiles(ctx context.Context, reqID uint64, req *pb.ListFilesRequest) {
 	// Clamp the limit before handing off (the store also clamps, but logging the

@@ -31,6 +31,18 @@
 
 namespace mcap_cloud {
 
+// Forward-declared on purpose: including query_filter.h here would drag the
+// whole query engine (query/token.h) into every consumer of this header, and
+// query/token.h declares a global-scope `enum class TokenType` that the Windows
+// SDK also declares as an ENUMERATOR (winnt.h, _TOKEN_INFORMATION_CLASS). A
+// non-type name hides a type name, so any TU that sees <windows.h> before
+// query/token.h fails to compile `TokenType type;` under MSVC. tests/
+// headless_init_test.cpp is exactly such a TU (ixwebsocket pulls in windows.h),
+// and it broke the windows-x64 build when this was an include. Only
+// visibleForLocked's by-reference parameter needs the name; the .cpp includes
+// the real header.
+struct FilterSequence;
+
 class ImportRuntime;
 class LuaQueryEngine;
 struct McapSaveResult;
@@ -78,6 +90,10 @@ struct DialogState {
   std::optional<VocabularyInfo> vocabulary;
   std::string gate_customer;  // selected NAMES (durable identity, persisted)
   std::string gate_site;
+  // Third gate level (2026-08-09). A file listing is the most expensive thing
+  // the browse path transfers, so nothing is listed until all three are chosen
+  // and the narrowing happens SERVER-side (ListFilter.robot_id).
+  std::string gate_robot;
   std::uint64_t gate_request_seq = 0;   // last issued id
   GatePhase gate_phase = GatePhase::kDisconnected;
   std::string active_server_key;        // canonical key of the CONNECTED server
@@ -90,6 +106,7 @@ struct DialogState {
   // string copies + JSON encoding on 59 of every 60 ticks for nothing.
   std::vector<std::string> gate_customer_items;
   std::vector<std::string> gate_site_items;
+  std::vector<std::string> gate_robot_items;
 
   // Cached pill-hint text (see widget_data()): gateHintText's kNeedsSelection
   // branch does two std::to_string() calls + concatenation, and kNeedsSelection
@@ -115,6 +132,18 @@ struct DialogState {
   // Collision-safe: any display that two keys share falls back to the full key
   // (see rebuildSeqDisplayLocked). Parallel to sequence_names by index.
   std::vector<std::string> seq_display_names;
+  // How many LEADING rows of `sequences` are guaranteed unchanged since the
+  // last seq_epoch bump. A progressive listing sweep only ever APPENDS, so the
+  // view cache can extend itself instead of rebuilding all N rows per render
+  // window (which made a sweep O(N x windows): 43k rows x ~15 windows). 0 means
+  // "assume nothing" — every non-append mutation (full populate, sort, erase)
+  // resets it, so the cache falls back to a full rebuild.
+  std::size_t seq_stable_prefix = 0;
+  // Occurrence count per candidate display name, maintained alongside
+  // seq_display_names so an append can detect a NEW collision in O(new) instead
+  // of recounting all names. A collision forces one full rebuildSeqDisplayLocked
+  // (rare: candidates keep the unique leaf filename).
+  std::unordered_map<std::string, int> seq_display_counts;
   // Bumped on every content/order change to `sequences` (populate + sort) so the
   // seqTable view cache below can detect staleness with a cheap counter compare.
   std::size_t seq_epoch = 0;
@@ -386,6 +415,13 @@ struct DialogState {
 };
 
 class McapCloudDialog : public PJ::DialogPluginTyped {
+  // The progressive-sweep path (appendSequencesLocked + the view cache's
+  // incremental extend) is private but is exactly where a wrong change ships
+  // silently: the end-of-sweep repopulate hides mid-sweep corruption from every
+  // other test. This friend lets sweep_incremental_test.cpp assert the invariant
+  // that append-in-chunks == one full populate.
+  friend struct McapCloudDialogSweepAccess;
+
  public:
   McapCloudDialog();
   ~McapCloudDialog() override;
@@ -396,6 +432,7 @@ class McapCloudDialog : public PJ::DialogPluginTyped {
   std::string widget_data() override;
   bool onTextChanged(std::string_view widget_name, std::string_view text) override;
   bool onClicked(std::string_view widget_name) override;
+  bool onFolderSelected(std::string_view widget_name, std::string_view path) override;
   bool onToggled(std::string_view widget_name, bool checked) override;
   bool onSelectionChanged(std::string_view widget_name, const std::vector<std::string>& selected) override;
   bool onValueChanged(std::string_view widget_name, int value) override;
@@ -576,7 +613,15 @@ class McapCloudDialog : public PJ::DialogPluginTyped {
   // result. Caller MUST hold state_.mu. When seed_dates is true the date-range
   // picker is reseeded to the dataset's full [min,max] span (final result
   // only — the progressive early populate leaves the picker untouched).
+  // The single definition of "which rows pass the current filters", shared by
+  // the view-cache rebuild and the incremental extend so they cannot disagree.
+  [[nodiscard]] std::vector<int> visibleForLocked(const std::vector<FilterSequence>& seqs);
   void populateSequencesLocked(std::vector<SequenceInfo>& sequences, bool seed_dates);
+  // Append-only fast path for a progressive sweep: adds seqs[from..) to the
+  // existing state instead of rebuilding it. Returns false when it cannot be
+  // used (a display-name collision needs a global re-derive), in which case the
+  // caller must fall back to populateSequencesLocked.
+  [[nodiscard]] bool appendSequencesLocked(const std::vector<SequenceInfo>& seqs, std::size_t from);
   // Recompute seq_display_names from sequence_names. Call after any rebuild of
   // sequence_names (populate + sort). Collision-safe: a display shared by two
   // distinct keys falls back to the full key for those rows.
@@ -627,6 +672,13 @@ class McapCloudDialog : public PJ::DialogPluginTyped {
   // regardless of whether the last progressive page rendered. GUI-thread only,
   // same as progressive_seqs_ above (no lock needed).
   std::chrono::steady_clock::time_point last_progressive_render_{};
+  // Duration of the last seqTable view-cache rebuild (widget_data). The
+  // progressive-render throttle scales its window off this: at 43k rows a
+  // rebuild costs ~150 ms, so the old FIXED 150 ms window let a large sweep
+  // trigger rebuilds back-to-back and saturate the GUI thread for its whole
+  // duration — the panel read as frozen. GUI-thread only, no lock (same as
+  // last_progressive_render_).
+  double last_rebuild_ms_ = 0.0;
 
   std::thread worker_thread_;
   std::unique_ptr<FetchWorker> worker_;

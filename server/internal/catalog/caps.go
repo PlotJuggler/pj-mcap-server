@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"sort"
+	"sync/atomic"
 )
 
 // caps.go answers the two questions the Hello handler derives BackendCapabilities
@@ -116,4 +117,58 @@ func BackendCaps(ctx context.Context, s *Store) (vocab []string, hierarchy bool,
 		return nil, false, err
 	}
 	return vocab, hierarchy, nil
+}
+
+// CapsSnapshot publishes the Hello BackendCapabilities as a value that can be
+// read WITHOUT touching SQLite.
+//
+// Before this, every WebSocket handshake called BackendCaps, running
+// `SELECT DISTINCT key FROM tags_effective` plus a files probe against the ONE
+// pinned catalog connection (readonly.go's C1 pin). While a slow catalog RPC
+// held that connection, a brand-new client could not complete its handshake:
+// the WebSocket upgrade succeeds, Hello is received and authenticated, and then
+// the HelloResponse starves waiting for the connection — the client gives up
+// and reports "no response to handshake". Measured 2026-08-09 against an
+// 8.78M-file catalog where GetVocabulary alone took 40.7 s.
+//
+// Deliberately NOT a cache with a freshness check on the request path: any
+// revision probe (e.g. PRAGMA data_version) would itself need that one
+// connection, reintroducing exactly the coupling this removes. Get() is an
+// atomic pointer load and nothing else; all DB work happens in Refresh, which
+// the server runs on a background ticker.
+type CapsSnapshot struct {
+	v atomic.Pointer[capsValue]
+}
+
+type capsValue struct {
+	vocab     []string
+	hierarchy bool
+}
+
+// NewCapsSnapshot publishes the derived-key floor so connect works before the
+// first refresh lands (and during a degraded start with no catalog at all).
+func NewCapsSnapshot() *CapsSnapshot {
+	s := &CapsSnapshot{}
+	s.v.Store(&capsValue{vocab: DerivedMetadataKeys(), hierarchy: false})
+	return s
+}
+
+// Get returns the published capabilities. Pure memory read — safe on the
+// handshake path and safe to call concurrently. The returned slice is shared
+// and MUST NOT be mutated by callers.
+func (s *CapsSnapshot) Get() (vocab []string, hierarchy bool) {
+	v := s.v.Load()
+	return v.vocab, v.hierarchy
+}
+
+// Refresh recomputes from the catalog and republishes. Call OFF the request
+// path. On failure the previously published value stays in place — stale
+// capabilities beat a blank or blocked handshake.
+func (s *CapsSnapshot) Refresh(ctx context.Context, st *Store) error {
+	vocab, hierarchy, err := BackendCaps(ctx, st)
+	if err != nil {
+		return err
+	}
+	s.v.Store(&capsValue{vocab: vocab, hierarchy: hierarchy})
+	return nil
 }

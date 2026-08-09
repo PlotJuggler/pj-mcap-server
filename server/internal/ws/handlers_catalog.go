@@ -33,12 +33,21 @@ import (
 	"google.golang.org/protobuf/proto"
 
 	"pj-cloud/server/internal/catalog"
+	"pj-cloud/server/internal/metrics"
 	pb "pj-cloud/server/internal/wire/pj_cloud"
 )
 
 // CatalogHandler answers the catalog RPCs against the SQLite store.
 type CatalogHandler struct {
 	Store *catalog.Store
+	// VocabCache memoizes GetVocabulary per (catalog revision, scoping options).
+	// Injected from the process-lifetime ws.Handler: this struct is constructed
+	// PER RPC, so a cache owned here would never hit. nil is allowed (tests that
+	// build a bare handler) and falls back to computing directly.
+	VocabCache *catalog.VocabularyCache
+	// Metrics, when set, records the vocabulary cache's hit/miss rate — the only
+	// production signal that the cache is actually working. Optional.
+	Metrics *metrics.Metrics
 }
 
 // ── generation-bound pagination cursors ──────────────────────────────────────
@@ -270,14 +279,37 @@ func (h *CatalogHandler) GetFile(ctx context.Context, req *pb.GetFileRequest) (*
 // snapshot's generation — the dimension ids are generation-scoped handles, only
 // meaningful together with the token (echoed back via
 // ListFilesRequest.expected_catalog_generation).
-func (h *CatalogHandler) GetVocabulary(ctx context.Context, _ *pb.GetVocabularyRequest) (*pb.GetVocabularyResponse, error) {
-	lease := h.Store.Acquire()
-	defer lease.Release()
-	v, err := catalog.GetVocabularyDB(ctx, lease.DB())
+func (h *CatalogHandler) GetVocabulary(ctx context.Context, req *pb.GetVocabularyRequest) (*pb.GetVocabularyResponse, error) {
+	// Scoping is OPT-IN and additive: an old client sends an empty request, every
+	// flag reads false, and it gets the full legacy response. A picker-only client
+	// switches off the sections it never maps, which removes three whole-table
+	// GROUP BY scans and the tag-facet scan from the critical path.
+	opts := catalog.VocabOptions{
+		OmitSources:         req.GetOmitSources(),
+		OmitTagFacets:       req.GetOmitTagFacets(),
+		OmitSiteRobotCounts: req.GetOmitSiteRobotCounts(),
+	}
+	// Served from the revision-keyed cache when possible. Uncached this is a
+	// whole-catalog aggregation (2.54 s full / 0.43 s picker-only at 8.8M files)
+	// that used to run on EVERY call — the reason browse latency depended on
+	// whether anyone had browsed recently. VocabCache may be nil in tests that
+	// construct a bare CatalogHandler; fall back to computing directly.
+	// A nil cache is valid (tests build a bare handler) and Get handles it — one
+	// implementation, and the production path is the one the tests exercise.
+	before := h.VocabCache.Computations()
+	v, gen, err := h.VocabCache.Get(ctx, h.Store, opts)
+	if h.Metrics != nil {
+		h.Metrics.VocabularyRequests.Inc()
+		// computations/requests is the miss rate. Read as a delta so a background
+		// refresh triggered by THIS request is counted too.
+		if h.VocabCache.Computations() > before {
+			h.Metrics.VocabularyComputations.Inc()
+		}
+	}
 	if err != nil {
 		return nil, fmt.Errorf("vocabulary: %w", err)
 	}
-	resp := &pb.GetVocabularyResponse{CatalogGeneration: lease.Generation()}
+	resp := &pb.GetVocabularyResponse{CatalogGeneration: gen}
 	for _, c := range v.Customers {
 		pc := &pb.DimCustomer{Id: c.ID, Name: c.Name, FileCount: c.FileCount}
 		for _, st := range c.Sites {
@@ -373,6 +405,17 @@ func fileSummaryToProto(s catalog.FileSummary) *pb.FileSummary {
 // overlaid by tags_effective (effective tags WIN on collision — see file header).
 func flatMetadata(s catalog.FileSummary) map[string]string {
 	out := map[string]string{
+		// s3_key IS duplicated here — FileSummary.s3_key carries it too, at ~98 B
+		// per file (22.6% of the uncompressed listing at 32k files). Dropping it
+		// was TRIED AND REVERTED, and the client does NOT re-derive it: this map
+		// is the documented client-ingest contract, caps.go advertises "s3_key"
+		// as a query-assist key the Lua filter can reference, and
+		// TestFlatMetadata_EffectiveTagsOverlayDerived pins it. Removing the
+		// emission would therefore silently break that filter unless a
+		// client-side re-derive ships FIRST. Measured trade at 32k files:
+		// deterministic marshaling alone already takes the wire from 1,111 KB to
+		// 512 KB; also dropping s3_key reaches 354 KB. Not worth breaking a
+		// documented contract for 158 KB — revisit under a protocol version bump.
 		"s3_key":        s.S3Key,
 		"size_bytes":    strconv.FormatInt(s.SizeBytes, 10),
 		"message_count": strconv.FormatUint(s.MessageCount, 10),

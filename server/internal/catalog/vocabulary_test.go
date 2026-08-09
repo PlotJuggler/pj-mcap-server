@@ -90,7 +90,7 @@ func TestGetVocabulary_Hermetic(t *testing.T) {
 	defer st.Close()
 	ctx := context.Background()
 
-	v, err := GetVocabulary(ctx, st)
+	v, err := GetVocabulary(ctx, st, VocabOptions{})
 	if err != nil {
 		t.Fatalf("GetVocabulary: %v", err)
 	}
@@ -168,7 +168,7 @@ func TestGetVocabulary_TagFacetCap(t *testing.T) {
 				t.Fatalf("OpenReadOnly: %v", err)
 			}
 			defer st.Close()
-			v, err := GetVocabulary(context.Background(), st)
+			v, err := GetVocabulary(context.Background(), st, VocabOptions{})
 			if err != nil {
 				t.Fatalf("GetVocabulary: %v", err)
 			}
@@ -225,7 +225,7 @@ func TestGetVocabulary_PrunesOrphans(t *testing.T) {
 		t.Fatalf("OpenReadOnly: %v", err)
 	}
 	defer st.Close()
-	v, err := GetVocabulary(context.Background(), st)
+	v, err := GetVocabulary(context.Background(), st, VocabOptions{})
 	if err != nil {
 		t.Fatalf("GetVocabulary: %v", err)
 	}
@@ -462,7 +462,7 @@ func TestGetVocabularyDB_SingleSnapshotUnderConcurrentWriter(t *testing.T) {
 			}
 			writerDone = true
 		default:
-			v, err := GetVocabulary(context.Background(), st)
+			v, err := GetVocabulary(context.Background(), st, VocabOptions{})
 			if err != nil {
 				t.Fatalf("GetVocabulary: %v", err)
 			}
@@ -472,11 +472,119 @@ func TestGetVocabularyDB_SingleSnapshotUnderConcurrentWriter(t *testing.T) {
 		}
 	}
 	// One final read with the writer quiescent must also be consistent.
-	v, err := GetVocabulary(context.Background(), st)
+	v, err := GetVocabulary(context.Background(), st, VocabOptions{})
 	if err != nil {
 		t.Fatalf("final GetVocabulary: %v", err)
 	}
 	if err := check(v); err != nil {
 		t.Fatalf("final: %v", err)
+	}
+}
+
+// TestGetVocabulary_LeanOmitsUnreadSections pins the opt-in scoping contract.
+//
+// The full assembly is four whole-table GROUP BY scans over `files` plus a
+// tag-facet scan — 2.44 s at 8.78M rows, on the browse path's critical section.
+// The shipped C++ picker (wire_mapping.cpp) maps ONLY the customer->site->robot
+// tree and CUSTOMER file counts, so it asks for the rest to be skipped. Two
+// things must hold or that is unsafe: the TREE must be byte-for-byte what the
+// full response would carry, and the omitted sections must actually be absent
+// (not silently still computed).
+func TestGetVocabulary_LeanOmitsUnreadSections(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "vocab-lean.db")
+	buildVocabDB(t, path, 0)
+	st, err := OpenReadOnly(context.Background(), path)
+	if err != nil {
+		t.Fatalf("OpenReadOnly: %v", err)
+	}
+	defer st.Close()
+	ctx := context.Background()
+
+	full, err := GetVocabulary(ctx, st, VocabOptions{})
+	if err != nil {
+		t.Fatalf("full: %v", err)
+	}
+	lean, err := GetVocabulary(ctx, st, VocabOptions{
+		OmitSources: true, OmitTagFacets: true, OmitSiteRobotCounts: true,
+	})
+	if err != nil {
+		t.Fatalf("lean: %v", err)
+	}
+
+	// The tree is what the picker renders: identical shape, names and ids.
+	if len(lean.Customers) != len(full.Customers) {
+		t.Fatalf("lean dropped customers: %d vs %d", len(lean.Customers), len(full.Customers))
+	}
+	for i := range full.Customers {
+		fc, lc := full.Customers[i], lean.Customers[i]
+		if lc.ID != fc.ID || lc.Name != fc.Name {
+			t.Fatalf("customer %d differs: %v vs %v", i, lc, fc)
+		}
+		// Customer counts drive the picker's summary hint — never omitted.
+		if lc.FileCount != fc.FileCount {
+			t.Fatalf("lean must keep customer counts: %d vs %d", lc.FileCount, fc.FileCount)
+		}
+		if len(lc.Sites) != len(fc.Sites) {
+			t.Fatalf("customer %q: lean dropped sites: %d vs %d", fc.Name, len(lc.Sites), len(fc.Sites))
+		}
+		for j := range fc.Sites {
+			if lc.Sites[j].ID != fc.Sites[j].ID || lc.Sites[j].Name != fc.Sites[j].Name {
+				t.Fatalf("site %d differs under %q", j, fc.Name)
+			}
+			if len(lc.Sites[j].Robots) != len(fc.Sites[j].Robots) {
+				t.Fatalf("site %q: lean dropped robots: %d vs %d",
+					fc.Sites[j].Name, len(lc.Sites[j].Robots), len(fc.Sites[j].Robots))
+			}
+			for k := range fc.Sites[j].Robots {
+				if lc.Sites[j].Robots[k].ID != fc.Sites[j].Robots[k].ID ||
+					lc.Sites[j].Robots[k].Name != fc.Sites[j].Robots[k].Name {
+					t.Fatalf("robot %d differs under site %q", k, fc.Sites[j].Name)
+				}
+			}
+		}
+	}
+
+	// REVIEW DEFECT (both reviewers): OmitSiteRobotCounts was never asserted, so
+	// ignoring it entirely — silently restoring two of the four whole-table scans
+	// this option exists to remove — would have passed. Assert the counts are
+	// actually zero, and require the FULL response to carry non-zero ones first so
+	// the assertion cannot be vacuous.
+	sawNonZeroLeafCount := false
+	for i := range full.Customers {
+		for j := range full.Customers[i].Sites {
+			if full.Customers[i].Sites[j].FileCount > 0 {
+				sawNonZeroLeafCount = true
+			}
+			if lean.Customers[i].Sites[j].FileCount != 0 {
+				t.Fatalf("OmitSiteRobotCounts ignored: site %q still reports %d files",
+					lean.Customers[i].Sites[j].Name, lean.Customers[i].Sites[j].FileCount)
+			}
+			for k := range full.Customers[i].Sites[j].Robots {
+				if lean.Customers[i].Sites[j].Robots[k].FileCount != 0 {
+					t.Fatalf("OmitSiteRobotCounts ignored: robot %q still reports %d files",
+						lean.Customers[i].Sites[j].Robots[k].Name,
+						lean.Customers[i].Sites[j].Robots[k].FileCount)
+				}
+			}
+		}
+	}
+	if !sawNonZeroLeafCount {
+		t.Fatal("fixture has no non-zero site counts: the OmitSiteRobotCounts assertion would be vacuous")
+	}
+
+	// The omitted sections must be gone. If the fixture has none of a section to
+	// begin with, the assertion would be vacuous — require the FULL response to
+	// carry it first, so this test can actually fail.
+	if len(full.Sources) == 0 {
+		t.Fatal("fixture carries no sources: the omit_sources assertion would be vacuous")
+	}
+	if len(lean.Sources) != 0 {
+		t.Fatalf("OmitSources ignored: got %d sources", len(lean.Sources))
+	}
+	if len(full.Tags) == 0 {
+		t.Fatal("fixture carries no tag facets: the omit_tag_facets assertion would be vacuous")
+	}
+	if len(lean.Tags) != 0 {
+		t.Fatalf("OmitTagFacets ignored: got %d facets", len(lean.Tags))
 	}
 }

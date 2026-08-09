@@ -213,7 +213,7 @@ func assertAurynReader(t *testing.T, st *Store, fixtures []hiveFixture) {
 	// GetVocabulary over the Python-built DB: the tree matches the fixtures'
 	// dimensions (customers test+acme; test has site lab with robots r1,r2; acme
 	// has hq with r9; one source 'synthetic').
-	vocab, err := GetVocabulary(ctx, st)
+	vocab, err := GetVocabulary(ctx, st, VocabOptions{})
 	if err != nil {
 		t.Fatalf("GetVocabulary: %v", err)
 	}

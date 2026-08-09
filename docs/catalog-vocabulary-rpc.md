@@ -8,9 +8,13 @@ all landed + tested (hermetic + cross-language). **CLIENT FACET UI LANDED — 20
 the C++ plugin gates browsing on a required customer+site selection fed by this RPC
 (server-filtered `ListFiles`, progressively rendered, persisted per server; the
 executed plan doc was removed once it landed — recover from git history if the
-design record is ever needed). Robot and source stay
-client-side narrowing over the loaded site's rows (not server-cascaded like
-this document's original robot-level vision).
+design record is ever needed). **ROBOT GATING LANDED — 2026-08-09:** the browse
+gate now requires customer+site+**robot** and sends `FileFilter.robot_id`, so the
+narrowing happens SERVER-side exactly as this document's §1 always specified;
+`source` remains client-side narrowing over the returned rows. Before that, robot
+was a client-side filter applied AFTER downloading a whole site's listing — the
+server had accepted `robot_id` and shipped the robot nodes since M3, and the
+client silently dropped them.
 Reviewed by Claude + Codex at the M3 boundary.
 **Scope:** the wire design for **filtering the catalog** by a strict
 customer→site→robot hierarchy plus flat tags, and the RPC that ships the
@@ -38,6 +42,13 @@ Two scale facts drive the design:
 - **The vocabulary is small and bounded** — ≤ ~99 customers / sites / robots
   each. So the *entire* customer→site→robot tree can be shipped **once, upfront**,
   and the client drives the cascade locally with **zero per-selection round-trips**.
+
+  > **[MEASURED 2026-08-09 — the bound is BREACHED; the conclusion survives.]**
+  > Production: **74 customers / 162 sites / 275 robots / 8,781,595 files**. Sites
+  > are 1.6x and robots 2.8x over the stated bound. Ship-once-upfront is still
+  > right — the response measured **10,001 B on the wire (6,534 B compressed)** —
+  > but the COST assumption below did not survive: see the §6 note. Re-measure
+  > before treating any figure here as current.
 - **A dimension selection narrows results sharply** — a `(customer, site, robot,
   date)` selection typically yields a single-digit number of files. So **file
   rows are filtered server-side** and only the small result set is returned,
@@ -136,7 +147,11 @@ message ServerMessage {
 // client, re-fetched only when the client wants a fresh view of the catalog.
 // Built from the catalog dimension tables + the tag facet query; NO `files`
 // table scan for the tree (only the dimension tables) — see §6.
-message GetVocabularyRequest {}                    // no args today; reserved for future scoping
+message GetVocabularyRequest {
+  bool omit_sources           = 1;
+  bool omit_tag_facets        = 2;
+  bool omit_site_robot_counts = 3;
+}
 
 message GetVocabularyResponse {
   repeated DimCustomer customers = 1;              // hierarchical dimensions (tree)
@@ -226,8 +241,14 @@ deliberate asymmetry from principle 2: dimensions filter by id, tags by string.
 ## 4. RPC semantics
 
 - **When called:** once after `Hello`, before the first `ListFiles`, to populate
-  the filter widgets. Re-called on an explicit "refresh" (the catalog grew/changed)
-  — it is cheap, so a manual refresh button or a periodic re-fetch is fine.
+  the filter widgets. Re-called on an explicit "refresh" (the catalog grew/changed).
+
+  > **[CORRECTED 2026-08-09 — this RPC is NOT cheap.]** It was described here as
+  > cheap enough for "a manual refresh button or a periodic re-fetch". Measured at
+  > 8.78M files: **2,953 ms +/- 40 ms steady state, 40,727 ms while the builder was
+  > ingesting**, against the client's 10 s request budget — the panel failed with
+  > "Could not load the catalog". A periodic re-fetch is NOT fine at this scale.
+  > The cost is server-side compute, not bytes (the response is ~10 KB).
 - **Caching:** the client caches the whole response and drives the cascading
   combos + facet widgets locally. No round-trip per combobox interaction.
 - **Generation-scoped ids (LANDED 2026-07-17 — the generation token):** dimension
@@ -266,6 +287,34 @@ deliberate asymmetry from principle 2: dimensions filter by id, tags by string.
 
 ---
 
+## 5b. Response scoping (added 2026-08-09)
+
+`GetVocabularyRequest` carries three **additive** booleans. All absent (proto3
+default `false`) = the FULL legacy response, so an older client is unaffected and
+**no `protocol_version` bump is required** — verified empirically: a new client
+sending the flags to a pre-change server gets the complete tree back, because
+unknown fields are ignored.
+
+| Field | Skips | Cost removed |
+|---|---|---|
+| `omit_sources` | the flat `source` dimension **and** its `GROUP BY` | ~0.4 s |
+| `omit_tag_facets` | the tag-facet scan | ~0.8 s (the costliest single leg) |
+| `omit_site_robot_counts` | the per-site and per-robot `COUNT(*) GROUP BY`s | ~0.8 s |
+
+Always computed: the dimension **tree** (EXISTS-gated dimension-table reads, ~7 ms
+— it is the point of the RPC) and **customer** file counts (they drive the
+picker's summary hint).
+
+**Who asks for what:** the C++ browse picker requests all three omissions
+(`BackendConnection::VocabScope::kPickerOnly`) because `wire_mapping.cpp` maps
+only the tree plus customer counts. `mcap-cloud-cli vocab` keeps the FULL scope —
+it prints per-site file counts, which the lean scope deliberately does not
+compute. `mcap-cloud-cli vocab --lean` exists to measure the difference.
+
+**Measured** (local server, 8.8M-row synthetic catalog, production cardinalities
+74 customers / 162 sites / 275 robots): full **2544 ms**, picker-only **428 ms** —
+**5.9x**, identical tree returned.
+
 ## 6. Server implementation (Go reader over the auryn schema — `vocabulary.go`)
 
 - **Tree:** read the dimension tables and assemble nested messages — but **each
@@ -277,9 +326,20 @@ deliberate asymmetry from principle 2: dimensions filter by id, tags by string.
   references it; the gates stay mutually consistent because `files` carries all
   four FKs denormalized.
 - **Counts:** `SELECT customer_id,count(*) FROM files GROUP BY customer_id` (and
-  per site/robot/source). **Indexing caveat:** only `customer_id` is index-backed
-  today (it leads the composite `UNIQUE`); `site_id`/`robot_id`/`source_id`-only
-  GROUP BYs and filters **scan `files`**. Fine at the v1 corpus; covering indexes
+  per site/robot/source).
+
+  > **[CORRECTED 2026-08-09.]** The "only `customer_id` is index-backed" caveat
+  > below is STALE — schema v3 carries `idx_files_{customer,site,robot,source}`
+  > (`mcap_catalog/mcap_catalog_builder/schema.sql:95-98`), so all four are
+  > covering-index scans. That did NOT make them cheap: an exact `COUNT(*) GROUP
+  > BY` must still visit every index entry, i.e. **4 x 8.78M = ~35M entries per
+  > call**, ~1.6 s of the ~2.4 s floor. Note also that `proto/pj_cloud.proto`
+  > claims this RPC does "no `files` scan for the tree" — the TREE indeed does not,
+  > but the COUNTS do, four times. The client reads only customer counts.
+
+  **Indexing caveat (superseded, kept for provenance):** only `customer_id` is
+  index-backed today (it leads the composite `UNIQUE`); `site_id`/`robot_id`/
+  `source_id`-only GROUP BYs and filters **scan `files`**. Fine at the v1 corpus; covering indexes
   (`files(robot_id,id)`, …) are a deferred auryn-schema add for lake scale (needs a
   SchemaVersion bump). `file_count` **counts all files incl. `has_error=1`**
   (consistent with the filter path).

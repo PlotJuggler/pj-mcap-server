@@ -162,7 +162,32 @@ class BackendConnection {
   // GetVocabulary RPC: the customer->site filter tree + the generation its ids
   // are bound to. nullopt on timeout / dead socket / server Error. ids are ONLY
   // valid together with result.generation — echo both, never cache ids alone.
-  [[nodiscard]] std::optional<VocabularyInfo> getVocabulary();
+  // `timeout` overrides the shared kRequestTimeout for THIS call only, and the
+  // DEFAULT is deliberately larger than every other catalog RPC's.
+  //
+  // GetVocabulary is not a lookup: the server recomputes the whole dimension
+  // aggregation per call (no cache), so its latency scales with CATALOG SIZE,
+  // not with what the user asked for. Measured against an 8.78M-file production
+  // catalog it is a stable ~3.0s — but it is serialized behind one SQLite
+  // connection shared by every client, so k concurrent browsers make the tail
+  // k x 3s, and a concurrent builder pass pushes it further. Under the shared
+  // 10s budget that surfaced as a hard "Could not load the catalog" the moment
+  // anything else touched the catalog. This is the ONE blocking RPC on the
+  // browse path, a timeout here costs the user the whole panel, and the server
+  // keeps computing regardless (nothing cancels it), so giving up early wastes
+  // the work without saving anything.
+  static constexpr std::chrono::seconds kVocabularyTimeout{60};
+
+  // Which SECTIONS to ask the server to compute. The full response costs four
+  // whole-table GROUP BY scans over `files` plus a tag-facet scan (measured
+  // 2.44 s at 8.78M files); the browse picker maps only the
+  // customer->site->robot tree and CUSTOMER file counts (wire_mapping.cpp), so
+  // it can switch the rest off. kFull is the DEFAULT so no caller silently
+  // loses data it was displaying — notably `mcap-cloud-cli vocab`, which prints
+  // per-site file counts and would otherwise report every site as "0 files".
+  enum class VocabScope { kFull, kPickerOnly };
+  [[nodiscard]] std::optional<VocabularyInfo> getVocabulary(
+      std::chrono::seconds timeout = kVocabularyTimeout, VocabScope scope = VocabScope::kFull);
 
   // GetFile RPC for the file backing `sequence_name`, addressed by s3_key
   // (sequence_name is sent verbatim as s3_key — see the key-addressing note

@@ -24,20 +24,36 @@ namespace mcap_cloud {
 // half-resolved filter (customer id but no site) is not a valid ListFilter.
 // The returned ids are session handles: they are only meaningful together with
 // the embedded generation, and go stale the moment a new vocabulary arrives.
+// `robot` is REQUIRED: the file list is by far the most expensive thing the
+// browse path transfers, and robot is the cheapest dimension that cuts it down,
+// so nothing is listed until all three are chosen. The server ANDs the ids it is
+// given, so sending robot_id narrows the query server-side rather than
+// downloading a whole site and filtering locally.
 [[nodiscard]] inline std::optional<ListFilter> resolveGateFilter(const VocabularyInfo& vocab,
                                                                  const std::string& customer,
-                                                                 const std::string& site) {
+                                                                 const std::string& site,
+                                                                 const std::string& robot) {
   for (const auto& c : vocab.customers) {
     if (c.name != customer) {
       continue;
     }
     for (const auto& s : c.sites) {
       if (s.name == site) {
-        ListFilter f;
-        f.customer_id = c.id;
-        f.site_id = s.id;
-        f.generation = vocab.generation;
-        return f;
+        for (const auto& r : s.robots) {
+          if (r.name != robot) {
+            continue;
+          }
+          ListFilter f;
+          f.customer_id = c.id;
+          f.site_id = s.id;
+          f.robot_id = r.id;
+          f.generation = vocab.generation;
+          return f;
+        }
+        // Site matched but the robot did not: a rebuild can retire a robot while
+        // the client still holds the persisted name. Site names are unique
+        // within a customer, so no later site could match either.
+        return std::nullopt;
       }
     }
     // Customer matched but no site under it matched: stop here rather than
@@ -76,6 +92,40 @@ namespace mcap_cloud {
   return {};
 }
 
+// Robot names under (customer, site), in vocabulary order. {} when either name
+// is absent. These come straight from GetVocabulary — no file list is needed to
+// populate the robot combo, which is the whole point of gating on it.
+[[nodiscard]] inline std::vector<std::string> robotNamesFor(const VocabularyInfo& vocab,
+                                                            const std::string& customer,
+                                                            const std::string& site) {
+  for (const auto& c : vocab.customers) {
+    if (c.name != customer) {
+      continue;
+    }
+    for (const auto& s : c.sites) {
+      if (s.name == site) {
+        std::vector<std::string> names;
+        names.reserve(s.robots.size());
+        for (const auto& r : s.robots) {
+          names.push_back(r.name);
+        }
+        return names;
+      }
+    }
+    return {};
+  }
+  return {};
+}
+
+// The sole robot name when (customer, site) has EXACTLY one, else "". Mirrors
+// autoSelectCustomer: requiring a pick from a one-item list is pure friction.
+[[nodiscard]] inline std::string autoSelectRobot(const VocabularyInfo& vocab,
+                                                 const std::string& customer,
+                                                 const std::string& site) {
+  const auto names = robotNamesFor(vocab, customer, site);
+  return names.size() == 1 ? names[0] : std::string{};
+}
+
 // The browse gate's lifecycle. Exactly one phase is active; the pill text is a
 // pure function of it (booleans could not represent VocabularyError /
 // EmptyCatalog / disconnected-with-cached-rows).
@@ -102,7 +152,7 @@ enum class GatePhase {
     case GatePhase::kEmptyCatalog:
       return "The catalog is empty - no recordings have been indexed yet";
     case GatePhase::kNeedsSelection:
-      return "Select customer and site to load recordings - " + std::to_string(total_files) +
+      return "Select customer, site and robot to load recordings - " + std::to_string(total_files) +
              " recordings across " + std::to_string(site_count) + " sites";
     case GatePhase::kListError:
       return "Recording list failed or is incomplete - use Refresh to retry";

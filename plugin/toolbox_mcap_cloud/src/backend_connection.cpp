@@ -532,6 +532,9 @@ std::vector<SequenceInfo> BackendConnection::listSequences(bool* complete,
         if (filter->site_id) {
           wire_filter->set_site_id(*filter->site_id);
         }
+        if (filter->robot_id) {
+          wire_filter->set_robot_id(*filter->robot_id);
+        }
         // Page-one-only echo: later pages carry the generation inside
         // page_token (server contract, handlers_catalog.go:157).
         if (page_token.empty()) {
@@ -660,14 +663,24 @@ std::vector<TopicInfo> BackendConnection::listTopics(const std::string& sequence
   return listTopicsChecked(sequence_name).topics;
 }
 
-std::optional<VocabularyInfo> BackendConnection::getVocabulary() {
+std::optional<VocabularyInfo> BackendConnection::getVocabulary(std::chrono::seconds timeout, VocabScope scope) {
   if (!socket_) {
     return std::nullopt;
   }
   pj_cloud::v1::ClientMessage request;
-  request.mutable_get_vocabulary();  // empty request message
+  auto* vocab_req = request.mutable_get_vocabulary();
+  if (scope == VocabScope::kPickerOnly) {
+    // Ask the server to skip what mapGetVocabularyResponse discards anyway: the
+    // flat source dimension, the tag facets, and the per-site/per-robot COUNT(*)
+    // GROUP BYs. Removes three whole-table scans plus the facet scan from the
+    // one RPC the browse UI blocks on. Additive fields — an older server ignores
+    // them and returns the full response, which still maps correctly.
+    vocab_req->set_omit_sources(true);
+    vocab_req->set_omit_tag_facets(true);
+    vocab_req->set_omit_site_robot_counts(true);
+  }
   pj_cloud::v1::ServerMessage response;
-  if (!sendAndWait(request, &response) || !response.has_get_vocabulary()) {
+  if (!sendAndWait(request, &response, timeout) || !response.has_get_vocabulary()) {
     return std::nullopt;
   }
   return mapGetVocabularyResponse(response.get_vocabulary());

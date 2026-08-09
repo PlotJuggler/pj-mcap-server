@@ -311,6 +311,22 @@ func main() {
 	// WS handler on /api/ws, now with streaming + metrics wired.
 	handler := ws.NewHandlerWithSession(store, cfg.Auth.BearerToken, log, sessDeps)
 	handler.SetMetrics(mx)
+	// Hello capabilities are published by this loop, never derived on the
+	// handshake path: deriving them per connection meant a handshake could queue
+	// behind a slow catalog RPC on the single pinned read connection and fail.
+	// One BOUNDED synchronous refresh before we serve, then the ticker. Without
+	// it the "immediate" pass races the first client: on a large catalog
+	// BackendCaps takes seconds, and a client that connects inside that window
+	// latches the derived-key floor for the whole connection (the client parses
+	// capabilities once, at connect). The deadline keeps a slow or missing
+	// catalog from delaying startup — a failure just serves the floor, which is
+	// exactly the degraded-start behaviour.
+	capsCtx, capsCancel := context.WithTimeout(ctx, 5*time.Second)
+	if err := handler.RefreshCaps(capsCtx); err != nil {
+		log.Warn("ws: initial capability refresh did not complete; serving the derived floor", "err", err)
+	}
+	capsCancel()
+	handler.StartCapsRefresh(ctx, 60*time.Second)
 	// Compressed-envelope path for bulky catalog RPC responses (opt-in per client
 	// via Hello). Transport-level; applies even to catalog-only connections.
 	if err := handler.SetResponseCompression(cfg.Server.ResponseCompression); err != nil {
