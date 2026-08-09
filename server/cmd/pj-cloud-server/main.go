@@ -311,6 +311,10 @@ func main() {
 	// WS handler on /api/ws, now with streaming + metrics wired.
 	handler := ws.NewHandlerWithSession(store, cfg.Auth.BearerToken, log, sessDeps)
 	handler.SetMetrics(mx)
+	// Hello capabilities are published by this loop, never derived on the
+	// handshake path: deriving them per connection meant a handshake could queue
+	// behind a slow catalog RPC on the single pinned read connection and fail.
+	handler.StartCapsRefresh(ctx, 60*time.Second)
 	// Compressed-envelope path for bulky catalog RPC responses (opt-in per client
 	// via Hello). Transport-level; applies even to catalog-only connections.
 	if err := handler.SetResponseCompression(cfg.Server.ResponseCompression); err != nil {

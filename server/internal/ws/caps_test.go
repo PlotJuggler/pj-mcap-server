@@ -24,6 +24,16 @@ func newWSTestServer(t *testing.T, store *catalog.Store) string {
 	t.Helper()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	h := NewHandler(store, "", log)
+	// Hello serves capabilities from a published snapshot, never a live query, so
+	// the startup refresh has to happen before a client connects — exactly what
+	// StartCapsRefresh's immediate first pass does in production (main.go). Doing
+	// it synchronously here keeps the assertions deterministic.
+	//
+	// The error is deliberately IGNORED: a degraded-start store (no catalog
+	// published yet) fails this refresh by design, and the contract is that Hello
+	// then serves the derived-key floor rather than failing. degraded_test.go
+	// depends on exactly that.
+	_ = h.RefreshCaps(context.Background())
 	mux := http.NewServeMux()
 	mux.Handle("/api/ws", h)
 	srv := httptest.NewServer(mux)
