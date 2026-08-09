@@ -148,6 +148,23 @@ doubt, but don't relitigate the decision itself.
   even at the fastest level); transport-level config `server.response_compression`,
   distinct from the session `body_zstd_level`. WS permessage-deflate stays OFF at
   both ends (it would double-compress the batch frames).
+- **Catalog RPC responses are marshaled DETERMINISTICALLY** before compression
+  (`marshalForCompression`, `internal/ws/compress.go`). `ListFilesResponse.metadata`
+  is a protobuf map with ~8 derived keys per file; Go randomizes map iteration, so
+  plain `proto.Marshal` emitted identical key sets at different offsets in every
+  file and defeated ZSTD's cross-file matching. Measured on a 32k-file listing:
+  1,111,112 B -> 512,385 B on the wire from the SAME 15,163,143 marshaled bytes
+  (13.6x -> 29.6x). Only the compression path is deterministic — raw frames are
+  never compressed (permessage-deflate is off at both ends), so ordering buys
+  nothing there. Pinned by `deterministic_marshal_test.go`.
+- **`Hello` NEVER touches SQLite.** Capabilities come from `catalog.CapsSnapshot`,
+  an `atomic.Pointer` value republished by `Handler.StartCapsRefresh` (immediate
+  pass at startup, then a 60s ticker). Deriving them per handshake meant a
+  connect could queue behind a slow catalog RPC on the single pinned read
+  connection and fail as "no response to handshake" — reproduced on demand
+  against a 2.5 GB catalog with a cold page cache. Do NOT add a freshness check
+  on the request path: any revision probe needs that same connection and
+  reintroduces the coupling. Pinned by `hello_availability_test.go`.
 - **GCS change-detect identity = `Generation` (decimal string) + `Updated`** — never
   MD5/CRC32C — slotted into the existing `(etag,size,last_modified)` triple with
   zero indexer/schema change.

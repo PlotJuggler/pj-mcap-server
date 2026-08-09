@@ -147,7 +147,11 @@ message ServerMessage {
 // client, re-fetched only when the client wants a fresh view of the catalog.
 // Built from the catalog dimension tables + the tag facet query; NO `files`
 // table scan for the tree (only the dimension tables) — see §6.
-message GetVocabularyRequest {}                    // no args today; reserved for future scoping
+message GetVocabularyRequest {
+  bool omit_sources           = 1;
+  bool omit_tag_facets        = 2;
+  bool omit_site_robot_counts = 3;
+}
 
 message GetVocabularyResponse {
   repeated DimCustomer customers = 1;              // hierarchical dimensions (tree)
@@ -282,6 +286,34 @@ deliberate asymmetry from principle 2: dimensions filter by id, tags by string.
   existing **client-side** name/Lua refinement over the returned metadata map.
 
 ---
+
+## 5b. Response scoping (added 2026-08-09)
+
+`GetVocabularyRequest` carries three **additive** booleans. All absent (proto3
+default `false`) = the FULL legacy response, so an older client is unaffected and
+**no `protocol_version` bump is required** — verified empirically: a new client
+sending the flags to a pre-change server gets the complete tree back, because
+unknown fields are ignored.
+
+| Field | Skips | Cost removed |
+|---|---|---|
+| `omit_sources` | the flat `source` dimension **and** its `GROUP BY` | ~0.4 s |
+| `omit_tag_facets` | the tag-facet scan | ~0.8 s (the costliest single leg) |
+| `omit_site_robot_counts` | the per-site and per-robot `COUNT(*) GROUP BY`s | ~0.8 s |
+
+Always computed: the dimension **tree** (EXISTS-gated dimension-table reads, ~7 ms
+— it is the point of the RPC) and **customer** file counts (they drive the
+picker's summary hint).
+
+**Who asks for what:** the C++ browse picker requests all three omissions
+(`BackendConnection::VocabScope::kPickerOnly`) because `wire_mapping.cpp` maps
+only the tree plus customer counts. `mcap-cloud-cli vocab` keeps the FULL scope —
+it prints per-site file counts, which the lean scope deliberately does not
+compute. `mcap-cloud-cli vocab --lean` exists to measure the difference.
+
+**Measured** (local server, 8.8M-row synthetic catalog, production cardinalities
+74 customers / 162 sites / 275 robots): full **2544 ms**, picker-only **428 ms** —
+**5.9x**, identical tree returned.
 
 ## 6. Server implementation (Go reader over the auryn schema — `vocabulary.go`)
 
