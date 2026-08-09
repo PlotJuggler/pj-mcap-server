@@ -574,15 +574,32 @@ estimates (`estimated_chunk_bytes`, `approximate_messages`).
 
 ## Working conventions
 
-- **A PR is NOT ready until the documentation audit passes**: before declaring any
-  branch/PR done, double-check that every document and instruction it touches the
-  truth of is up to date — the affected `README.md`s, the `CLAUDE.md`s (root +
-  `mcap_catalog/`), `CATALOG_CONTRACT.md` (BOTH byte-identical copies — verify with
-  `cmp`), the deploy runbooks (`server/deploy/`, `docs/ec2-deploy.md`,
-  `docs/gce-deploy-smoke.md`), CLI `--help` texts, and any design doc whose Status
-  header the PR advances. Grep the docs for the behavior you changed (flag names,
-  intervals, event/ack semantics, file paths) rather than trusting memory — the
-  2026-07-30 event-discovery PR found seven stale spots this way.
+- **A PR is NOT ready until the documentation audit passes — this is a MERGE GATE,
+  not a reminder.** Every document whose truth the PR changes must be updated in
+  the SAME PR. Run this before asking for review, and state in the PR body that
+  you did:
+
+  1. **Grep for the behaviour you changed**, never trust memory: flag names, RPC
+     names, field names, intervals, thresholds, file paths, measured numbers. A
+     doc that states a measurement your PR invalidates is a stale doc.
+  2. **Walk the fixed list**: the affected `README.md`s (INCLUDING
+     `plugin/toolbox_mcap_cloud/README.md` — its browse-flow section describes
+     user-visible behaviour and is easy to forget), the `CLAUDE.md`s (root +
+     `mcap_catalog/`), `CATALOG_CONTRACT.md` (BOTH copies — verify with `cmp`),
+     `proto/pj_cloud.proto`'s message comments, the deploy runbooks
+     (`server/deploy/`, `docs/ec2-deploy.md`, `docs/gce-deploy-smoke.md`), CLI
+     `--help` text, and any `docs/` design doc whose claims the PR falsifies.
+  3. **A claim you contradicted must be corrected, not just avoided.** If a doc
+     asserts something now false, fix it in place with a dated note rather than
+     leaving it for a reader to trip over. If a doc is right and the CODE drifted,
+     say so explicitly — that is the more dangerous direction.
+  4. **New invariants get recorded in "Decisions & pins" above**, naming the test
+     that enforces them, so the next reader can check rather than trust.
+
+  Evidence this gate is load-bearing: the 2026-07-30 event-discovery PR found
+  seven stale spots this way, and the 2026-08-09 browse-perf PR shipped with the
+  plugin README still documenting the old customer+site gate until an adversarial
+  review caught it — the earlier, softer wording of this rule did not.
 - The plans are written **for agentic execution**: each starts with a required
   sub-skill (`superpowers:subagent-driven-development` or `superpowers:executing-plans`) and
   uses `- [ ]` checkboxes for task tracking. Follow that workflow when implementing them, and
