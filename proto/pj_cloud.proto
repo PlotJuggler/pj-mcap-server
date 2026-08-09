@@ -144,7 +144,20 @@ message FileFilter {
 // dimension, and the flat tag facets. Small + bounded — sent once, cached by the
 // client, re-fetched on an explicit refresh. Built from the dimension tables + a
 // tag-facet query; no `files` scan for the tree.
-message GetVocabularyRequest {}                    // no args today; reserved for future scoping
+message GetVocabularyRequest {
+  // Scoping (2026-08-09). The full response needs FOUR whole-table GROUP BY
+  // aggregations over `files` plus a tag-facet scan — measured 2.44 s at 8.78M
+  // files, recomputed per call. A client that only renders the
+  // customer->site->robot picker reads none of the sections below, so it can ask
+  // the server not to compute them. All fields ABSENT (proto3 default false) =
+  // the FULL legacy response, so older clients are unaffected and no
+  // protocol_version bump is needed.
+  bool omit_sources           = 1;  // skip the flat source dimension + its GROUP BY
+  bool omit_tag_facets        = 2;  // skip the tag-facet scan (the single costliest leg)
+  // Skip the per-site and per-robot COUNT(*) GROUP BYs (two of the four scans).
+  // Customer counts are ALWAYS computed: they drive the picker's summary hint.
+  bool omit_site_robot_counts = 3;
+}
 
 message GetVocabularyResponse {
   repeated DimCustomer customers = 1;              // hierarchical dimensions (tree)

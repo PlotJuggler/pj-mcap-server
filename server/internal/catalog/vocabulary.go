@@ -65,10 +65,26 @@ type Vocabulary struct {
 // facet query. Leases ONE snapshot for every phase (B1): the vocabulary is
 // built from ~8 separate queries (per-dimension counts, the robot/site/customer
 // tree, sources, tag facets) that must all describe the SAME generation.
-func GetVocabulary(ctx context.Context, s *Store) (*Vocabulary, error) {
+// VocabOptions selects which sections to COMPUTE. The zero value is the full
+// legacy response, so every existing caller keeps its behaviour.
+//
+// This exists because the full assembly is four whole-table GROUP BY scans over
+// `files` plus a tag-facet scan — 2.44 s at 8.78M files, and it is on the browse
+// path's critical section. The shipped C++ picker reads only the
+// customer->site->robot tree plus CUSTOMER file counts, so it can switch the
+// rest off (see wire_mapping.cpp). The dimension TREE itself is always built:
+// it is EXISTS-gated dimension-table reads, ~7 ms, and it is the whole point of
+// the RPC.
+type VocabOptions struct {
+	OmitSources         bool
+	OmitTagFacets       bool
+	OmitSiteRobotCounts bool
+}
+
+func GetVocabulary(ctx context.Context, s *Store, opts VocabOptions) (*Vocabulary, error) {
 	lease := s.Acquire()
 	defer lease.Release()
-	return GetVocabularyDB(ctx, lease.DB())
+	return GetVocabularyDB(ctx, lease.DB(), opts)
 }
 
 // GetVocabularyDB is GetVocabulary against an already-leased snapshot handle:
@@ -82,33 +98,40 @@ func GetVocabulary(ctx context.Context, s *Store) (*Vocabulary, error) {
 // (customer count 1 beside a child site count 2; pinned by the
 // concurrent-writer test). The tx is read-only in effect (mode=ro DSN) and
 // always rolled back.
-func GetVocabularyDB(ctx context.Context, db *sql.DB) (*Vocabulary, error) {
+func GetVocabularyDB(ctx context.Context, db *sql.DB, opts VocabOptions) (*Vocabulary, error) {
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err
 	}
 	defer func() { _ = tx.Rollback() }()
-	return vocabularyFromSnapshot(ctx, tx)
+	return vocabularyFromSnapshot(ctx, tx, opts)
 }
 
 // vocabularyFromSnapshot assembles the vocabulary over one already-pinned WAL
 // snapshot (the GetVocabularyDB transaction).
-func vocabularyFromSnapshot(ctx context.Context, db querier) (*Vocabulary, error) {
+func vocabularyFromSnapshot(ctx context.Context, db querier, opts VocabOptions) (*Vocabulary, error) {
+	// Each groupCount is a full covering-index scan of `files` (~8.78M entries in
+	// production, ~0.4 s each). Customer counts are always needed — they drive the
+	// picker's "N recordings across M sites" hint. The rest are computed only when
+	// the caller actually reads them; an omitted map yields zero counts, which is
+	// what the omit_* fields promise.
 	custCount, err := groupCount(ctx, db, "customer_id")
 	if err != nil {
 		return nil, err
 	}
-	siteCount, err := groupCount(ctx, db, "site_id")
-	if err != nil {
-		return nil, err
+	var siteCount, robotCount, srcCount map[uint64]uint64
+	if !opts.OmitSiteRobotCounts {
+		if siteCount, err = groupCount(ctx, db, "site_id"); err != nil {
+			return nil, err
+		}
+		if robotCount, err = groupCount(ctx, db, "robot_id"); err != nil {
+			return nil, err
+		}
 	}
-	robotCount, err := groupCount(ctx, db, "robot_id")
-	if err != nil {
-		return nil, err
-	}
-	srcCount, err := groupCount(ctx, db, "source_id")
-	if err != nil {
-		return nil, err
+	if !opts.OmitSources {
+		if srcCount, err = groupCount(ctx, db, "source_id"); err != nil {
+			return nil, err
+		}
 	}
 
 	// robots grouped by site_id, sorted by name. The EXISTS gate prunes ORPHAN
@@ -163,26 +186,32 @@ func vocabularyFromSnapshot(ctx context.Context, db querier) (*Vocabulary, error
 		return nil, err
 	}
 
-	if err := queryRows(ctx, db,
-		`SELECT id, name FROM sources src WHERE EXISTS (SELECT 1 FROM files WHERE source_id = src.id) ORDER BY name`,
-		func(scan func(...any) error) error {
-			var id uint64
-			var name string
-			if err := scan(&id, &name); err != nil {
-				return err
-			}
-			vocab.Sources = append(vocab.Sources,
-				VocabSource{ID: id, Name: name, FileCount: srcCount[id]})
-			return nil
-		}); err != nil {
-		return nil, err
+	if !opts.OmitSources {
+		if err := queryRows(ctx, db,
+			`SELECT id, name FROM sources src WHERE EXISTS (SELECT 1 FROM files WHERE source_id = src.id) ORDER BY name`,
+			func(scan func(...any) error) error {
+				var id uint64
+				var name string
+				if err := scan(&id, &name); err != nil {
+					return err
+				}
+				vocab.Sources = append(vocab.Sources,
+					VocabSource{ID: id, Name: name, FileCount: srcCount[id]})
+				return nil
+			}); err != nil {
+			return nil, err
+		}
 	}
 
-	facets, err := tagFacets(ctx, db)
-	if err != nil {
-		return nil, err
+	// tagFacets is the single most expensive leg (measured 804 ms of the 2.44 s
+	// floor): it scans every tags_embedded row plus the override legs.
+	if !opts.OmitTagFacets {
+		facets, err := tagFacets(ctx, db)
+		if err != nil {
+			return nil, err
+		}
+		vocab.Tags = facets
 	}
-	vocab.Tags = facets
 	return &vocab, nil
 }
 

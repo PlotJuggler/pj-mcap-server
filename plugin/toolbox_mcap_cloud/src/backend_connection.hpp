@@ -177,8 +177,17 @@ class BackendConnection {
   // keeps computing regardless (nothing cancels it), so giving up early wastes
   // the work without saving anything.
   static constexpr std::chrono::seconds kVocabularyTimeout{60};
+
+  // Which SECTIONS to ask the server to compute. The full response costs four
+  // whole-table GROUP BY scans over `files` plus a tag-facet scan (measured
+  // 2.44 s at 8.78M files); the browse picker maps only the
+  // customer->site->robot tree and CUSTOMER file counts (wire_mapping.cpp), so
+  // it can switch the rest off. kFull is the DEFAULT so no caller silently
+  // loses data it was displaying — notably `mcap-cloud-cli vocab`, which prints
+  // per-site file counts and would otherwise report every site as "0 files".
+  enum class VocabScope { kFull, kPickerOnly };
   [[nodiscard]] std::optional<VocabularyInfo> getVocabulary(
-      std::chrono::seconds timeout = kVocabularyTimeout);
+      std::chrono::seconds timeout = kVocabularyTimeout, VocabScope scope = VocabScope::kFull);
 
   // GetFile RPC for the file backing `sequence_name`, addressed by s3_key
   // (sequence_name is sent verbatim as s3_key — see the key-addressing note

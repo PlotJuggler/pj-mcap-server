@@ -270,10 +270,19 @@ func (h *CatalogHandler) GetFile(ctx context.Context, req *pb.GetFileRequest) (*
 // snapshot's generation — the dimension ids are generation-scoped handles, only
 // meaningful together with the token (echoed back via
 // ListFilesRequest.expected_catalog_generation).
-func (h *CatalogHandler) GetVocabulary(ctx context.Context, _ *pb.GetVocabularyRequest) (*pb.GetVocabularyResponse, error) {
+func (h *CatalogHandler) GetVocabulary(ctx context.Context, req *pb.GetVocabularyRequest) (*pb.GetVocabularyResponse, error) {
 	lease := h.Store.Acquire()
 	defer lease.Release()
-	v, err := catalog.GetVocabularyDB(ctx, lease.DB())
+	// Scoping is OPT-IN and additive: an old client sends an empty request, every
+	// flag reads false, and it gets the full legacy response. A picker-only client
+	// switches off the sections it never maps, which removes three whole-table
+	// GROUP BY scans and the tag-facet scan from the critical path.
+	opts := catalog.VocabOptions{
+		OmitSources:         req.GetOmitSources(),
+		OmitTagFacets:       req.GetOmitTagFacets(),
+		OmitSiteRobotCounts: req.GetOmitSiteRobotCounts(),
+	}
+	v, err := catalog.GetVocabularyDB(ctx, lease.DB(), opts)
 	if err != nil {
 		return nil, fmt.Errorf("vocabulary: %w", err)
 	}

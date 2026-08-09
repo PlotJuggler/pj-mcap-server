@@ -485,7 +485,10 @@ void FetchWorker::fetchVocabularyAsync(std::uint64_t request_id) {
     }
     return;
   }
-  auto vocab = backend_->getVocabulary();
+  // The browse picker maps only the customer->site->robot tree + customer
+  // counts, so ask the server to compute only that.
+  auto vocab = backend_->getVocabulary(BackendConnection::kVocabularyTimeout,
+                                       BackendConnection::VocabScope::kPickerOnly);
   if (backend_->isClosed()) {
     // A dead browse socket during the fetch: route through the same
     // once-per-connection connectionLost signal as every other RPC here,
@@ -541,7 +544,8 @@ void FetchWorker::listSequencesFilteredAsync(std::uint64_t request_id, std::stri
   // generation died mid-request (builder rebuild raced the sweep).
   for (int attempt = 0; attempt < 2; ++attempt) {
     if (!vocab_) {
-      auto fresh = backend_->getVocabulary();
+      auto fresh = backend_->getVocabulary(BackendConnection::kVocabularyTimeout,
+                                           BackendConnection::VocabScope::kPickerOnly);
       if (backend_->isClosed()) {
         // A dead browse socket during the recovery refresh: mirror
         // fetchVocabularyAsync's and the sweep-below's handling exactly —

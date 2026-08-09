@@ -663,12 +663,22 @@ std::vector<TopicInfo> BackendConnection::listTopics(const std::string& sequence
   return listTopicsChecked(sequence_name).topics;
 }
 
-std::optional<VocabularyInfo> BackendConnection::getVocabulary(std::chrono::seconds timeout) {
+std::optional<VocabularyInfo> BackendConnection::getVocabulary(std::chrono::seconds timeout, VocabScope scope) {
   if (!socket_) {
     return std::nullopt;
   }
   pj_cloud::v1::ClientMessage request;
-  request.mutable_get_vocabulary();  // empty request message
+  auto* vocab_req = request.mutable_get_vocabulary();
+  if (scope == VocabScope::kPickerOnly) {
+    // Ask the server to skip what mapGetVocabularyResponse discards anyway: the
+    // flat source dimension, the tag facets, and the per-site/per-robot COUNT(*)
+    // GROUP BYs. Removes three whole-table scans plus the facet scan from the
+    // one RPC the browse UI blocks on. Additive fields — an older server ignores
+    // them and returns the full response, which still maps correctly.
+    vocab_req->set_omit_sources(true);
+    vocab_req->set_omit_tag_facets(true);
+    vocab_req->set_omit_site_robot_counts(true);
+  }
   pj_cloud::v1::ServerMessage response;
   if (!sendAndWait(request, &response, timeout) || !response.has_get_vocabulary()) {
     return std::nullopt;
