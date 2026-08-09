@@ -29,7 +29,6 @@ MappedSequence mapFileSummary(const pj_cloud::v1::FileSummary& summary, const pj
       info.user_metadata.emplace(kv.first, kv.second);
     }
   }
-
   // FileSummary.tags carries the per-tag is_override bit (same effective set as
   // the flat map). The tag editor reads this to tint override rows.
   info.tags = mapTags(summary.tags());

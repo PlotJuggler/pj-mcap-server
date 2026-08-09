@@ -58,6 +58,7 @@
 #include "format_utils.h"
 #include "session_download.hpp"
 #include "stitch_select.h"  // buildStitchedSelection / validateNonOverlapping
+#include "vocab_select.hpp"  // resolveGateFilter (the browse gate's name->id resolution)
 #include "time_format.h"  // src/core is on the include path
 
 namespace {
@@ -97,6 +98,7 @@ void printUsage(std::ostream& os) {
         "  --time-range startNs,endNs (download/debug) optional time window in nanoseconds\n"
         "  --latched                (download) also deliver each topic's last message before the\n"
         "                           window (latched/transient-local replay: map, costmaps, static poses)\n"
+        "  --customer/--site/--robot (list) server-side browse gate, as the plugin sends it\n"
         "  --limit N                (debug) number of messages to print (default 10; 0 = all)\n"
         "  --timeout N              (vocab) seconds to wait for GetVocabulary (default: the\n"
         "                           browse panel's own budget)\n"
@@ -176,11 +178,37 @@ int runHello(mcap_cloud::BackendConnection& conn, const std::string& error) {
 // catalog: a degraded-start server's ERROR_CATALOG_UNAVAILABLE ("first build in
 // progress"), a timeout, or exhausted stale retries previously rendered as
 // "0 sequence(s)" / exit 0 — indistinguishable from an empty bucket.
+// Optional server-side dimension gate, mirroring the plugin's browse gate. Set
+// by --customer/--site/--robot; empty means "unfiltered", which on a large
+// catalog is not a real option (8.8M files is millions of rows over the wire).
+struct CliGate {
+  std::string customer, site, robot;
+  [[nodiscard]] bool any() const { return !customer.empty() || !site.empty() || !robot.empty(); }
+};
+CliGate g_gate;
+
 bool listSequencesChecked(mcap_cloud::BackendConnection& conn, const char* cmd,
                           std::vector<mcap_cloud::SequenceInfo>* out) {
   bool complete = false;
   std::string error;
-  *out = conn.listSequences(&complete, {}, nullptr, nullptr, {}, &error);
+  // Resolve the gate exactly as the plugin does: names are durable, ids are
+  // generation-scoped session handles, so they must come from a vocabulary
+  // fetched on THIS connection and travel with its generation token.
+  std::optional<mcap_cloud::ListFilter> filter;
+  if (g_gate.any()) {
+    const auto vocab = conn.getVocabulary();
+    if (!vocab.has_value()) {
+      std::cerr << cmd << ": GetVocabulary failed; cannot resolve the filter\n";
+      return false;
+    }
+    filter = mcap_cloud::resolveGateFilter(*vocab, g_gate.customer, g_gate.site, g_gate.robot);
+    if (!filter.has_value()) {
+      std::cerr << cmd << ": no such customer/site/robot: " << g_gate.customer << "/" << g_gate.site
+                << "/" << g_gate.robot << '\n';
+      return false;
+    }
+  }
+  *out = conn.listSequences(&complete, {}, filter ? &*filter : nullptr, nullptr, {}, &error);
   if (!complete) {
     std::cerr << cmd << ": listing failed: " << (error.empty() ? "incomplete listing" : error)
               << '\n';
@@ -842,6 +870,18 @@ int main(int argc, char** argv) {
         return kExitUsage;
       }
       time_range_csv = v;
+    } else if (arg == "--customer") {
+      const char* v = needValue(arg, i);
+      if (v == nullptr) { return kExitUsage; }
+      g_gate.customer = v;
+    } else if (arg == "--site") {
+      const char* v = needValue(arg, i);
+      if (v == nullptr) { return kExitUsage; }
+      g_gate.site = v;
+    } else if (arg == "--robot") {
+      const char* v = needValue(arg, i);
+      if (v == nullptr) { return kExitUsage; }
+      g_gate.robot = v;
     } else if (arg == "--lean") {
       vocab_lean = true;
     } else if (arg == "--timeout") {
