@@ -27,6 +27,7 @@
 #include "credential_store.hpp"  // mcap_cloud::CredentialStore (D6 token store)
 #include "trusted_origins.hpp"   // mcap_cloud::TrustedOrigins (spec §7 guard 1 ledger)
 #include "fetch_worker.hpp"      // mcap_cloud::FetchWorker::GateListResult (onGateListFinished's param type)
+#include "query_filter.h"       // mcap_cloud::FilterSequence (visibleForLocked's param)
 #include "vocab_select.hpp"      // mcap_cloud::GatePhase / resolveGateFilter / autoSelectCustomer / siteNamesFor
 
 namespace mcap_cloud {
@@ -601,6 +602,9 @@ class McapCloudDialog : public PJ::DialogPluginTyped {
   // result. Caller MUST hold state_.mu. When seed_dates is true the date-range
   // picker is reseeded to the dataset's full [min,max] span (final result
   // only — the progressive early populate leaves the picker untouched).
+  // The single definition of "which rows pass the current filters", shared by
+  // the view-cache rebuild and the incremental extend so they cannot disagree.
+  [[nodiscard]] std::vector<int> visibleForLocked(const std::vector<FilterSequence>& seqs);
   void populateSequencesLocked(std::vector<SequenceInfo>& sequences, bool seed_dates);
   // Append-only fast path for a progressive sweep: adds seqs[from..) to the
   // existing state instead of rebuilding it. Returns false when it cannot be

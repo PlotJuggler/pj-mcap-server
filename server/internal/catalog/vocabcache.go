@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -90,11 +91,13 @@ type VocabularyCache struct {
 }
 
 type vocabEntry struct {
-	rev        Revision
-	val        *Vocabulary
-	storedAt   time.Time
-	epoch      uint64
-	refreshing bool
+	rev      Revision
+	val      *Vocabulary
+	storedAt time.Time
+	// epoch orders COMPLETED computations so a slow one cannot overwrite a value
+	// produced by a later one. It must be our own monotonic counter:
+	// data_version is connection-local and not a cross-connection sequence.
+	epoch uint64
 }
 
 // NewVocabularyCache builds a cache whose same-generation entries may be served
@@ -105,7 +108,12 @@ func NewVocabularyCache(staleFor time.Duration) *VocabularyCache {
 
 // Computations reports how many times the aggregation actually ran (cache
 // misses + background refreshes). Test- and metrics-facing.
-func (c *VocabularyCache) Computations() int64 { return c.computations.Load() }
+func (c *VocabularyCache) Computations() int64 {
+	if c == nil {
+		return 0
+	}
+	return c.computations.Load()
+}
 
 // Get returns the vocabulary for `opts` and the generation its dimension ids
 // belong to. The returned *Vocabulary is SHARED and must be treated as
@@ -116,18 +124,36 @@ func (c *VocabularyCache) Get(ctx context.Context, s *Store, opts VocabOptions) 
 	if lease.DB() == nil {
 		return nil, nil, ErrNoCatalog
 	}
+	if c == nil {
+		// Uncached path, for callers that build a bare handler (tests). Living
+		// HERE rather than at the call site keeps ONE implementation of "fetch the
+		// vocabulary and the generation its ids belong to".
+		v, err := GetVocabularyDB(ctx, lease.DB(), opts)
+		if err != nil {
+			return nil, nil, err
+		}
+		return v, lease.Generation(), nil
+	}
 	rev, err := ReadRevision(ctx, lease)
 	if err != nil {
 		return nil, nil, err
 	}
 	gen := lease.Generation()
 
-	// The computation is PINNED to this lease for its whole duration, so the rows
-	// it reads and the revision it is stored under always describe the same file.
-	// A background refresh takes its OWN lease (see refresh) because it outlives
-	// this call.
+	// compute takes its OWN lease per invocation. It must NOT capture the lease
+	// above: the stale-serve path fires this on a background goroutine that
+	// outlives Get's `defer lease.Release()`, and once the last lease on a retired
+	// snapshot drops, its handle is closed — the refresh would then spend the full
+	// aggregation only to end in "sql: database is closed", leaving the entry
+	// stale so the next request repeats it. Each invocation is still PINNED to one
+	// snapshot for its whole duration, which is what the revision claim needs.
 	v, err := c.get(ctx, rev, opts, func(cctx context.Context) (*Vocabulary, error) {
-		return GetVocabularyDB(cctx, lease.DB(), opts)
+		l := s.Acquire()
+		defer l.Release()
+		if l.DB() == nil {
+			return nil, ErrNoCatalog
+		}
+		return GetVocabularyDB(cctx, l.DB(), opts)
 	})
 	if err != nil {
 		return nil, nil, err
@@ -154,14 +180,12 @@ func (c *VocabularyCache) get(
 	if e != nil && c.staleFor > 0 && e.rev.Generation == rev.Generation &&
 		time.Since(e.storedAt) < c.staleFor {
 		v := e.val
-		start := !e.refreshing
-		if start {
-			e.refreshing = true
-		}
 		c.mu.Unlock()
-		if start {
-			go c.refresh(rev, opts, compute)
-		}
+		// Refresh behind the caller. No dedup flag needed: computeAndStore goes
+		// through singleflight on the same (rev, opts) key, so concurrent stale
+		// hits join one computation. Detached context — the requester already has
+		// its answer and the refresh must not die with that request.
+		go func() { _, _ = c.computeAndStore(context.Background(), rev, opts, compute) }()
 		return v, nil
 	}
 	c.mu.Unlock()
@@ -189,21 +213,6 @@ func (c *VocabularyCache) computeAndStore(
 	return v.(*Vocabulary), nil
 }
 
-func (c *VocabularyCache) refresh(
-	rev Revision, opts VocabOptions, compute func(context.Context) (*Vocabulary, error),
-) {
-	defer func() {
-		c.mu.Lock()
-		if e := c.entries[opts]; e != nil {
-			e.refreshing = false
-		}
-		c.mu.Unlock()
-	}()
-	// Detached context: the requester already has its answer, so the refresh must
-	// not die with that request.
-	_, _ = c.computeAndStore(context.Background(), rev, opts, compute)
-}
-
 func (c *VocabularyCache) store(rev Revision, opts VocabOptions, val *Vocabulary, epoch uint64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -217,41 +226,14 @@ func (c *VocabularyCache) store(rev Revision, opts VocabOptions, val *Vocabulary
 }
 
 func cacheKey(rev Revision, opts VocabOptions) string {
-	b := make([]byte, 0, len(rev.Generation)+32)
-	b = append(b, rev.Generation...)
-	b = append(b, 0)
-	b = appendInt(b, rev.DataVersion)
-	b = append(b, 0)
-	if opts.OmitSources {
-		b = append(b, 's')
-	}
-	if opts.OmitTagFacets {
-		b = append(b, 't')
-	}
-	if opts.OmitSiteRobotCounts {
-		b = append(b, 'c')
-	}
-	return string(b)
-}
-
-func appendInt(b []byte, v int64) []byte {
-	if v == 0 {
-		return append(b, '0')
-	}
-	neg := v < 0
-	u := uint64(v)
-	if neg {
-		u = uint64(-v)
-	}
-	var tmp [20]byte
-	i := len(tmp)
-	for u > 0 {
-		i--
-		tmp[i] = byte('0' + u%10)
-		u /= 10
-	}
-	if neg {
-		b = append(b, '-')
-	}
-	return append(b, tmp[i:]...)
+	// Deliberately keyed on (generation, options) WITHOUT data_version. The
+	// builder commits continuously, so two clients arriving either side of one
+	// commit would otherwise get different keys and BOTH run the full aggregation,
+	// serialized on the single pinned connection — k clients, k x 2.44 s — which
+	// is precisely the stampede singleflight is here to stop. Generation stays in
+	// the key because ids renumber across it and those results must never merge.
+	// The winner stores under the revision it actually read; losers accept a
+	// value that may be one commit older, which the stale window already allows.
+	return fmt.Sprintf("%s|%t%t%t", rev.Generation,
+		opts.OmitSources, opts.OmitTagFacets, opts.OmitSiteRobotCounts)
 }

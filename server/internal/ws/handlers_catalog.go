@@ -33,6 +33,7 @@ import (
 	"google.golang.org/protobuf/proto"
 
 	"pj-cloud/server/internal/catalog"
+	"pj-cloud/server/internal/metrics"
 	pb "pj-cloud/server/internal/wire/pj_cloud"
 )
 
@@ -44,6 +45,9 @@ type CatalogHandler struct {
 	// PER RPC, so a cache owned here would never hit. nil is allowed (tests that
 	// build a bare handler) and falls back to computing directly.
 	VocabCache *catalog.VocabularyCache
+	// Metrics, when set, records the vocabulary cache's hit/miss rate — the only
+	// production signal that the cache is actually working. Optional.
+	Metrics *metrics.Metrics
 }
 
 // ── generation-bound pagination cursors ──────────────────────────────────────
@@ -290,16 +294,17 @@ func (h *CatalogHandler) GetVocabulary(ctx context.Context, req *pb.GetVocabular
 	// that used to run on EVERY call — the reason browse latency depended on
 	// whether anyone had browsed recently. VocabCache may be nil in tests that
 	// construct a bare CatalogHandler; fall back to computing directly.
-	var v *catalog.Vocabulary
-	var gen []byte
-	var err error
-	if h.VocabCache != nil {
-		v, gen, err = h.VocabCache.Get(ctx, h.Store, opts)
-	} else {
-		lease := h.Store.Acquire()
-		gen = lease.Generation()
-		v, err = catalog.GetVocabularyDB(ctx, lease.DB(), opts)
-		lease.Release()
+	// A nil cache is valid (tests build a bare handler) and Get handles it — one
+	// implementation, and the production path is the one the tests exercise.
+	before := h.VocabCache.Computations()
+	v, gen, err := h.VocabCache.Get(ctx, h.Store, opts)
+	if h.Metrics != nil {
+		h.Metrics.VocabularyRequests.Inc()
+		// computations/requests is the miss rate. Read as a delta so a background
+		// refresh triggered by THIS request is counted too.
+		if h.VocabCache.Computations() > before {
+			h.Metrics.VocabularyComputations.Inc()
+		}
 	}
 	if err != nil {
 		return nil, fmt.Errorf("vocabulary: %w", err)

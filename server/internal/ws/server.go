@@ -168,9 +168,13 @@ func NewHandler(store *catalog.Store, authToken string, log *slog.Logger) *Handl
 // NewHandlerWithSession builds a WS handler with the session/streaming subsystem
 // wired in. The SessionDeps.Store should resolve files against the same catalog.
 func NewHandlerWithSession(store *catalog.Store, authToken string, log *slog.Logger, sess *SessionDeps) *Handler {
-	return &Handler{store: store, log: log, authToken: authToken, auth: newAuthenticator(authToken), sess: sess,
-		metrics: sess.Metrics, caps: catalog.NewCapsSnapshot(),
-		vocabCache: catalog.NewVocabularyCache(vocabCacheStaleWindow)}
+	// Delegate rather than restate: every process-lifetime field added to Handler
+	// would otherwise have to be added in both constructors, and forgetting the
+	// catalog-only one yields a nil cache/snapshot at runtime.
+	h := NewHandler(store, authToken, log)
+	h.sess = sess
+	h.metrics = sess.Metrics
+	return h
 }
 
 // newAuthenticator returns a bearer-token ClientAuthenticator for a non-empty
@@ -194,9 +198,9 @@ func (h *Handler) RefreshCaps(ctx context.Context) error {
 }
 
 // StartCapsRefresh keeps the published Hello capabilities fresh, OFF the
-// handshake path. Runs one refresh immediately (so the first client after
-// startup sees real values rather than the derived-key floor) and then on a
-// ticker until ctx is cancelled.
+// handshake path, on a ticker until ctx is cancelled. It does NOT do a first
+// pass — the caller owns that, because only the caller knows whether it can
+// afford to wait (see RefreshCaps).
 //
 // The interval is far tighter than these values actually move — the metadata-key
 // vocabulary changes only when the builder ingests a brand-new tag key — and
@@ -209,10 +213,13 @@ func (h *Handler) StartCapsRefresh(ctx context.Context, interval time.Duration) 
 	if interval <= 0 {
 		interval = 60 * time.Second
 	}
+	// Pure ticker: NO immediate pass. Both callers already do their own first
+	// refresh (main.go bounded-synchronously before serving, newWSTestServer
+	// synchronously so assertions are deterministic), and doing it here as well
+	// ran two full `SELECT DISTINCT key FROM tags_effective` + hierarchy probes
+	// back to back on the single pinned read connection at exactly the moment the
+	// first clients connect — the contention this change set exists to remove.
 	go func() {
-		if err := h.RefreshCaps(ctx); err != nil {
-			h.log.Warn("ws: initial capability refresh failed; serving derived floor", "err", err)
-		}
 		t := time.NewTicker(interval)
 		defer t.Stop()
 		for {
@@ -651,7 +658,7 @@ func (c *connState) handleHello(reqID uint64, hello *pb.Hello) {
 const vocabCacheStaleWindow = 5 * time.Minute
 
 func (c *connState) catalogHandler() *CatalogHandler {
-	return &CatalogHandler{Store: c.h.store, VocabCache: c.h.vocabCache}
+	return &CatalogHandler{Store: c.h.store, VocabCache: c.h.vocabCache, Metrics: c.h.metrics}
 }
 
 func (c *connState) handleListFiles(ctx context.Context, reqID uint64, req *pb.ListFilesRequest) {

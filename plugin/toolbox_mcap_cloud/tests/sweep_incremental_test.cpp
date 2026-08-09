@@ -41,11 +41,6 @@ struct McapCloudDialogSweepAccess {
   // against that cache.
   static void render(McapCloudDialog& d) { (void)d.widget_data(); }
   static void sort(McapCloudDialog& d) { d.sortSequencesLocked(); }
-  static void setGate(McapCloudDialog& d, const char* c, const char* si, const char* r) {
-    d.state_.gate_customer = c; d.state_.gate_site = si; d.state_.gate_robot = r;
-  }
-  static std::string robot(McapCloudDialog& d) { return d.state_.gate_robot; }
-  static std::string site(McapCloudDialog& d) { return d.state_.gate_site; }
   static void beginGate(McapCloudDialog& d) { (void)d.beginGateRequestLocked(GatePhase::kNeedsSelection); }
   static void seedRowMaps(McapCloudDialog& d) {
     d.state_.seq_view_cache.row_to_keys["stale-label"] = {"stale-key.mcap"};

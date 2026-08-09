@@ -765,6 +765,42 @@ bool McapCloudDialog::loadConfig(std::string_view config_json) {
   return true;
 }
 
+// visibleForLocked — THE definition of "which of these rows pass the current
+// filters". Both the full view-cache rebuild and the incremental extend call it,
+// so they cannot disagree about what visible means. They previously carried two
+// copies of this logic, and a divergence would have been near-invisible: the
+// authoritative end-of-sweep repopulate always takes the rebuild path, so a
+// filter honoured in only one branch produces wrong rows ONLY while a sweep is
+// in flight. Caller must hold state_.mu.
+std::vector<int> McapCloudDialog::visibleForLocked(const std::vector<FilterSequence>& seqs) {
+  FilterParams params;
+  params.name_filter = state_.seq_filter;
+  params.name_regex = state_.seq_filter_regex;
+  // The metadata query applies ONLY on the Advanced tab; on Basic the Lua query
+  // is ignored. Name + date filters always apply in both modes.
+  params.query_text = state_.filter_tab == 1 ? state_.query_text : std::string{};
+  params.date_from_ns = state_.date_from_ns;
+  params.date_to_ns = state_.date_to_ns;
+  // Advanced -> the Lua query, fed the epoch-cached canonical schema for
+  // shorthand expansion (it filters only by canonical fields, never by
+  // MCAP-content stats). Basic -> the dropdown equality filters on the S3 fields.
+  ensureQuerySchemaLocked();
+  std::vector<int> visible = computeVisibleSequences(seqs, params, state_.query_schema);
+  if (state_.filter_tab == 0 && !state_.basic_filter.empty()) {
+    std::vector<int> narrowed;
+    narrowed.reserve(visible.size());
+    for (int idx : visible) {
+      // seqs[idx].metadata already holds the parsed canonical fields — no second
+      // key parse.
+      if (matchesBasicFilter(seqs[static_cast<std::size_t>(idx)].metadata, state_.basic_filter)) {
+        narrowed.push_back(idx);
+      }
+    }
+    visible = std::move(narrowed);
+  }
+  return visible;
+}
+
 std::string McapCloudDialog::widget_data() {
   std::lock_guard<std::mutex> lock(state_.mu);
   PJ::WidgetData wd;
@@ -1023,11 +1059,15 @@ std::string McapCloudDialog::widget_data() {
     // widget_data() runs every host tick, and the per-sequence filter + metadata
     // copies are too heavy to redo at 20Hz on the GUI thread.
     auto& cache = state_.seq_view_cache;
-    const bool cache_hit = cache.valid && cache.aggregate == state_.aggregate && cache.filter_tab == state_.filter_tab &&
-                     cache.basic_filter == state_.basic_filter && cache.seq_epoch == state_.seq_epoch &&
-                     cache.seq_filter == state_.seq_filter && cache.seq_filter_regex == state_.seq_filter_regex &&
-                     cache.query_text == state_.query_text && cache.date_from_ns == state_.date_from_ns &&
-                     cache.date_to_ns == state_.date_to_ns;
+    const bool filters_match = cache.valid && cache.filter_tab == state_.filter_tab &&
+                               cache.basic_filter == state_.basic_filter &&
+                               cache.seq_filter == state_.seq_filter &&
+                               cache.seq_filter_regex == state_.seq_filter_regex &&
+                               cache.query_text == state_.query_text &&
+                               cache.date_from_ns == state_.date_from_ns &&
+                               cache.date_to_ns == state_.date_to_ns;
+    const bool cache_hit = filters_match && cache.aggregate == state_.aggregate &&
+                           cache.seq_epoch == state_.seq_epoch;
     // INCREMENTAL EXTEND: during a progressive sweep only new rows arrive, so
     // when every filter input is unchanged and the previously built rows are
     // still a valid prefix (seq_stable_prefix, set only by appendSequencesLocked)
@@ -1037,12 +1077,12 @@ std::string McapCloudDialog::widget_data() {
     //
     // File mode only: aggregate re-sessionizes every file, so an append can
     // change EARLIER rows (a new file extends the last session's span/label).
-    const bool inputs_unchanged =
-        cache.valid && !state_.aggregate && !cache.aggregate && cache.filter_tab == state_.filter_tab &&
-        cache.basic_filter == state_.basic_filter && cache.seq_filter == state_.seq_filter &&
-        cache.seq_filter_regex == state_.seq_filter_regex && cache.query_text == state_.query_text &&
-        cache.date_from_ns == state_.date_from_ns && cache.date_to_ns == state_.date_to_ns;
-    const bool can_extend = !cache_hit && inputs_unchanged && state_.seq_stable_prefix > 0 &&
+    // filters_match is the SHARED half of cache_hit (everything except the epoch);
+    // stating it once stops a newly added filter input from being wired into the
+    // hit test but not the extend test, which would append a tail filtered by the
+    // NEW inputs onto a prefix filtered by the OLD ones.
+    const bool can_extend = !cache_hit && filters_match && !state_.aggregate && !cache.aggregate &&
+                            state_.seq_stable_prefix > 0 &&
                             state_.seq_stable_prefix == cache.rows.size() &&
                             state_.sequences.size() > state_.seq_stable_prefix;
     if (can_extend) {
@@ -1055,24 +1095,7 @@ std::string McapCloudDialog::widget_data() {
         const auto& rec = state_.sequences[i];
         tail.push_back({rec.name, rec.min_ts_ns, rec.max_ts_ns, canonicalFilterFields(rec.name)});
       }
-      FilterParams params;
-      params.name_filter = state_.seq_filter;
-      params.name_regex = state_.seq_filter_regex;
-      params.query_text = state_.filter_tab == 1 ? state_.query_text : std::string{};
-      params.date_from_ns = state_.date_from_ns;
-      params.date_to_ns = state_.date_to_ns;
-      ensureQuerySchemaLocked();
-      std::vector<int> tail_visible = computeVisibleSequences(tail, params, state_.query_schema);
-      if (state_.filter_tab == 0 && !state_.basic_filter.empty()) {
-        std::vector<int> narrowed;
-        narrowed.reserve(tail_visible.size());
-        for (int idx : tail_visible) {
-          if (matchesBasicFilter(tail[static_cast<std::size_t>(idx)].metadata, state_.basic_filter)) {
-            narrowed.push_back(idx);
-          }
-        }
-        tail_visible = std::move(narrowed);
-      }
+      const std::vector<int> tail_visible = visibleForLocked(tail);
       for (std::size_t i = state_.seq_stable_prefix; i < state_.sequences.size(); ++i) {
         const auto& rec = state_.sequences[i];
         const std::string& display = i < state_.seq_display_names.size() ? state_.seq_display_names[i] : rec.name;
@@ -1083,10 +1106,11 @@ std::string McapCloudDialog::widget_data() {
         cache.visible.push_back(static_cast<int>(state_.seq_stable_prefix) + idx);
       }
       cache.seq_epoch = state_.seq_epoch;
-      state_.seq_stable_prefix = state_.sequences.size();  // consumed
       last_rebuild_ms_ =
           std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - extend_t0).count();
-      state_.seq_rows_pushed = false;  // rows grew: re-push them this tick
+      // NB: no seq_rows_pushed reset needed — the push gate is
+      // `!cache_hit || !seq_rows_pushed`, and cache_hit is false on every path
+      // that reaches here.
     } else if (!cache_hit) {
       const auto rebuild_t0 = std::chrono::steady_clock::now();
       std::vector<FilterSequence> filter_seqs;
@@ -1094,34 +1118,7 @@ std::string McapCloudDialog::widget_data() {
       for (const auto& rec : state_.sequences) {
         filter_seqs.push_back({rec.name, rec.min_ts_ns, rec.max_ts_ns, canonicalFilterFields(rec.name)});
       }
-      FilterParams params;
-      params.name_filter = state_.seq_filter;
-      params.name_regex = state_.seq_filter_regex;
-      // The metadata query applies ONLY on the Advanced tab; on Basic the Lua
-      // query is ignored. Name + date filters always apply in both modes.
-      params.query_text = state_.filter_tab == 1 ? state_.query_text : std::string{};
-      params.date_from_ns = state_.date_from_ns;
-      params.date_to_ns = state_.date_to_ns;
-      // Per-file visible set (indices into state_.sequences): name + date + the
-      // active tab's metadata filter. Advanced -> the Lua query (computed by the
-      // shared helper, fed the epoch-cached canonical schema for shorthand
-      // expansion — the Advanced query filters only by the canonical fields,
-      // never by MCAP-content stats). Basic -> the dropdown equality filters
-      // on the S3 fields.
-      ensureQuerySchemaLocked();
-      std::vector<int> file_visible = computeVisibleSequences(filter_seqs, params, state_.query_schema);
-      if (state_.filter_tab == 0 && !state_.basic_filter.empty()) {
-        std::vector<int> narrowed;
-        narrowed.reserve(file_visible.size());
-        for (int idx : file_visible) {
-          // filter_seqs[idx].metadata already holds the parsed canonical fields
-          // for this record — no second key parse.
-          if (matchesBasicFilter(filter_seqs[static_cast<std::size_t>(idx)].metadata, state_.basic_filter)) {
-            narrowed.push_back(idx);
-          }
-        }
-        file_visible = std::move(narrowed);
-      }
+      const std::vector<int> file_visible = visibleForLocked(filter_seqs);
 
       std::vector<std::vector<std::string>> rows;
       std::vector<std::vector<std::string>> row_keys;
@@ -2581,6 +2578,13 @@ std::uint64_t McapCloudDialog::beginGateRequestLocked(GatePhase next_phase) {
   // next one, then issues the new request id and supersedes in-flight sweeps.
   state_.sequences.clear();
   state_.sequence_names.clear();
+  // The derived companions of `sequences` must die with it. Leaving them was
+  // benign only by accident (can_append separately requires a non-empty
+  // vector) — an invariant upheld by an unrelated clause in another function
+  // is not an invariant.
+  state_.seq_display_names.clear();
+  state_.seq_display_counts.clear();
+  state_.seq_stable_prefix = 0;
   progressive_seqs_.clear();
   // A new sweep must always render its first page immediately, not wait out
   // whatever is left of the PREVIOUS sweep's progressive-render window
@@ -3457,6 +3461,37 @@ void McapCloudDialog::rebuildSeqDisplayLocked() {
   }
 }
 
+namespace {
+// SequenceInfo -> SequenceRecord, and the running [min,max] span. Shared by
+// populateSequencesLocked and appendSequencesLocked: the conversion used to be
+// duplicated verbatim, so a 7th SequenceRecord field would have been silently
+// dropped for APPENDED rows only — invisible until a user scrolled past the
+// first page, and papered over by the authoritative end-of-sweep repopulate.
+SequenceRecord toRecord(const SequenceInfo& s) {
+  SequenceRecord rec;
+  rec.name = s.name;
+  rec.min_ts_ns = s.min_ts_ns;
+  rec.max_ts_ns = s.max_ts_ns;
+  rec.total_size_bytes = s.total_size_bytes;
+  // The backend's user_metadata is unordered_map; the ported PJ3 Lua engine
+  // wants std::map<..., std::less<>>.
+  for (const auto& kv : s.user_metadata) {
+    rec.metadata.emplace(kv.first, kv.second);
+  }
+  rec.tags = s.tags;  // effective tags with the override bit (tag editor)
+  return rec;
+}
+
+void widenSpan(const SequenceInfo& s, std::int64_t& gmin, std::int64_t& gmax) {
+  if (s.min_ts_ns > 0 && (gmin == 0 || s.min_ts_ns < gmin)) {
+    gmin = s.min_ts_ns;
+  }
+  if (s.max_ts_ns > gmax) {
+    gmax = s.max_ts_ns;
+  }
+}
+}  // namespace
+
 bool McapCloudDialog::appendSequencesLocked(const std::vector<SequenceInfo>& seqs, std::size_t from) {
   if (from > seqs.size() || state_.sequences.size() != from) {
     return false;  // not a clean append onto what we already hold
@@ -3486,32 +3521,29 @@ bool McapCloudDialog::appendSequencesLocked(const std::vector<SequenceInfo>& seq
     new_displays.push_back(std::move(cand));
   }
 
-  state_.sequences.reserve(seqs.size());
-  state_.sequence_names.reserve(seqs.size());
-  state_.seq_display_names.reserve(seqs.size());
+  // Grow with HEADROOM, not exactly. reserve(seqs.size()) leaves capacity == size
+  // after each append, so the next page reallocates and moves the entire prefix —
+  // over 86 pages that is ~1.87M element moves per vector (measured 81.8 ms vs
+  // 31.8 ms for the record vector alone). Doubling restores push_back's amortized
+  // O(1) across the sweep.
+  const auto grow = [&](auto& v) {
+    if (v.capacity() < seqs.size()) {
+      v.reserve(std::max(seqs.size(), v.capacity() * 2));
+    }
+  };
+  grow(state_.sequences);
+  grow(state_.sequence_names);
+  grow(state_.seq_display_names);
   std::int64_t gmin = state_.global_min_ts_ns;
   std::int64_t gmax = state_.global_max_ts_ns;
   for (std::size_t i = from; i < seqs.size(); ++i) {
     const auto& s = seqs[i];
-    SequenceRecord rec;
-    rec.name = s.name;
-    rec.min_ts_ns = s.min_ts_ns;
-    rec.max_ts_ns = s.max_ts_ns;
-    rec.total_size_bytes = s.total_size_bytes;
-    for (const auto& kv : s.user_metadata) {
-      rec.metadata.emplace(kv.first, kv.second);
-    }
-    rec.tags = s.tags;
+    SequenceRecord rec = toRecord(s);
     state_.sequence_names.push_back(rec.name);
     state_.sequences.push_back(std::move(rec));
     ++state_.seq_display_counts[new_displays[i - from]];
     state_.seq_display_names.push_back(std::move(new_displays[i - from]));
-    if (s.min_ts_ns > 0 && (gmin == 0 || s.min_ts_ns < gmin)) {
-      gmin = s.min_ts_ns;
-    }
-    if (s.max_ts_ns > gmax) {
-      gmax = s.max_ts_ns;
-    }
+    widenSpan(s, gmin, gmax);
   }
   state_.global_min_ts_ns = gmin;
   state_.global_max_ts_ns = gmax;
@@ -3529,20 +3561,8 @@ void McapCloudDialog::populateSequencesLocked(std::vector<SequenceInfo>& seqs, b
   state_.sequence_names.clear();
   state_.sequences.reserve(seqs.size());
   state_.sequence_names.reserve(seqs.size());
-  for (auto& s : seqs) {
-    SequenceRecord rec;
-    rec.name = s.name;
-    rec.min_ts_ns = s.min_ts_ns;
-    rec.max_ts_ns = s.max_ts_ns;
-    rec.total_size_bytes = s.total_size_bytes;
-    // The backend's user_metadata is std::unordered_map<string, string>;
-    // convert into the std::map<string, string, std::less<>> used by the
-    // ported PJ3 Lua engine.
-    for (const auto& kv : s.user_metadata) {
-      rec.metadata.emplace(kv.first, kv.second);
-    }
-    // Effective tags with the override bit (tag editor reads this).
-    rec.tags = s.tags;
+  for (const auto& s : seqs) {
+    SequenceRecord rec = toRecord(s);
     state_.sequence_names.push_back(rec.name);
     state_.sequences.push_back(std::move(rec));
   }
@@ -3553,13 +3573,8 @@ void McapCloudDialog::populateSequencesLocked(std::vector<SequenceInfo>& seqs, b
   // 29/04/2016 → 08/04/2020). "All" filter ⇒ the span passes every sequence.
   std::int64_t gmin = 0;
   std::int64_t gmax = 0;
-  for (const auto& s : state_.sequences) {
-    if (s.min_ts_ns > 0 && (gmin == 0 || s.min_ts_ns < gmin)) {
-      gmin = s.min_ts_ns;
-    }
-    if (s.max_ts_ns > gmax) {
-      gmax = s.max_ts_ns;
-    }
+  for (const auto& s : seqs) {
+    widenSpan(s, gmin, gmax);
   }
   state_.global_min_ts_ns = gmin;
   state_.global_max_ts_ns = gmax;
