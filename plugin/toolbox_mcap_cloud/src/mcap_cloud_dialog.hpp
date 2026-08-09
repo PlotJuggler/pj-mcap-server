@@ -27,10 +27,21 @@
 #include "credential_store.hpp"  // mcap_cloud::CredentialStore (D6 token store)
 #include "trusted_origins.hpp"   // mcap_cloud::TrustedOrigins (spec §7 guard 1 ledger)
 #include "fetch_worker.hpp"      // mcap_cloud::FetchWorker::GateListResult (onGateListFinished's param type)
-#include "query_filter.h"       // mcap_cloud::FilterSequence (visibleForLocked's param)
 #include "vocab_select.hpp"      // mcap_cloud::GatePhase / resolveGateFilter / autoSelectCustomer / siteNamesFor
 
 namespace mcap_cloud {
+
+// Forward-declared on purpose: including query_filter.h here would drag the
+// whole query engine (query/token.h) into every consumer of this header, and
+// query/token.h declares a global-scope `enum class TokenType` that the Windows
+// SDK also declares as an ENUMERATOR (winnt.h, _TOKEN_INFORMATION_CLASS). A
+// non-type name hides a type name, so any TU that sees <windows.h> before
+// query/token.h fails to compile `TokenType type;` under MSVC. tests/
+// headless_init_test.cpp is exactly such a TU (ixwebsocket pulls in windows.h),
+// and it broke the windows-x64 build when this was an include. Only
+// visibleForLocked's by-reference parameter needs the name; the .cpp includes
+// the real header.
+struct FilterSequence;
 
 class ImportRuntime;
 class LuaQueryEngine;

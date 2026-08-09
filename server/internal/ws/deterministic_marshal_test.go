@@ -33,12 +33,12 @@ func TestCatalogResponsesMarshalDeterministically(t *testing.T) {
 	lf := msg.GetListFiles()
 	for i := 0; i < 24; i++ {
 		lf.Files = append(lf.Files, &pb.FileSummary{
-			Id:     uint64(i),
-			S3Key:  "customer=c/customer_site=s/robot=r/source=src/date=2026-07-13/f.mcap",
-			Tags:   []*pb.Tag{{Key: "vehicle", Value: "arri-182"}},
+			Id:    uint64(i),
+			S3Key: "customer=c/customer_site=s/robot=r/source=src/date=2026-07-13/f.mcap",
+			Tags:  []*pb.Tag{{Key: "vehicle", Value: "arri-182"}},
 		})
 		lf.Metadata[string(rune('0'+i%10))+"x"] = &pb.FlatMetadata{Entries: map[string]string{
-			"s3_key": "customer=c/customer_site=s/robot=r/source=src/date=2026-07-13/f.mcap",
+			"s3_key":     "customer=c/customer_site=s/robot=r/source=src/date=2026-07-13/f.mcap",
 			"size_bytes": "2200000", "message_count": "14904", "topic_count": "174",
 			"chunk_count": "10", "duration_ns": "60000000000",
 			"start_ns": "1752000000000000000", "end_ns": "1752000060000000000",

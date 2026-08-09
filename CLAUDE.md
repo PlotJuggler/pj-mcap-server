@@ -203,6 +203,17 @@ doubt, but don't relitigate the decision itself.
 - **`.ui` files must stay ASCII** (the build hex-embeds them) — PanelEngine's widget
   whitelist has no `QTreeWidget` binding, so any hierarchy UI is a prefix-filter
   combo, not a tree.
+- **`src/query/*.h` must NEVER be reachable from a header that a `<windows.h>`
+  translation unit includes** — `query/token.h` declares a global-scope
+  `enum class TokenType`, and the Windows SDK declares `TokenType` as an
+  ENUMERATOR (`winnt.h`, `_TOKEN_INFORMATION_CLASS`). A non-type name hides a
+  type name, so once `<windows.h>` is seen first, `TokenType type;` fails under
+  MSVC with "unknown override specifier" — never a redefinition error, which is
+  why it reads as nonsense. `mcap_cloud_dialog.hpp` therefore FORWARD-DECLARES
+  `FilterSequence` instead of including `query_filter.h`; including it broke
+  `tests/headless_init_test.cpp` (ixwebsocket pulls in windows.h) and only the
+  `plugin (windows-x64)` CI job caught it — linux and every local build are
+  green. Keep query includes in `.cpp` files.
 - **Ground truth for the C++ live gtests comes from a deterministic synthetic Hive
   corpus** (`gen-ci-fixtures -hive -hive-big` + `gen-3d-fixture`); `make smoke`
   derives everything else (counts, topics) at runtime via `mcaptopics` — never
