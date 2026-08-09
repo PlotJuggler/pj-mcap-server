@@ -157,10 +157,22 @@ struct ServerCaps {
 // GetVocabularyResponse mapped for the client (catalog-vocabulary-rpc.md).
 // ids are SESSION HANDLES bound to `generation` — they renumber across builder
 // rebuilds and MUST only be echoed together with the generation they came from.
+struct VocabRobot {
+  std::uint64_t id = 0;
+  std::string name;
+  std::uint64_t file_count = 0;
+};
 struct VocabSite {
   std::uint64_t id = 0;
   std::string name;
   std::uint64_t file_count = 0;
+  // The server has ALWAYS sent these (GetVocabularyResponse.customers[].sites[]
+  // .robots); the client used to drop them on the floor and rebuild a robot list
+  // client-side from whatever rows a full-site ListFiles had already delivered.
+  // That made robot a POST-download filter, which is backwards: robot is the
+  // cheapest way to cut the download down. Kept so the gate can require a robot
+  // BEFORE any file list is requested.
+  std::vector<VocabRobot> robots;
 };
 struct VocabCustomer {
   std::uint64_t id = 0;
@@ -181,6 +193,13 @@ struct VocabularyInfo {
     for (const auto& c : customers) { n += c.sites.size(); }
     return n;
   }
+  [[nodiscard]] std::size_t totalRobots() const {
+    std::size_t n = 0;
+    for (const auto& c : customers) {
+      for (const auto& s : c.sites) { n += s.robots.size(); }
+    }
+    return n;
+  }
 };
 
 // Server-side ListFiles dimension filter. ids come from a VocabularyInfo and
@@ -188,8 +207,13 @@ struct VocabularyInfo {
 struct ListFilter {
   std::optional<std::uint64_t> customer_id;
   std::optional<std::uint64_t> site_id;
+  // The strict hierarchy means a set robot_id already implies its site+customer;
+  // the server ANDs whatever is present (auryn_read.go adds `f.robot_id = ?`),
+  // so sending it narrows the listing SERVER-SIDE instead of downloading a whole
+  // site and filtering locally.
+  std::optional<std::uint64_t> robot_id;
   std::string generation;  // REQUIRED when any id is set (server: INVALID_REQUEST otherwise)
-  [[nodiscard]] bool empty() const { return !customer_id && !site_id; }
+  [[nodiscard]] bool empty() const { return !customer_id && !site_id && !robot_id; }
 };
 
 // ---------------------------------------------------------------------------

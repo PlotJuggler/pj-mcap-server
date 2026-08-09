@@ -204,9 +204,10 @@ TEST(McapCloudSessionResumeLive, RepeatFetchIsCacheHitZeroTransport) {
   // pullTopicsAsync), so this isn't required for the cache lookup below; it
   // exercises the real gated list path the dialog always uses before a pull.
   // request_id 0 matches FetchWorker's default latest_gate_request_, so this
-  // standalone call is never treated as superseded. customer/site match the
-  // fixture's pinned Hive path (kSeq above).
-  worker.listSequencesFilteredAsync(0, "test", "lab");
+  // standalone call is never treated as superseded. customer/site/robot match
+  // the fixture's pinned Hive path (kSeq above) — robot is a mandatory gate
+  // level, so it must be supplied or the listing resolves to nothing.
+  worker.listSequencesFilteredAsync(0, "test", "lab", "r1");
 
   const std::vector<std::string> topics = allTopics();
 

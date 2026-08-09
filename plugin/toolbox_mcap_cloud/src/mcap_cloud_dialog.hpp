@@ -78,6 +78,10 @@ struct DialogState {
   std::optional<VocabularyInfo> vocabulary;
   std::string gate_customer;  // selected NAMES (durable identity, persisted)
   std::string gate_site;
+  // Third gate level (2026-08-09). A file listing is the most expensive thing
+  // the browse path transfers, so nothing is listed until all three are chosen
+  // and the narrowing happens SERVER-side (ListFilter.robot_id).
+  std::string gate_robot;
   std::uint64_t gate_request_seq = 0;   // last issued id
   GatePhase gate_phase = GatePhase::kDisconnected;
   std::string active_server_key;        // canonical key of the CONNECTED server
@@ -90,6 +94,7 @@ struct DialogState {
   // string copies + JSON encoding on 59 of every 60 ticks for nothing.
   std::vector<std::string> gate_customer_items;
   std::vector<std::string> gate_site_items;
+  std::vector<std::string> gate_robot_items;
 
   // Cached pill-hint text (see widget_data()): gateHintText's kNeedsSelection
   // branch does two std::to_string() calls + concatenation, and kNeedsSelection
@@ -396,6 +401,7 @@ class McapCloudDialog : public PJ::DialogPluginTyped {
   std::string widget_data() override;
   bool onTextChanged(std::string_view widget_name, std::string_view text) override;
   bool onClicked(std::string_view widget_name) override;
+  bool onFolderSelected(std::string_view widget_name, std::string_view path) override;
   bool onToggled(std::string_view widget_name, bool checked) override;
   bool onSelectionChanged(std::string_view widget_name, const std::vector<std::string>& selected) override;
   bool onValueChanged(std::string_view widget_name, int value) override;

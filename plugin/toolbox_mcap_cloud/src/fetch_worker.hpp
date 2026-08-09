@@ -435,7 +435,8 @@ class FetchWorker {
   void fetchVocabularyAsync(std::uint64_t request_id);
   /// List ONE site server-filtered, resolving (customer, site) NAMES against
   /// the worker's latest vocabulary; supersedable by a later gate request id.
-  void listSequencesFilteredAsync(std::uint64_t request_id, std::string customer, std::string site);
+  void listSequencesFilteredAsync(std::uint64_t request_id, std::string customer, std::string site,
+                                  std::string robot);
   /// Called from the GUI thread when a NEW gate request id is issued, so an
   /// in-flight sweep aborts promptly (atomic; safe cross-thread).
   void supersedeGateRequests(std::uint64_t latest) { latest_gate_request_.store(latest); }
@@ -447,7 +448,8 @@ class FetchWorker {
   std::atomic<std::uint64_t> latest_gate_request_{0};
   std::string last_gate_customer_;
   std::string last_gate_site_;
-  std::uint64_t last_gate_request_id_ = 0;  // worker-thread only: the id last_gate_customer_/site_ were requested under
+  std::string last_gate_robot_;
+  std::uint64_t last_gate_request_id_ = 0;  // worker-thread only: the id last_gate_customer_/site_/robot_ were requested under
 
   std::unique_ptr<BackendConnection> backend_;  // catalog-browse socket
   // Credentials remembered from the last successful connectAsync, so a pull can

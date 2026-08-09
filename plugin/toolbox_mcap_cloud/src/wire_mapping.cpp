@@ -107,7 +107,12 @@ VocabularyInfo mapGetVocabularyResponse(const pj_cloud::v1::GetVocabularyRespons
     customer.file_count = c.file_count();
     customer.sites.reserve(static_cast<std::size_t>(c.sites_size()));
     for (const auto& s : c.sites()) {
-      customer.sites.push_back(VocabSite{s.id(), s.name(), s.file_count()});
+      VocabSite site{s.id(), s.name(), s.file_count(), {}};
+      site.robots.reserve(static_cast<std::size_t>(s.robots_size()));
+      for (const auto& r : s.robots()) {
+        site.robots.push_back(VocabRobot{r.id(), r.name(), r.file_count()});
+      }
+      customer.sites.push_back(std::move(site));
     }
     out.customers.push_back(std::move(customer));
   }

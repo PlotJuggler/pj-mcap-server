@@ -419,6 +419,7 @@ void FetchWorker::connectAsync(std::string uri, std::string cert_path, std::stri
     vocab_.reset();
     last_gate_customer_.clear();
     last_gate_site_.clear();
+    last_gate_robot_.clear();
     last_gate_request_id_ = 0;
     std::string error;
     if (!backend_->connect(&error)) {
@@ -506,7 +507,7 @@ void FetchWorker::fetchVocabularyAsync(std::uint64_t request_id) {
 }
 
 void FetchWorker::listSequencesFilteredAsync(std::uint64_t request_id, std::string customer,
-                                             std::string site) {
+                                             std::string site, std::string robot) {
   // The ONLY terminal signal for a gated list: exactly one finish() call on
   // every path out of this function (including the pre-start supersession
   // no-op below) — see F5/F4 in the task's design rationale.
@@ -533,6 +534,7 @@ void FetchWorker::listSequencesFilteredAsync(std::uint64_t request_id, std::stri
   // use time) so the pair can never drift apart — see the tag-edit call site.
   last_gate_customer_ = customer;
   last_gate_site_ = site;
+  last_gate_robot_ = robot;
   last_gate_request_id_ = request_id;
 
   // Two resolution attempts: the cached vocabulary, then ONE refresh when the
@@ -561,7 +563,7 @@ void FetchWorker::listSequencesFilteredAsync(std::uint64_t request_id, std::stri
         vocabularyReady(request_id, *vocab_, /*recovery=*/true);
       }
     }
-    const auto filter = resolveGateFilter(*vocab_, customer, site);
+    const auto filter = resolveGateFilter(*vocab_, customer, site, robot);
     if (!filter) {
       // Names no longer resolve against the (possibly just-refreshed)
       // vocabulary: a rebuild renamed/removed the site, or this is a stale
@@ -708,8 +710,8 @@ void FetchWorker::updateTagsAsync(std::string sequence_name,
   // dialog's id-equality check. Passing last_gate_request_id_ (the id these
   // NAMES were actually requested under) makes a stale pairing correctly
   // no-op as kSuperseded instead.
-  if (!last_gate_customer_.empty() && !last_gate_site_.empty()) {
-    listSequencesFilteredAsync(last_gate_request_id_, last_gate_customer_, last_gate_site_);
+  if (!last_gate_customer_.empty() && !last_gate_site_.empty() && !last_gate_robot_.empty()) {
+    listSequencesFilteredAsync(last_gate_request_id_, last_gate_customer_, last_gate_site_, last_gate_robot_);
     return;
   }
 
