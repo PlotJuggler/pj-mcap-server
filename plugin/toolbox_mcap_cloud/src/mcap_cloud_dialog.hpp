@@ -120,6 +120,18 @@ struct DialogState {
   // Collision-safe: any display that two keys share falls back to the full key
   // (see rebuildSeqDisplayLocked). Parallel to sequence_names by index.
   std::vector<std::string> seq_display_names;
+  // How many LEADING rows of `sequences` are guaranteed unchanged since the
+  // last seq_epoch bump. A progressive listing sweep only ever APPENDS, so the
+  // view cache can extend itself instead of rebuilding all N rows per render
+  // window (which made a sweep O(N x windows): 43k rows x ~15 windows). 0 means
+  // "assume nothing" — every non-append mutation (full populate, sort, erase)
+  // resets it, so the cache falls back to a full rebuild.
+  std::size_t seq_stable_prefix = 0;
+  // Occurrence count per candidate display name, maintained alongside
+  // seq_display_names so an append can detect a NEW collision in O(new) instead
+  // of recounting all names. A collision forces one full rebuildSeqDisplayLocked
+  // (rare: candidates keep the unique leaf filename).
+  std::unordered_map<std::string, int> seq_display_counts;
   // Bumped on every content/order change to `sequences` (populate + sort) so the
   // seqTable view cache below can detect staleness with a cheap counter compare.
   std::size_t seq_epoch = 0;
@@ -391,6 +403,13 @@ struct DialogState {
 };
 
 class McapCloudDialog : public PJ::DialogPluginTyped {
+  // The progressive-sweep path (appendSequencesLocked + the view cache's
+  // incremental extend) is private but is exactly where a wrong change ships
+  // silently: the end-of-sweep repopulate hides mid-sweep corruption from every
+  // other test. This friend lets sweep_incremental_test.cpp assert the invariant
+  // that append-in-chunks == one full populate.
+  friend struct McapCloudDialogSweepAccess;
+
  public:
   McapCloudDialog();
   ~McapCloudDialog() override;
@@ -583,6 +602,11 @@ class McapCloudDialog : public PJ::DialogPluginTyped {
   // picker is reseeded to the dataset's full [min,max] span (final result
   // only — the progressive early populate leaves the picker untouched).
   void populateSequencesLocked(std::vector<SequenceInfo>& sequences, bool seed_dates);
+  // Append-only fast path for a progressive sweep: adds seqs[from..) to the
+  // existing state instead of rebuilding it. Returns false when it cannot be
+  // used (a display-name collision needs a global re-derive), in which case the
+  // caller must fall back to populateSequencesLocked.
+  [[nodiscard]] bool appendSequencesLocked(const std::vector<SequenceInfo>& seqs, std::size_t from);
   // Recompute seq_display_names from sequence_names. Call after any rebuild of
   // sequence_names (populate + sort). Collision-safe: a display shared by two
   // distinct keys falls back to the full key for those rows.

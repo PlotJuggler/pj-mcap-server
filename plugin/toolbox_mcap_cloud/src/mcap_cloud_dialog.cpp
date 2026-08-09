@@ -1028,7 +1028,66 @@ std::string McapCloudDialog::widget_data() {
                      cache.seq_filter == state_.seq_filter && cache.seq_filter_regex == state_.seq_filter_regex &&
                      cache.query_text == state_.query_text && cache.date_from_ns == state_.date_from_ns &&
                      cache.date_to_ns == state_.date_to_ns;
-    if (!cache_hit) {
+    // INCREMENTAL EXTEND: during a progressive sweep only new rows arrive, so
+    // when every filter input is unchanged and the previously built rows are
+    // still a valid prefix (seq_stable_prefix, set only by appendSequencesLocked)
+    // the cache can append the tail instead of rebuilding all N rows. This is
+    // what stops a sweep being O(rows x windows) — at 43k rows over ~15 render
+    // windows the full rebuild dominated the whole sweep.
+    //
+    // File mode only: aggregate re-sessionizes every file, so an append can
+    // change EARLIER rows (a new file extends the last session's span/label).
+    const bool inputs_unchanged =
+        cache.valid && !state_.aggregate && !cache.aggregate && cache.filter_tab == state_.filter_tab &&
+        cache.basic_filter == state_.basic_filter && cache.seq_filter == state_.seq_filter &&
+        cache.seq_filter_regex == state_.seq_filter_regex && cache.query_text == state_.query_text &&
+        cache.date_from_ns == state_.date_from_ns && cache.date_to_ns == state_.date_to_ns;
+    const bool can_extend = !cache_hit && inputs_unchanged && state_.seq_stable_prefix > 0 &&
+                            state_.seq_stable_prefix == cache.rows.size() &&
+                            state_.sequences.size() > state_.seq_stable_prefix;
+    if (can_extend) {
+      const auto extend_t0 = std::chrono::steady_clock::now();
+      // Only the appended tail needs filtering; the prefix's verdicts already
+      // sit in cache.visible and cannot change (its rows and inputs are fixed).
+      std::vector<FilterSequence> tail;
+      tail.reserve(state_.sequences.size() - state_.seq_stable_prefix);
+      for (std::size_t i = state_.seq_stable_prefix; i < state_.sequences.size(); ++i) {
+        const auto& rec = state_.sequences[i];
+        tail.push_back({rec.name, rec.min_ts_ns, rec.max_ts_ns, canonicalFilterFields(rec.name)});
+      }
+      FilterParams params;
+      params.name_filter = state_.seq_filter;
+      params.name_regex = state_.seq_filter_regex;
+      params.query_text = state_.filter_tab == 1 ? state_.query_text : std::string{};
+      params.date_from_ns = state_.date_from_ns;
+      params.date_to_ns = state_.date_to_ns;
+      ensureQuerySchemaLocked();
+      std::vector<int> tail_visible = computeVisibleSequences(tail, params, state_.query_schema);
+      if (state_.filter_tab == 0 && !state_.basic_filter.empty()) {
+        std::vector<int> narrowed;
+        narrowed.reserve(tail_visible.size());
+        for (int idx : tail_visible) {
+          if (matchesBasicFilter(tail[static_cast<std::size_t>(idx)].metadata, state_.basic_filter)) {
+            narrowed.push_back(idx);
+          }
+        }
+        tail_visible = std::move(narrowed);
+      }
+      for (std::size_t i = state_.seq_stable_prefix; i < state_.sequences.size(); ++i) {
+        const auto& rec = state_.sequences[i];
+        const std::string& display = i < state_.seq_display_names.size() ? state_.seq_display_names[i] : rec.name;
+        cache.rows.push_back({display, dateOnly(rec.max_ts_ns), formatBytes(rec.total_size_bytes)});
+        cache.row_keys.push_back({rec.name});
+      }
+      for (int idx : tail_visible) {  // tail-relative -> absolute row index
+        cache.visible.push_back(static_cast<int>(state_.seq_stable_prefix) + idx);
+      }
+      cache.seq_epoch = state_.seq_epoch;
+      state_.seq_stable_prefix = state_.sequences.size();  // consumed
+      last_rebuild_ms_ =
+          std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - extend_t0).count();
+      state_.seq_rows_pushed = false;  // rows grew: re-push them this tick
+    } else if (!cache_hit) {
       const auto rebuild_t0 = std::chrono::steady_clock::now();
       std::vector<FilterSequence> filter_seqs;
       filter_seqs.reserve(state_.sequences.size());
@@ -2968,8 +3027,25 @@ void McapCloudDialog::onGatePageReady(std::uint64_t request_id, std::vector<Sequ
   const auto window = std::chrono::milliseconds(
       std::max<std::int64_t>(150, static_cast<std::int64_t>(3.0 * last_rebuild_ms_)));
   if (reset || now - last_progressive_render_ >= window) {
-    populateSequencesLocked(progressive_seqs_, /*seed_dates=*/false);
-    sortSequencesLocked();
+    // Append-only fast path: a sweep only ever grows the list, so when no sort
+    // is active (a sort would reorder every row) extend the existing state
+    // instead of rebuilding it. Falls back to the full path whenever append
+    // cannot apply — a display-name collision, or state that is not a clean
+    // prefix of what arrived.
+    // The sort is DEFERRED for the duration of the sweep. Sorting per window
+    // costs a full reorder plus a second display-name derive, and — worse — it
+    // destroys the append invariant the incremental view-cache extend depends
+    // on, forcing a full N-row rebuild every window (the O(rows x windows)
+    // blowup that froze the panel). Rows therefore fill in ARRIVAL order while
+    // loading and snap to sorted order when the sweep ends; server keyset order
+    // is Hive-key order, so for the sorted-by-Name default the visible
+    // difference is slight. Correctness is unaffected: onGateListFinished ->
+    // onSequencesReady always repopulates + sorts authoritatively.
+    const bool can_append = !state_.sequences.empty() && state_.sequences.size() < progressive_seqs_.size();
+    if (!can_append || !appendSequencesLocked(progressive_seqs_, state_.sequences.size())) {
+      populateSequencesLocked(progressive_seqs_, /*seed_dates=*/false);
+      sortSequencesLocked();
+    }
     last_progressive_render_ = now;
   }
 }
@@ -3328,7 +3404,8 @@ void McapCloudDialog::rebuildSeqDisplayLocked() {
   // stripped, date= segment dropped).
   std::vector<std::string> candidates;
   candidates.reserve(state_.sequence_names.size());
-  std::unordered_map<std::string, int> counts;
+  std::unordered_map<std::string, int>& counts = state_.seq_display_counts;
+  counts.clear();
   for (const std::string& key : state_.sequence_names) {
     std::string disp = shortenSequenceName(key);
     ++counts[disp];
@@ -3346,7 +3423,65 @@ void McapCloudDialog::rebuildSeqDisplayLocked() {
   }
 }
 
+bool McapCloudDialog::appendSequencesLocked(const std::vector<SequenceInfo>& seqs, std::size_t from) {
+  if (from > seqs.size() || state_.sequences.size() != from) {
+    return false;  // not a clean append onto what we already hold
+  }
+  // Derive the new rows' display names FIRST: a candidate that collides with an
+  // existing display forces the earlier row to fall back to its full key, which
+  // is a global re-derive. Bail out and let the caller do a full populate — rare,
+  // because a candidate keeps the (unique) leaf filename.
+  const std::size_t added = seqs.size() - from;
+  std::vector<std::string> new_displays;
+  new_displays.reserve(added);
+  for (std::size_t i = from; i < seqs.size(); ++i) {
+    std::string cand = shortenSequenceName(seqs[i].name);
+    auto it = state_.seq_display_counts.find(cand);
+    if (it != state_.seq_display_counts.end()) {
+      return false;  // collision: needs the global two-pass derive
+    }
+    new_displays.push_back(std::move(cand));
+  }
+
+  state_.sequences.reserve(seqs.size());
+  state_.sequence_names.reserve(seqs.size());
+  state_.seq_display_names.reserve(seqs.size());
+  std::int64_t gmin = state_.global_min_ts_ns;
+  std::int64_t gmax = state_.global_max_ts_ns;
+  for (std::size_t i = from; i < seqs.size(); ++i) {
+    const auto& s = seqs[i];
+    SequenceRecord rec;
+    rec.name = s.name;
+    rec.min_ts_ns = s.min_ts_ns;
+    rec.max_ts_ns = s.max_ts_ns;
+    rec.total_size_bytes = s.total_size_bytes;
+    for (const auto& kv : s.user_metadata) {
+      rec.metadata.emplace(kv.first, kv.second);
+    }
+    rec.tags = s.tags;
+    state_.sequence_names.push_back(rec.name);
+    state_.sequences.push_back(std::move(rec));
+    ++state_.seq_display_counts[new_displays[i - from]];
+    state_.seq_display_names.push_back(std::move(new_displays[i - from]));
+    if (s.min_ts_ns > 0 && (gmin == 0 || s.min_ts_ns < gmin)) {
+      gmin = s.min_ts_ns;
+    }
+    if (s.max_ts_ns > gmax) {
+      gmax = s.max_ts_ns;
+    }
+  }
+  state_.global_min_ts_ns = gmin;
+  state_.global_max_ts_ns = gmax;
+  // Everything before `from` kept its row and its position: the view cache may
+  // extend itself rather than rebuild.
+  state_.seq_stable_prefix = from;
+  ++state_.seq_epoch;
+  return true;
+}
+
 void McapCloudDialog::populateSequencesLocked(std::vector<SequenceInfo>& seqs, bool seed_dates) {
+  // A full rebuild replaces every row: the view cache may assume nothing.
+  state_.seq_stable_prefix = 0;
   state_.sequences.clear();
   state_.sequence_names.clear();
   state_.sequences.reserve(seqs.size());
@@ -3445,6 +3580,7 @@ void McapCloudDialog::sortSequencesLocked() {
     }
   }
   std::sort(state_.seq_selected_rows.begin(), state_.seq_selected_rows.end());
+  state_.seq_stable_prefix = 0;  // order changed: no row keeps its position
   ++state_.seq_epoch;  // row order changed → invalidate the seqTable view cache
 }
 
