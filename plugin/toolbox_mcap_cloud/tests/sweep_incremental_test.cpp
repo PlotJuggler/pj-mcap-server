@@ -34,6 +34,12 @@ struct McapCloudDialogSweepAccess {
   static const std::vector<std::string>& displays(McapCloudDialog& d) { return d.state_.seq_display_names; }
   static std::size_t stablePrefix(McapCloudDialog& d) { return d.state_.seq_stable_prefix; }
   static std::size_t count(McapCloudDialog& d) { return d.state_.sequences.size(); }
+  static const std::vector<std::string>& selected(McapCloudDialog& d) { return d.state_.selected_sequences; }
+  // Renders once so the seqTable view cache (and its row_to_keys map, in the
+  // modes that build one) reflects current state — the dialog resolves a click
+  // against that cache.
+  static void render(McapCloudDialog& d) { (void)d.widget_data(); }
+  static void sort(McapCloudDialog& d) { d.sortSequencesLocked(); }
 };
 
 namespace {
@@ -125,6 +131,84 @@ TEST(SweepIncremental, StablePrefixMarksExactlyTheUnchangedRows) {
   EXPECT_EQ(Access::stablePrefix(d), 100u)
       << "after appending onto 100 rows, exactly those 100 are unchanged";
   EXPECT_EQ(Access::count(d), 300u);
+}
+
+// Clicking a row must resolve to the right s3_key.
+//
+// The seqTable row->keys hash map (43k string-keyed inserts, each allocating a
+// key copy, a vector and a string) was MEASURED at 48% of the view-cache rebuild
+// and is no longer built in file mode: `display` is seq_display_names[i] and the
+// sole key is sequences[i].name, a 1:1 correspondence sortSequencesLocked
+// preserves. onSelectionChanged resolves through those parallel vectors instead.
+//
+// That path had ZERO coverage while being rewritten. If it is wrong, a user
+// clicks a recording and the Topics panel silently stays empty — no crash, no
+// failing test, just a dead UI.
+TEST(SweepIncremental, ClickResolvesDisplayLabelToTheRealS3Key) {
+  mcap_cloud_test::HermeticEnv env("mcap-cloud-sweep-click");
+  const auto all = corpus(300);
+
+  McapCloudDialog d;
+  {
+    auto copy = all;
+    Access::populate(d, copy);
+  }
+  Access::render(d);
+
+  // The host harvests column-0 TEXT, so a click arrives as the DISPLAY label.
+  const auto& displays = Access::displays(d);
+  const auto& names = Access::names(d);
+  ASSERT_EQ(displays.size(), names.size());
+  ASSERT_GE(displays.size(), 3u);
+
+  for (std::size_t idx : {std::size_t{0}, displays.size() / 2, displays.size() - 1}) {
+    ASSERT_TRUE(d.onSelectionChanged("seqTable", {displays[idx]}))
+        << "the dialog must claim the seqTable selection event";
+    const auto& sel = Access::selected(d);
+    ASSERT_EQ(sel.size(), 1u) << "display label " << displays[idx] << " resolved to "
+                              << sel.size() << " keys, expected exactly 1";
+    EXPECT_EQ(sel[0], names[idx])
+        << "display label " << displays[idx] << " resolved to the WRONG file: got " << sel[0]
+        << ", expected " << names[idx];
+  }
+
+  // Multi-select must resolve every row, not just the first.
+  ASSERT_TRUE(d.onSelectionChanged("seqTable", {displays[1], displays[5], displays[9]}));
+  EXPECT_EQ(Access::selected(d).size(), 3u) << "a 3-row selection must resolve to 3 keys";
+
+  // An unknown label must resolve to nothing rather than to an arbitrary row.
+  ASSERT_TRUE(d.onSelectionChanged("seqTable", {"no-such-row.mcap"}));
+  EXPECT_TRUE(Access::selected(d).empty()) << "an unknown label must not resolve to some other file";
+}
+
+// Selection must survive a sort: sortSequencesLocked reorders `sequences`, then
+// rebuilds sequence_names and re-derives seq_display_names. The lookup depends
+// on those three staying parallel — if a sort ever broke that, clicks would
+// silently resolve to the wrong recording.
+TEST(SweepIncremental, ClickResolvesCorrectlyAfterASort) {
+  mcap_cloud_test::HermeticEnv env("mcap-cloud-sweep-click-sorted");
+  const auto all = corpus(120);
+
+  McapCloudDialog d;
+  {
+    auto copy = all;
+    Access::populate(d, copy);
+  }
+  Access::sort(d);
+  Access::render(d);
+
+  const auto& displays = Access::displays(d);
+  const auto& names = Access::names(d);
+  ASSERT_EQ(displays.size(), names.size());
+  ASSERT_GE(displays.size(), 2u);
+
+  for (std::size_t idx : {std::size_t{0}, displays.size() - 1}) {
+    ASSERT_TRUE(d.onSelectionChanged("seqTable", {displays[idx]}));
+    const auto& sel = Access::selected(d);
+    ASSERT_EQ(sel.size(), 1u);
+    EXPECT_EQ(sel[0], names[idx])
+        << "after sorting, display/name vectors are no longer parallel — clicks resolve to the wrong file";
+  }
 }
 
 }  // namespace

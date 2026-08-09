@@ -80,15 +80,26 @@ func compressible(m *pb.ServerMessage) bool {
 // error along the compression path is non-fatal — it falls back to raw. The outer
 // EncodedServerMessage carries ZERO request_id/subscription_id: the inner message
 // is the sole routing authority (the client unwraps before it routes).
+// marshalForCompression serializes a response for the compression path with
+// DETERMINISTIC map ordering.
+//
+// Map fields — notably ListFilesResponse.metadata, ~8 derived keys per file —
+// otherwise serialize in Go's RANDOMIZED iteration order, so an identical key
+// set lands at a different offset in every file and ZSTD cannot match the
+// repetition across files. Measured on a 32,000-file listing against an 8.78M-row
+// catalog: 1,111,112 B on the wire non-deterministic vs 512,385 B deterministic,
+// from the SAME 15,163,143 marshaled bytes (13.6x -> 29.6x). Sorting 8 keys per
+// file is negligible beside the query and the compression itself.
+//
+// Named (rather than inlined) so deterministic_marshal_test.go can pin it:
+// dropping Deterministic changes no behaviour and breaks no other test, it just
+// silently doubles catalog bandwidth.
+func marshalForCompression(m *pb.ServerMessage) ([]byte, error) {
+	return proto.MarshalOptions{Deterministic: true}.Marshal(m)
+}
+
 func (rc *responseCompressor) marshalResponse(m *pb.ServerMessage, negotiated bool) ([]byte, error) {
-	// DETERMINISTIC marshaling: map fields (notably ListFilesResponse.metadata,
-	// 8 derived keys per file) otherwise serialize in Go's RANDOMIZED map
-	// iteration order, so the same key set lands at a different offset in every
-	// file and ZSTD cannot match the repetition across files. Measured on a
-	// 32,000-file listing: the flat map's bytes were compressing at only ~5.7:1
-	// while the rest of the response hit ~23:1. Sorting 8 keys per file is
-	// negligible next to the query and the compression itself.
-	raw, err := proto.MarshalOptions{Deterministic: true}.Marshal(m)
+	raw, err := marshalForCompression(m)
 	if err != nil {
 		return nil, err
 	}
