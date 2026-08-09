@@ -54,6 +54,11 @@ schema/IPC changes MUST update it.
   customer+site selection fed by `GetVocabulary`, server-filtered (`ListFiles`) and
   progressively rendered, persisted per server -- the executed plan doc was removed
   once it landed (recover from git history if the design record is ever needed).
+  **Extended to customer+site+ROBOT (2026-08-09)**: robot was a client-side filter
+  applied AFTER downloading a whole site's listing, even though the server had
+  accepted `FileFilter.robot_id` and shipped robot nodes since M3. It is now a
+  required third gate level sending `robot_id`, so the narrowing happens
+  server-side and a 43k-row site listing never crosses the wire unasked.
 - **Team rule:** technical decisions are cross-checked with a standing Codex instance
   before they're locked; milestone boundaries get adversarial review (Codex + Claude —
   this caught ~35 real defects across the M6 tail).
@@ -469,16 +474,23 @@ cd plugin/toolbox_mcap_cloud \
   && cmake -B build -DCMAKE_TOOLCHAIN_FILE=build/conan_toolchain.cmake -DCMAKE_BUILD_TYPE=Release \
   && cmake --build build -j"$(nproc)"   # -> plugin/toolbox_mcap_cloud/build/bin/
 
-# Run PJ4 — ALWAYS the CLOUD-FORK app (the sibling checkout ~/ws_plotjuggler/PJ4-cloud;
-# its run.sh auto-loads plugins from its sibling pj-official-plugins build dir). NEVER
-# the PRISTINE upstream PJ4 checkout: it carries NONE of the host-side changes (SDK
-# tail slots, RangeSlider markers, widget bindings, …) — the plugin .so still loads
-# there, so plugin features appear while host features silently vanish, which looks
-# like "nothing changed".
-cd ~/ws_plotjuggler/PJ4-cloud && ./run.sh
-# After a host edit: rebuild the fork app (./build.sh in PJ4-cloud) and commit to its
-# `cloud` branch. After a connector edit: rebuild plugin/toolbox_mcap_cloud (this
-# repo's root ./build.sh does it and re-stages the .so).
+# Run PJ4 — the app is ~/ws_plotjuggler/PJ4 (branch `main`).
+#
+# [CORRECTED 2026-08-09] This block used to insist on a `~/ws_plotjuggler/PJ4-cloud`
+# fork and to say the pristine upstream checkout must NEVER be used. That directory
+# DOES NOT EXIST on this machine, so the instruction sent agents to a dead path. The
+# host-side changes it was protecting (SDK tail slots, RangeSlider markers, widget
+# bindings) were upstreamed, so plain PJ4 carries them.
+#
+# Point it at this repo's plugin build dir explicitly (this is how the running
+# instance was launched, verified 2026-08-09):
+cd ~/ws_plotjuggler/PJ4 && ./run.sh
+#   or: ~/ws_plotjuggler/PJ4/build/pj_app/plotjuggler4 \
+#         --plugin-dir <this-repo>/plugin/toolbox_mcap_cloud/build/bin/
+# After a host edit: rebuild PJ4 (./build.sh there). After a connector edit: rebuild
+# plugin/toolbox_mcap_cloud (this repo's root ./build.sh does it and re-stages the
+# .so). NOTE: ~/ws_plotjuggler/PJ4/appimage_plugins/ holds a STALE staged copy that
+# the --plugin-dir launch above does not use.
 ```
 
 ### Once implementation lands in this repo (per the plans)
