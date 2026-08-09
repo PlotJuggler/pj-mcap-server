@@ -226,10 +226,12 @@ std::string sessionLabel(const mcap_cloud::AggSession& s) {
 // (server-filtered, fed from GetVocabulary — filter_customer /
 // filter_customer_site, which share basicPane's grid but stay visible in
 // Advanced mode; resolved in onIndexChanged and populated in
-// getWidgetData()); only robot/source remain as client-side equality filters
-// applied on top of the already gate-scoped result set.
-const std::array<std::pair<const char*, const char*>, 2> kLocalBasicFilterKeys = {{
-    {"robot", "Robot"},
+// getWidgetData()); ROBOT joined them there too (2026-08-09) — it is the
+// cheapest dimension that shrinks the file listing, and the server has always
+// accepted it (FileFilter.robot_id -> `f.robot_id = ?`), so filtering by robot
+// AFTER downloading a whole site was backwards. Only source remains a
+// client-side equality filter applied on top of the gate-scoped result set.
+const std::array<std::pair<const char*, const char*>, 1> kLocalBasicFilterKeys = {{
     {"source", "Source"},
 }};
 
@@ -607,6 +609,12 @@ void McapCloudDialog::initFromSettings() {
       state_.basic_filter[key] = value;
     }
   }
+  // Robot left kLocalBasicFilterKeys for the browse gate (2026-08-09), so the
+  // loop above no longer reads its legacy global key. Drop it for the same
+  // reason customer/site are dropped below: a downgrade must not resurrect a
+  // local equality filter that would silently hide rows the gate already
+  // scoped. Unconditional remove — absent keys are a no-op.
+  settings.remove("mcap_cloud/basic_filter/robot");
 
   // NOTE: `history` itself is moved-from above — test the seeded member. (The
   // previous `!history.empty()` check silently killed the auto-connect when
@@ -769,6 +777,13 @@ std::string McapCloudDialog::widget_data() {
   const bool save_dir_enabled = state_.save_mcap && !state_.fetch_active;
   wd.setEnabled("saveDirectory", save_dir_enabled);
   wd.setEnabled("labelSaveDirectory", save_dir_enabled);
+  // Directory chooser for the export path. The plugin stays Qt-free: the picker
+  // declaration is a widget_data key the HOST acts on (PanelEngine runs
+  // QFileDialog::getExistingDirectory and posts the result back as
+  // onFolderSelected) — the plugin never touches Qt. Re-declared every tick
+  // because PanelEngine resolves the picker against the cached previous view.
+  wd.setFolderPicker("buttonBrowseSaveDir", "Browse...", "Select MCAP output directory");
+  wd.setEnabled("buttonBrowseSaveDir", save_dir_enabled);
   wd.setEnabled("checkSaveMcap", !state_.fetch_active);
 
   // PJ3 parity: combo always lists the MRU history + the default server pin.
@@ -1157,15 +1172,15 @@ std::string McapCloudDialog::widget_data() {
     wd.setChecked("radioFilterBasic", state_.filter_tab == 0);
     wd.setChecked("radioFilterAdvanced", state_.filter_tab == 1);
     // basicPane holds all four filter rows in ONE grid so the combo columns
-    // align. Customer/Site are the MANDATORY browse gate, so the pane stays
-    // visible in Advanced mode and only the Robot/Source rows are hidden —
-    // otherwise an Advanced-mode user with no restored site could never pass
-    // the gate. Their grid rows collapse to zero height once both the label
-    // and the combo in them are hidden.
+    // align. Customer/Site/Robot are the MANDATORY browse gate, so the pane
+    // stays visible in Advanced mode and only the Source row is hidden —
+    // otherwise an Advanced-mode user with no restored selection could never
+    // pass the gate. Its grid row collapses to zero height once both the label
+    // and the combo in it are hidden.
     const bool basic_mode = state_.filter_tab == 0;
     wd.setVisible("basicPane", true);
-    wd.setVisible("labelRobot", basic_mode);
-    wd.setVisible("filter_robot", basic_mode);
+    wd.setVisible("labelRobot", true);
+    wd.setVisible("filter_robot", true);
     wd.setVisible("labelSource", basic_mode);
     wd.setVisible("filter_source", basic_mode);
     wd.setVisible("advancedPane", state_.filter_tab == 1);
@@ -1201,25 +1216,26 @@ std::string McapCloudDialog::widget_data() {
     // unselected (either no vocabulary yet, or the persisted/typed name isn't in
     // this vocabulary).
     {
-      int customer_idx = -1, site_idx = -1;
+      const auto index_of = [](const std::vector<std::string>& items, const std::string& sel) {
+        for (std::size_t i = 0; i < items.size(); ++i) {
+          if (items[i] == sel) {
+            return static_cast<int>(i);
+          }
+        }
+        return -1;
+      };
       const auto& customers = state_.gate_customer_items;
       const auto& sites = state_.gate_site_items;
-      for (std::size_t i = 0; i < customers.size(); ++i) {
-        if (customers[i] == state_.gate_customer) {
-          customer_idx = static_cast<int>(i);
-          break;
-        }
-      }
-      for (std::size_t i = 0; i < sites.size(); ++i) {
-        if (sites[i] == state_.gate_site) {
-          site_idx = static_cast<int>(i);
-          break;
-        }
-      }
+      const auto& robots = state_.gate_robot_items;
       wd.setItems("filter_customer", customers);
-      wd.setCurrentIndex("filter_customer", customer_idx);
+      wd.setCurrentIndex("filter_customer", index_of(customers, state_.gate_customer));
       wd.setItems("filter_customer_site", sites);
-      wd.setCurrentIndex("filter_customer_site", site_idx);
+      wd.setCurrentIndex("filter_customer_site", index_of(sites, state_.gate_site));
+      // Robot is the third gate level, fed from GetVocabulary like the other
+      // two — NOT from the loaded rows, which is the point: the robot must be
+      // choosable BEFORE any file list has been transferred.
+      wd.setItems("filter_robot", robots);
+      wd.setCurrentIndex("filter_robot", index_of(robots, state_.gate_robot));
     }
 
     // (The D8 "Folder:" prefix combo was removed 2026-07-12: with Hive keys the
@@ -1316,8 +1332,10 @@ std::string McapCloudDialog::widget_data() {
     std::vector<int> disabled;
     for (size_t i = 0; i < state_.topic_names.size(); ++i) {
       const auto& name = state_.topic_names[i];
+      // All mode: every row is inert (the mode already selects everything).
       // Custom mode: a zero-count row is not selectable (nothing to download).
-      if (!state_.topics_all && i < state_.topic_infos.size() && state_.topic_infos[i].message_count == 0) {
+      if (state_.topics_all ||
+          (i < state_.topic_infos.size() && state_.topic_infos[i].message_count == 0)) {
         disabled.push_back(static_cast<int>(i));
       }
       if (nameMatches(name, state_.topic_filter, state_.topic_filter_regex)) {
@@ -1347,10 +1365,15 @@ std::string McapCloudDialog::widget_data() {
     }
     wd.setChecked("radioTopicsAll", state_.topics_all);
     wd.setChecked("radioTopicsCustom", !state_.topics_all);
-    // In All mode the table is inert — the mode already selects everything.
-    wd.setEnabled("topicTable", !state_.topics_all);
+    // The table stays ENABLED in both modes. Disabling the QTableWidget itself
+    // also disables its scrollbars and wheel/keyboard handling, which made a
+    // long topic list unbrowsable in All mode (a 174-topic robot showed only the
+    // first screenful, with a dead scrollbar). Inertness is expressed per-row
+    // instead: disabled_rows clears ItemIsEnabled|ItemIsSelectable on each item,
+    // so All mode is still read-only but remains scrollable and sortable.
+    wd.setEnabled("topicTable", true);
     wd.setVisibleRows("topicTable", visible);
-    wd.setDisabledRows("topicTable", state_.topics_all ? std::vector<int>{} : disabled);
+    wd.setDisabledRows("topicTable", disabled);
     if (!state_.topic_selected_rows.empty()) {
       wd.setSelectedRows("topicTable", state_.topic_selected_rows);
     }
@@ -1688,7 +1711,7 @@ bool McapCloudDialog::onClicked(std::string_view widget_name) {
     // NEVER fetched unfiltered: with both gate names already chosen, re-sweep
     // the same site; otherwise re-fetch the vocabulary (mirrors a fresh
     // connect's gate entry point).
-    std::string customer, site;
+    std::string customer, site, robot;
     std::uint64_t id = 0;
     bool has_selection = false;
     {
@@ -1696,18 +1719,24 @@ bool McapCloudDialog::onClicked(std::string_view widget_name) {
       if (!state_.connected || state_.connecting || state_.fetch_active) {
         return true;
       }
-      has_selection = !state_.gate_customer.empty() && !state_.gate_site.empty();
+      // All THREE gate levels are required before a listing is re-issued; a
+      // partial selection falls through to a vocabulary refresh instead.
+      has_selection =
+          !state_.gate_customer.empty() && !state_.gate_site.empty() && !state_.gate_robot.empty();
       if (has_selection) {
         customer = state_.gate_customer;
         site = state_.gate_site;
+        robot = state_.gate_robot;
         id = beginGateRequestLocked(GatePhase::kListLoading);
       } else {
         id = beginGateRequestLocked(GatePhase::kVocabularyLoading);
       }
     }
     if (has_selection) {
-      notify(PJ::ToolboxMessageLevel::kInfo, fmt::format("Refreshing {}/{}…", customer, site));
-      postCommand([w = worker_.get(), id, customer, site] { w->listSequencesFilteredAsync(id, customer, site); });
+      notify(PJ::ToolboxMessageLevel::kInfo, fmt::format("Refreshing {}/{}/{}…", customer, site, robot));
+      postCommand([w = worker_.get(), id, customer, site, robot] {
+        w->listSequencesFilteredAsync(id, customer, site, robot);
+      });
     } else {
       notify(PJ::ToolboxMessageLevel::kInfo, "Refreshing catalog…");
       postCommand([w = worker_.get(), id] { w->fetchVocabularyAsync(id); });
@@ -2049,6 +2078,20 @@ bool McapCloudDialog::onClicked(std::string_view widget_name) {
   return false;
 }
 
+bool McapCloudDialog::onFolderSelected(std::string_view widget_name, std::string_view path) {
+  // The host ran the directory chooser for buttonBrowseSaveDir (declared as a
+  // folder picker in widget_data) and hands back the chosen path. An empty path
+  // means the user cancelled — leave the configured directory untouched. The
+  // next render tick pushes the new value into the saveDirectory line edit and
+  // re-opens the Download gate, and saveConfig() persists it.
+  if (widget_name != "buttonBrowseSaveDir" || path.empty()) {
+    return false;
+  }
+  std::lock_guard<std::mutex> lock(state_.mu);
+  state_.save_directory = std::string(path);
+  return true;
+}
+
 bool McapCloudDialog::onToggled(std::string_view widget_name, bool checked) {
   if (widget_name == "allowInsecure") {
     std::lock_guard<std::mutex> lock(state_.mu);
@@ -2267,9 +2310,11 @@ bool McapCloudDialog::onIndexChanged(std::string_view widget_name, int index) {
       if (new_customer == state_.gate_customer) {
         return true;  // no-op re-pick
       }
-      // A new customer invalidates any site pick made under the OLD one.
+      // A new customer invalidates any site pick made under the OLD one, and
+      // with it the robot (robots are scoped to a site).
       state_.gate_customer = new_customer;
       state_.gate_site.clear();
+      state_.gate_robot.clear();
       refreshGateComboItemsLocked();  // the site list is scoped to the new customer
       server_key = state_.active_server_key;
       (void)beginGateRequestLocked(GatePhase::kNeedsSelection);  // clears the old site's rows immediately
@@ -2278,11 +2323,13 @@ bool McapCloudDialog::onIndexChanged(std::string_view widget_name, int index) {
     const std::string prefix = gateSettingsPrefix(server_key);
     settings.setString(prefix + "customer", new_customer);
     settings.remove(prefix + "site");
+    settings.remove(prefix + "robot");
     return true;
   }
   if (widget_name == "filter_customer_site") {
     std::string new_site;
     std::string customer;
+    std::string robot;
     std::string server_key;
     std::uint64_t id = 0;
     {
@@ -2302,15 +2349,65 @@ bool McapCloudDialog::onIndexChanged(std::string_view widget_name, int index) {
         return true;  // no-op re-pick
       }
       state_.gate_site = new_site;
-      refreshGateComboItemsLocked();  // same customer/site list, new selection
+      // A site pick no longer starts a listing: robot is the third mandatory
+      // level, so the sequence table stays empty until it is chosen. A site
+      // with exactly ONE robot auto-selects it (mirrors autoSelectCustomer) —
+      // making the user pick from a one-item list is pure friction.
+      state_.gate_robot = autoSelectRobot(*state_.vocabulary, state_.gate_customer, new_site);
+      refreshGateComboItemsLocked();  // rescopes the robot list to the new site
       customer = state_.gate_customer;
+      robot = state_.gate_robot;
+      server_key = state_.active_server_key;
+      id = beginGateRequestLocked(robot.empty() ? GatePhase::kNeedsSelection : GatePhase::kListLoading);
+    }
+    SettingsStore settings(settings_);
+    const std::string prefix = gateSettingsPrefix(server_key);
+    settings.setString(prefix + "site", new_site);
+    if (robot.empty()) {
+      settings.remove(prefix + "robot");
+      return true;  // wait for the robot pick — nothing is listed yet
+    }
+    settings.setString(prefix + "robot", robot);
+    notify(PJ::ToolboxMessageLevel::kInfo, fmt::format("Loading {}/{}/{}…", customer, new_site, robot));
+    postCommand([w = worker_.get(), id, customer, new_site, robot] {
+      w->listSequencesFilteredAsync(id, customer, new_site, robot);
+    });
+    return true;
+  }
+  if (widget_name == "filter_robot") {
+    // The third gate level. This is the pick that finally authorizes a file
+    // listing, and it narrows it SERVER-side via ListFilter.robot_id.
+    std::string new_robot;
+    std::string customer;
+    std::string site;
+    std::string server_key;
+    std::uint64_t id = 0;
+    {
+      std::lock_guard<std::mutex> lock(state_.mu);
+      if (!state_.connected || !state_.vocabulary) {
+        return true;
+      }
+      const std::vector<std::string> robots =
+          robotNamesFor(*state_.vocabulary, state_.gate_customer, state_.gate_site);
+      if (index < 0 || index >= static_cast<int>(robots.size())) {
+        return true;  // out of range -- vocabulary changed under us; ignore
+      }
+      new_robot = robots[static_cast<std::size_t>(index)];
+      if (new_robot == state_.gate_robot) {
+        return true;  // no-op re-pick
+      }
+      state_.gate_robot = new_robot;
+      customer = state_.gate_customer;
+      site = state_.gate_site;
       server_key = state_.active_server_key;
       id = beginGateRequestLocked(GatePhase::kListLoading);
     }
     SettingsStore settings(settings_);
-    settings.setString(gateSettingsPrefix(server_key) + "site", new_site);
-    notify(PJ::ToolboxMessageLevel::kInfo, fmt::format("Loading {}/{}…", customer, new_site));
-    postCommand([w = worker_.get(), id, customer, new_site] { w->listSequencesFilteredAsync(id, customer, new_site); });
+    settings.setString(gateSettingsPrefix(server_key) + "robot", new_robot);
+    notify(PJ::ToolboxMessageLevel::kInfo, fmt::format("Loading {}/{}/{}…", customer, site, new_robot));
+    postCommand([w = worker_.get(), id, customer, site, new_robot] {
+      w->listSequencesFilteredAsync(id, customer, site, new_robot);
+    });
     return true;
   }
   // Basic-tab metadata dropdowns (filter_<field>, robot/source only — see
@@ -2436,6 +2533,7 @@ bool McapCloudDialog::gateRequestStaleLocked(std::uint64_t request_id) const {
 void McapCloudDialog::refreshGateComboItemsLocked() {
   state_.gate_customer_items.clear();
   state_.gate_site_items.clear();
+  state_.gate_robot_items.clear();
   if (!state_.vocabulary) {
     return;
   }
@@ -2444,6 +2542,7 @@ void McapCloudDialog::refreshGateComboItemsLocked() {
     state_.gate_customer_items.push_back(c.name);
   }
   state_.gate_site_items = siteNamesFor(*state_.vocabulary, state_.gate_customer);
+  state_.gate_robot_items = robotNamesFor(*state_.vocabulary, state_.gate_customer, state_.gate_site);
 }
 
 bool McapCloudDialog::onSelectionChanged(std::string_view widget_name, const std::vector<std::string>& selected) {
@@ -2679,7 +2778,7 @@ void McapCloudDialog::onConnectFinished(bool ok, std::string uri, std::string st
 }
 
 void McapCloudDialog::onVocabularyReady(std::uint64_t request_id, VocabularyInfo vocab, bool recovery) {
-  std::string customer, site;
+  std::string customer, site, robot;
   std::uint64_t id = 0;
   {
     std::lock_guard<std::mutex> lock(state_.mu);
@@ -2702,12 +2801,14 @@ void McapCloudDialog::onVocabularyReady(std::uint64_t request_id, VocabularyInfo
       return;
     }
 
-    // Resolve the (customer, site) selection: an already-set in-session choice
-    // wins outright (e.g. a reconnect to the same server), else the per-server
-    // persisted values, else auto-select (exactly one customer).
+    // Resolve the (customer, site, robot) selection: an already-set in-session
+    // choice wins outright (e.g. a reconnect to the same server), else the
+    // per-server persisted values, else auto-select (exactly one customer, or
+    // exactly one robot under the resolved site).
     customer = state_.gate_customer;
     site = state_.gate_site;
-    if (customer.empty() || site.empty()) {
+    robot = state_.gate_robot;
+    if (customer.empty() || site.empty() || robot.empty()) {
       SettingsStore settings(settings_);
       const std::string prefix = gateSettingsPrefix(state_.active_server_key);
       if (customer.empty()) {
@@ -2715,6 +2816,9 @@ void McapCloudDialog::onVocabularyReady(std::uint64_t request_id, VocabularyInfo
       }
       if (site.empty()) {
         site = settings.getString(prefix + "site");
+      }
+      if (robot.empty()) {
+        robot = settings.getString(prefix + "robot");
       }
     }
     if (customer.empty()) {
@@ -2757,22 +2861,42 @@ void McapCloudDialog::onVocabularyReady(std::uint64_t request_id, VocabularyInfo
       // both and let kNeedsSelection below start the picker over clean.
       customer.clear();
       site.clear();
-    } else if (!customer.empty() && !site.empty() && !resolveGateFilter(vocab, customer, site)) {
-      // The customer IS known but the pair still doesn't resolve (a rebuild
-      // renamed/removed the site, or this was a stale persisted/migrated
-      // pick): keep the customer, drop only the site.
-      site.clear();
+      robot.clear();
+    } else if (!customer.empty() && !site.empty()) {
+      const std::vector<std::string> sites = siteNamesFor(vocab, customer);
+      if (std::find(sites.begin(), sites.end(), site) == sites.end()) {
+        // The customer IS known but the SITE is gone (a rebuild renamed/removed
+        // it, or this was a stale persisted/migrated pick): keep the customer,
+        // drop the site and — since robots are site-scoped — the robot too.
+        site.clear();
+        robot.clear();
+      }
+    }
+    // With customer+site settled, settle the robot against THIS vocabulary. A
+    // retired robot must not silently widen the query to the whole site, so an
+    // unresolvable one is dropped back to "needs selection" rather than ignored.
+    if (!customer.empty() && !site.empty()) {
+      if (robot.empty()) {
+        robot = autoSelectRobot(vocab, customer, site);
+      } else if (!resolveGateFilter(vocab, customer, site, robot)) {
+        robot.clear();
+      }
+    } else {
+      robot.clear();
     }
     state_.gate_customer = customer;
     state_.gate_site = site;
-    refreshGateComboItemsLocked();  // customer/site (hence the site list) just resolved
-    if (customer.empty() || site.empty()) {
+    state_.gate_robot = robot;
+    refreshGateComboItemsLocked();  // customer/site/robot (hence their lists) just resolved
+    if (customer.empty() || site.empty() || robot.empty()) {
       state_.gate_phase = GatePhase::kNeedsSelection;
       return;
     }
     id = beginGateRequestLocked(GatePhase::kListLoading);
   }
-  postCommand([w = worker_.get(), id, customer, site] { w->listSequencesFilteredAsync(id, customer, site); });
+  postCommand([w = worker_.get(), id, customer, site, robot] {
+    w->listSequencesFilteredAsync(id, customer, site, robot);
+  });
 }
 
 void McapCloudDialog::onVocabularyFailed(std::uint64_t request_id) {

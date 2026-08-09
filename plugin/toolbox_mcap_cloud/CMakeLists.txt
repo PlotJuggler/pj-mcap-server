@@ -1119,6 +1119,88 @@ if(BUILD_TESTING)
   add_test(NAME McapCloudHeadlessInitTest COMMAND toolbox_mcap_cloud_headless_init_test)
   set_tests_properties(McapCloudHeadlessInitTest PROPERTIES TIMEOUT 60)
 
+  # The export-directory "Browse..." folder picker: declaration in widget_data()
+  # + the onFolderSelected round-trip. Same dialog-level link set as the headless
+  # init test (no fake server needed — nothing here touches the network).
+  add_executable(toolbox_mcap_cloud_save_dir_picker_test
+    tests/save_dir_picker_test.cpp
+    src/mcap_cloud_toolbox.cpp
+    src/descriptor_import_provider.cpp
+    src/mcap_cloud_dialog.cpp
+    src/parser_ingest_driver.cpp
+    src/fetch_worker.cpp
+    src/backend_connection.cpp
+    src/wire_mapping.cpp
+    src/session_decode.cpp
+    src/session_mcap_writer.cpp
+    ${MCAP_CLOUD_IMPORT_SOURCES}
+    src/settings_store.cpp
+    src/credential_resolve.cpp
+    src/mcap_save_path.cpp
+    src/core/time_format.cpp
+    src/mcap_implementation.cpp
+    ${MCAP_CLOUD_PROTO_SRCS}
+  )
+  target_compile_features(toolbox_mcap_cloud_save_dir_picker_test PRIVATE cxx_std_20)
+  target_compile_options(toolbox_mcap_cloud_save_dir_picker_test PRIVATE
+    "$<${PJ_NOT_MSVC}:-Wall;-Wextra;-Werror;-Wno-conversion;-Wno-unused-parameter;-Wno-unused-function>"
+  )
+  target_include_directories(toolbox_mcap_cloud_save_dir_picker_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/core
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/query
+    ${MCAP_CLOUD_PROTO_OUT_DIR}
+  )
+  target_link_libraries(toolbox_mcap_cloud_save_dir_picker_test PRIVATE
+    plotjuggler_sdk::plugin_sdk
+    fmt::fmt lua::lua sol2::sol2
+    protobuf::libprotobuf ixwebsocket::ixwebsocket nlohmann_json::nlohmann_json
+    zstd::libzstd_static LZ4::lz4_static mcap::mcap GTest::gtest_main
+  )
+  add_test(NAME McapCloudSaveDirPickerTest COMMAND toolbox_mcap_cloud_save_dir_picker_test)
+  set_tests_properties(McapCloudSaveDirPickerTest PROPERTIES TIMEOUT 60)
+
+  # Topic-table render contract: the shipped bug this pins was a whole-widget
+  # setEnabled(false) that also killed the table's scrollbars. Same dialog-level
+  # link set as the save-dir picker test.
+  add_executable(toolbox_mcap_cloud_topic_table_render_test
+    tests/topic_table_render_test.cpp
+    src/mcap_cloud_toolbox.cpp
+    src/descriptor_import_provider.cpp
+    src/mcap_cloud_dialog.cpp
+    src/parser_ingest_driver.cpp
+    src/fetch_worker.cpp
+    src/backend_connection.cpp
+    src/wire_mapping.cpp
+    src/session_decode.cpp
+    src/session_mcap_writer.cpp
+    ${MCAP_CLOUD_IMPORT_SOURCES}
+    src/settings_store.cpp
+    src/credential_resolve.cpp
+    src/mcap_save_path.cpp
+    src/core/time_format.cpp
+    src/mcap_implementation.cpp
+    ${MCAP_CLOUD_PROTO_SRCS}
+  )
+  target_compile_features(toolbox_mcap_cloud_topic_table_render_test PRIVATE cxx_std_20)
+  target_compile_options(toolbox_mcap_cloud_topic_table_render_test PRIVATE
+    "$<${PJ_NOT_MSVC}:-Wall;-Wextra;-Werror;-Wno-conversion;-Wno-unused-parameter;-Wno-unused-function>"
+  )
+  target_include_directories(toolbox_mcap_cloud_topic_table_render_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/core
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/query
+    ${MCAP_CLOUD_PROTO_OUT_DIR}
+  )
+  target_link_libraries(toolbox_mcap_cloud_topic_table_render_test PRIVATE
+    plotjuggler_sdk::plugin_sdk
+    fmt::fmt lua::lua sol2::sol2
+    protobuf::libprotobuf ixwebsocket::ixwebsocket nlohmann_json::nlohmann_json
+    zstd::libzstd_static LZ4::lz4_static mcap::mcap GTest::gtest_main
+  )
+  add_test(NAME McapCloudTopicTableRenderTest COMMAND toolbox_mcap_cloud_topic_table_render_test)
+  set_tests_properties(McapCloudTopicTableRenderTest PROPERTIES TIMEOUT 60)
+
   add_executable(toolbox_mcap_cloud_parser_ingest_live_test
     tests/parser_ingest_live_test.cpp
     src/parser_ingest_driver.cpp
