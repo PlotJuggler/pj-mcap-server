@@ -75,7 +75,8 @@ void printUsage(std::ostream& os) {
         "Commands:\n"
         "  hello                            connect and print the server version\n"
         "  list [--json]                    list sequences (name, time range, size, count, metadata)\n"
-        "  vocab [--json]                   time GetVocabulary (the browse gate) and print its size\n"
+        "  vocab [--json] [--lean]          time GetVocabulary (the browse gate) and print its size\n"
+        "                                   (--lean = what the browse picker actually asks for)\n"
         "  topics <sequence-name> [--json]  list a sequence's topics (name, schema, encoding, count)\n"
         "  download <seq1> [<seq2> ...] --output FILE [--topics a,b] [--time-range s,e] [--latched] [--json]\n"
         "                                   open a session and reconstruct a local MCAP\n"
@@ -196,9 +197,16 @@ bool listSequencesChecked(mcap_cloud::BackendConnection& conn, const char* cmd,
 // is looking at — on a large catalog it is the first thing to blow the client's
 // request timeout ("Could not load the catalog"). Reports wall time so a slow
 // catalog can be told apart from a slow link.
-int runVocab(mcap_cloud::BackendConnection& conn, bool as_json, int timeout_s) {
+int runVocab(mcap_cloud::BackendConnection& conn, bool as_json, int timeout_s, bool lean) {
   const auto t0 = std::chrono::steady_clock::now();
-  const auto vocab = conn.getVocabulary(std::chrono::seconds(timeout_s));
+  // --lean asks the server for exactly what the browse picker maps
+  // (customer->site->robot tree + customer counts), skipping the flat source
+  // dimension, the tag facets, and the per-site/per-robot COUNT(*) GROUP BYs.
+  // Default stays FULL so the per-site counts printed below stay truthful.
+  const auto vocab = conn.getVocabulary(
+      std::chrono::seconds(timeout_s),
+      lean ? mcap_cloud::BackendConnection::VocabScope::kPickerOnly
+           : mcap_cloud::BackendConnection::VocabScope::kFull);
   const auto elapsed_ms =
       std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
 
@@ -759,6 +767,7 @@ int main(int argc, char** argv) {
   std::string command;
   std::vector<std::string> positionals;
   bool as_json = false;
+  bool vocab_lean = false;
   bool include_latched = false;  // download --latched (latched/transient-local replay)
   std::string output;          // download --output
   std::string topics_csv;      // download/debug --topics
@@ -833,6 +842,8 @@ int main(int argc, char** argv) {
         return kExitUsage;
       }
       time_range_csv = v;
+    } else if (arg == "--lean") {
+      vocab_lean = true;
     } else if (arg == "--timeout") {
       const char* v = needValue(arg, i);
       if (v == nullptr) {
@@ -995,7 +1006,7 @@ int main(int argc, char** argv) {
     return runList(conn, as_json);
   }
   if (command == "vocab") {
-    return runVocab(conn, as_json, vocab_timeout_s);
+    return runVocab(conn, as_json, vocab_timeout_s, vocab_lean);
   }
   if (command == "download") {
     // All positionals are sequence names (one or more); they stitch into one
