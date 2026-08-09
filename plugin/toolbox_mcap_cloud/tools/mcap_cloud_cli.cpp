@@ -75,6 +75,7 @@ void printUsage(std::ostream& os) {
         "Commands:\n"
         "  hello                            connect and print the server version\n"
         "  list [--json]                    list sequences (name, time range, size, count, metadata)\n"
+        "  vocab [--json]                   time GetVocabulary (the browse gate) and print its size\n"
         "  topics <sequence-name> [--json]  list a sequence's topics (name, schema, encoding, count)\n"
         "  download <seq1> [<seq2> ...] --output FILE [--topics a,b] [--time-range s,e] [--latched] [--json]\n"
         "                                   open a session and reconstruct a local MCAP\n"
@@ -96,6 +97,8 @@ void printUsage(std::ostream& os) {
         "  --latched                (download) also deliver each topic's last message before the\n"
         "                           window (latched/transient-local replay: map, costmaps, static poses)\n"
         "  --limit N                (debug) number of messages to print (default 10; 0 = all)\n"
+        "  --timeout N              (vocab) seconds to wait for GetVocabulary (default: the\n"
+        "                           browse panel's own budget)\n"
         "  --set k=v                (tag) upsert one override tag (repeatable)\n"
         "  --unset k                (tag) remove an override / mask an embedded tag (repeatable)\n"
         "\n"
@@ -183,6 +186,50 @@ bool listSequencesChecked(mcap_cloud::BackendConnection& conn, const char* cmd,
     return false;
   }
   return true;
+}
+
+// ---- vocab ----------------------------------------------------------------
+
+// Times the ONE RPC the browse UI must complete before it can show anything.
+// GetVocabulary aggregates the whole `files` table server-side (a GROUP BY per
+// dimension), so its latency scales with catalog size, not with what the user
+// is looking at — on a large catalog it is the first thing to blow the client's
+// request timeout ("Could not load the catalog"). Reports wall time so a slow
+// catalog can be told apart from a slow link.
+int runVocab(mcap_cloud::BackendConnection& conn, bool as_json, int timeout_s) {
+  const auto t0 = std::chrono::steady_clock::now();
+  const auto vocab = conn.getVocabulary(std::chrono::seconds(timeout_s));
+  const auto elapsed_ms =
+      std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+
+  if (!vocab.has_value()) {
+    std::cerr << "vocab: GetVocabulary failed after " << elapsed_ms << " ms"
+              << " (a timeout here is what the panel reports as"
+                 " \"Could not load the catalog\")\n";
+    return kExitFailure;
+  }
+
+  if (as_json) {
+    nlohmann::json obj;
+    obj["elapsed_ms"] = elapsed_ms;
+    obj["customers"] = vocab->customers.size();
+    obj["sites"] = vocab->totalSites();
+    obj["robots"] = vocab->totalRobots();
+    obj["total_files"] = vocab->totalFiles();
+    std::cout << obj.dump(2) << '\n';
+    return kExitOk;
+  }
+
+  std::cout << "GetVocabulary: " << elapsed_ms << " ms\n"
+            << "customers: " << vocab->customers.size() << "  sites: " << vocab->totalSites()
+            << "  robots: " << vocab->totalRobots() << "  files: " << vocab->totalFiles() << '\n';
+  for (const auto& c : vocab->customers) {
+    std::cout << "  " << c.name << " (" << c.file_count << " files, " << c.sites.size() << " sites)\n";
+    for (const auto& s : c.sites) {
+      std::cout << "    " << s.name << " (" << s.file_count << " files, " << s.robots.size() << " robots)\n";
+    }
+  }
+  return kExitOk;
 }
 
 // ---- list -----------------------------------------------------------------
@@ -717,6 +764,9 @@ int main(int argc, char** argv) {
   std::string topics_csv;      // download/debug --topics
   std::string time_range_csv;  // download/debug --time-range
   std::uint64_t debug_limit = 10;  // debug --limit (0 = all)
+  // vocab --timeout: defaults to the SAME budget the browse panel uses, so a
+  // bare `vocab` reproduces what the UI would experience.
+  int vocab_timeout_s = static_cast<int>(mcap_cloud::BackendConnection::kVocabularyTimeout.count());
   std::vector<std::pair<std::string, std::string>> set_tags;  // tag --set k=v (repeatable)
   std::vector<std::string> unset_keys;                        // tag --unset k (repeatable)
   // --insecure: for wss:// against a self-signed dev cert, skip TLS certificate
@@ -783,6 +833,22 @@ int main(int argc, char** argv) {
         return kExitUsage;
       }
       time_range_csv = v;
+    } else if (arg == "--timeout") {
+      const char* v = needValue(arg, i);
+      if (v == nullptr) {
+        return kExitUsage;
+      }
+      try {
+        const long long parsed = std::stoll(v);
+        if (parsed <= 0) {
+          std::cerr << "error: --timeout must be > 0\n";
+          return kExitUsage;
+        }
+        vocab_timeout_s = static_cast<int>(parsed);
+      } catch (const std::exception&) {
+        std::cerr << "error: --timeout must be a positive integer (seconds)\n";
+        return kExitUsage;
+      }
     } else if (arg == "--limit") {
       const char* v = needValue(arg, i);
       if (v == nullptr) {
@@ -839,8 +905,8 @@ int main(int argc, char** argv) {
     printUsage(std::cerr);
     return kExitUsage;
   }
-  if (command != "hello" && command != "list" && command != "topics" && command != "download" && command != "tag" &&
-      command != "debug") {
+  if (command != "hello" && command != "list" && command != "vocab" && command != "topics" &&
+      command != "download" && command != "tag" && command != "debug") {
     std::cerr << "error: unknown command '" << command << "'\n";
     printUsage(std::cerr);
     return kExitUsage;
@@ -927,6 +993,9 @@ int main(int argc, char** argv) {
   }
   if (command == "list") {
     return runList(conn, as_json);
+  }
+  if (command == "vocab") {
+    return runVocab(conn, as_json, vocab_timeout_s);
   }
   if (command == "download") {
     // All positionals are sequence names (one or more); they stitch into one
