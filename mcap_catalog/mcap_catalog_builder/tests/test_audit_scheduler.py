@@ -352,3 +352,29 @@ def test_fixed_hour_honored_for_non_immediate_start(monkeypatch):
     finally:
         stop.set()
         coordinator.join()
+
+
+def test_fixed_hour_failure_backoff_never_past_next_slot(monkeypatch):
+    """§5.2: in fixed-hour mode a failed audit retries with capped backoff,
+    but NEVER past the next fixed slot — with the slot (patched) nearer than
+    the backoff (large backoff_initial), the retry lands at the slot."""
+    import mcap_catalog_builder.__main__ as main_mod
+
+    monkeypatch.setattr(main_mod, "_next_fixed_hour_delay",
+                        lambda _now, _hour: 0.06)
+    work_q = queue.Queue()
+    stop = threading.Event()
+    coordinator = AuditCoordinator(
+        work_q, stop, interval=999.0, backoff_initial=30.0, full_audit_hour=2
+    )
+    coordinator.start(immediate=True)
+    try:
+        first = work_q.get(timeout=1.0)
+        t1 = time.monotonic()
+        first.finish(AuditResult("failed", 0.01, "boom"))
+        second = work_q.get(timeout=1.0)
+        assert time.monotonic() - t1 < 1.0   # the slot (0.06s), not 30s backoff
+        second.finish(AuditResult("ok", 0.01))
+    finally:
+        stop.set()
+        coordinator.join()

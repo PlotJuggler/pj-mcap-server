@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
@@ -125,7 +126,18 @@ func (s *s3Store) Head(ctx context.Context, key string) (ObjectInfo, error) {
 		return nil
 	}, classify)
 	if err != nil {
-		return ObjectInfo{}, err
+		// §7.1: a HEAD 404 is ambiguous (missing object vs missing bucket —
+		// HeadObject returns bare NotFound for both). Upgrade to ErrNotFound
+		// only after confirming the bucket exists; error-path-only cost.
+		return ObjectInfo{}, disambiguate404(err, isHead404(err), func() bool {
+			probeCtx, cancel := context.WithTimeout(
+				context.WithoutCancel(ctx), 10*time.Second)
+			defer cancel()
+			_, bErr := s.client.HeadBucket(probeCtx, &s3.HeadBucketInput{
+				Bucket: aws.String(s.bucket),
+			})
+			return bErr == nil
+		})
 	}
 	return info, nil
 }
@@ -178,6 +190,25 @@ func deref(p *string) string {
 	return *p
 }
 
+// isHead404 reports whether err is 404-shaped as HeadObject surfaces it:
+// the typed types.NotFound, or a smithy code "NotFound"/"NoSuchKey".
+func isHead404(err error) bool {
+	var nf *types.NotFound
+	if errors.As(err, &nf) {
+		return true
+	}
+	var nsk *types.NoSuchKey
+	if errors.As(err, &nsk) {
+		return true
+	}
+	var apiErr smithy.APIError
+	if errors.As(err, &apiErr) {
+		code := apiErr.ErrorCode()
+		return code == "NotFound" || code == "NoSuchKey"
+	}
+	return false
+}
+
 // classify maps an S3/smithy error onto ErrTransient / ErrPermanent so the
 // caller can decide whether to retry, while preserving the original message.
 func classify(err error) error {
@@ -197,9 +228,13 @@ func classify(err error) error {
 	var apiErr smithy.APIError
 	if errors.As(err, &apiErr) {
 		switch code := apiErr.ErrorCode(); {
-		case code == "NoSuchKey" || code == "NotFound":
+		case code == "NoSuchKey":
+			// GET-shaped and unambiguous (GetObject distinguishes
+			// NoSuchBucket). Bare "NotFound" (a HEAD 404) is NOT wrapped
+			// here — it cannot name its cause (missing object vs missing
+			// bucket); s3Store.Head disambiguates it with a bucket probe.
 			return fmt.Errorf("%w: %w: %v", ErrPermanent, ErrNotFound, err)
-		case code == "NoSuchBucket" ||
+		case code == "NotFound" || code == "NoSuchBucket" ||
 			code == "AccessDenied" || code == "Forbidden" || strings.HasPrefix(code, "InvalidAccessKeyId") ||
 			// PreconditionFailed = a GetRangeVersioned If-Match miss: the object
 			// was overwritten (a new version). Retrying can NEVER succeed against

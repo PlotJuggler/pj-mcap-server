@@ -450,15 +450,27 @@ let the UI say "recording was deleted — refresh the list" instead of implying 
 retryable outage. Candidate for the implementation plan's server-side touch.
 
 **IMPLEMENTED 2026-08-10** (`storage.ErrNotFound` + `planBuildErrorCode`,
-pinned by `TestPlanBuildErrorCode`): the dual-wrap covers ONLY object absence
-(S3 `NoSuchKey`/`NotFound`, GCS `ErrObjectNotExist`) — bucket absence and 403
-deliberately stay `ERROR_S3_UNAVAILABLE` (S3 answers 403 for a missing object
-without `s3:ListBucket`; claiming deletion there would misdirect the
-operator). This extends `ERROR_NOT_FOUND`'s wire semantics: besides "s3_key
-names no cataloged file at open", it now also covers "cataloged object
-vanished from the bucket at plan-build" (the proto comment was deliberately
-left untouched — a comment-only proto change would ripple into the checked-in
-generated bindings; this paragraph is the semantic record).
+pinned by `TestPlanBuildErrorCode`/`TestDisambiguate404`): attachment is
+conservative because a HEAD 404 cannot name its cause — S3 `HeadObject`
+returns bare `NotFound` for a missing object AND a missing bucket, and GCS
+object `Attrs` normalize a bucket-level 404 to `ErrObjectNotExist`. So the
+classifier dual-wraps only GET-shaped `NoSuchKey`, and the store `Head`
+methods upgrade a 404 via a bucket-existence probe (`disambiguate404`,
+error-path-only); bucket absence, ambiguous 404s, and 403 deliberately stay
+`ERROR_S3_UNAVAILABLE` (S3 answers 403 for a missing object without
+`s3:ListBucket`; claiming deletion there would misdirect the operator). This
+extends `ERROR_NOT_FOUND`'s wire semantics: besides "s3_key names no
+cataloged file at open", it now also covers "cataloged object vanished from
+the bucket at plan-build" (the proto comment was deliberately left untouched
+— a comment-only proto change would ripple into the checked-in generated
+bindings; this paragraph is the semantic record).
+
+**Hot-sweep HEAD-guard (2026-08-10 branch review):** the tier-2 scoped sweep
+HEAD-confirms every deletion candidate (live/ambiguous ⇒ skip), because its
+LIST-to-sweep window recurs ~50x more often per day than tier 3's. Tier 3's
+full sweep keeps this section's live-LIST-authority semantics unchanged; the
+§7 "HEAD-miss → re-upload → row deleted" row's bounded-staleness claim now
+applies to tier 3 only.
 
 ## 8. Rollout phases (reordered per review: burn in events *before* loosening the safety net)
 

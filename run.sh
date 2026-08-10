@@ -326,11 +326,14 @@ cloud_builder_args() {
     # the freshness path, so the full audit relaxes to the 6 h safety net
     # (Phase 0 value). The queue must be provisioned for THIS bucket+prefix
     # first — scripts/staging-sqs-setup.sh prints the URL to export.
-    BARGS+=(--sqs-url "$MCAP_CATALOG_SQS_URL" --rescan-interval 21600)
+    BARGS+=(--sqs-url "$MCAP_CATALOG_SQS_URL" --tag-socket "$TAG_SOCKET" --db "$DB_PATH" --rescan-interval 21600 --log-level INFO)
   else
-    BARGS+=(--no-watch --rescan-interval 300)
+    # Byte-identical to the pre-event-tier argv (order included): the builder
+    # reuse check hashes the exact vector, so reordering it would declare
+    # drift on the first rerun after upgrade and kill/restart a healthy
+    # builder mid-scan for nothing.
+    BARGS+=(--no-watch --tag-socket "$TAG_SOCKET" --db "$DB_PATH" --rescan-interval 300 --log-level INFO)
   fi
-  BARGS+=(--tag-socket "$TAG_SOCKET" --db "$DB_PATH" --log-level INFO)
 }
 
 # start_local_builder — ensures the Minio-backed catalog builder for

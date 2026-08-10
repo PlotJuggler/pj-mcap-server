@@ -204,14 +204,36 @@ def hot_audit(
     # per-prefix row set is re-read here, AFTER apply, so rows just written
     # are present and can never be swept. One transaction, rolled back on
     # cancellation (mirrors full_reconcile's sweep discipline).
+    #
+    # HEAD-guard (Codex branch review 2026-08-10): the LIST completed EARLIER
+    # — an object deleted-and-re-uploaded (or first uploaded) between that
+    # LIST and this sweep is absent from `listed` yet LIVE, and deleting its
+    # row would cascade `tags_override` (user data no rebuild reconstructs).
+    # Deletions are rare in an append-only bucket, so candidates ≈ actual
+    # deletions: one stat() per candidate confirms the 404. Live or ambiguous
+    # (stat raised) ⇒ skip, fail-closed — the next pass or the object's own
+    # create event self-heals. (Tier 3's full sweep keeps the design's
+    # live-LIST-authority semantics unchanged; this guard exists because the
+    # hot tier runs ~50x more windows per day.)
     try:
-        for _prefix, combo, date, listings in covered:
+        for prefix, combo, date, listings in covered:
             _raise_if_stopped(stop_event)
             listed = {lst.key.rsplit("/", 1)[-1] for lst in listings}
             for filename, (row_id, _etag) in _stored_for(conn, caches, combo, date).items():
-                if filename not in listed:
-                    conn.execute("DELETE FROM files WHERE id=?", (row_id,))
-                    tally["deleted"] += 1
+                if filename in listed:
+                    continue
+                try:
+                    still_gone = source.stat(prefix + filename) is None
+                except Exception as e:  # noqa: BLE001 — ambiguous ⇒ no delete
+                    logger.warning(
+                        "hot audit: HEAD-guard inconclusive for %s%s, "
+                        "skipping delete: %s", prefix, filename, e,
+                    )
+                    continue
+                if not still_gone:
+                    continue  # re-uploaded after the LIST — leave the row
+                conn.execute("DELETE FROM files WHERE id=?", (row_id,))
+                tally["deleted"] += 1
         _raise_if_stopped(stop_event)
         conn.commit()
     except ReconcileCancelled:

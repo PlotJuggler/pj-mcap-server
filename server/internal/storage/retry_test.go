@@ -181,14 +181,15 @@ func TestS3_ClassifyErrors(t *testing.T) {
 	// recording as ERROR_NOT_FOUND. Bucket absence and auth-shaped permanents
 	// deliberately do NOT carry it — claiming "recording deleted" on a
 	// misconfigured bucket or a 403 would misdirect the operator.
-	for _, code := range []string{"NoSuchKey", "NotFound"} {
-		if !errors.Is(classify(&apiErr{code: code, msg: "x"}), ErrNotFound) {
-			t.Errorf("code %q should carry ErrNotFound", code)
-		}
+	if !errors.Is(classify(&apiErr{code: "NoSuchKey", msg: "x"}), ErrNotFound) {
+		t.Error("NoSuchKey (GET-shaped, unambiguous) should carry ErrNotFound")
 	}
-	for _, code := range []string{"NoSuchBucket", "AccessDenied"} {
+	// Bare "NotFound" is a HEAD 404 that cannot name its cause (missing
+	// object vs missing bucket) — the classifier must NOT wrap it; the
+	// upgrade happens in s3Store.Head via disambiguate404's bucket probe.
+	for _, code := range []string{"NotFound", "NoSuchBucket", "AccessDenied"} {
 		if errors.Is(classify(&apiErr{code: code, msg: "x"}), ErrNotFound) {
-			t.Errorf("code %q must NOT carry ErrNotFound", code)
+			t.Errorf("code %q must NOT carry ErrNotFound at the classifier", code)
 		}
 	}
 }

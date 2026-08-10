@@ -213,3 +213,41 @@ def test_hot_audit_stop_raises_cancelled_and_changes_nothing(tmp_db, tmp_path):
         hot_audit(conn, caches, S3Source(InMemoryS3Client({}), "bucket"),
                   today=TODAY, stop_event=stop)
     assert _count(conn, "a.mcap") == 1
+
+
+def test_hot_audit_sweep_head_guards_deletion_candidates(tmp_db, tmp_path):
+    """TOCTOU (Codex branch review 2026-08-10): an object re-uploaded AFTER
+    the prefix LIST but before the sweep is absent from the listing yet LIVE —
+    the sweep must HEAD-confirm the 404 before deleting, or a live object's
+    row (and its cascading tags_override) would be destroyed."""
+    conn, caches = tmp_db
+    raw = _seed(conn, caches, tmp_path, [KA])
+
+    class ReappearingClient(InMemoryS3Client):
+        """LISTs report the object gone, but HEAD finds it live (re-upload
+        landed between the LIST and the sweep)."""
+
+        def list_objects_v2(self, Bucket, Prefix="", Delimiter=None,
+                            ContinuationToken=None):
+            return {"Contents": [], "IsTruncated": False}
+
+    src = S3Source(ReappearingClient({KA: raw}), "bucket")
+    tally = hot_audit(conn, caches, src, today=TODAY)
+    assert tally["deleted"] == 0
+    assert _count(conn, "a.mcap") == 1   # live object's row survives
+
+
+def test_hot_audit_zero_coverage_raises(tmp_db, tmp_path):
+    """All prefix LISTs failed => the pass did nothing; it must FAIL (so the
+    coordinator backs off), never report a healthy ok with zero coverage."""
+    conn, caches = tmp_db
+    _seed(conn, caches, tmp_path, [KA])
+
+    class AlwaysFailsClient(InMemoryS3Client):
+        def list_objects_v2(self, *_a, **_kw):
+            raise RuntimeError("LIST always fails")
+
+    with pytest.raises(RuntimeError, match="zero coverage"):
+        hot_audit(conn, caches, S3Source(AlwaysFailsClient({}), "bucket"),
+                  today=TODAY)
+    assert _count(conn, "a.mcap") == 1

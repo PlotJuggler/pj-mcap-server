@@ -28,17 +28,41 @@ var (
 	ErrTransient = errors.New("storage: transient error")
 	// ErrPermanent marks a non-retryable failure (404, auth, malformed key).
 	ErrPermanent = errors.New("storage: permanent error")
-	// ErrNotFound marks the OBJECT-absent subset of ErrPermanent (NoSuchKey /
-	// NotFound / gcs.ErrObjectNotExist). Retry logic keys on ErrPermanent as
-	// before; the session plan-build additionally keys on this to report a
-	// vanished recording as ERROR_NOT_FOUND instead of a generic bucket
-	// outage (event-discovery design 2026-07-30 §7.1). Bucket absence
-	// (NoSuchBucket / ErrBucketNotExist) and auth-shaped permanents (403 —
-	// which S3 also returns for missing objects without s3:ListBucket)
-	// deliberately do NOT carry it: claiming "recording deleted" on config
-	// breakage would misdirect the operator.
+	// ErrNotFound marks the OBJECT-absent subset of ErrPermanent. Retry logic
+	// keys on ErrPermanent as before; the session plan-build additionally keys
+	// on this to report a vanished recording as ERROR_NOT_FOUND instead of a
+	// generic bucket outage (event-discovery design 2026-07-30 §7.1).
+	//
+	// Attachment is deliberately conservative: at the classifier level only
+	// the GET-shaped, unambiguous NoSuchKey carries it. A HEAD 404 cannot
+	// name its cause (S3 HeadObject returns bare NotFound for a missing
+	// OBJECT *and* a missing BUCKET; GCS object Attrs likewise normalize a
+	// bucket-level 404 to ErrObjectNotExist), so the store Head methods
+	// upgrade a 404 via disambiguate404 — probing bucket existence on the
+	// error path — and anything ambiguous stays plain ErrPermanent. Bucket
+	// absence and auth-shaped permanents (403 — which S3 also returns for
+	// missing objects without s3:ListBucket) never carry it: claiming
+	// "recording deleted" on config breakage would misdirect the operator.
 	ErrNotFound = errors.New("storage: object not found")
 )
+
+// disambiguate404 upgrades an object-level 404 from a Head call to carry
+// ErrNotFound (§7.1) ONLY when the bucket itself is confirmed to exist.
+// bucketExists is invoked solely on this error path (one probe per failed
+// Head, never on the happy path); a failed/uncertain probe keeps the error
+// as-is — fail-closed to the outage-shaped code.
+func disambiguate404(err error, is404 bool, bucketExists func() bool) error {
+	if err == nil || !is404 {
+		return err
+	}
+	if errors.Is(err, ErrNotFound) {
+		return err // already precise (GET-shape NoSuchKey via classify)
+	}
+	if !bucketExists() {
+		return err
+	}
+	return fmt.Errorf("%w: %w", ErrNotFound, err)
+}
 
 // ObjectInfo is the listing/head view of one object. LastModifiedNs is unix nanos.
 type ObjectInfo struct {

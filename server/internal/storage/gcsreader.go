@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"strconv"
+	"time"
 
 	gcs "cloud.google.com/go/storage"
 	"google.golang.org/api/googleapi"
@@ -104,7 +105,17 @@ func (g *gcsStore) Head(ctx context.Context, key string) (ObjectInfo, error) {
 		return nil
 	}, classifyGCS)
 	if err != nil {
-		return ObjectInfo{}, err
+		// §7.1: ErrObjectNotExist is ambiguous (object Attrs normalize a
+		// bucket-level 404 to the same sentinel). Upgrade to ErrNotFound only
+		// after confirming the bucket exists; error-path-only cost.
+		return ObjectInfo{}, disambiguate404(
+			err, errors.Is(err, gcs.ErrObjectNotExist), func() bool {
+				probeCtx, cancel := context.WithTimeout(
+					context.WithoutCancel(ctx), 10*time.Second)
+				defer cancel()
+				_, bErr := g.client.Bucket(g.bucket).Attrs(probeCtx)
+				return bErr == nil
+			})
 	}
 	return info, nil
 }
@@ -162,14 +173,11 @@ func classifyGCS(err error) error {
 	if err == nil {
 		return nil
 	}
-	if errors.Is(err, gcs.ErrObjectNotExist) {
-		// Object-absent: additionally carries ErrNotFound (§7.1). A raw
-		// googleapi 404 is NOT dual-wrapped — at the HTTP level it can be a
-		// bucket-level miss, and misreporting config breakage as "recording
-		// deleted" is the exact misdirection §7.1 avoids for 403.
-		return fmt.Errorf("%w: %w: %v", ErrPermanent, ErrNotFound, err)
-	}
-	if errors.Is(err, gcs.ErrBucketNotExist) {
+	if errors.Is(err, gcs.ErrObjectNotExist) || errors.Is(err, gcs.ErrBucketNotExist) {
+		// ErrObjectNotExist is NOT dual-wrapped with ErrNotFound here: object
+		// Attrs normalize a bucket-level 404 to the same sentinel, so at the
+		// classifier level it is ambiguous — gcsStore.Head disambiguates
+		// with a bucket probe (§7.1; see storage.disambiguate404).
 		return fmt.Errorf("%w: %v", ErrPermanent, err)
 	}
 	code := 0

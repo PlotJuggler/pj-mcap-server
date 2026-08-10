@@ -242,17 +242,25 @@ doubt, but don't relitigate the decision itself.
   documented drop-in behind the same seam if/when it's worth the Qt6 pull.
 - **Hot audits are fail-closed per prefix and NEVER stamp `build_metadata`** —
   deletions happen only inside prefixes whose pagination COMPLETED
-  (`S3Source.list_prefix` raises rather than returning a partial listing), zero
-  coverage fails the audit, and tier-2 status lives in the sidecar only. S3-only:
-  local `intended_key` overrides break raw-path prefix scoping. Pinned by
-  `test_hot_audit_deletes_only_inside_covered_prefixes` /
+  (`S3Source.list_prefix` raises rather than returning a partial listing), every
+  deletion candidate is HEAD-confirmed at sweep time (live/ambiguous ⇒ skip — a
+  re-upload landing between LIST and sweep must not cascade `tags_override`),
+  zero coverage FAILS the audit, and tier-2 status lives in the sidecar only.
+  S3-only: local `intended_key` overrides break raw-path prefix scoping. Pinned
+  by `test_hot_audit_deletes_only_inside_covered_prefixes` /
+  `test_hot_audit_sweep_head_guards_deletion_candidates` /
+  `test_hot_audit_zero_coverage_raises` /
   `test_hot_audit_never_stamps_build_metadata` (`test_hot_audit.py`).
 - **A vanished object at session plan-build is `ERROR_NOT_FOUND`, never
-  `ERROR_S3_UNAVAILABLE`** — `storage.ErrNotFound` dual-wraps ONLY object-absence
-  (NoSuchKey/NotFound, `gcs.ErrObjectNotExist`); bucket absence and 403 stay
-  UNAVAILABLE (S3 returns 403 for missing objects without `s3:ListBucket`, so
-  claiming "recording deleted" there would misdirect the operator). Pinned by
-  `TestPlanBuildErrorCode` (`session_error_code_test.go`) + the classify tests.
+  `ERROR_S3_UNAVAILABLE`** — but only when object-absence is UNAMBIGUOUS: the
+  classifier dual-wraps `storage.ErrNotFound` solely for GET-shaped `NoSuchKey`,
+  and a HEAD 404 (which S3/GCS return for a missing object AND a missing bucket
+  alike) is upgraded only by the store `Head` methods after a bucket-existence
+  probe (`disambiguate404`, error-path-only). Bucket absence, ambiguous 404s,
+  and 403 stay UNAVAILABLE (S3 returns 403 for missing objects without
+  `s3:ListBucket`, so claiming "recording deleted" there would misdirect the
+  operator). Pinned by `TestPlanBuildErrorCode`, `TestDisambiguate404`, and the
+  classify tests.
 
 ## Reference codebases (MANDATORY context — always reuse these)
 
