@@ -162,7 +162,14 @@ func classifyGCS(err error) error {
 	if err == nil {
 		return nil
 	}
-	if errors.Is(err, gcs.ErrObjectNotExist) || errors.Is(err, gcs.ErrBucketNotExist) {
+	if errors.Is(err, gcs.ErrObjectNotExist) {
+		// Object-absent: additionally carries ErrNotFound (§7.1). A raw
+		// googleapi 404 is NOT dual-wrapped — at the HTTP level it can be a
+		// bucket-level miss, and misreporting config breakage as "recording
+		// deleted" is the exact misdirection §7.1 avoids for 403.
+		return fmt.Errorf("%w: %w: %v", ErrPermanent, ErrNotFound, err)
+	}
+	if errors.Is(err, gcs.ErrBucketNotExist) {
 		return fmt.Errorf("%w: %v", ErrPermanent, err)
 	}
 	code := 0

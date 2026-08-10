@@ -185,14 +185,21 @@ func classify(err error) error {
 		return nil
 	}
 	var nf *types.NoSuchKey
+	if errors.As(err, &nf) {
+		// Object-absent: additionally carries ErrNotFound (§7.1) so the
+		// session plan-build can distinguish "recording deleted" from outage.
+		return fmt.Errorf("%w: %w: %v", ErrPermanent, ErrNotFound, err)
+	}
 	var nb *types.NoSuchBucket
-	if errors.As(err, &nf) || errors.As(err, &nb) {
+	if errors.As(err, &nb) {
 		return fmt.Errorf("%w: %v", ErrPermanent, err)
 	}
 	var apiErr smithy.APIError
 	if errors.As(err, &apiErr) {
 		switch code := apiErr.ErrorCode(); {
-		case code == "NoSuchKey" || code == "NotFound" || code == "NoSuchBucket" ||
+		case code == "NoSuchKey" || code == "NotFound":
+			return fmt.Errorf("%w: %w: %v", ErrPermanent, ErrNotFound, err)
+		case code == "NoSuchBucket" ||
 			code == "AccessDenied" || code == "Forbidden" || strings.HasPrefix(code, "InvalidAccessKeyId") ||
 			// PreconditionFailed = a GetRangeVersioned If-Match miss: the object
 			// was overwritten (a new version). Retrying can NEVER succeed against

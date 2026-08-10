@@ -28,6 +28,16 @@ var (
 	ErrTransient = errors.New("storage: transient error")
 	// ErrPermanent marks a non-retryable failure (404, auth, malformed key).
 	ErrPermanent = errors.New("storage: permanent error")
+	// ErrNotFound marks the OBJECT-absent subset of ErrPermanent (NoSuchKey /
+	// NotFound / gcs.ErrObjectNotExist). Retry logic keys on ErrPermanent as
+	// before; the session plan-build additionally keys on this to report a
+	// vanished recording as ERROR_NOT_FOUND instead of a generic bucket
+	// outage (event-discovery design 2026-07-30 §7.1). Bucket absence
+	// (NoSuchBucket / ErrBucketNotExist) and auth-shaped permanents (403 —
+	// which S3 also returns for missing objects without s3:ListBucket)
+	// deliberately do NOT carry it: claiming "recording deleted" on config
+	// breakage would misdirect the operator.
+	ErrNotFound = errors.New("storage: object not found")
 )
 
 // ObjectInfo is the listing/head view of one object. LastModifiedNs is unix nanos.

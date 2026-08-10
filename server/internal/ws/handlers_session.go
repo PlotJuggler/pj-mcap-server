@@ -276,7 +276,7 @@ func (c *connState) openFresh(ctx context.Context, reqID uint64, fresh *pb.OpenF
 		if len(msg) > 256 {
 			msg = msg[:256]
 		}
-		c.sendError(reqID, 0, pb.ErrorCode_ERROR_S3_UNAVAILABLE, msg, err.Error())
+		c.sendError(reqID, 0, planBuildErrorCode(err), msg, err.Error())
 		return
 	}
 	// Collect the per-topic schema bindings across the stitched files. The
@@ -779,4 +779,18 @@ func truncate(s string, max int) string {
 		return s[:max]
 	}
 	return s
+}
+
+// planBuildErrorCode maps a plan-build failure onto the wire code: a vanished
+// object (storage.ErrNotFound — deleted from the bucket after cataloging; the
+// event-discovery design's §7.1 deletion-staleness window) is ERROR_NOT_FOUND
+// so the client can say "recording was deleted — refresh the list". Everything
+// else — outages, throttling, auth-shaped permanents (403 can mask a missing
+// object without s3:ListBucket, so it must never claim deletion) — stays
+// ERROR_S3_UNAVAILABLE. Mid-stream failures keep their existing mapping.
+func planBuildErrorCode(err error) pb.ErrorCode {
+	if errors.Is(err, storage.ErrNotFound) {
+		return pb.ErrorCode_ERROR_NOT_FOUND
+	}
+	return pb.ErrorCode_ERROR_S3_UNAVAILABLE
 }

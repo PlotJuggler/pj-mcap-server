@@ -176,4 +176,19 @@ func TestS3_ClassifyErrors(t *testing.T) {
 	if !errors.Is(classify(errors.New("dial tcp: connection refused")), ErrTransient) {
 		t.Error("an unclassified network error should default to transient")
 	}
+	// §7.1 (event-discovery design): the OBJECT-absent subset additionally
+	// carries ErrNotFound so the session plan-build can report a vanished
+	// recording as ERROR_NOT_FOUND. Bucket absence and auth-shaped permanents
+	// deliberately do NOT carry it — claiming "recording deleted" on a
+	// misconfigured bucket or a 403 would misdirect the operator.
+	for _, code := range []string{"NoSuchKey", "NotFound"} {
+		if !errors.Is(classify(&apiErr{code: code, msg: "x"}), ErrNotFound) {
+			t.Errorf("code %q should carry ErrNotFound", code)
+		}
+	}
+	for _, code := range []string{"NoSuchBucket", "AccessDenied"} {
+		if errors.Is(classify(&apiErr{code: code, msg: "x"}), ErrNotFound) {
+			t.Errorf("code %q must NOT carry ErrNotFound", code)
+		}
+	}
 }

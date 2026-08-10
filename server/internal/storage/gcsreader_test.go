@@ -55,6 +55,14 @@ func TestGCS_ClassifyErrors(t *testing.T) {
 	if !errors.Is(classifyGCS(gcs.ErrObjectNotExist), ErrPermanent) {
 		t.Error("ErrObjectNotExist should be permanent")
 	}
+	// §7.1: object absence additionally carries ErrNotFound; bucket absence
+	// must NOT (a missing bucket is config breakage, not a deleted recording).
+	if !errors.Is(classifyGCS(gcs.ErrObjectNotExist), ErrNotFound) {
+		t.Error("ErrObjectNotExist should carry ErrNotFound")
+	}
+	if errors.Is(classifyGCS(gcs.ErrBucketNotExist), ErrNotFound) {
+		t.Error("ErrBucketNotExist must NOT carry ErrNotFound")
+	}
 	if !errors.Is(classifyGCS(gcs.ErrBucketNotExist), ErrPermanent) {
 		t.Error("ErrBucketNotExist should be permanent")
 	}
