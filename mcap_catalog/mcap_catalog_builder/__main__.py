@@ -461,10 +461,14 @@ def worker_loop(
                         stop_event=stop_event,
                     )
                 elif ev.audit_kind == "hot":
-                    hot_tally = hot_audit(
+                    # Caller-owned tally: on a raise (incl. zero-coverage) the
+                    # partial counts — covered/skipped, the diagnostic — still
+                    # reach the sidecar below instead of reporting 0/0.
+                    hot_tally = {}
+                    hot_audit(
                         conn, caches, source, window_days=hot_window_days,
                         workers=workers, source_spec=source_spec,
-                        stop_event=stop_event,
+                        stop_event=stop_event, tally=hot_tally,
                     )
                 else:
                     # Positive dispatch, fail closed: a typo'd kind must never
@@ -505,7 +509,19 @@ def worker_loop(
             # terminal: the message stays unacked and SQS redelivers it.
             terminal = False
             try:
-                if ev.kind == "catalog":
+                scope = getattr(source, "scope_prefix", "")
+                if scope and not ev.key.startswith(scope):
+                    # Structural guard mirroring the hot audit's (Fable review
+                    # 2026-08-10): an out-of-scope key would be cataloged and
+                    # then swept forever by the prefix-scoped full audit. The
+                    # notification prefix SHOULD equal --s3-prefix (deploy
+                    # rule), but config drift must not become churn. Ack it —
+                    # redelivery cannot make it in-scope.
+                    logger.warning(
+                        "event key outside --s3-prefix scope, ignoring: %s", ev.key
+                    )
+                    terminal = True
+                elif ev.kind == "catalog":
                     catalog_object(conn, caches, ev.key, source)
                     terminal = True
                 elif ev.kind == "delete":
@@ -530,6 +546,11 @@ def worker_loop(
                     ev.batch.record_terminal()
                     if progress is not None:
                         progress.event_applied()
+                else:
+                    # Abandoned for redelivery (§3.3) — settle the gate
+                    # WITHOUT acking, or one failed record wedges every
+                    # audit's drain barrier forever (Fable review 2026-08-10).
+                    ev.batch.record_failed()
             continue
 
         try:

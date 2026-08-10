@@ -309,3 +309,49 @@ def test_event_family_fixtures_cover_all_three_families():
     assert any(n.startswith("create_") for n in names)
     assert any(n.startswith("delete_lifecycleexpiration") for n in names)
     assert any(n.startswith("ack_") for n in names)
+
+
+# --------------------------------------------------------------------------
+# Gate settlement for abandoned records (Fable review 2026-08-10): one failed
+# record must never wedge the audit drain barrier.
+# --------------------------------------------------------------------------
+
+def test_failed_record_settles_gate_without_ack():
+    """A batch with an abandoned record SETTLES the gate promptly (audits can
+    run) but is NEVER acked (SQS redelivers the whole message)."""
+    ack_q: queue.Queue = queue.Queue()
+    gate = IntakeGate()
+    gate.batch_received(2)
+    b = SqsBatch("rh", 2, ack_q, gate)
+    b.record_terminal()
+    b.record_failed()
+    stop = threading.Event()
+    assert gate.wait_drained(stop) is True   # settled, not wedged
+    assert ack_q.empty()                     # no ack -> redelivery
+    assert gate.records_buffered() == 0      # backpressure released
+
+
+def test_all_failed_batch_settles_and_double_failed_is_noop():
+    ack_q: queue.Queue = queue.Queue()
+    gate = IntakeGate()
+    gate.batch_received(1)
+    b = SqsBatch("rh", 1, ack_q, gate)
+    b.record_failed()
+    b.record_failed()   # defensive: never double-settle
+    stop = threading.Event()
+    assert gate.wait_drained(stop) is True
+    assert ack_q.empty()
+    assert gate.records_buffered() == 0
+
+
+def test_fully_committed_batch_still_acks():
+    """Settlement accounting must not change the happy path: all-committed
+    batches ack exactly once (the producer then calls batch_acked)."""
+    ack_q: queue.Queue = queue.Queue()
+    gate = IntakeGate()
+    gate.batch_received(2)
+    b = SqsBatch("rh", 2, ack_q, gate)
+    b.record_terminal()
+    b.record_terminal()
+    assert ack_q.get_nowait() is b
+    assert gate.records_buffered() == 0

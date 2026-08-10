@@ -267,6 +267,15 @@ doubt, but don't relitigate the decision itself.
   silently kills the Head-path upgrade (merge-gate-caught). Pinned by
   `TestPlanBuildErrorCode`, `TestDisambiguate404`,
   `TestHeadErrorFlowPreserves404Shape`, and the classify tests.
+- **A failed event record SETTLES the intake gate without acking** — the §3.5
+  audit drain barrier waits for settlement (acked OR abandoned-for-redelivery),
+  never for a message SQS will redeliver anyway; before this, ONE failed record
+  wedged every audit tier permanently behind `wait_drained` while the
+  healthcheck stayed green (Fable review 2026-08-10). The worker also acks
+  out-of-scope event keys without cataloging (the tier-1 mirror of the hot
+  audit's `--s3-prefix` intersection). Pinned by
+  `test_failed_record_settles_gate_without_ack` /
+  `test_worker_acks_out_of_scope_event_without_cataloging`.
 
 ## Reference codebases (MANDATORY context — always reuse these)
 

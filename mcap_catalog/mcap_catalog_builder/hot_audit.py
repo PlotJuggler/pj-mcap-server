@@ -133,6 +133,7 @@ def _stored_for(conn, caches, combo: Combo, date: str) -> "dict[str, tuple[int, 
 def hot_audit(
     conn, caches, source, *, window_days: int = 2, workers: int = 1,
     source_spec=None, stop_event=None, today: "dt.date | None" = None,
+    tally: "dict[str, int] | None" = None,
 ) -> "dict[str, int]":
     """One tier-2 pass: scoped LIST -> catalog changes -> scoped sweep.
 
@@ -142,8 +143,13 @@ def hot_audit(
     ``RuntimeError`` when EVERY targeted prefix failed to LIST (zero
     coverage = the pass did nothing; the coordinator's backoff should see a
     failure, not a healthy "ok" — Codex consult 2026-08-10)."""
-    tally = {"cataloged": 0, "skipped": 0, "failed": 0, "deleted": 0,
-             "covered_prefixes": 0, "skipped_prefixes": 0}
+    # ``tally`` may be caller-owned so partial counts (covered/skipped — the
+    # diagnostics) survive a raise; a fresh dict otherwise.
+    if tally is None:
+        tally = {}
+    for k in ("cataloged", "skipped", "failed", "deleted",
+              "covered_prefixes", "skipped_prefixes"):
+        tally.setdefault(k, 0)
     _raise_if_stopped(stop_event)
     targets = hot_prefixes(
         registry_combos(conn),

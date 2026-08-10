@@ -201,7 +201,13 @@ rare in an append-only bucket.
 - **Intake pause around audits** (handshake, not just a flag): before an audit
   starts, the coordinator (§5.3) signals pause; the producer stops receiving;
   the audit waits until every already-received batch is terminal **and acked**;
-  only then does the audit run. The pause clears in a `finally` on every exit
+  only then does the audit run. *(Amended 2026-08-10, Fable review: the drain
+  barrier waits for every batch to be SETTLED — acked, or abandoned-for-
+  redelivery. As originally written, one failed (non-terminal) record leaked
+  the gate's counters forever and the next audit's drain wedged every tier
+  permanently while the healthcheck stayed green. `SqsBatch.record_failed`
+  settles without acking; pinned by
+  `test_failed_record_settles_gate_without_ack`.)* The pause clears in a `finally` on every exit
   path. Alternative if drain latency ever hurts: `ChangeMessageVisibility`
   heartbeats on in-flight messages (IAM already granted). Tier-2 pauses are
   seconds-to-a-minute; tier-3 pauses are the §5.2 maintenance window.

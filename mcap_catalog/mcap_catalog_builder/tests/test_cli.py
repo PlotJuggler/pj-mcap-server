@@ -540,3 +540,27 @@ def test_full_audit_hour_range_validated():
     assert rc == 2
     rc = main([".", "--full-audit-hour", "-1", "--once"])
     assert rc == 2
+
+
+def test_worker_acks_out_of_scope_event_without_cataloging(tmp_db, monkeypatch):
+    """Tier-1 scope guard (Fable review 2026-08-10): an event whose key falls
+    outside the source's --s3-prefix scope is ACKED (redelivery cannot help)
+    and never cataloged — the prefix-scoped full audit would sweep it forever."""
+    conn, caches = tmp_db
+    import mcap_catalog_builder.__main__ as m
+
+    cataloged: list[str] = []
+    monkeypatch.setattr(m, "catalog_object",
+                        lambda c, ca, k, s, stat=None: cataloged.append(k))
+
+    class ScopedSource:
+        scope_prefix = "customer=acme/"
+
+    rec, ack_q = _event_record("catalog", "customer=beta/customer_site=s/robot=r/source=x/date=2026-06-02/f.mcap")
+    q: queue.Queue = queue.Queue()
+    q.put(rec)
+    q.put(WatchEvent("stop"))
+    worker_loop(conn, caches, ScopedSource(), q)
+
+    assert cataloged == []               # never cataloged
+    assert not ack_q.empty()             # but ACKED (terminal)

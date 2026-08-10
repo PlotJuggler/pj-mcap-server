@@ -51,29 +51,55 @@ _IDLE_WAIT = 0.2
 class SqsBatch:
     """Ack accounting for one SQS message: terminal-record countdown -> ack queue.
 
-    The worker thread calls ``record_terminal`` once per COMMITTED record; the
-    batch enqueues itself on ``ack_q`` when the last record completes. All SQS
-    I/O (the actual DeleteMessage) happens on the producer thread.
+    The worker thread calls ``record_terminal`` once per COMMITTED record — the
+    batch enqueues itself on ``ack_q`` when every record committed — and
+    ``record_failed`` once per ABANDONED record (processing raised; the record
+    is dropped in-process and the message stays unacked so SQS redelivers it).
+    Either way the batch eventually SETTLES the intake gate: a batch with any
+    abandoned record settles WITHOUT acking. Before that distinction existed,
+    one failed record leaked the gate's counters forever and the next audit's
+    drain barrier wedged every tier permanently (Fable review 2026-08-10).
+    All SQS I/O (the actual DeleteMessage) happens on the producer thread.
     """
 
     def __init__(self, receipt_handle: str, total: int, ack_q: "queue.Queue",
                  gate: "IntakeGate | None" = None) -> None:
         self.receipt_handle = receipt_handle
-        self._remaining = total
+        self._total = total
+        self._committed = 0
+        self._abandoned = 0
         self._ack_q = ack_q
         self._gate = gate
         self._lock = threading.Lock()
 
     def record_terminal(self) -> None:
         with self._lock:
-            if self._remaining <= 0:
+            if self._committed + self._abandoned >= self._total:
                 return  # defensive: never double-count / double-ack
-            self._remaining -= 1
-            done = self._remaining == 0
+            self._committed += 1
+            ack = self._committed == self._total
+            settled_without_ack = (not ack and
+                                   self._committed + self._abandoned == self._total)
         if self._gate is not None:
             self._gate.record_done()
-        if done:
-            self._ack_q.put(self)
+        if ack:
+            self._ack_q.put(self)   # producer acks, then gate.batch_acked()
+        elif settled_without_ack and self._gate is not None:
+            self._gate.batch_settled()
+
+    def record_failed(self) -> None:
+        """A record the worker ABANDONED (its processing raised, §3.3): it
+        stays unacked so SQS redelivers it, but it is no longer in-flight in
+        this process — the gate must not make audits wait for it."""
+        with self._lock:
+            if self._committed + self._abandoned >= self._total:
+                return  # defensive
+            self._abandoned += 1
+            settled = self._committed + self._abandoned == self._total
+        if self._gate is not None:
+            self._gate.record_done()
+            if settled:
+                self._gate.batch_settled()
 
 
 @dataclass(frozen=True)
@@ -123,6 +149,13 @@ class IntakeGate:
             self._batches_outstanding = max(0, self._batches_outstanding - 1)
             self._cond.notify_all()
 
+    def batch_settled(self) -> None:
+        """A batch left in-process flight WITHOUT an ack (some records were
+        abandoned for redelivery). For the gate the two are the same event —
+        nothing of this batch remains in flight here — but the distinct name
+        keeps ack semantics (producer-side, after DeleteMessage) honest."""
+        self.batch_acked()
+
     # -- coordinator side --------------------------------------------------
     def pause(self) -> None:
         with self._cond:
@@ -134,7 +167,10 @@ class IntakeGate:
             self._cond.notify_all()
 
     def wait_drained(self, stop_event: threading.Event, poll: float = 0.1) -> bool:
-        """Block until every received batch is acked (or stop). True = drained."""
+        """Block until every received batch SETTLED — acked, or abandoned for
+        redelivery — or stop. True = drained. Settlement (not just ack) is
+        what bounds this wait: a batch with a failed record never acks, and
+        waiting for a message SQS will simply redeliver serves nothing."""
         while True:
             with self._cond:
                 if self._batches_outstanding == 0:

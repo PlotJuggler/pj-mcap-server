@@ -235,10 +235,12 @@ def test_hot_audit_zero_coverage_raises(tmp_db, tmp_path):
         def list_objects_v2(self, *_a, **_kw):
             raise RuntimeError("LIST always fails")
 
+    tally = {}   # caller-owned: the diagnostics must survive the raise
     with pytest.raises(RuntimeError, match="zero coverage"):
         hot_audit(conn, caches, S3Source(AlwaysFailsClient({}), "bucket"),
-                  today=TODAY)
+                  today=TODAY, tally=tally)
     assert _count(conn, "a.mcap") == 1
+    assert tally["skipped_prefixes"] > 0 and tally["covered_prefixes"] == 0
 
 
 def test_hot_audit_respects_configured_source_prefix(tmp_db, tmp_path):
