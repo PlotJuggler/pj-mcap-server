@@ -7,7 +7,6 @@ import (
 	"io"
 	"net/http"
 	"strconv"
-	"time"
 
 	gcs "cloud.google.com/go/storage"
 	"google.golang.org/api/googleapi"
@@ -107,14 +106,13 @@ func (g *gcsStore) Head(ctx context.Context, key string) (ObjectInfo, error) {
 	if err != nil {
 		// §7.1: ErrObjectNotExist is ambiguous (object Attrs normalize a
 		// bucket-level 404 to the same sentinel). Upgrade to ErrNotFound only
-		// after confirming the bucket exists; error-path-only cost.
-		return ObjectInfo{}, disambiguate404(
-			err, errors.Is(err, gcs.ErrObjectNotExist), func() bool {
-				probeCtx, cancel := context.WithTimeout(
-					context.WithoutCancel(ctx), 10*time.Second)
-				defer cancel()
-				_, bErr := g.client.Bucket(g.bucket).Attrs(probeCtx)
-				return bErr == nil
+		// after confirming the bucket exists; error-path-only cost, and the
+		// probe budget/detachment policy lives in disambiguate404.
+		return ObjectInfo{}, disambiguate404(ctx, err,
+			errors.Is(err, gcs.ErrObjectNotExist),
+			func(pc context.Context) error {
+				_, bErr := g.client.Bucket(g.bucket).Attrs(pc)
+				return bErr
 			})
 	}
 	return info, nil

@@ -388,12 +388,15 @@ def test_hot_audit_and_maintenance_fields(tmp_path):
 
 
 def test_tag_edit_counters(tmp_path):
-    """§6 counters, design names: tag_edit_expired / tag_edit_failed."""
+    """§6 counters, design names: tag_edit_expired / tag_edit_failed —
+    keyed off the TagEditItem's terminal status; ok/not_found don't count."""
     db = str(tmp_path / "catalog.db")
     w = StatusWriter(db, min_interval=0.0)
     w.update(phase="idle")
-    w.tag_edit_expired()
-    w.tag_edit_failed()
-    w.tag_edit_expired()
+    w.tag_edit_result("expired")
+    w.tag_edit_result("error")
+    w.tag_edit_result("expired")
+    w.tag_edit_result("ok")
+    w.tag_edit_result("not_found")
     doc = _read_status(db)
     assert doc["tag_edit_expired"] == 2 and doc["tag_edit_failed"] == 1

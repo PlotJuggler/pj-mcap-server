@@ -14,7 +14,7 @@ import pytest
 
 from mcap_catalog_builder.reconcile import ReconcileCancelled, full_reconcile
 from mcap_catalog_builder.s3_storage import S3Source
-from mcap_catalog_builder.tests.fixtures import InMemoryS3Client, write_minimal_mcap
+from mcap_catalog_builder.tests.fixtures import InMemoryS3Client, minimal_mcap_bytes
 
 CH = [("/a", "S", "ros2msg", 2)]
 TODAY = dt.date(2026, 6, 2)
@@ -25,31 +25,14 @@ KB = PB + "b.mcap"
 
 
 def _raw(tmp_path):
-    local = str(tmp_path / "src.mcap")
-    write_minimal_mcap(local, channels=CH)
-    with open(local, "rb") as f:
-        return f.read()
+    return minimal_mcap_bytes(tmp_path, CH)
 
 
-class PagedClient(InMemoryS3Client):
-    """Two-page pagination for list_objects_v2 (InMemoryS3Client is single-page)."""
-
-    def list_objects_v2(self, Bucket, Prefix="", Delimiter=None, ContinuationToken=None):
-        keys = sorted(k for k in self._objects if k.startswith(Prefix))
-        page = keys[:1] if ContinuationToken is None else keys[1:]
-        return {
-            "Contents": [{"Key": k, "Size": len(self._objects[k]),
-                          "ETag": f'"etag-{k}"'} for k in page],
-            "IsTruncated": ContinuationToken is None and len(keys) > 1,
-            "NextContinuationToken": "page2",
-        }
-
-
-class Page2FailsClient(PagedClient):
+class Page2FailsClient(InMemoryS3Client):
     """Page 1 OK, page 2 raises for keys under fail_prefix — a PARTIAL listing."""
 
     def __init__(self, objects, fail_prefix):
-        super().__init__(objects)
+        super().__init__(objects, page_size=1)
         self._fail_prefix = fail_prefix
 
     def list_objects_v2(self, Bucket, Prefix="", Delimiter=None, ContinuationToken=None):
@@ -62,7 +45,8 @@ class Page2FailsClient(PagedClient):
 
 def test_s3_list_prefix_paginates_to_completion(tmp_path):
     raw = _raw(tmp_path)
-    src = S3Source(PagedClient({KA: raw, PA + "a2.mcap": raw, KB: raw}), "bucket")
+    src = S3Source(InMemoryS3Client({KA: raw, PA + "a2.mcap": raw, KB: raw},
+                                page_size=1), "bucket")
     got = src.list_prefix(PA)
     assert sorted(l.key for l in got) == [KA, PA + "a2.mcap"]  # complete, scoped
     for l in got:
@@ -78,7 +62,7 @@ def test_s3_list_prefix_raises_on_page_failure_never_partial(tmp_path):
 
 def test_s3_list_prefix_stop_raises_cancelled(tmp_path):
     raw = _raw(tmp_path)
-    src = S3Source(PagedClient({KA: raw}), "bucket")
+    src = S3Source(InMemoryS3Client({KA: raw}, page_size=1), "bucket")
     stop = threading.Event()
     stop.set()
     with pytest.raises(ReconcileCancelled):

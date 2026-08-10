@@ -95,25 +95,27 @@ class StatusWriter:
         normal ``min_interval`` coalescing; polls recur every ~20 s anyway."""
         self.update(producer_last_poll_ok_at=_utc_iso())
 
-    def producer_acked(self) -> None:
+    def _bump(self, attr: str) -> int:
+        """Increment one telemetry counter under the counters lock (the shared
+        idiom behind every event/tag counter below) and return the new value
+        for the caller's sidecar-field write."""
         with self._counters_lock:
-            self._events_acked += 1
-            n = self._events_acked
-        self.update(producer_last_ack_at=_utc_iso(), events_acked=n)
+            n = getattr(self, attr) + 1
+            setattr(self, attr, n)
+        return n
+
+    def producer_acked(self) -> None:
+        self.update(producer_last_ack_at=_utc_iso(),
+                    events_acked=self._bump("_events_acked"))
 
     def event_unknown(self, name: str) -> None:
         """Count an S3 event name the translator does not support (§3.2) — a
         visible counter, never a silently acked-and-dropped message."""
-        with self._counters_lock:
-            self._events_unknown += 1
-            n = self._events_unknown
-        self.update(events_unknown_name=n)
+        logger.debug("unsupported S3 event name counted: %r", name)
+        self.update(events_unknown_name=self._bump("_events_unknown"))
 
     def event_applied(self) -> None:
-        with self._counters_lock:
-            self._events_applied += 1
-            n = self._events_applied
-        self.update(events_applied=n)
+        self.update(events_applied=self._bump("_events_applied"))
 
     def full_audit_finished(self, outcome: str, duration: float) -> None:
         """Record the last terminal full-audit result.
@@ -146,20 +148,15 @@ class StatusWriter:
         events pause and tag edits can expire; make it sidecar-visible."""
         self.update(maintenance_window_active=bool(active), force=True)
 
-    def tag_edit_expired(self) -> None:
-        """§6 counter (design name ``tag_edit_expired``): an edit whose 5 s
-        deadline passed before the worker reached it — the visible cost of a
-        busy writer (e.g. the nightly maintenance window)."""
-        with self._counters_lock:
-            self._tag_edits_expired += 1
-            n = self._tag_edits_expired
-        self.update(tag_edit_expired=n)
-
-    def tag_edit_failed(self) -> None:
-        with self._counters_lock:
-            self._tag_edits_failed += 1
-            n = self._tag_edits_failed
-        self.update(tag_edit_failed=n)
+    def tag_edit_result(self, status: str) -> None:
+        """§6 counters keyed on a TagEditItem's terminal status: ``expired``
+        (the 5 s deadline passed before the worker reached it — the visible
+        cost of a busy writer, e.g. the nightly maintenance window) and
+        ``error``; ``ok``/``not_found`` are business outcomes, not counted."""
+        if status == "expired":
+            self.update(tag_edit_expired=self._bump("_tag_edits_expired"))
+        elif status == "error":
+            self.update(tag_edit_failed=self._bump("_tag_edits_failed"))
 
     def heartbeat_start(self, stop_event: threading.Event, interval: float = 10.0) -> None:
         """Refresh ``updated_at`` every ``interval`` seconds on a daemon thread,
@@ -343,13 +340,9 @@ class ReconcileProgress:
         if self._status is not None:
             self._status.maintenance_window(active)
 
-    def tag_edit_expired(self) -> None:
+    def tag_edit_result(self, status: str) -> None:
         if self._status is not None:
-            self._status.tag_edit_expired()
-
-    def tag_edit_failed(self) -> None:
-        if self._status is not None:
-            self._status.tag_edit_failed()
+            self._status.tag_edit_result(status)
 
     @property
     def summary_via_counts(self) -> dict:

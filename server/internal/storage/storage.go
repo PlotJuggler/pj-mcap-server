@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"time"
 
 	"pj-cloud/server/internal/config"
 )
@@ -46,19 +47,30 @@ var (
 	ErrNotFound = errors.New("storage: object not found")
 )
 
+// bucketProbeTimeout bounds the disambiguation probe below — an error-path
+// nicety must never hang a failed Head for long.
+const bucketProbeTimeout = 10 * time.Second
+
 // disambiguate404 upgrades an object-level 404 from a Head call to carry
 // ErrNotFound (§7.1) ONLY when the bucket itself is confirmed to exist.
-// bucketExists is invoked solely on this error path (one probe per failed
-// Head, never on the happy path); a failed/uncertain probe keeps the error
-// as-is — fail-closed to the outage-shaped code.
-func disambiguate404(err error, is404 bool, bucketExists func() bool) error {
+// probeBucket (nil error = bucket exists) is invoked solely on this error
+// path — one probe per failed Head, never on the happy path — under a
+// context detached from the caller's cancellation (a bailing caller must not
+// abort the classification) but capped at bucketProbeTimeout. A
+// failed/uncertain probe keeps the error as-is — fail-closed to the
+// outage-shaped code.
+func disambiguate404(ctx context.Context, err error, is404 bool,
+	probeBucket func(context.Context) error) error {
 	if err == nil || !is404 {
 		return err
 	}
 	if errors.Is(err, ErrNotFound) {
 		return err // already precise (GET-shape NoSuchKey via classify)
 	}
-	if !bucketExists() {
+	probeCtx, cancel := context.WithTimeout(
+		context.WithoutCancel(ctx), bucketProbeTimeout)
+	defer cancel()
+	if probeBucket(probeCtx) != nil {
 		return err
 	}
 	return fmt.Errorf("%w: %w", ErrNotFound, err)

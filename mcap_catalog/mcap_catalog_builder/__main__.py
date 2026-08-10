@@ -10,6 +10,7 @@ writer. It is driven by a storage ``Source`` and is identical for all backends.
 import argparse
 import calendar
 import logging
+import math
 import os
 import queue
 import signal
@@ -218,12 +219,16 @@ class AuditCoordinator:
                 self._current = None
                 self._queued_or_running = False
 
-    def _fire(self, kind: str) -> AuditResult | None:
+    def _fire(self, kind: str) -> "tuple[AuditItem, AuditResult | None] | None":
         """Run one audit through the arbiter: pause/drain intake (§3.5, BOTH
         tiers — a message must never sit un-acked behind an audit blowing its
         visibility timeout), enqueue (or observe an externally-requested
-        active item), wait for the worker's result. None = stop arrived.
-        resume() runs in the finally on every exit path."""
+        active item), wait for the worker's result. Returns the ITEM alongside
+        the result — the coalescing path can hand back a DIFFERENT tier's item
+        (request_due() always creates a full one), and the scheduler must
+        attribute the outcome to the audit that actually ran, not the tier
+        whose tick fired. None = stop arrived; resume() runs in the finally
+        on every exit path."""
         try:
             if self._gate is not None:
                 self._gate.pause()
@@ -239,7 +244,7 @@ class AuditCoordinator:
                 if item is None:
                     return None  # stop raced the due tick
             try:
-                return item.wait(self._stop_event)
+                return item, item.wait(self._stop_event)
             finally:
                 # Never leave the arbiter stuck after failure, cancellation,
                 # or an unexpected result-handling exception.
@@ -250,59 +255,59 @@ class AuditCoordinator:
 
     def _run(self, initial_delay: float) -> None:
         mono = time.monotonic
-        full_failures = 0
-        hot_failures = 0
-        next_full = mono() + initial_delay
-        next_hot = (mono() + self._hot_interval) if self._hot_interval > 0 else None
+        # One schedule/backoff state per tier; a disabled hot tier is simply
+        # never due (math.inf) rather than a special case at every use site.
+        failures = {"full": 0, "hot": 0}
+        next_due = {
+            "full": mono() + initial_delay,
+            "hot": (mono() + self._hot_interval) if self._hot_interval > 0
+                   else math.inf,
+        }
         while True:
-            due_times = [next_full] if next_hot is None else [next_full, next_hot]
-            if self._stop_event.wait(max(0.0, min(due_times) - mono())):
+            if self._stop_event.wait(max(0.0, min(next_due.values()) - mono())):
                 break
             now = mono()
-            full_due = now >= next_full
-            if not full_due and (next_hot is None or now < next_hot):
+            if now < min(next_due.values()):
                 continue
-            kind = "full" if full_due else "hot"  # full supersedes hot (§5.2)
-            result = self._fire(kind)
+            kind = "full" if now >= next_due["full"] else "hot"  # full supersedes (§5.2)
+            fired = self._fire(kind)
+            if fired is None:
+                break
+            item, result = fired
             if result is None or result.outcome == "cancelled":
                 break
-            if kind == "hot":
-                if result.outcome == "ok":
-                    hot_failures = 0
-                    next_hot = mono() + self._hot_interval
-                else:
-                    # §5.2's result-bearing rule applies to both tiers: capped
-                    # exponential backoff, never slower than the cadence.
-                    hot_failures += 1
-                    backoff = min(
-                        self._hot_interval,
-                        self._backoff_initial * (2 ** (hot_failures - 1)),
-                    )
-                    next_hot = mono() + backoff
-                    logger.warning(
-                        "hot audit failed; retrying in %.1fs (failure %d): %s",
-                        backoff, hot_failures, result.error or "unknown error",
-                    )
-                continue
+            # Attribute to the audit that RAN (see _fire): a hot tick that
+            # coalesced into an externally-requested full item must advance
+            # the FULL schedule and leave the hot tick due.
+            kind = item.audit_kind
+            if kind not in next_due:
+                continue  # unknown tier: nothing to schedule (worker failed it)
             if result.outcome == "ok":
-                full_failures = 0
-                next_full = mono() + self._full_delay()
+                failures[kind] = 0
+                delay = self._full_delay() if kind == "full" else self._hot_interval
             else:
-                full_failures += 1
-                cap = (self._interval if self._full_hour is None
-                       else _FIXED_HOUR_BACKOFF_CAP)
-                backoff = min(cap, self._backoff_initial * (2 ** (full_failures - 1)))
-                if self._full_hour is not None:
-                    # Never retry past the next fixed slot (skip-missed, §5.2).
-                    backoff = min(
-                        backoff,
+                # §5.2's result-bearing rule, both tiers: capped exponential
+                # backoff, never slower than the tier's cadence; fixed-hour
+                # mode additionally never retries past the next slot.
+                failures[kind] += 1
+                if kind == "full":
+                    cap = (self._interval if self._full_hour is None
+                           else _FIXED_HOUR_BACKOFF_CAP)
+                else:
+                    cap = self._hot_interval
+                delay = min(cap, self._backoff_initial * (2 ** (failures[kind] - 1)))
+                if kind == "full" and self._full_hour is not None:
+                    delay = min(
+                        delay,
                         _next_fixed_hour_delay(self._wall(), self._full_hour),
                     )
-                next_full = mono() + backoff
                 logger.warning(
-                    "full audit failed; retrying in %.1fs (failure %d): %s",
-                    backoff, full_failures, result.error or "unknown error",
+                    "%s audit failed; retrying in %.1fs (failure %d): %s",
+                    kind, delay, failures[kind], result.error or "unknown error",
                 )
+            if kind == "hot" and self._hot_interval <= 0:
+                continue  # coalesced hot item with tier 2 off: keep it off
+            next_due[kind] = mono() + delay
 
         # Stop may arrive while the first/due timer is waiting. If an external
         # due request queued an item, make it a dropped terminal item.
@@ -438,7 +443,7 @@ def worker_loop(
             started = time.monotonic()
             outcome = "ok"
             error = None
-            is_full = ev.audit_kind != "hot"
+            is_full = ev.audit_kind == "full"
             hot_tally: dict | None = None
             try:
                 if is_full:
@@ -455,12 +460,16 @@ def worker_loop(
                         progress=progress,
                         stop_event=stop_event,
                     )
-                else:
+                elif ev.audit_kind == "hot":
                     hot_tally = hot_audit(
                         conn, caches, source, window_days=hot_window_days,
                         workers=workers, source_spec=source_spec,
                         stop_event=stop_event,
                     )
+                else:
+                    # Positive dispatch, fail closed: a typo'd kind must never
+                    # fall through to the expensive, globally-deleting tier.
+                    raise ValueError(f"unknown audit kind {ev.audit_kind!r}")
             except ReconcileCancelled:
                 outcome = "cancelled"
                 logger.info("%s audit cancelled", ev.audit_kind)
@@ -476,7 +485,7 @@ def worker_loop(
                             progress.maintenance_window(False)
                             progress.audit_finished(result.outcome, result.duration)
                             progress.idle()
-                        else:
+                        elif ev.audit_kind == "hot":
                             t = hot_tally or {}
                             progress.hot_audit_finished(
                                 result.outcome, result.duration,
@@ -525,7 +534,12 @@ def worker_loop(
 
         try:
             if isinstance(ev, TagEditItem):
-                handle_tag_edit(conn, caches, ev, telemetry=progress)
+                # TagEditItem is result-bearing (status set on every path
+                # before its event fires) — read the outcome here instead of
+                # threading a telemetry hook into the pure IPC module.
+                handle_tag_edit(conn, caches, ev)
+                if progress is not None:
+                    progress.tag_edit_result(ev.result.status)
                 continue
             if ev.kind == "stop":
                 break

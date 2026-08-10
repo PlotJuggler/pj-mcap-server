@@ -30,8 +30,19 @@ if [ "$CMD" != freshness ] || [ -z "$BUCKET" ] || [ -z "$REGION" ]; then
   exit 2
 fi
 
-count() { sqlite3 "file:$DB?mode=ro" \
-  "SELECT COUNT(*) FROM files WHERE filename='$1'" 2>/dev/null || echo 0; }
+# python3 + stdlib sqlite3, read-only URI — the repo convention (run.sh
+# db_query, sabotage-check.sh); no sqlite3-CLI dependency.
+count() {
+  python3 - "$DB" "$1" <<'PY'
+import sqlite3, sys
+try:
+    conn = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True)
+    print(conn.execute("SELECT COUNT(*) FROM files WHERE filename=?",
+                       (sys.argv[2],)).fetchone()[0])
+except Exception:
+    print(0)
+PY
+}
 
 wait_count() { # $1=filename $2=want -> prints elapsed seconds, or fails
   local t0 now
@@ -46,7 +57,15 @@ wait_count() { # $1=filename $2=want -> prints elapsed seconds, or fails
   done
 }
 
-command -v sqlite3 >/dev/null || { echo "FAIL: sqlite3 not installed" >&2; exit 1; }
+expect_count() { # $1=filename $2=want $3=pass-label $4=fail-label
+  local t
+  if t=$(wait_count "$1" "$2"); then
+    echo "PASS: $3 in ${t}s"
+  else
+    echo "FAIL: $4 within ${TIMEOUT}s"; exit 1
+  fi
+}
+
 [ -f "$DB" ] || { echo "FAIL: catalog DB not found at $DB (is the builder running?)" >&2; exit 1; }
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -62,17 +81,9 @@ K="customer=drill/customer_site=lab/robot=r1/source=ros-bags/date=$(date -u +%F)
 
 echo "== upload s3://$BUCKET/$K"
 aws s3 cp "$F" "s3://$BUCKET/$K" --region "$REGION" --only-show-errors
-if T=$(wait_count "$FN" 1); then
-  echo "PASS: row appeared in ${T}s"
-else
-  echo "FAIL: row did not appear within ${TIMEOUT}s"; exit 1
-fi
+expect_count "$FN" 1 "row appeared" "row did not appear"
 
 echo "== delete s3://$BUCKET/$K"
 aws s3 rm "s3://$BUCKET/$K" --region "$REGION" --only-show-errors
-if T=$(wait_count "$FN" 0); then
-  echo "PASS: row removed in ${T}s"
-else
-  echo "FAIL: row not removed within ${TIMEOUT}s"; exit 1
-fi
+expect_count "$FN" 0 "row removed" "row not removed"
 echo "FRESHNESS DRILL PASS"

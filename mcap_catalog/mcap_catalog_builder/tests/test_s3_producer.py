@@ -308,5 +308,4 @@ def test_event_family_fixtures_cover_all_three_families():
     names = [p.name for p in _DATA.glob("*.json")]
     assert any(n.startswith("create_") for n in names)
     assert any(n.startswith("delete_lifecycleexpiration") for n in names)
-    assert any(n.startswith("delete_") for n in names)
     assert any(n.startswith("ack_") for n in names)

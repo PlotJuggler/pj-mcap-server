@@ -328,10 +328,11 @@ cloud_builder_args() {
     # first — scripts/staging-sqs-setup.sh prints the URL to export.
     BARGS+=(--sqs-url "$MCAP_CATALOG_SQS_URL" --tag-socket "$TAG_SOCKET" --db "$DB_PATH" --rescan-interval 21600 --log-level INFO)
   else
-    # Byte-identical to the pre-event-tier argv (order included): the builder
-    # reuse check hashes the exact vector, so reordering it would declare
-    # drift on the first rerun after upgrade and kill/restart a healthy
-    # builder mid-scan for nothing.
+    # Kept byte-identical to the pre-event-tier argv (order included),
+    # DELIBERATELY but unenforced: the builder reuse check hashes the exact
+    # vector (see the sha256 above), so reordering it would declare drift on
+    # the first rerun after upgrade and kill/restart a healthy builder
+    # mid-scan for nothing.
     BARGS+=(--no-watch --tag-socket "$TAG_SOCKET" --db "$DB_PATH" --rescan-interval 300 --log-level INFO)
   fi
 }

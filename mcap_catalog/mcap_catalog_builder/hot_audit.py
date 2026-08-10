@@ -8,7 +8,8 @@ Fail-closed by construction (§4.2):
 - a prefix counts as *covered* only if its pagination COMPLETED (list_prefix
   raises rather than returning a partial result);
 - the deletion sweep runs per covered prefix ONLY — global deletion is
-  structurally impossible from a scoped feed;
+  structurally impossible from a scoped feed — and every candidate is
+  HEAD-confirmed (live/ambiguous ⇒ skip);
 - a hot audit NEVER stamps ``build_metadata`` (that is whole-catalog freshness,
   owned by the tier-3 full audit). Its telemetry goes to the sidecar only.
 
@@ -26,18 +27,31 @@ import datetime as dt
 import logging
 from concurrent.futures import ThreadPoolExecutor
 
-from .builder import resolve_key_dims
-from .db import record_failure
-from .keyparse import parse_hive_key
-from .reconcile import ReconcileCancelled, _raise_if_stopped, _run_extract_apply
+from .keyparse import parse_hive_key, rebuild_hive_key
+from .reconcile import (
+    ReconcileCancelled,
+    _classify_listing,
+    _composite_ids,
+    _raise_if_stopped,
+    _run_extract_apply,
+)
 
 logger = logging.getLogger(__name__)
 
 # Hot prefixes are small (one robot-day each); a modest pool keeps the LIST
-# phase snappy without the full sharded-LIST machinery.
+# phase (and the sweep's HEAD-confirm phase) snappy without the full
+# sharded-LIST machinery.
 _LIST_PREFIX_THREADS = 8
 
-Combo = tuple  # (customer, site, robot, source) — names, not ids
+Combo = tuple[str, str, str, str]  # (customer, site, robot, source) names
+
+
+def _combo_dims(combo: Combo, date: str, filename: str = "") -> dict[str, str]:
+    """The keyparse/caches ``dims`` dict for a combo — the one shape every
+    shared helper (rebuild_hive_key, _composite_ids) speaks."""
+    customer, site, robot, source = combo
+    return {"customer": customer, "site": site, "robot": robot,
+            "source": source, "date": date, "filename": filename}
 
 
 def registry_combos(conn) -> "set[Combo]":
@@ -79,36 +93,32 @@ def hot_prefixes(
 ) -> "list[tuple[str, Combo, str]]":
     """Hive prefixes for ``date ∈ [today − window_days, today]`` per combo,
     oldest-first, as ``(prefix, combo, date)`` — the combo+date ride along so
-    the scoped sweep never has to re-parse a prefix string. Dates are ISO
-    (matching the builder's own key convention); a bucket using non-ISO
-    ``date=`` values is repaired by tier 3 only (§4.3's honesty list)."""
+    the scoped sweep never has to re-parse a prefix string. The layout comes
+    from ``rebuild_hive_key`` (an empty filename yields the ``date=…/``
+    prefix), so keyparse stays the sole owner of the partition template.
+    Dates are ISO (matching the builder's own key convention); a bucket using
+    non-ISO ``date=`` values is repaired by tier 3 only (§4.3's honesty
+    list)."""
     dates = [
         (today - dt.timedelta(days=n)).isoformat()
         for n in range(window_days, -1, -1)
     ]
-    out: list[tuple[str, Combo, str]] = []
-    for combo in sorted(combos):
-        customer, site, robot, source = combo
-        for d in dates:
-            out.append((
-                f"customer={customer}/customer_site={site}/robot={robot}/"
-                f"source={source}/date={d}/",
-                combo, d,
-            ))
-    return out
+    return [
+        (rebuild_hive_key(_combo_dims(combo, d)), combo, d)
+        for combo in sorted(combos)
+        for d in dates
+    ]
 
 
 def _stored_for(conn, caches, combo: Combo, date: str) -> "dict[str, tuple[int, str]]":
     """{filename: (files.id, etag)} for one combo+date, via the UNIQUE
     composite index — O(scope) on the SQLite side (§4.2), never a full-table
-    fingerprint load like full_reconcile's."""
-    customer, site, robot, source = combo
-    cid = caches.customer.get(customer)
-    sid = caches.site.get((cid, site)) if cid is not None else None
-    rid = caches.robot.get((sid, robot)) if sid is not None else None
-    srcid = caches.source.get(source)
-    if None in (cid, sid, rid, srcid):
+    fingerprint load like full_reconcile's. Id resolution goes through
+    reconcile._composite_ids so the caches' key shapes live in one place."""
+    comp = _composite_ids(caches, _combo_dims(combo, date))
+    if comp is None:
         return {}   # no ids cached => no rows can exist for this combo
+    cid, sid, rid, srcid = comp[:4]
     return {
         r["filename"]: (r["id"], r["etag"])
         for r in conn.execute(
@@ -172,27 +182,21 @@ def hot_audit(
             "prefix LISTs failed"
         )
 
-    # Classify: scoped fingerprint lookup per covered prefix; unchanged files
-    # skip with zero network (the listing carries the etag), like tier 3.
+    # Classify (shared rules — reconcile._classify_listing): unchanged files
+    # skip with zero network, unparseable keys quarantine. The fingerprint
+    # lookup is the per-prefix filename map; S3 keys are authoritative
+    # (intended_key is None), so dims always match this prefix's combo/date.
     to_extract: list = []
     for _prefix, combo, date, listings in covered:
         stored = _stored_for(conn, caches, combo, date)
         for lst in listings:
             _raise_if_stopped(stop_event)
-            res = resolve_key_dims(lst.key, source)
-            if res is None:
-                record_failure(conn, lst.key, "unparseable key")
-                conn.commit()
-                tally["failed"] += 1
-                continue
-            dims, eff_key = res
-            # S3 keys are authoritative (intended_key is None), so dims always
-            # match this prefix's combo/date and the filename lookup is exact.
-            row = stored.get(dims["filename"])
-            if row is not None and row[1] == lst.stat.etag:
-                tally["skipped"] += 1
-                continue
-            to_extract.append((lst.key, lst.stat, dims, eff_key))
+            _dims, _eff, item = _classify_listing(
+                conn, source, lst,
+                lambda d: (stored.get(d["filename"]) or (None, None))[1], tally)
+            if item is not None:
+                to_extract.append(item)
+    conn.commit()  # the classify loops' record_failure upserts, one fsync
 
     _run_extract_apply(
         conn, caches, source, to_extract, workers=workers,
@@ -200,46 +204,60 @@ def hot_audit(
         stop_event=stop_event,
     )
 
-    # Scoped sweep: deletions ONLY for rows inside covered prefixes. The
-    # per-prefix row set is re-read here, AFTER apply, so rows just written
-    # are present and can never be swept. One transaction, rolled back on
-    # cancellation (mirrors full_reconcile's sweep discipline).
+    # Scoped sweep, three phases so no network call ever runs inside an open
+    # write transaction (the single writer's lock would make SQS events and
+    # 5s-deadline tag edits queue behind per-candidate HEADs).
     #
-    # HEAD-guard (Codex branch review 2026-08-10): the LIST completed EARLIER
-    # — an object deleted-and-re-uploaded (or first uploaded) between that
-    # LIST and this sweep is absent from `listed` yet LIVE, and deleting its
-    # row would cascade `tags_override` (user data no rebuild reconstructs).
-    # Deletions are rare in an append-only bucket, so candidates ≈ actual
-    # deletions: one stat() per candidate confirms the 404. Live or ambiguous
-    # (stat raised) ⇒ skip, fail-closed — the next pass or the object's own
-    # create event self-heals. (Tier 3's full sweep keeps the design's
-    # live-LIST-authority semantics unchanged; this guard exists because the
-    # hot tier runs ~50x more windows per day.)
+    # Phase 1 — candidates: rows in covered prefixes absent from their
+    # listing. Rows are re-read AFTER apply because apply can re-insert a
+    # row under a NEW id — deleting by a pre-apply id could hit a reused
+    # rowid; the re-read is an index seek per prefix, sub-ms.
+    candidates: list = []  # (prefix, filename, row_id)
+    for prefix, combo, date, listings in covered:
+        _raise_if_stopped(stop_event)
+        listed = {lst.key.rsplit("/", 1)[-1] for lst in listings}
+        for filename, (row_id, _etag) in _stored_for(conn, caches, combo, date).items():
+            if filename not in listed:
+                candidates.append((prefix, filename, row_id))
+
+    # Phase 2 — HEAD-guard (Codex branch review 2026-08-10), concurrent: the
+    # LIST completed EARLIER, so an object (re-)uploaded since is absent from
+    # the listing yet LIVE, and deleting its row would cascade tags_override
+    # (user data no rebuild reconstructs). One stat() per candidate confirms
+    # the 404; live or ambiguous (stat raised) ⇒ skip, fail-closed — the next
+    # pass or the object's own create event self-heals. (Tier 3's full sweep
+    # keeps the design's live-LIST-authority semantics unchanged; this guard
+    # exists because the hot tier runs ~50x more windows per day.)
+    confirmed: list = []
+    if candidates:
+        def _gone_row_id(cand):
+            prefix, filename, row_id = cand
+            try:
+                return row_id if source.stat(prefix + filename) is None else None
+            except Exception as e:  # noqa: BLE001 — ambiguous ⇒ no delete
+                logger.warning(
+                    "hot audit: HEAD-guard inconclusive for %s%s, "
+                    "skipping delete: %s", prefix, filename, e,
+                )
+                return None
+
+        with ThreadPoolExecutor(
+            max_workers=min(_LIST_PREFIX_THREADS, len(candidates))
+        ) as pool:
+            for row_id in pool.map(_gone_row_id, candidates):
+                _raise_if_stopped(stop_event)
+                if row_id is not None:
+                    confirmed.append(row_id)
+
+    # Phase 3 — one short transaction for the confirmed deletions.
     try:
-        for prefix, combo, date, listings in covered:
+        for row_id in confirmed:
             _raise_if_stopped(stop_event)
-            listed = {lst.key.rsplit("/", 1)[-1] for lst in listings}
-            for filename, (row_id, _etag) in _stored_for(conn, caches, combo, date).items():
-                if filename in listed:
-                    continue
-                try:
-                    still_gone = source.stat(prefix + filename) is None
-                except Exception as e:  # noqa: BLE001 — ambiguous ⇒ no delete
-                    logger.warning(
-                        "hot audit: HEAD-guard inconclusive for %s%s, "
-                        "skipping delete: %s", prefix, filename, e,
-                    )
-                    continue
-                if not still_gone:
-                    continue  # re-uploaded after the LIST — leave the row
-                conn.execute("DELETE FROM files WHERE id=?", (row_id,))
-                tally["deleted"] += 1
+            conn.execute("DELETE FROM files WHERE id=?", (row_id,))
+            tally["deleted"] += 1
         _raise_if_stopped(stop_event)
         conn.commit()
-    except ReconcileCancelled:
-        conn.rollback()
-        raise
-    except Exception:
+    except Exception:  # incl. ReconcileCancelled — never leave partial deletes
         conn.rollback()
         raise
 

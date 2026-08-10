@@ -65,31 +65,31 @@ DLQ="${NAME_BASE}-dlq"
 RETENTION=345600   # 4 days (§3.1: covers an initial build + a prolonged outage)
 VISIBILITY=300     # §3.1
 
+# ensure_queue NAME: idempotently create NAME and set QURL/QARN (dry-run
+# stand-ins included). Callers converge their own attributes afterwards, so a
+# pre-existing queue with drifted values is corrected, not silently kept.
+ensure_queue() {
+  local name="$1"
+  run aws sqs create-queue --region "$REGION" --queue-name "$name" || true
+  if [ "$DRY_RUN" = 1 ]; then
+    QURL="DRY-${name}-URL" QARN="arn:aws:sqs:$REGION:000000000000:$name"
+  else
+    QURL=$(aws sqs get-queue-url --region "$REGION" --queue-name "$name" \
+      --query QueueUrl --output text)
+    QARN=$(aws sqs get-queue-attributes --region "$REGION" --queue-url "$QURL" \
+      --attribute-names QueueArn --query Attributes.QueueArn --output text)
+  fi
+}
+
 echo "== DLQ: $DLQ"
-run aws sqs create-queue --region "$REGION" --queue-name "$DLQ" || true
-if [ "$DRY_RUN" = 1 ]; then
-  DLQ_URL="DRY-DLQ-URL" DLQ_ARN="arn:aws:sqs:$REGION:000000000000:$DLQ"
-else
-  DLQ_URL=$(aws sqs get-queue-url --region "$REGION" --queue-name "$DLQ" \
-    --query QueueUrl --output text)
-  DLQ_ARN=$(aws sqs get-queue-attributes --region "$REGION" --queue-url "$DLQ_URL" \
-    --attribute-names QueueArn --query Attributes.QueueArn --output text)
-fi
-# Converge attributes even when the queue pre-existed with drifted values.
+ensure_queue "$DLQ"
+DLQ_URL="$QURL" DLQ_ARN="$QARN"
 run aws sqs set-queue-attributes --region "$REGION" --queue-url "$DLQ_URL" \
   --attributes "{\"MessageRetentionPeriod\":\"$RETENTION\"}"
 
 echo "== queue: $QUEUE (retention 4d, visibility ${VISIBILITY}s, redrive after 5)"
-run aws sqs create-queue --region "$REGION" --queue-name "$QUEUE" || true
-if [ "$DRY_RUN" = 1 ]; then
-  QUEUE_URL="DRY-QUEUE-URL" QUEUE_ARN="arn:aws:sqs:$REGION:000000000000:$QUEUE"
-else
-  QUEUE_URL=$(aws sqs get-queue-url --region "$REGION" --queue-name "$QUEUE" \
-    --query QueueUrl --output text)
-  QUEUE_ARN=$(aws sqs get-queue-attributes --region "$REGION" --queue-url "$QUEUE_URL" \
-    --attribute-names QueueArn --query Attributes.QueueArn --output text)
-fi
-# Converge attributes even when the queue pre-existed with drifted values.
+ensure_queue "$QUEUE"
+QUEUE_URL="$QURL" QUEUE_ARN="$QARN"
 run aws sqs set-queue-attributes --region "$REGION" --queue-url "$QUEUE_URL" --attributes "{
   \"MessageRetentionPeriod\":\"$RETENTION\",
   \"VisibilityTimeout\":\"$VISIBILITY\",

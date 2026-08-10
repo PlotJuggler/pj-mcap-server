@@ -155,6 +155,32 @@ def _composite_ids(caches: Caches, dims) -> tuple | None:
     return (cid, sid, rid, srcid, dims["date"], dims["filename"])
 
 
+def _classify_listing(conn, source, lst, stored_etag_for, tally):
+    """Shared per-listing classification for BOTH audit tiers — the rules here
+    are pinned and must never diverge between them: an unparseable key is
+    quarantined, never a guessed row (R3); an unchanged etag skips with ZERO
+    network (R4 — the listing carries the fingerprint); everything else emits
+    the exact ``(key, stat, dims, eff_key)`` tuple ``_run_extract_apply``
+    consumes. ``stored_etag_for(dims)`` is the tier's fingerprint lookup
+    (full: whole-catalog composite map; hot: per-prefix filename map).
+
+    Returns ``(dims, eff_key, extract_item_or_None)``; ``(None, None, None)``
+    for a quarantined key. record_failure is NOT committed here — callers
+    commit once after their classify loop (a per-key fsync 48x/day per
+    persistently-bad key was measurable on the hot cadence).
+    """
+    res = resolve_key_dims(lst.key, source)
+    if res is None:
+        record_failure(conn, lst.key, "unparseable key")
+        tally["failed"] += 1
+        return None, None, None
+    dims, eff_key = res
+    if stored_etag_for(dims) == lst.stat.etag:
+        tally["skipped"] += 1
+        return dims, eff_key, None
+    return dims, eff_key, (lst.key, lst.stat, dims, eff_key)
+
+
 def _run_extract_apply(
     conn, caches, source, to_extract, *, workers, source_spec,
     tally, progress=None, stop_event=None,
@@ -287,26 +313,26 @@ def full_reconcile(
     # extract_summary). dims_by_key drives the deletion sweep below.
     dims_by_key: dict[str, dict] = {}
     to_extract: list = []  # (key, stat, dims, eff_key)
-    # Effective keys seen this enumeration: quarantine records failures under
-    # eff_key (which a local s3_key override can make differ from the raw
-    # listing key), so the hygiene sweep below must compare raw ∪ effective.
-    eff_keys: set[str] = set()
+    # Every key this enumeration accounts for, RAW ∪ EFFECTIVE — quarantine
+    # records failures under eff_key (which a local s3_key override can make
+    # differ from the raw listing key), so the hygiene sweep below compares
+    # against this one set (folded here rather than unioned later: two extra
+    # 1M-element throwaway sets were ~67 MB transient in the function whose
+    # memory ceiling was the 2026-07-28 production kill).
+    present_keys: set[str] = set()
     for lst in listings:
         _raise_if_stopped(stop_event)
-        res = resolve_key_dims(lst.key, source)
-        if res is None:
-            record_failure(conn, lst.key, "unparseable key")
-            conn.commit()
-            tally["failed"] += 1
+        present_keys.add(lst.key)
+        dims, eff_key, item = _classify_listing(
+            conn, source, lst,
+            lambda d: stored.get(_composite_ids(caches, d)), tally)
+        if dims is None:
             continue
-        dims, eff_key = res
-        eff_keys.add(eff_key)
+        present_keys.add(eff_key)
         dims_by_key[lst.key] = dims
-        comp = _composite_ids(caches, dims)
-        if comp is not None and stored.get(comp) == lst.stat.etag:
-            tally["skipped"] += 1
-            continue
-        to_extract.append((lst.key, lst.stat, dims, eff_key))
+        if item is not None:
+            to_extract.append(item)
+    conn.commit()  # the classify loop's record_failure upserts, one fsync
 
     if progress is not None:
         progress.extract_start(len(to_extract), tally["skipped"], tally["failed"])
@@ -346,9 +372,9 @@ def full_reconcile(
         # touches failure rows): prune failure rows whose keys are absent
         # from this COMPLETE enumeration. Reachable only when list_all
         # finished without raising, so absence here is authoritative — the
-        # same fail-closed rule as row deletion. Compare against raw listing
-        # keys ∪ effective keys (quarantine records eff_key).
-        present_keys = {lst.key for lst in listings} | eff_keys
+        # same fail-closed rule as row deletion. present_keys (built in the
+        # classify loop) is raw listing keys ∪ effective keys — quarantine
+        # records eff_key.
         for r in conn.execute("SELECT s3_key FROM catalog_failures").fetchall():
             _raise_if_stopped(stop_event)
             if r["s3_key"] not in present_keys:

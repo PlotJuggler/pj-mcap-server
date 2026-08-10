@@ -52,10 +52,13 @@ class InMemoryS3Client:
 
     Serves bytes from a ``{key: data}`` dict and tallies the bytes fetched, so
     tests can assert the cheap-read property without touching AWS or boto3.
+    ``page_size`` makes the delimiter-less ``list_objects_v2`` paginate (real
+    S3 truncates at 1000) so pagination-contract tests need no bespoke fake.
     """
 
-    def __init__(self, objects: dict[str, bytes]) -> None:
+    def __init__(self, objects: dict[str, bytes], page_size: int | None = None) -> None:
         self._objects = dict(objects)
+        self._page_size = page_size
         self.fetched = 0
 
     def head_object(self, Bucket, Key):
@@ -70,7 +73,16 @@ class InMemoryS3Client:
         return {"Body": io.BytesIO(chunk)}
 
     def list_objects_v2(self, Bucket, Prefix="", Delimiter=None, ContinuationToken=None):
-        return _delimited_listing(self._objects, Prefix, Delimiter)
+        resp = _delimited_listing(self._objects, Prefix, Delimiter)
+        if self._page_size is None or Delimiter is not None:
+            return resp
+        contents = resp["Contents"]
+        start = int(ContinuationToken) if ContinuationToken else 0
+        end = start + self._page_size
+        out = {"Contents": contents[start:end], "IsTruncated": end < len(contents)}
+        if out["IsTruncated"]:
+            out["NextContinuationToken"] = str(end)
+        return out
 
     def get_paginator(self, name):
         assert name == "list_objects_v2"
@@ -87,6 +99,15 @@ class InMemoryS3Client:
                 }
 
         return _Paginator()
+
+
+def minimal_mcap_bytes(tmp_dir, channels) -> bytes:
+    """``write_minimal_mcap`` to a scratch file under ``tmp_dir`` and return
+    its bytes — the fixture-bytes helper the S3-fake tests all need."""
+    p = os.path.join(str(tmp_dir), "src.mcap")
+    write_minimal_mcap(p, channels=channels)
+    with open(p, "rb") as f:
+        return f.read()
 
 
 def sample_file(name: str) -> str:

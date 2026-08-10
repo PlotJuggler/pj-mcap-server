@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"strings"
-	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
@@ -128,16 +127,15 @@ func (s *s3Store) Head(ctx context.Context, key string) (ObjectInfo, error) {
 	if err != nil {
 		// §7.1: a HEAD 404 is ambiguous (missing object vs missing bucket —
 		// HeadObject returns bare NotFound for both). Upgrade to ErrNotFound
-		// only after confirming the bucket exists; error-path-only cost.
-		return ObjectInfo{}, disambiguate404(err, isHead404(err), func() bool {
-			probeCtx, cancel := context.WithTimeout(
-				context.WithoutCancel(ctx), 10*time.Second)
-			defer cancel()
-			_, bErr := s.client.HeadBucket(probeCtx, &s3.HeadBucketInput{
-				Bucket: aws.String(s.bucket),
+		// only after confirming the bucket exists; error-path-only cost, and
+		// the probe budget/detachment policy lives in disambiguate404.
+		return ObjectInfo{}, disambiguate404(ctx, err, isHead404(err),
+			func(pc context.Context) error {
+				_, bErr := s.client.HeadBucket(pc, &s3.HeadBucketInput{
+					Bucket: aws.String(s.bucket),
+				})
+				return bErr
 			})
-			return bErr == nil
-		})
 	}
 	return info, nil
 }
@@ -190,23 +188,16 @@ func deref(p *string) string {
 	return *p
 }
 
-// isHead404 reports whether err is 404-shaped as HeadObject surfaces it:
-// the typed types.NotFound, or a smithy code "NotFound"/"NoSuchKey".
+// isHead404 reports whether err is 404-shaped as HeadObject surfaces it.
+// One check suffices: the SDK's typed types.NotFound / types.NoSuchKey both
+// implement smithy.APIError with exactly these codes.
 func isHead404(err error) bool {
-	var nf *types.NotFound
-	if errors.As(err, &nf) {
-		return true
-	}
-	var nsk *types.NoSuchKey
-	if errors.As(err, &nsk) {
-		return true
-	}
 	var apiErr smithy.APIError
-	if errors.As(err, &apiErr) {
-		code := apiErr.ErrorCode()
-		return code == "NotFound" || code == "NoSuchKey"
+	if !errors.As(err, &apiErr) {
+		return false
 	}
-	return false
+	code := apiErr.ErrorCode()
+	return code == "NotFound" || code == "NoSuchKey"
 }
 
 // classify maps an S3/smithy error onto ErrTransient / ErrPermanent so the
