@@ -505,3 +505,38 @@ def test_worker_delete_event_head_guard_deletes_vanished_object(tmp_db, monkeypa
     worker_loop(conn, caches, src, q)
     assert deleted == ["customer=a/x.mcap"]
     assert ack_q.get_nowait() is rec.batch
+
+
+# -- Phase 5/6 flags (design §4/§5.2) -----------------------------------------
+
+def test_hot_audit_flag_defaults():
+    args = build_parser().parse_args(["."])
+    assert args.hot_audit_interval == 0.0     # tier 2 is opt-in (deploy flag)
+    assert args.hot_audit_window_days == 2
+    assert args.full_audit_hour is None
+
+
+def test_hot_audit_rejected_for_non_s3_sources(tmp_path):
+    # local: raw-path scoping vs intended_key overrides — S3-only by decision.
+    rc = main([str(tmp_path), "--hot-audit-interval", "1800", "--once"])
+    assert rc == 2
+    # gcs: no scoped-LIST wiring.
+    rc = main([".", "--source", "gcs", "--gcs-bucket", "b",
+               "--hot-audit-interval", "1800", "--once"])
+    assert rc == 2
+
+
+def test_hot_audit_negative_values_rejected():
+    rc = main([".", "--source", "s3", "--s3-bucket", "b", "--once",
+               "--hot-audit-interval", "-1"])
+    assert rc == 2
+    rc = main([".", "--source", "s3", "--s3-bucket", "b", "--once",
+               "--hot-audit-window-days", "-1"])
+    assert rc == 2
+
+
+def test_full_audit_hour_range_validated():
+    rc = main([".", "--full-audit-hour", "24", "--once"])
+    assert rc == 2
+    rc = main([".", "--full-audit-hour", "-1", "--once"])
+    assert rc == 2

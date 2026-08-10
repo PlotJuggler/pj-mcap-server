@@ -351,6 +351,22 @@ def build_parser() -> argparse.ArgumentParser:
                    help="seconds between full audits, completion-relative: the next audit "
                         "is scheduled this long after the previous one finished; "
                         "failures retry with capped exponential backoff (default: 300)")
+    p.add_argument("--hot-audit-interval", type=float, default=0.0,
+                   help="[s3 daemon] seconds between tier-2 hot-window scoped "
+                        "audits (design 2026-07-30 §4): a cheap LIST of only "
+                        "the registry-derived recent date= prefixes, repairing "
+                        "lost events within one cadence; fail-closed per "
+                        "prefix; never stamps build_metadata. 0 = disabled "
+                        "(default). Deploys with the SQS event tier typically "
+                        "set 1800. S3-only.")
+    p.add_argument("--hot-audit-window-days", type=int, default=2,
+                   help="tier-2 window W: audit date= partitions in "
+                        "[today-W, today] UTC (default: 2)")
+    p.add_argument("--full-audit-hour", type=int, default=None,
+                   help="run the FULL audit at this fixed UTC hour (0-23) "
+                        "nightly, skip-missed, instead of completion-relative "
+                        "--rescan-interval (design §5.2/§5.3 — Phase 6; "
+                        "enable only after the event tier has burned in)")
     p.add_argument("--no-watch", action="store_true",
                    help="daemon mode: start no live event producer at all — no "
                         "local watchdog/inotify observer, no S3 SQS long-poll "
@@ -533,6 +549,18 @@ def main(argv: list[str] | None = None) -> int:
         level=getattr(logging, args.log_level),
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
+
+    if args.full_audit_hour is not None and not (0 <= args.full_audit_hour <= 23):
+        logger.error("--full-audit-hour must be 0-23 (UTC)")
+        return 2
+    if args.hot_audit_interval < 0 or args.hot_audit_window_days < 0:
+        logger.error("--hot-audit-interval/--hot-audit-window-days must be >= 0")
+        return 2
+    if args.hot_audit_interval > 0 and args.source != "s3":
+        # S3-only by decision (Codex consult 2026-08-10): local intended_key
+        # overrides break raw-path prefix scoping; GCS has no scoped-LIST wiring.
+        logger.error("--hot-audit-interval requires --source s3")
+        return 2
 
     work_q: "queue.Queue[WatchEvent | TagEditItem | AuditItem]" = queue.Queue()
     stop_event = threading.Event()
@@ -750,13 +778,16 @@ def _locked_main(args, source, start_producer, work_q, stop_event,
             start_producer()
 
         audit_coordinator = AuditCoordinator(
-            work_q, stop_event, args.rescan_interval, intake_gate=intake_gate
+            work_q, stop_event, args.rescan_interval, intake_gate=intake_gate,
+            hot_interval=args.hot_audit_interval,
+            full_audit_hour=args.full_audit_hour,
         )
         audit_coordinator.start(immediate=startup_audit)
 
         worker_loop(conn, caches, source, work_q, workers=args.extract_workers,
                     source_spec=extract_spec, progress=progress,
-                    stop_event=stop_event)
+                    stop_event=stop_event,
+                    hot_window_days=args.hot_audit_window_days)
     finally:
         stop_event.set()
         if audit_coordinator is not None:
