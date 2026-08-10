@@ -15,6 +15,12 @@
 #   ./run.sh --gcs   GCS staging bucket on Google Cloud Storage (config.gcs-staging.yaml).
 #   ./run.sh <path/to.yaml>     power user: any S3/GCS server config file.
 #
+#   MCAP_CATALOG_SQS_URL=<queue url> ./run.sh --aws
+#                        event-driven builder discovery (Phase 4): the builder
+#                        drains S3 event notifications from that queue instead
+#                        of running --no-watch; the full audit relaxes to 6 h.
+#                        Provision the queue first: scripts/staging-sqs-setup.sh.
+#
 # Idempotent: if the target's server is ALREADY running it is reused (and its
 # catalog builder's liveness is checked too — a dead builder under a live
 # server is repaired in place instead of silently staying dead); if the SAME
@@ -315,7 +321,16 @@ cloud_builder_args() {
     BARGS=(--source s3 --s3-bucket "$BUCKET")
     [ -n "$PREFIX" ] && BARGS+=(--s3-prefix "$PREFIX")
   fi
-  BARGS+=(--no-watch --tag-socket "$TAG_SOCKET" --db "$DB_PATH" --rescan-interval 300 --log-level INFO)
+  if [ "$STORAGE_KIND" = s3 ] && [ -n "${MCAP_CATALOG_SQS_URL:-}" ]; then
+    # Event-driven discovery (design 2026-07-30 Phase 4): the SQS drainer is
+    # the freshness path, so the full audit relaxes to the 6 h safety net
+    # (Phase 0 value). The queue must be provisioned for THIS bucket+prefix
+    # first — scripts/staging-sqs-setup.sh prints the URL to export.
+    BARGS+=(--sqs-url "$MCAP_CATALOG_SQS_URL" --rescan-interval 21600)
+  else
+    BARGS+=(--no-watch --rescan-interval 300)
+  fi
+  BARGS+=(--tag-socket "$TAG_SOCKET" --db "$DB_PATH" --log-level INFO)
 }
 
 # start_local_builder — ensures the Minio-backed catalog builder for

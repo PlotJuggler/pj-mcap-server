@@ -177,53 +177,111 @@ first, since the server unit depends on it having run at least once.
 ## S3 event notifications (SQS) — enabling event-driven discovery
 
 Design: `docs/plans/2026-07-30-builder-event-discovery-design.md` (§3, §8).
-The builder code ships ack-hardened SQS intake, but every deploy shape above
-still runs `--no-watch` (rescan-only). Enablement is a phased ops change —
-create the infra (Phase 2-3), burn in the consumer (Phase 4), and only then
-loosen the audit interval (Phase 6):
+The builder ships the full event tier (ack-hardened SQS intake, tier-2
+hot-window audit, fixed-hour full audits), but every deploy shape above still
+runs `--no-watch` (rescan-only). Enablement is a phased ops change — create
+the infra (Phase 3), burn in the consumer (Phase 4), turn on the hot audit
+(Phase 5), and only then loosen the full audit to nightly (Phase 6).
+
+### Phase 3 — provision the queue + notifications
 
 ```bash
-# 1. Queue + DLQ (retention >= 4 days on both; redrive after 5 receives).
-aws sqs create-queue --queue-name pj-cloud-catalog-dlq \
-    --attributes MessageRetentionPeriod=1209600
-DLQ_ARN=$(aws sqs get-queue-attributes --queue-url <dlq-url> \
-    --attribute-names QueueArn --query Attributes.QueueArn --output text)
-aws sqs create-queue --queue-name pj-cloud-catalog-events --attributes '{
-  "MessageRetentionPeriod": "345600",
-  "VisibilityTimeout": "300",
-  "RedrivePolicy": "{\"deadLetterTargetArn\":\"'"$DLQ_ARN"'\",\"maxReceiveCount\":\"5\"}"
-}'
-# 2. Queue policy: allow THIS bucket's S3 notifications to send.
-cat > /tmp/queue-policy.json <<'POLICY'
-{"Policy": "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":{\"Service\":\"s3.amazonaws.com\"},\"Action\":\"sqs:SendMessage\",\"Resource\":\"<queue-arn>\",\"Condition\":{\"ArnLike\":{\"aws:SourceArn\":\"arn:aws:s3:::<bucket>\"}}}]}"}
-POLICY
-aws sqs set-queue-attributes --queue-url <queue-url> \
-    --attributes file:///tmp/queue-policy.json
-# 3. Wire the bucket notification with a .mcap suffix filter (and your key
-#    prefix). Include lifecycle events — they have their OWN event names,
-#    ObjectRemoved does not cover them.
-aws s3api put-bucket-notification-configuration --bucket <bucket> \
-  --notification-configuration '{"QueueConfigurations": [{
-    "QueueArn": "<queue-arn>",
-    "Events": ["s3:ObjectCreated:*", "s3:ObjectRemoved:*",
-               "s3:LifecycleExpiration:*"],
-    "Filter": {"Key": {"FilterRules": [{"Name": "suffix", "Value": ".mcap"}]}}}]}'
-# 4. Builder IAM: sqs:ReceiveMessage, sqs:DeleteMessage,
-#    sqs:ChangeMessageVisibility, sqs:GetQueueAttributes on the queue ARN
-#    (on EC2: add these to the instance role from docs/ec2-deploy.md).
+scripts/staging-sqs-setup.sh --bucket <bucket> --region <region> \
+    {--prefix <builder --s3-prefix value> | --whole-bucket}
 ```
 
-Steps 1–3 are safe to do **early**, well before enabling the consumer: only
-objects uploaded *after* the notification config exists generate events, and
-the queue simply accumulates them durably (4-day retention) until Phase 4
-drains it.
+Idempotent: DLQ + events queue (retention 4 d, visibility 300 s, redrive after
+5 receives), the s3.amazonaws.com queue policy, and the bucket notification
+configuration (`ObjectCreated:*`/`ObjectRemoved:*`/`LifecycleExpiration:*`,
+`suffix=.mcap`). Two deliberate guards:
 
-Enable the consumer (Phase 4): replace `--no-watch` with
-`--sqs-url <queue-url>` in the compose file / `BUILDER_ARGS` — keep the 6 h
-`--rescan-interval` until the burn-in drills pass (see the design doc), then
-move it to nightly. Alarm on SQS `ApproximateAgeOfOldestMessage` and DLQ
-depth > 0; the sidecar's `producer_last_poll_ok_at` distinguishes a dead
-intake thread from a quiet bucket.
+- **The notification prefix must equal the builder's `--s3-prefix` exactly**
+  (the flag choice is mandatory): the event worker catalogs whatever key an
+  event carries, so an out-of-scope event would be cataloged and then swept by
+  the prefix-scoped full audit — churn forever.
+- **Ownership is structural, fail-closed**: the script proceeds only if the
+  bucket's existing notification configuration is empty or exactly its own
+  single entry — `PutBucketNotificationConfiguration` REPLACES the whole
+  document, so it never "merges" into a foreign config (exit 3 instead).
+
+Caller IAM for the script: `sqs:CreateQueue/GetQueueUrl/GetQueueAttributes/
+SetQueueAttributes`, `s3:GetBucketNotification/PutBucketNotification`.
+Builder-runtime IAM (on EC2: add to the instance role from
+`docs/ec2-deploy.md`): `sqs:ReceiveMessage`, `sqs:DeleteMessage`,
+`sqs:ChangeMessageVisibility`, `sqs:GetQueueAttributes` on the queue ARN.
+
+Phase 3 is safe to do **early**, well before enabling the consumer: only
+objects uploaded *after* the notification config exists generate events, and
+the queue accumulates them durably (4-day retention) until Phase 4 drains it.
+**Never purge the events queue** — the accumulated backlog is exactly what
+Phase 4's consumer is supposed to drain; purging discards real changes.
+
+**Capturing real payloads for the translator test fixtures** (the committed
+fixtures under `mcap_catalog/mcap_catalog_builder/tests/data/s3_events/` are
+SYNTHESIZED — replace them with captured ones when access allows): do it
+during Phase 3, while the consumer is off. Upload + delete a drill object
+under the notification prefix, `aws sqs receive-message` the bodies into
+files named by family (`create_*`/`delete_*`/`ack_*` — the test derives the
+expectation from the prefix), sanitize account identifiers, and let the
+messages redeliver or expire naturally. For `LifecycleExpiration:*` payloads,
+add a 1-day expiry lifecycle rule on a dedicated drill prefix — but NOTE:
+`put-bucket-lifecycle-configuration` REPLACES all lifecycle rules, so fetch
+and re-merge the existing rules, and capture the expiry event before the
+consumer is enabled (a running consumer acks it away).
+
+### Phase 4 — enable the consumer + burn-in drills
+
+Compose: use the overlay (it swaps `--no-watch` for `--sqs-url` and turns on
+the tier-2 hot audit):
+
+```bash
+PJ_CLOUD_S3_BUCKET=<bucket> PJ_CLOUD_S3_PREFIX=<prefix> \
+MCAP_CATALOG_SQS_URL=<queue url> \
+docker compose -f docker-compose.aws.yml -f docker-compose.aws.events.yml up -d
+```
+
+systemd: the unit's `ExecStart` hardcodes `--no-watch`, so `BUILDER_ARGS`
+alone cannot enable events — install a drop-in that replaces `ExecStart`
+(see the "Event-mode drop-in" comment block in `pj-cloud-builder.service`).
+
+Dev box against staging: `MCAP_CATALOG_SQS_URL=<url> ./run.sh --aws`.
+
+Keep the 6 h `--rescan-interval` until the burn-in drills pass. Alarm on SQS
+`ApproximateAgeOfOldestMessage` and DLQ depth > 0; the sidecar's
+`producer_last_poll_ok_at` distinguishes a dead intake thread from a quiet
+bucket.
+
+**Burn-in drills** (design §9 — record the results before loosening anything):
+
+1. **Freshness** (scripted): with the consumer running,
+   `scripts/staging-event-drills.sh freshness --bucket <b> --region <r> --db <db>`
+   uploads a fixture under a drill Hive key, asserts the catalog row appears,
+   deletes the object, asserts the row disappears — PASS/FAIL with latencies.
+2. **kill −9 mid-batch** (redelivery proof): upload ~5 objects, `kill -9` the
+   builder while they are in flight, restart it, and verify within
+   ~VisibilityTimeout (300 s) that all rows exist exactly once (idempotency
+   absorbs the replay; the UNIQUE composite makes duplicates impossible).
+3. **Notification outage** (run only once Phase 5 is on): note a sentinel
+   object is absent from the catalog, disable the bucket notification config
+   (SAVE the original document first and restore it in a shell `trap` — an
+   interrupted drill must not leave notifications off), upload the sentinel
+   under a registry-known combo with today's date, and verify the hot audit
+   catalogs it within ~2 cadences — fail explicitly on timeout, not silently.
+   Run the builder from `mcap_catalog/` (`python -m mcap_catalog_builder`
+   resolves the package from the cwd), and wait for the sidecar to report
+   `phase: idle` before starting the drill so the initial full scan cannot
+   produce a false pass.
+
+### Phases 5–6 — hot audit + nightly fixed hour
+
+The overlay already passes `--hot-audit-interval=1800` (tier 2: scoped
+hot-window audit; fail-closed per prefix; status in the sidecar's
+`hot_audit_*` fields only — it never stamps `build_metadata`). After tiers
+1–2 have burned in, uncomment `--full-audit-hour=<utc hour>` in the overlay
+(or the systemd drop-in) to move the full audit to a nightly fixed off-peak
+hour — the safety net loosens LAST (design §8). While a full audit runs, the
+sidecar shows `maintenance_window_active: true` (events pause, tag edits can
+expire — the declared ~30 min nightly window, design §5.2).
 
 ## TLS
 
