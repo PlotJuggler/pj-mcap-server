@@ -247,7 +247,8 @@ def full_reconcile(
         source = LocalSource(source)
 
     _raise_if_stopped(stop_event)
-    tally = {"cataloged": 0, "skipped": 0, "failed": 0, "deleted": 0}
+    tally = {"cataloged": 0, "skipped": 0, "failed": 0, "deleted": 0,
+             "failures_pruned": 0}
     listings = []
     listing_iter = (
         source.list_all(stop_event=stop_event)
@@ -286,6 +287,10 @@ def full_reconcile(
     # extract_summary). dims_by_key drives the deletion sweep below.
     dims_by_key: dict[str, dict] = {}
     to_extract: list = []  # (key, stat, dims, eff_key)
+    # Effective keys seen this enumeration: quarantine records failures under
+    # eff_key (which a local s3_key override can make differ from the raw
+    # listing key), so the hygiene sweep below must compare raw ∪ effective.
+    eff_keys: set[str] = set()
     for lst in listings:
         _raise_if_stopped(stop_event)
         res = resolve_key_dims(lst.key, source)
@@ -295,6 +300,7 @@ def full_reconcile(
             tally["failed"] += 1
             continue
         dims, eff_key = res
+        eff_keys.add(eff_key)
         dims_by_key[lst.key] = dims
         comp = _composite_ids(caches, dims)
         if comp is not None and stored.get(comp) == lst.stat.etag:
@@ -336,6 +342,20 @@ def full_reconcile(
             if comp not in present:
                 conn.execute("DELETE FROM files WHERE id=?", (r["id"],))
                 tally["deleted"] += 1
+        # §5.3 catalog_failures hygiene (tier 3 ONLY — the hot audit never
+        # touches failure rows): prune failure rows whose keys are absent
+        # from this COMPLETE enumeration. Reachable only when list_all
+        # finished without raising, so absence here is authoritative — the
+        # same fail-closed rule as row deletion. Compare against raw listing
+        # keys ∪ effective keys (quarantine records eff_key).
+        present_keys = {lst.key for lst in listings} | eff_keys
+        for r in conn.execute("SELECT s3_key FROM catalog_failures").fetchall():
+            _raise_if_stopped(stop_event)
+            if r["s3_key"] not in present_keys:
+                conn.execute(
+                    "DELETE FROM catalog_failures WHERE s3_key=?", (r["s3_key"],)
+                )
+                tally["failures_pruned"] += 1
         _raise_if_stopped(stop_event)
         conn.commit()
     except ReconcileCancelled:

@@ -307,6 +307,7 @@ class ReconcileProgress:
             skipped=tally.get("skipped", 0),
             failed=tally.get("failed", 0),
             deleted=tally.get("deleted", 0),
+            failures_pruned=tally.get("failures_pruned", 0),
             summary_targeted_ok=self._via_counts["targeted"],
             summary_fallbacks_unavailable=self._via_counts["fallback-unavailable"],
             summary_fallbacks_unexpected=self._via_counts["fallback-unexpected"],
