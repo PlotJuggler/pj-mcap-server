@@ -1,0 +1,204 @@
+# If the catalog builder were rewritten: language and design (2026-08-10)
+
+**Status:** design note. No rewrite is proposed or scheduled — this records the position
+so that *if* a rewrite is ever forced (a major schema redesign, a second bucket layout,
+a maintainability wall), the decision starts from evidence rather than from scratch.
+
+Third of three companion records:
+`docs/data-lake-alternatives-review.md` (should we have built it?),
+`docs/capability-review-2026-08.md` (what does it do today?), this one (if we did it
+again, how?).
+
+---
+
+## 1. Language: Go, in the server repo, sharing its packages
+
+Not "Go is better than Python". The argument is specific to this codebase, and it is
+about **deleting a boundary**, not about speed.
+
+### 1.1 What the two-language split actually costs
+
+Every row below is duplicated work that exists *only* because the writer and the reader
+are in different languages:
+
+| Surface | Python side | Go side | Nature of the duplication |
+|---|---|---|---|
+| WAN-aware MCAP footer/summary read | `targeted_summary.py` (277 lines, 3 → 1.58 GETs/file, measured 2026-07-29) | `internal/format/summary_reader.go` (≤3 ranged GETs, built after a measured 3m24s-per-file pathology) | **The same optimization, solved independently twice, measured twice, maintained twice** |
+| Object key ↔ dimensions | `keyparse.py` (`HIVE_RE` + `rebuild_hive_key`) | `rebuildHiveKey` (`auryn_read.go:26`, "the exact inverse of the Python builder's") | A hand-maintained inverse pair across a language boundary |
+| `topic_counts` codec | `varint.encode_counts_blob` | `decodeCountsBlob` ("must stay byte-identical to the writer") | Byte-level format agreement, enforced by comment |
+| Schema knowledge | `schema.sql` | the reader's queries + `crosslang_test.go` | Two encodings of one truth |
+| The contract itself | — | — | `CATALOG_CONTRACT.md`, 39,299 bytes, **two byte-identical copies** kept in sync and verified with `cmp` |
+| Version interlock | `SCHEMA_VERSION` + fail-fast in `db.py` | fail-fast in the reader | Exists purely to police the boundary |
+| Dependency pinning | `boto3` / `google-cloud-storage` / `mcap` / `watchdog`, pinned identically in the CI workflow, `smoke.sh`, `ci-integration.sh` and `Dockerfile.builder` ("keep these three in lockstep") | vendored in `go.mod` | A four-place manual pin |
+
+**The M6 migration was right to separate the writer from the reader as processes. It also
+separated them by language, and only the first separation was load-bearing.** Single
+writer, independent restart, and process isolation are all preserved by two binaries in
+one repo: `cmd/pj-cloud-builder` beside `cmd/pj-cloud-server`, sharing `internal/storage`
+(the `BlobStore` seam, S3 + GCS) and `internal/format` (MCAP). Every row of the table
+above disappears.
+
+### 1.2 The GIL tax
+
+The second-hardest file in the builder is hard mostly because of the GIL. `reconcile.py`
+carries a `ProcessPoolExecutor` with an explicit `forkserver` context (to dodge the
+fork-after-threads hazard created by the sidecar heartbeat thread), a picklable
+`SourceSpec` because a boto3 client cannot cross a process boundary, an `_init_worker`
+per-process singleton, ~57 MiB RSS per worker, and `_bounded_completions` windowing.
+
+In Go that is a bounded worker pool feeding a single writer goroutine over a channel,
+sharing one client. The domain logic — classify, skip, extract, apply — is unchanged; the
+scaffolding around it mostly evaporates.
+
+### 1.3 Deployment
+
+Today: a second base image (`python:3.12-slim`), four pinned wheels, and the
+`~/.venvs/pj-catalog` bootstrap that every developer and both harness scripts must
+remember. After: one more `CGO_ENABLED=0` static binary in the image already being built.
+
+### 1.4 The rewrite would be unusually safe here
+
+`scripts/catalog-semantic-diff.py` already exists — id-dictionary-decoded comparison, the
+only valid equivalence check between two catalogs (they are not byte-reproducible). Run
+old and new builders over the same bucket, assert `SEMANTICALLY IDENTICAL`. Very few
+rewrites come with a ready-made oracle; this one does, because the parallel-extraction
+work already needed it.
+
+### 1.5 What stays Python
+
+The **content-aware metrics pass** (R11–R13, `file_metrics`). numpy/scipy/ML belong in
+Python, and `REQUIREMENTS.md` already declares that pass *distinct* from the metadata
+builder. So the language boundary does not vanish — it moves to where it earns something:
+Go for footer-only metadata on the hot path, Python for optional enrichment that reads
+payloads off the critical path.
+
+### 1.6 Why not Rust or C++
+
+Rust is faster, has a good MCAP crate, and would suit the extraction loop. But the win
+being claimed here is *reuse and contract deletion*, and that is Go's for free — the
+storage seam, the MCAP reader, the SQLite driver, the config and metrics plumbing all
+already exist in Go in this repo. A fourth language in a C++/Go/Python stack is a cost
+with no offsetting reuse. C++ would mean aws-sdk-cpp and hand-rolled SQLite plumbing for
+no benefit.
+
+---
+
+## 2. What I would do differently
+
+### 2.1 Make the key → dimension mapping configurable (the big one)
+
+`HIVE_RE` (`keyparse.py:15`) is one hardcoded regex requiring exactly:
+
+```
+customer=<c>/customer_site=<s>/robot=<r>/source=<x>/date=<d>/<name>.mcap
+```
+
+Anything else — a customer whose bucket is `/{fleet}/{date}/{vin}/`, or flat filenames —
+routes **every object** to `catalog_failures`. For a product positioned as "point it at
+your lake", the builder currently works on exactly one lake's layout.
+
+Rewrite: a **declarative per-deployment pattern** (named-capture template or regex,
+validated at startup), the raw object key stored **verbatim** alongside the parsed
+dimensions, and the round-trip guard kept — checked against the *configured* pattern
+rather than a compiled-in one. Storing the key costs roughly 1 GB at 8.78M files against
+a 2.5 GB catalog; it buys arbitrary customer layouts and ends the need for an exact
+parser inverse on the reader side.
+
+Dimension *names* would follow: `customer/site/robot/source` is one deployment's ontology
+baked into table names. A generic `dimensions(file_id, dim_id, value_id)` shape with a
+configured display order is the portable form — at the cost of losing the strict
+hierarchy that currently makes illegal states unrepresentable. That trade needs measuring
+before committing; the hierarchy is genuinely valuable in the picker.
+
+### 2.2 Migrations, not fail-fast rebuild
+
+`open_db` refuses a version mismatch and the documented recovery is "delete the DB"
+(`db.py:104-120`) — a ~23-hour rebuild tax on every schema change, which will quietly
+discourage exactly the schema evolution the product needs (`dimension_counts`, derived
+tags, `file_metrics` all want one). A migrations table with additive steps plus targeted
+backfill jobs removes it.
+
+### 2.3 …which, together with 2.2, shrinks the generation machinery
+
+Snapshot leases, the opaque generation token, and `ERROR_STALE_CATALOG` all exist because
+rowids renumber when a rebuild publishes a *new file*. With migrations, full rebuilds
+become rare and renumbering mostly stops — that layer becomes a safety net rather than a
+load-bearing protocol on the wire. Keep the mechanism (it is correct and cheap); stop
+depending on it for routine operation.
+
+### 2.4 Streaming reconcile from day one
+
+Temp indexed table, presence and diff computed in SQL, the bucket never resident in
+memory — and enumeration off the writer thread from the start. Both are already written
+down as follow-on work; in a rewrite they are the default, not a retrofit.
+
+### 2.5 Never ship `derive_tags() → []`
+
+Three trivial derived tags on day one (duration bucket, topic count, a topic-set layout
+id) would have kept the facet path honest instead of building an 804 ms scan over a table
+that has been empty in every production catalog since the beginning. A schema surface
+with no producer is a liability, not a placeholder.
+
+### 2.6 Publish-as-artifact as a first-class mode
+
+The publish step already produces a checkpointed, self-contained, sidecar-free file.
+Make "publish → upload to the bucket → readers download and open read-only" a supported
+deployment mode. It removes the builder/server same-host constraint without introducing
+Postgres, and it reuses the `ReopenIfSwapped` path unchanged.
+
+### 2.7 Instrument both sides from the start
+
+The builder's status sidecar is genuinely good and should be kept. The server has 23
+counters and gauges and zero histograms; per-RPC and per-storage-operation latency belongs
+in the first version, not the fifth.
+
+### 2.8 One thing to reconsider, not to change
+
+The packed `topic_counts` varint blob forecloses per-topic count predicates ("files where
+`/imu` has more than N messages") — the alternative, a `file_topic_counts` row per
+(file, topic), is ~175M rows at current scale and is correctly rejected. In a single
+language the codec-duplication cost disappears, so the blob stays. If per-topic
+thresholds ever matter, add rows for the top-K topics only rather than unpacking the blob.
+
+---
+
+## 3. What I would keep unchanged
+
+The parts that took real thought, none of which are language-specific:
+
+- **Quarantine semantics** — a file is never simultaneously cataloged and failed.
+- **Round-trip-or-quarantine** — never guess a row from a near-miss key.
+- **The count check** — `sum(counts) == message_count` inside the transaction.
+- **Cache reload on rollback** — ids from a rolled-back transaction can never poison the
+  in-memory caches.
+- **etag-skip before any body read** — a restart over a cataloged lake reads zero files.
+- **Targeted read with the streamed path as the sole semantics authority** for quarantine
+  verdicts.
+- **Atomic publish** (temp → checkpoint-gate → rename → dirfsync).
+- **The status sidecar** and **`catalog-semantic-diff.py`**.
+
+---
+
+## 4. Sequencing, if it ever happens
+
+1. Port `keyparse` + `varint` + the summary extractor into Go **as shared packages the
+   current reader also uses**, deleting the duplicate implementations first. This is
+   valuable on its own and does not commit to a rewrite.
+2. Build `cmd/pj-cloud-builder` against those packages, single-threaded, no daemon.
+3. Gate on `catalog-semantic-diff.py` over the staging corpus: `SEMANTICALLY IDENTICAL`.
+4. Add the worker pool, the event/audit producers, the tag endpoint (now an in-process
+   call for a co-located server, or an HTTP endpoint — the unix socket exists only
+   because of the language split).
+5. Cut over behind the same publish protocol; keep the Python builder runnable for one
+   release as the differential oracle.
+
+## 5. What would change this recommendation
+
+- **The metrics pass lands first and grows large.** If payload-reading enrichment becomes
+  the centre of gravity rather than a side pass, Python's ecosystem outweighs the
+  boundary cost and the split should stay.
+- **A second consumer of the catalog appears in another language.** Then the contract is
+  earning its keep and the boundary is real rather than accidental.
+- **The team is Python-first in practice.** A rewrite that nobody is comfortable
+  maintaining is worse than a boundary that is merely tedious. This note argues from the
+  code, not from who works on it.
