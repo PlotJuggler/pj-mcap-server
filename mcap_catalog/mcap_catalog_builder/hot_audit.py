@@ -149,6 +149,15 @@ def hot_audit(
         today if today is not None else dt.datetime.now(dt.timezone.utc).date(),
         window_days,
     )
+    # Intersect with the deployment's --s3-prefix scope (merge-gate review
+    # 2026-08-10): the registry can name combos/dates outside a scoped
+    # deployment (e.g. a date-scoped prefix), and cataloging out-of-scope
+    # keys would make the prefix-scoped full audit sweep them forever. Only a
+    # target wholly inside the scope is audited; anything else is tier 3's
+    # job (or nobody's, if it is genuinely out of scope).
+    scope = getattr(source, "scope_prefix", "")
+    if scope:
+        targets = [t for t in targets if t[0].startswith(scope)]
     if not targets:
         return tally
 
@@ -241,13 +250,31 @@ def hot_audit(
                 )
                 return None
 
-        with ThreadPoolExecutor(
-            max_workers=min(_LIST_PREFIX_THREADS, len(candidates))
-        ) as pool:
-            for row_id in pool.map(_gone_row_id, candidates):
+        # Same teardown idiom as _run_extract_apply: on stop, cancel queued
+        # HEADs and drain only the ≤pool-width in flight — SIGTERM during a
+        # bulk-deletion sweep must not wait out every submitted stat.
+        pool = ThreadPoolExecutor(
+            max_workers=min(_LIST_PREFIX_THREADS, len(candidates)))
+        try:
+            for fut in [pool.submit(_gone_row_id, c) for c in candidates]:
                 _raise_if_stopped(stop_event)
+                row_id = fut.result()
                 if row_id is not None:
                     confirmed.append(row_id)
+        finally:
+            cancelled = stop_event is not None and stop_event.is_set()
+            pool.shutdown(wait=not cancelled, cancel_futures=cancelled)
+
+    # Pass-level bucket confirmation (merge-gate review 2026-08-10): a
+    # transient bucket-level 404 makes EVERY stat above look like a confirmed
+    # object deletion. One probe vetoes the whole batch when the bucket
+    # cannot be confirmed — fail-closed; the next pass self-heals.
+    if confirmed and not source.bucket_exists():
+        logger.warning(
+            "hot audit: bucket existence unconfirmed — skipping %d deletion(s)",
+            len(confirmed),
+        )
+        confirmed = []
 
     # Phase 3 — one short transaction for the confirmed deletions.
     try:

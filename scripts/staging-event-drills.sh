@@ -2,7 +2,14 @@
 # staging-event-drills.sh — Phase-4 burn-in drills (design 2026-07-30 §9).
 #
 #   staging-event-drills.sh freshness --bucket B --region R \
-#       [--db /tmp/pj-cloud-catalog.db] [--timeout 120]
+#       [--db /tmp/pj-cloud-catalog.db] [--timeout 120] [--hive-prefix P]
+#
+# --hive-prefix replaces the default drill combo (customer=drill/
+# customer_site=lab/robot=r1/source=ros-bags) — REQUIRED when the bucket's
+# notification/builder prefix is scoped (the drill key must fall under it or
+# no event ever fires and the drill fails confusingly). Pass the combo root
+# WITHOUT the date= segment, e.g.
+#   --hive-prefix "customer=acme/customer_site=lab/robot=drill/source=ros-bags"
 #
 # freshness: upload a fixture under a drill Hive key -> assert the catalog row
 # appears (event-tier latency), delete the object -> assert the row is
@@ -16,12 +23,14 @@ set -euo pipefail
 
 CMD="${1:-}"; shift || true
 BUCKET="" REGION="" DB="/tmp/pj-cloud-catalog.db" TIMEOUT=120
+HIVE_PREFIX="customer=drill/customer_site=lab/robot=r1/source=ros-bags"
 while [ $# -gt 0 ]; do
   case "$1" in
     --bucket)  BUCKET="$2"; shift 2 ;;
     --region)  REGION="$2"; shift 2 ;;
     --db)      DB="$2"; shift 2 ;;
     --timeout) TIMEOUT="$2"; shift 2 ;;
+    --hive-prefix) HIVE_PREFIX="${2%/}"; shift 2 ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
 done
@@ -77,7 +86,7 @@ TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
 F=$(find "$TMP" -name '*.mcap' | head -1)
 [ -n "$F" ] || { echo "FAIL: fixture generation produced no .mcap" >&2; exit 1; }
 FN="drill-$(date +%s).mcap"
-K="customer=drill/customer_site=lab/robot=r1/source=ros-bags/date=$(date -u +%F)/$FN"
+K="$HIVE_PREFIX/date=$(date -u +%F)/$FN"
 
 echo "== upload s3://$BUCKET/$K"
 aws s3 cp "$F" "s3://$BUCKET/$K" --region "$REGION" --only-show-errors

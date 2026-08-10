@@ -5,6 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"testing"
+
+	gcs "cloud.google.com/go/storage"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 )
 
 // TestDisambiguate404 pins the §7.1 upgrade rule: a 404-shaped Head error
@@ -80,5 +83,32 @@ func TestDisambiguate404(t *testing.T) {
 
 	if disambiguate404(ctx, nil, true, exists) != nil {
 		t.Error("nil error must stay nil")
+	}
+}
+
+// TestHeadErrorFlowPreserves404Shape pins the property the 2026-08-10
+// merge-gate review found broken: the error a store Head hands to
+// disambiguate404 has passed through classify, and classify MUST preserve the
+// typed SDK error / sentinel chain (a %v cause-wrap silently made the §7.1
+// upgrade unreachable). These reproduce the stores' exact wrap order.
+func TestHeadErrorFlowPreserves404Shape(t *testing.T) {
+	// s3Store.Head's inner fn shape:
+	s3err := classify(fmt.Errorf("head %q: %w", "k", &types.NotFound{}))
+	if !isHead404(s3err) {
+		t.Error("classified S3 HEAD 404 must still be recognizable by isHead404")
+	}
+	if !errors.Is(s3err, ErrPermanent) {
+		t.Error("classified S3 HEAD 404 must be permanent")
+	}
+	// gcsStore.Head's inner fn shape:
+	gcsErr := classifyGCS(fmt.Errorf("gcs attrs %q: %w", "k", gcs.ErrObjectNotExist))
+	if !errors.Is(gcsErr, gcs.ErrObjectNotExist) {
+		t.Error("classified GCS object-404 must still carry ErrObjectNotExist")
+	}
+	// End-to-end through the upgrade: bucket exists => ErrNotFound attaches.
+	up := disambiguate404(context.Background(), s3err, isHead404(s3err),
+		func(context.Context) error { return nil })
+	if !errors.Is(up, ErrNotFound) {
+		t.Error("classified S3 HEAD 404 + live bucket must upgrade to ErrNotFound")
 	}
 }

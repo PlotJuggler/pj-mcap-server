@@ -14,7 +14,11 @@ import pytest
 
 from mcap_catalog_builder.reconcile import ReconcileCancelled, full_reconcile
 from mcap_catalog_builder.s3_storage import S3Source
-from mcap_catalog_builder.tests.fixtures import InMemoryS3Client, minimal_mcap_bytes
+from mcap_catalog_builder.tests.fixtures import (
+    InMemoryS3Client,
+    _S3ClientError,
+    minimal_mcap_bytes,
+)
 
 CH = [("/a", "S", "ros2msg", 2)]
 TODAY = dt.date(2026, 6, 2)
@@ -235,3 +239,38 @@ def test_hot_audit_zero_coverage_raises(tmp_db, tmp_path):
         hot_audit(conn, caches, S3Source(AlwaysFailsClient({}), "bucket"),
                   today=TODAY)
     assert _count(conn, "a.mcap") == 1
+
+
+def test_hot_audit_respects_configured_source_prefix(tmp_db, tmp_path):
+    """Merge-gate review 2026-08-10: a deployment scoped by --s3-prefix must
+    never hot-audit (catalog OR sweep) prefixes outside that scope — an
+    out-of-scope catalog row would be swept by the prefix-scoped full audit,
+    churning forever. Out-of-scope combos are simply not targeted."""
+    conn, caches = tmp_db
+    raw = _seed(conn, caches, tmp_path, [KA, KB])   # acme + beta rows exist
+    # Scoped source: only acme is in scope. Both objects vanish from listings.
+    src = S3Source(InMemoryS3Client({}), "bucket", prefix="customer=acme/")
+    tally = hot_audit(conn, caches, src, today=TODAY)
+    assert _count(conn, "a.mcap") == 0   # in scope: covered-empty, deleted
+    assert _count(conn, "b.mcap") == 1   # OUT of scope: untouched (tier 3's job)
+    assert tally["deleted"] == 1
+
+
+def test_hot_audit_skips_deletions_when_bucket_unconfirmed(tmp_db, tmp_path):
+    """Merge-gate review 2026-08-10: a transient bucket-level 404 makes every
+    stat() look like a confirmed object deletion — one pass-level bucket probe
+    must veto ALL deletions when the bucket can't be confirmed."""
+    conn, caches = tmp_db
+    _seed(conn, caches, tmp_path, [KA])
+
+    class BucketGoneClient(InMemoryS3Client):
+        def list_objects_v2(self, *a, **kw):
+            return {"Contents": [], "IsTruncated": False}  # LISTs "succeed"
+
+        def head_bucket(self, Bucket):
+            raise _S3ClientError("404")
+
+    src = S3Source(BucketGoneClient({}), "bucket")
+    tally = hot_audit(conn, caches, src, today=TODAY)
+    assert tally["deleted"] == 0
+    assert _count(conn, "a.mcap") == 1   # nothing deleted under an unconfirmed bucket

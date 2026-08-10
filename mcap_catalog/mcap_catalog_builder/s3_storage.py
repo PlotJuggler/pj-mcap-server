@@ -131,6 +131,24 @@ class S3Source:
         self._bucket = bucket
         self._prefix = prefix
 
+    @property
+    def scope_prefix(self) -> str:
+        """The configured key-prefix scope (``--s3-prefix``). The hot audit
+        intersects its registry-derived targets with this so a scoped
+        deployment never audits (catalogs or sweeps) outside its scope."""
+        return self._prefix
+
+    def bucket_exists(self) -> bool:
+        """One HeadBucket — the hot sweep's pass-level guard: a transient
+        bucket-level 404 makes every object stat() look like a confirmed
+        deletion, so the sweep re-confirms the bucket before deleting
+        anything. Any error ⇒ unconfirmed (fail-closed)."""
+        try:
+            self._c.head_bucket(Bucket=self._bucket)
+            return True
+        except Exception:  # noqa: BLE001 — ambiguous ⇒ not confirmed
+            return False
+
     def stat(self, key: str) -> Stat | None:
         try:
             h = retry_with(

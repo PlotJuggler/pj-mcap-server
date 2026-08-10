@@ -242,7 +242,10 @@ entry with a **mandatory scope**:
 - The deletion sweep considers only rows whose exact
   `(customer, site, robot, source, date)` lies in a *covered* prefix. Ambiguous
   coverage ⇒ **no deletions at all** for that pass. Global deletion is
-  structurally impossible from a scoped feed.
+  structurally impossible from a scoped feed. *(As built, 2026-08-10:
+  coverage is tracked per prefix, so "ambiguous" cannot arise — a prefix is
+  either fully listed (deletions allowed there, each candidate additionally
+  HEAD-confirmed) or excluded entirely; zero coverage fails the whole pass.)*
 - DB work is scoped too (v1 said O(scope) but reused O(catalog) internals —
   Codex finding 10): stored-fingerprint lookup and sweep candidates go through
   composite-indexed predicates / a temp scope table, so a hot pass is O(scope)

@@ -61,6 +61,9 @@ class InMemoryS3Client:
         self._page_size = page_size
         self.fetched = 0
 
+    def head_bucket(self, Bucket):
+        return {}  # the in-memory bucket always exists
+
     def head_object(self, Bucket, Key):
         if Key not in self._objects:
             raise _S3ClientError("404")

@@ -246,10 +246,14 @@ doubt, but don't relitigate the decision itself.
   deletion candidate is HEAD-confirmed at sweep time (live/ambiguous ⇒ skip — a
   re-upload landing between LIST and sweep must not cascade `tags_override`),
   zero coverage FAILS the audit, and tier-2 status lives in the sidecar only.
-  S3-only: local `intended_key` overrides break raw-path prefix scoping. Pinned
+  S3-only: local `intended_key` overrides break raw-path prefix scoping.
+  Targets intersect the deployment's `--s3-prefix` scope, and a pass-level
+  bucket probe vetoes all deletions when the bucket can't be confirmed. Pinned
   by `test_hot_audit_deletes_only_inside_covered_prefixes` /
   `test_hot_audit_sweep_head_guards_deletion_candidates` /
   `test_hot_audit_zero_coverage_raises` /
+  `test_hot_audit_respects_configured_source_prefix` /
+  `test_hot_audit_skips_deletions_when_bucket_unconfirmed` /
   `test_hot_audit_never_stamps_build_metadata` (`test_hot_audit.py`).
 - **A vanished object at session plan-build is `ERROR_NOT_FOUND`, never
   `ERROR_S3_UNAVAILABLE`** — but only when object-absence is UNAMBIGUOUS: the
@@ -259,8 +263,10 @@ doubt, but don't relitigate the decision itself.
   probe (`disambiguate404`, error-path-only). Bucket absence, ambiguous 404s,
   and 403 stay UNAVAILABLE (S3 returns 403 for missing objects without
   `s3:ListBucket`, so claiming "recording deleted" there would misdirect the
-  operator). Pinned by `TestPlanBuildErrorCode`, `TestDisambiguate404`, and the
-  classify tests.
+  operator). Classifiers preserve the cause chain with `%w` — a `%v` there
+  silently kills the Head-path upgrade (merge-gate-caught). Pinned by
+  `TestPlanBuildErrorCode`, `TestDisambiguate404`,
+  `TestHeadErrorFlowPreserves404Shape`, and the classify tests.
 
 ## Reference codebases (MANDATORY context — always reuse these)
 

@@ -201,7 +201,10 @@ func isHead404(err error) bool {
 }
 
 // classify maps an S3/smithy error onto ErrTransient / ErrPermanent so the
-// caller can decide whether to retry, while preserving the original message.
+// caller can decide whether to retry. The cause is wrapped with %w, NOT
+// stringified: Head's §7.1 disambiguation (isHead404) inspects the typed SDK
+// error AFTER classification, so classify must preserve the chain (a %v here
+// silently killed that path — 2026-08-10 merge-gate review).
 func classify(err error) error {
 	if err == nil {
 		return nil
@@ -210,11 +213,11 @@ func classify(err error) error {
 	if errors.As(err, &nf) {
 		// Object-absent: additionally carries ErrNotFound (§7.1) so the
 		// session plan-build can distinguish "recording deleted" from outage.
-		return fmt.Errorf("%w: %w: %v", ErrPermanent, ErrNotFound, err)
+		return fmt.Errorf("%w: %w: %w", ErrPermanent, ErrNotFound, err)
 	}
 	var nb *types.NoSuchBucket
 	if errors.As(err, &nb) {
-		return fmt.Errorf("%w: %v", ErrPermanent, err)
+		return fmt.Errorf("%w: %w", ErrPermanent, err)
 	}
 	var apiErr smithy.APIError
 	if errors.As(err, &apiErr) {
@@ -224,7 +227,7 @@ func classify(err error) error {
 			// NoSuchBucket). Bare "NotFound" (a HEAD 404) is NOT wrapped
 			// here — it cannot name its cause (missing object vs missing
 			// bucket); s3Store.Head disambiguates it with a bucket probe.
-			return fmt.Errorf("%w: %w: %v", ErrPermanent, ErrNotFound, err)
+			return fmt.Errorf("%w: %w: %w", ErrPermanent, ErrNotFound, err)
 		case code == "NotFound" || code == "NoSuchBucket" ||
 			code == "AccessDenied" || code == "Forbidden" || strings.HasPrefix(code, "InvalidAccessKeyId") ||
 			// PreconditionFailed = a GetRangeVersioned If-Match miss: the object
@@ -232,11 +235,11 @@ func classify(err error) error {
 			// this ETag, so it is PERMANENT — retrying just delays the clean
 			// "object changed mid-session" failure.
 			code == "PreconditionFailed" || code == "412":
-			return fmt.Errorf("%w: %v", ErrPermanent, err)
+			return fmt.Errorf("%w: %w", ErrPermanent, err)
 		default:
-			return fmt.Errorf("%w: %v", ErrTransient, err)
+			return fmt.Errorf("%w: %w", ErrTransient, err)
 		}
 	}
 	// Network/timeout/unknown -> transient by default.
-	return fmt.Errorf("%w: %v", ErrTransient, err)
+	return fmt.Errorf("%w: %w", ErrTransient, err)
 }

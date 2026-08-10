@@ -1473,7 +1473,7 @@ def test_worker_dispatches_hot_item_to_hot_audit(tmp_db, monkeypatch):
     assert full.wait(threading.Event()).outcome == "ok"
 ```
 
-Run: expected failures — `AuditCoordinator.__init__() got an unexpected keyword argument 'hot_interval'`, `AuditItem() takes no arguments`… 
+Run: expected failures — `AuditCoordinator.__init__() got an unexpected keyword argument 'hot_interval'`, `AuditItem() takes no arguments`…
 
 - [ ] **Step 2: Implement in `__main__.py`.**
 

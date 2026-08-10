@@ -33,7 +33,7 @@ python3 -m mcap_catalog_builder --source s3 --s3-bucket B --sqs-url U  # S3
 | `--full-audit-hour` | off | run the FULL audit at this fixed UTC hour (0–23) **nightly, skip-missed** (a slot that passed while the process was down or an audit overran is skipped, never replayed), instead of completion-relative `--rescan-interval`; failed audits retry with capped backoff, never past the next slot. Phase 6 of the event-discovery design — enable only after the event tier has burned in |
 | `--hot-audit-interval` | `0` (off) | [s3 daemon] seconds between tier-2 **hot-window scoped audits** (design §4): a cheap per-prefix LIST of only the registry-derived recent `date=` partitions (files ∪ quarantined combos × the window), repairing lost events within one cadence. Fail-closed per prefix — deletions happen ONLY inside prefixes whose pagination completed, zero coverage fails the audit — and it never stamps `build_metadata` (status goes to the sidecar `hot_audit_*` fields). Requires `--source s3` |
 | `--hot-audit-window-days` | `2` | tier-2 window W: audit `date=` partitions in `[today−W, today]` UTC |
-| `--no-watch` | off | daemon mode: start **no** live event producer (no local watchdog/inotify observer, no S3 SQS long-poll thread) — discovery is then rescan-only, driven purely by `--rescan-interval`. With `--source s3`, also drops the `--sqs-url` requirement. No-op for `--source gcs` (already rescan-only) and for `--once` |
+| `--no-watch` | off | daemon mode: start **no** live event producer (no local watchdog/inotify observer, no S3 SQS long-poll thread) — discovery is then audit-only, driven by the scheduled audits (`--rescan-interval` or `--full-audit-hour`, plus `--hot-audit-interval` if set). With `--source s3`, also drops the `--sqs-url` requirement. No-op for `--source gcs` (already rescan-only) and for `--once` |
 | `--extract-workers` | `2×CPU, max 32` | concurrency for the full-reconcile read phase (fetch+parse summaries). For a remote bucket (`--source s3`) these are worker **processes** — each with its own client and its own GIL, so the GIL-bound pure-Python MCAP parse scales across cores; for a local watch root (or `--source gcs`) they are threads. The DB apply stays serial either way. Read-phase memory is bounded by a sliding submission window of `2×workers` in-flight results — it does **not** grow with bucket size, so raising workers costs memory O(workers), never O(objects). Rarely needs tuning |
 | `--debounce` | `2.0` | [local] seconds to debounce file events |
 | `--stability-checks` | `3` | [local] size-stability polls before cataloging |
@@ -57,10 +57,10 @@ immediately and the startup audit is scheduled like any other; a missing DB
 
 **`--no-watch` (rescan-only daemon).** Pass `--no-watch` to skip starting any live
 event producer at all: no `watchdog`/inotify observer for `local`, no SQS long-poll
-thread for `s3`. The scheduled audits (startup + periodic, via the audit
-coordinator), the worker loop, and the tag-edit IPC server (`--tag-socket`) all still run
-exactly as without the flag — only file *discovery* changes, to purely
-rescan-driven. This is for hosts where inotify is unavailable (e.g. exhausted
+thread for `s3`. The scheduled audits (startup + periodic full audits via
+`--rescan-interval`/`--full-audit-hour`, hot audits via `--hot-audit-interval`),
+the worker loop, and the tag-edit IPC server (`--tag-socket`) all still run
+exactly as without the flag — only live event *discovery* is dropped. This is for hosts where inotify is unavailable (e.g. exhausted
 `fs.inotify.max_user_instances`) or where SQS isn't wired up yet; `--source gcs` is
 already rescan-only, so `--no-watch` is a harmless no-op there, and it's likewise a
 no-op with `--once` (which never starts a producer regardless).
