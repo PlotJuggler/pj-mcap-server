@@ -61,6 +61,8 @@ class StatusWriter:
         self._events_applied = 0
         self._events_unknown = 0
         self._events_acked = 0
+        self._tag_edits_expired = 0
+        self._tag_edits_failed = 0
 
     def update(self, *, force: bool = False, **fields) -> None:
         """Merge ``fields`` into the state and write, subject to throttling.
@@ -125,6 +127,39 @@ class StatusWriter:
             full_audit_duration=max(0.0, duration),
             force=True,
         )
+
+    def hot_audit_finished(self, outcome: str, duration: float,
+                           covered: int, skipped: int) -> None:
+        """Tier-2 result (design §4.2: hot-audit status goes to the sidecar
+        ONLY — never ``build_metadata``, which is whole-catalog freshness)."""
+        self.update(
+            hot_audit_last=_utc_iso(),
+            hot_audit_outcome=outcome,
+            hot_audit_duration=max(0.0, duration),
+            hot_audit_covered_prefixes=covered,
+            hot_audit_skipped_prefixes=skipped,
+            force=True,
+        )
+
+    def maintenance_window(self, active: bool) -> None:
+        """§5.2: the declared window while a full audit holds the writer —
+        events pause and tag edits can expire; make it sidecar-visible."""
+        self.update(maintenance_window_active=bool(active), force=True)
+
+    def tag_edit_expired(self) -> None:
+        """§6 counter (design name ``tag_edit_expired``): an edit whose 5 s
+        deadline passed before the worker reached it — the visible cost of a
+        busy writer (e.g. the nightly maintenance window)."""
+        with self._counters_lock:
+            self._tag_edits_expired += 1
+            n = self._tag_edits_expired
+        self.update(tag_edit_expired=n)
+
+    def tag_edit_failed(self) -> None:
+        with self._counters_lock:
+            self._tag_edits_failed += 1
+            n = self._tag_edits_failed
+        self.update(tag_edit_failed=n)
 
     def heartbeat_start(self, stop_event: threading.Event, interval: float = 10.0) -> None:
         """Refresh ``updated_at`` every ``interval`` seconds on a daemon thread,
@@ -297,6 +332,23 @@ class ReconcileProgress:
         """Count one committed event-tier record (create/delete via SQS)."""
         if self._status is not None:
             self._status.event_applied()
+
+    def hot_audit_finished(self, outcome: str, duration: float,
+                           covered: int, skipped: int) -> None:
+        if self._status is not None:
+            self._status.hot_audit_finished(outcome, duration, covered, skipped)
+
+    def maintenance_window(self, active: bool) -> None:
+        if self._status is not None:
+            self._status.maintenance_window(active)
+
+    def tag_edit_expired(self) -> None:
+        if self._status is not None:
+            self._status.tag_edit_expired()
+
+    def tag_edit_failed(self) -> None:
+        if self._status is not None:
+            self._status.tag_edit_failed()
 
     @property
     def summary_via_counts(self) -> dict:

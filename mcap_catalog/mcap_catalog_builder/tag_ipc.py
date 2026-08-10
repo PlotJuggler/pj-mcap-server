@@ -100,7 +100,7 @@ class TagEditItem:
     result: TagEditResult = field(default_factory=TagEditResult)
 
 
-def handle_tag_edit(conn, caches, item: TagEditItem) -> None:
+def handle_tag_edit(conn, caches, item: TagEditItem, telemetry=None) -> None:
     """Single-writer-thread handling of one queued tag edit.
 
     Always sets ``item.event`` exactly once (success, business-rule outcome, or
@@ -114,6 +114,8 @@ def handle_tag_edit(conn, caches, item: TagEditItem) -> None:
                 "tag-edit deadline expired before processing, dropping (dims=%r)", item.dims
             )
             item.result.status = "expired"
+            if telemetry is not None:  # §6: the visible cost of a busy writer
+                telemetry.tag_edit_expired()
             return
         file_id = lookup_file_id(conn, item.dims)
         if file_id is None:
@@ -132,6 +134,8 @@ def handle_tag_edit(conn, caches, item: TagEditItem) -> None:
     except Exception:  # noqa: BLE001 - the worker must never die
         logger.exception("tag-edit failed (dims=%r)", item.dims)
         item.result.status = "error"
+        if telemetry is not None:
+            telemetry.tag_edit_failed()
     finally:
         item.event.set()
 

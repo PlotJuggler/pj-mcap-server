@@ -367,3 +367,33 @@ def test_status_write_failure_is_swallowed_and_recovers(tmp_path, monkeypatch, c
     doc = _read_status(db)
     assert doc["phase"] == "listing"
     assert doc["listed_total"] == 5
+
+
+def test_hot_audit_and_maintenance_fields(tmp_path):
+    """§6 additive fields for the tier-2 audit + the §5.2 declared window."""
+    db = str(tmp_path / "catalog.db")
+    w = StatusWriter(db, min_interval=0.0)
+    w.update(phase="idle")
+    w.hot_audit_finished("ok", 1.5, covered=6, skipped=1)
+    w.maintenance_window(True)
+    doc = _read_status(db)
+    assert doc["hot_audit_outcome"] == "ok"
+    assert doc["hot_audit_duration"] == 1.5
+    assert doc["hot_audit_covered_prefixes"] == 6
+    assert doc["hot_audit_skipped_prefixes"] == 1
+    assert doc["hot_audit_last"].endswith("Z")
+    assert doc["maintenance_window_active"] is True
+    w.maintenance_window(False)
+    assert _read_status(db)["maintenance_window_active"] is False
+
+
+def test_tag_edit_counters(tmp_path):
+    """§6 counters, design names: tag_edit_expired / tag_edit_failed."""
+    db = str(tmp_path / "catalog.db")
+    w = StatusWriter(db, min_interval=0.0)
+    w.update(phase="idle")
+    w.tag_edit_expired()
+    w.tag_edit_failed()
+    w.tag_edit_expired()
+    doc = _read_status(db)
+    assert doc["tag_edit_expired"] == 2 and doc["tag_edit_failed"] == 1

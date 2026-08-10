@@ -411,7 +411,7 @@ def worker_loop(
 
         try:
             if isinstance(ev, TagEditItem):
-                handle_tag_edit(conn, caches, ev)
+                handle_tag_edit(conn, caches, ev, telemetry=progress)
                 continue
             if ev.kind == "stop":
                 break
