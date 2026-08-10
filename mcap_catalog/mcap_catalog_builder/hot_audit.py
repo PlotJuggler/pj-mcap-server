@@ -30,6 +30,7 @@ from concurrent.futures import ThreadPoolExecutor
 from .keyparse import parse_hive_key, rebuild_hive_key
 from .reconcile import (
     ReconcileCancelled,
+    _bounded_completions,
     _classify_listing,
     _composite_ids,
     _raise_if_stopped,
@@ -250,15 +251,18 @@ def hot_audit(
                 )
                 return None
 
-        # Same teardown idiom as _run_extract_apply: on stop, cancel queued
-        # HEADs and drain only the ≤pool-width in flight — SIGTERM during a
-        # bulk-deletion sweep must not wait out every submitted stat.
-        pool = ThreadPoolExecutor(
-            max_workers=min(_LIST_PREFIX_THREADS, len(candidates)))
+        # The shared bounded-window engine (reconcile._bounded_completions):
+        # at most 2x pool-width HEADs in flight, results dropped as consumed,
+        # stop polled every 0.1s inside the wait loop — SIGTERM during a
+        # bulk-deletion sweep aborts within one in-flight stat, never waiting
+        # out every submitted candidate.
+        n = min(_LIST_PREFIX_THREADS, len(candidates))
+        pool = ThreadPoolExecutor(max_workers=n)
         try:
-            for fut in [pool.submit(_gone_row_id, c) for c in candidates]:
-                _raise_if_stopped(stop_event)
-                row_id = fut.result()
+            for row_id in _bounded_completions(
+                lambda c: pool.submit(_gone_row_id, c), candidates,
+                window=2 * n, stop_event=stop_event,
+            ):
                 if row_id is not None:
                     confirmed.append(row_id)
         finally:

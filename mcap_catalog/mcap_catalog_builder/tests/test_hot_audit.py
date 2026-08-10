@@ -274,3 +274,25 @@ def test_hot_audit_skips_deletions_when_bucket_unconfirmed(tmp_db, tmp_path):
     tally = hot_audit(conn, caches, src, today=TODAY)
     assert tally["deleted"] == 0
     assert _count(conn, "a.mcap") == 1   # nothing deleted under an unconfirmed bucket
+
+
+def test_hot_audit_stop_during_head_guard_aborts_without_deletions(tmp_db, tmp_path):
+    """Merge-gate review 2026-08-10: stop arriving DURING the phase-2 HEAD
+    guard must abort the pass promptly (bounded-window + stop polling) and
+    commit no deletions — phase 3 is never reached."""
+    conn, caches = tmp_db
+    _seed(conn, caches, tmp_path, [KA])
+    stop = threading.Event()
+
+    class StopDuringHeadClient(InMemoryS3Client):
+        def list_objects_v2(self, *a, **kw):
+            return {"Contents": [], "IsTruncated": False}  # a.mcap = candidate
+
+        def head_object(self, Bucket, Key):
+            stop.set()   # SIGTERM lands mid-HEAD-guard
+            raise _S3ClientError("404")
+
+    with pytest.raises(ReconcileCancelled):
+        hot_audit(conn, caches, S3Source(StopDuringHeadClient({}), "bucket"),
+                  today=TODAY, stop_event=stop)
+    assert _count(conn, "a.mcap") == 1   # nothing deleted
