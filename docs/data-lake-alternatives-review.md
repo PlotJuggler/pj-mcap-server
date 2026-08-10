@@ -205,8 +205,38 @@ counts, chunk counts still require our footer reads.
 S3 Inventory (batch, daily, no events) is the weaker predecessor of the same idea. Glue
 crawlers infer tabular schemas and are irrelevant here.
 
-**Verdict: a real, if partial, missed option — AWS-only, and it arrived after our
-discovery path was designed.** Concretely worth costing now (see §5).
+**Verdict (revised 2026-08-10, after costing it): no, not now — and cost is not why.**
+Priced out: live-inventory backfill of 8.78M objects is **$2.63 one-time**, ongoing
+live inventory is **free** below 1 billion objects, and journal updates are **$0.30 per
+million** (~$0.27/month at ~30k new files/day). Money does not decide this.
+
+What decides it is that S3 Metadata replaces the **cheap** half of the audit. A full
+LIST at 8.78M objects is 8,780 requests — **$0.044 per audit**, minutes of wall time
+when sharded. The expensive half is what happens after the listing arrives: the 8.78M-row
+`stored` map, the classify loop, and the deletion sweep, all on the single writer thread
+with `listings`/`dims_by_key`/`present` resident (§2.3 of the capability review). An
+Iceberg result set still has to stream in and be diffed. **The streaming reconcile is the
+real fix and is required either way** — which is exactly what the event-discovery design
+already says (`InventoryFeed` is *gated on* the streaming rework), and its own trigger
+("nightly audit > ~2 h, roughly tens of millions of objects") puts us below the line.
+
+Two things keep it on the list for later:
+
+- **The journal table as a durable, ordered, replayable change log** — not the inventory
+  table. SQS is at-least-once with no replay after ack, which is why the full audit must
+  stay authoritative for removals. A journal watermark turns "we lost events, enumerate
+  everything" into "resume from sequence N": O(changes), not O(objects). Worth a spike
+  *after* streaming reconcile.
+- **Bulk object user-metadata without a HEAD per object** — a second route to the empty
+  `tags_embedded` problem. For a two-cloud product, MCAP metadata records are the better
+  channel (cloud-neutral, written by the recorder, survive a bucket copy, and
+  `extract_s3_key` already reads one).
+
+The real adoption cost is deployment surface, not dollars: a table bucket, a metadata
+configuration, Athena+Glue or an Iceberg client, and IAM for all of it **in every
+customer account**, AWS-only, as a permanent second code path. Worth checking whether
+`pyiceberg` against the S3 Tables Iceberg REST endpoint removes the Athena/Glue half of
+that ask.
 
 ### 3.7 Governance catalogs — DataHub, OpenMetadata, Amundsen, Unity, Polaris, Glue
 
@@ -299,11 +329,13 @@ or split-host deployment is asked for.
 1. **Materialize `dimension_counts` (schema v4).** Already planned. It is the fix for the
    only measured performance problem in the read path, and it is what every table format
    would have handed us from partition summaries. *Cost: small, one cross-repo schema bump.*
-2. **Cost out S3 Metadata live-inventory tables as the S3 leg's discovery source.**
-   Replaces the full-LIST reconcile sweep with an anti-join and gives near-real-time
-   change detection without our SQS plumbing. AWS-only, so it becomes a *third* discovery
-   mode beside events and rescan, not a replacement. *Cost: medium; measure the per-object
-   monthly charge against the LIST spend at 8.78M objects before committing.*
+2. ~~Cost out S3 Metadata live-inventory tables as the S3 leg's discovery source.~~
+   **Done 2026-08-10 — the answer is no, not now** (§3.6 above carries the revised
+   verdict). It replaces the $0.044-per-audit LIST and leaves the writer-thread diff
+   untouched; the streaming reconcile is the actual fix and is needed regardless. Revisit
+   the **journal** table (watermark-resume discovery) *after* streaming reconcile lands,
+   or when the nightly audit passes the ~2 h trigger already recorded in the
+   event-discovery design.
 3. **Keep a Postgres backend on the table behind the store seam** — not to build now, but
    as the documented answer to "can the builder run on a different host than the server"
    and "can we run two read replicas". Today the honest answer is no, and the reason is
