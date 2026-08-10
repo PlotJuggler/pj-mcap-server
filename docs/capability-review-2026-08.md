@@ -117,6 +117,10 @@ Two supporting gaps make this worse:
   its own right: it is also the most likely contributor to the read path's worst
   observed pathology (`GetVocabulary` at **40,727 ms** while the builder runs), since a
   multi-GB parent plus WAL churn shares one box with the reader.
+  **Update 2026-08-10:** open PR #25 (Phases 3–6) re-confirms this gate — Phase 7
+  `InventoryFeed` is explicitly excluded "gated on the streaming-reconcile prerequisite".
+  Streaming reconcile is therefore no longer just a memory fix: it is the blocker on the
+  next phase of a discovery roadmap already in flight, which raises its priority.
 - **Audit enumeration runs on the writer thread** (acknowledged as a non-goal in the same
   design). At 8.78M objects the classify loop and the `stored` map build occupy the one
   thread that must also service tag IPC and event applies.
@@ -130,10 +134,15 @@ Two supporting gaps make this worse:
   ~23-hour rebuild in production. Atomic publish means the old catalog keeps serving
   throughout, so this is a cost rather than an outage — but it is a cost that will
   discourage exactly the schema evolution the product needs.
-- **GCS has no event discovery.** S3 gets SQS-driven near-real-time discovery; GCS is
-  rescan-only, so new-file latency equals the rescan interval and every cycle is a full
-  LIST. An asymmetry worth stating in the deploy docs even if Pub/Sub parity stays
-  deferred.
+- **GCS has no event discovery, and the S3 tier is not on by default.** The SQS producer
+  exists on `main` (PR #17, Phases 0–2), but every deploy default still runs `--no-watch`
+  — enablement is an explicit operator ops change, and open PR #25 ships the artifacts
+  (`staging-sqs-setup.sh`, compose overlay, systemd drop-in, drill runbook) to make that
+  change safe. So *in production today both legs are effectively rescan-only*, and the
+  asymmetry is in what each leg **can** be turned into. PR #25 widens it further: its
+  tier-2 hot-window scoped audit is **S3-only**, so once enabled, S3 gets cheap frequent
+  self-healing plus a fixed-hour nightly full audit while GCS keeps only the full rescan.
+  Worth stating plainly in the deploy docs even while Pub/Sub parity stays deferred.
 
 ### 2.4 Multi-user serving
 
@@ -158,6 +167,9 @@ Two supporting gaps make this worse:
 - **Quarantined files are invisible to users.** `catalog_failures` surfaces on the
   dashboard only; nothing in the client says "17 recordings under this robot could not be
   cataloged". At 8.78M files, a 1% failure rate is 88,000 silently missing recordings.
+  (Open PR #25 adds `catalog_failures` *hygiene* to the full audit — stale entries get
+  cleaned, fail-closed on complete enumeration. That makes the set accurate; it does not
+  make it visible. The finding stands.)
 - **No dimension GC** (documented as by-design). A robot renamed repeatedly leaves a row
   in every `GetVocabulary` response forever.
 - **`matrix.sh` is dead** (exit 2, pending migration). The real-corpus performance gate
