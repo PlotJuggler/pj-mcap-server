@@ -8,6 +8,7 @@ writer. It is driven by a storage ``Source`` and is identical for all backends.
 """
 
 import argparse
+import calendar
 import logging
 import os
 import queue
@@ -19,6 +20,7 @@ from dataclasses import dataclass
 
 from .db import Caches, load_caches, open_db
 from .builder import catalog_object, delete_by_key
+from .hot_audit import hot_audit
 from .publish import build_and_publish
 from .reconcile import ReconcileCancelled, SourceSpec, full_reconcile
 from .s3_producer import EventRecord, IntakeGate
@@ -32,6 +34,23 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_DB = "/tmp/pj-cloud-catalog.db"
 _AUDIT_BACKOFF_INITIAL = 1.0
+# Fixed-hour mode has no completion-relative interval to cap backoff at;
+# retry a failing nightly audit at most hourly (never past the next slot —
+# see the backoff arm in AuditCoordinator._run).
+_FIXED_HOUR_BACKOFF_CAP = 3600.0
+
+
+def _next_fixed_hour_delay(now_wall: float, hour: int) -> float:
+    """Seconds from ``now_wall`` (unix) to the NEXT occurrence of ``hour``:00
+    UTC STRICTLY after now. Always computed from now — a slot that passed
+    while the process was down or an audit overran is simply skipped (§5.2
+    skip-missed), never replayed."""
+    t = time.gmtime(now_wall)
+    today_slot = float(calendar.timegm(
+        (t.tm_year, t.tm_mon, t.tm_mday, hour, 0, 0, 0, 0, 0)))
+    if now_wall < today_slot:
+        return today_slot - now_wall
+    return today_slot + 86400.0 - now_wall
 
 
 @dataclass(frozen=True)
@@ -54,7 +73,8 @@ class AuditItem:
 
     kind = "audit"
 
-    def __init__(self) -> None:
+    def __init__(self, audit_kind: str = "full") -> None:
+        self.audit_kind = audit_kind  # "full" | "hot" (worker dispatch key)
         self._lock = threading.Lock()
         self._done = threading.Event()
         self._state = "pending"  # pending | running | finished
@@ -102,11 +122,16 @@ class AuditItem:
 
 
 class AuditCoordinator:
-    """Single arbiter for completion-relative full-audit scheduling.
+    """Single arbiter for BOTH audit tiers (design §5.2).
 
-    Exactly one item may be queued or running. Successful audits schedule the
-    next audit one full interval after completion; failures retry with
-    exponential backoff capped at that same interval.
+    Exactly one audit — hot or full — may be queued or running; a due full
+    audit supersedes a due hot one, and a hot audit never delays a due full
+    audit by more than its own runtime. Full audits schedule either
+    completion-relative (``interval``) or at a fixed nightly UTC hour
+    (``full_audit_hour``, skip-missed); hot audits are completion-relative
+    (``hot_interval``; 0 = tier 2 off). Failures on either tier retry with
+    exponential backoff capped at the tier's cadence (fixed-hour: capped at
+    ``_FIXED_HOUR_BACKOFF_CAP``, never past the next slot).
     """
 
     def __init__(
@@ -117,6 +142,9 @@ class AuditCoordinator:
         *,
         backoff_initial: float = _AUDIT_BACKOFF_INITIAL,
         intake_gate=None,
+        hot_interval: float = 0.0,
+        full_audit_hour: int | None = None,
+        wall_clock=time.time,
     ) -> None:
         self._work_q = work_q
         self._stop_event = stop_event
@@ -125,6 +153,9 @@ class AuditCoordinator:
         # §3.5 handshake: pause SQS intake and wait until every received batch
         # is terminal AND acked before an audit runs (None = no event tier).
         self._gate = intake_gate
+        self._hot_interval = max(0.0, hot_interval)
+        self._full_hour = full_audit_hour
+        self._wall = wall_clock
         self._lock = threading.Lock()
         self._queued_or_running = False
         self._current: AuditItem | None = None
@@ -141,8 +172,11 @@ class AuditCoordinator:
         return item is not None
 
     def start(self, *, immediate: bool) -> None:
-        """Start scheduling; ``immediate`` is used for an existing served DB."""
-        initial_delay = 0.0 if immediate else self._interval
+        """Start scheduling; ``immediate`` is used for an existing served DB.
+        A non-immediate start honors the fixed hour too (a fresh build must
+        not schedule its first full audit off --rescan-interval when
+        --full-audit-hour is set — Codex consult 2026-08-10)."""
+        initial_delay = 0.0 if immediate else self._full_delay()
         self._thread = threading.Thread(
             target=self._run,
             args=(initial_delay,),
@@ -151,16 +185,22 @@ class AuditCoordinator:
         )
         self._thread.start()
 
+    def _full_delay(self) -> float:
+        """Delay from NOW to the next scheduled full audit."""
+        if self._full_hour is None:
+            return self._interval
+        return _next_fixed_hour_delay(self._wall(), self._full_hour)
+
     def join(self, timeout: float = 5.0) -> None:
         if self._thread is not None:
             self._thread.join(timeout=timeout)
             self._thread = None
 
-    def _enqueue_if_idle(self) -> AuditItem | None:
+    def _enqueue_if_idle(self, kind: str = "full") -> AuditItem | None:
         with self._lock:
             if self._stop_event.is_set() or self._queued_or_running:
                 return None
-            item = AuditItem()
+            item = AuditItem(audit_kind=kind)
             self._queued_or_running = True
             self._current = item
         try:
@@ -178,56 +218,91 @@ class AuditCoordinator:
                 self._current = None
                 self._queued_or_running = False
 
-    def _run(self, initial_delay: float) -> None:
-        delay = initial_delay
-        failures = 0
-        while not self._stop_event.wait(delay):
-            try:
-                if self._gate is not None:
-                    # Pause intake BEFORE enqueueing the audit, then wait for
-                    # every already-received batch to be committed and acked —
-                    # a message must never sit un-acked behind a long audit
-                    # blowing its visibility timeout (§3.5). resume() runs in
-                    # the outer finally on every exit path.
-                    self._gate.pause()
-                    if not self._gate.wait_drained(self._stop_event):
-                        return  # stop arrived during the drain
-                item = self._enqueue_if_idle()
+    def _fire(self, kind: str) -> AuditResult | None:
+        """Run one audit through the arbiter: pause/drain intake (§3.5, BOTH
+        tiers — a message must never sit un-acked behind an audit blowing its
+        visibility timeout), enqueue (or observe an externally-requested
+        active item), wait for the worker's result. None = stop arrived.
+        resume() runs in the finally on every exit path."""
+        try:
+            if self._gate is not None:
+                self._gate.pause()
+                if not self._gate.wait_drained(self._stop_event):
+                    return None  # stop arrived during the drain
+            item = self._enqueue_if_idle(kind)
+            if item is None:
+                # A due tick while an audit is queued/running is deliberately
+                # coalesced. If another caller requested the active audit, this
+                # scheduler observes that same result instead of creating work.
+                with self._lock:
+                    item = self._current
                 if item is None:
-                    # A due tick while an audit is queued/running is deliberately
-                    # coalesced. If another caller requested the active audit, this
-                    # scheduler observes that same result instead of creating work.
-                    with self._lock:
-                        item = self._current
-                    if item is None:
-                        return  # stop raced the due tick
-                result: AuditResult | None = None
-                try:
-                    result = item.wait(self._stop_event)
-                    if result is None or result.outcome == "cancelled":
-                        return
-                    if result.outcome == "ok":
-                        failures = 0
-                        delay = self._interval
-                    else:
-                        failures += 1
-                        delay = min(
-                            self._interval,
-                            self._backoff_initial * (2 ** (failures - 1)),
-                        )
-                        logger.warning(
-                            "full audit failed; retrying in %.1fs (failure %d): %s",
-                            delay,
-                            failures,
-                            result.error or "unknown error",
-                        )
-                finally:
-                    # Never leave the arbiter stuck after failure, cancellation,
-                    # or an unexpected result-handling exception.
-                    self._clear_active(item)
+                    return None  # stop raced the due tick
+            try:
+                return item.wait(self._stop_event)
             finally:
-                if self._gate is not None:
-                    self._gate.resume()
+                # Never leave the arbiter stuck after failure, cancellation,
+                # or an unexpected result-handling exception.
+                self._clear_active(item)
+        finally:
+            if self._gate is not None:
+                self._gate.resume()
+
+    def _run(self, initial_delay: float) -> None:
+        mono = time.monotonic
+        full_failures = 0
+        hot_failures = 0
+        next_full = mono() + initial_delay
+        next_hot = (mono() + self._hot_interval) if self._hot_interval > 0 else None
+        while True:
+            due_times = [next_full] if next_hot is None else [next_full, next_hot]
+            if self._stop_event.wait(max(0.0, min(due_times) - mono())):
+                break
+            now = mono()
+            full_due = now >= next_full
+            if not full_due and (next_hot is None or now < next_hot):
+                continue
+            kind = "full" if full_due else "hot"  # full supersedes hot (§5.2)
+            result = self._fire(kind)
+            if result is None or result.outcome == "cancelled":
+                break
+            if kind == "hot":
+                if result.outcome == "ok":
+                    hot_failures = 0
+                    next_hot = mono() + self._hot_interval
+                else:
+                    # §5.2's result-bearing rule applies to both tiers: capped
+                    # exponential backoff, never slower than the cadence.
+                    hot_failures += 1
+                    backoff = min(
+                        self._hot_interval,
+                        self._backoff_initial * (2 ** (hot_failures - 1)),
+                    )
+                    next_hot = mono() + backoff
+                    logger.warning(
+                        "hot audit failed; retrying in %.1fs (failure %d): %s",
+                        backoff, hot_failures, result.error or "unknown error",
+                    )
+                continue
+            if result.outcome == "ok":
+                full_failures = 0
+                next_full = mono() + self._full_delay()
+            else:
+                full_failures += 1
+                cap = (self._interval if self._full_hour is None
+                       else _FIXED_HOUR_BACKOFF_CAP)
+                backoff = min(cap, self._backoff_initial * (2 ** (full_failures - 1)))
+                if self._full_hour is not None:
+                    # Never retry past the next fixed slot (skip-missed, §5.2).
+                    backoff = min(
+                        backoff,
+                        _next_fixed_hour_delay(self._wall(), self._full_hour),
+                    )
+                next_full = mono() + backoff
+                logger.warning(
+                    "full audit failed; retrying in %.1fs (failure %d): %s",
+                    backoff, full_failures, result.error or "unknown error",
+                )
 
         # Stop may arrive while the first/due timer is waiting. If an external
         # due request queued an item, make it a dropped terminal item.
@@ -313,6 +388,7 @@ def worker_loop(
     source_spec: "SourceSpec | None" = None,
     progress=None,
     stop_event: threading.Event | None = None,
+    hot_window_days: int = 2,
 ) -> None:
     """Drain the work queue and perform all DB writes (the single writer).
 
@@ -346,31 +422,53 @@ def worker_loop(
             started = time.monotonic()
             outcome = "ok"
             error = None
+            is_full = ev.audit_kind != "hot"
+            hot_tally: dict | None = None
             try:
-                full_reconcile(
-                    conn,
-                    caches,
-                    source,
-                    workers=workers,
-                    source_spec=source_spec,
-                    progress=progress,
-                    stop_event=stop_event,
-                )
+                if is_full:
+                    if progress is not None:
+                        # §5.2's declared window: events pause and tag edits
+                        # can expire while the full audit holds the writer.
+                        progress.maintenance_window(True)
+                    full_reconcile(
+                        conn,
+                        caches,
+                        source,
+                        workers=workers,
+                        source_spec=source_spec,
+                        progress=progress,
+                        stop_event=stop_event,
+                    )
+                else:
+                    hot_tally = hot_audit(
+                        conn, caches, source, window_days=hot_window_days,
+                        workers=workers, source_spec=source_spec,
+                        stop_event=stop_event,
+                    )
             except ReconcileCancelled:
                 outcome = "cancelled"
-                logger.info("full audit cancelled")
+                logger.info("%s audit cancelled", ev.audit_kind)
             except Exception as e:  # noqa: BLE001 - result is explicit; worker survives
                 outcome = "failed"
                 error = f"{type(e).__name__}: {e}"
-                logger.exception("full audit failed")
+                logger.exception("%s audit failed", ev.audit_kind)
             finally:
                 result = AuditResult(outcome, time.monotonic() - started, error)
                 try:
                     if progress is not None:
-                        progress.audit_finished(result.outcome, result.duration)
-                        progress.idle()
+                        if is_full:
+                            progress.maintenance_window(False)
+                            progress.audit_finished(result.outcome, result.duration)
+                            progress.idle()
+                        else:
+                            t = hot_tally or {}
+                            progress.hot_audit_finished(
+                                result.outcome, result.duration,
+                                t.get("covered_prefixes", 0),
+                                t.get("skipped_prefixes", 0),
+                            )
                 except Exception:  # noqa: BLE001 - observability cannot kill the worker
-                    logger.exception("failed to record full-audit status")
+                    logger.exception("failed to record audit status")
                 finally:
                     ev.finish(result)
             continue

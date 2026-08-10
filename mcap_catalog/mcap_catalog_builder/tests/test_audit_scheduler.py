@@ -187,3 +187,103 @@ def test_intake_gate_pauses_and_drains_before_audit_then_resumes():
         stop.set()
         coordinator.join()
     assert not gate.paused  # resume also holds on the stop path
+
+
+# -- dual-cadence scheduling (design §5.2: one arbiter, full supersedes hot) --
+
+def test_hot_audits_run_completion_relative_alongside_full():
+    """hot_interval small, full interval large: hot items flow with
+    audit_kind='hot', completion-relative, through the SAME single arbiter."""
+    work_q = queue.Queue()
+    stop = threading.Event()
+    coordinator = AuditCoordinator(
+        work_q, stop, interval=60.0, backoff_initial=0.02, hot_interval=0.05
+    )
+    coordinator.start(immediate=False)
+    try:
+        first = work_q.get(timeout=1.0)
+        assert first.audit_kind == "hot"
+        assert coordinator.queued_or_running
+        assert first.start()
+        completed = time.monotonic()
+        first.finish(AuditResult("ok", 0.01))
+        second = work_q.get(timeout=1.0)
+        assert second.audit_kind == "hot"
+        assert time.monotonic() - completed >= 0.05 * 0.70  # completion-relative
+        second.finish(AuditResult("ok", 0.01))
+    finally:
+        stop.set()
+        coordinator.join()
+
+
+def test_hot_failures_back_off_capped_at_hot_interval():
+    """A failing hot audit retries with capped exponential backoff (§5.2's
+    result-bearing rule applies to BOTH tiers — Codex consult 2026-08-10)."""
+    work_q = queue.Queue()
+    stop = threading.Event()
+    coordinator = AuditCoordinator(
+        work_q, stop, interval=60.0, backoff_initial=0.03, hot_interval=0.20
+    )
+    coordinator.start(immediate=False)
+    try:
+        first = work_q.get(timeout=1.0)
+        t1 = time.monotonic()
+        first.finish(AuditResult("failed", 0.01, "first"))
+        second = work_q.get(timeout=1.0)
+        t2 = time.monotonic()
+        assert 0.03 * 0.70 <= t2 - t1 < 0.20  # backoff, not the full cadence
+        second.finish(AuditResult("ok", 0.01))
+    finally:
+        stop.set()
+        coordinator.join()
+
+
+def test_due_full_supersedes_due_hot():
+    """Both due when the scheduler wakes: full wins (§5.2), and the arbiter
+    never queues a hot item while an audit is queued/running."""
+    work_q = queue.Queue()
+    stop = threading.Event()
+    coordinator = AuditCoordinator(
+        work_q, stop, interval=0.05, backoff_initial=0.02, hot_interval=0.05
+    )
+    coordinator.start(immediate=True)   # full due NOW; hot due at 0.05
+    try:
+        first = work_q.get(timeout=1.0)
+        assert first.audit_kind == "full"
+        time.sleep(0.12)                # hot came due while full still runs
+        assert work_q.empty()
+        first.finish(AuditResult("ok", 0.01))
+        second = work_q.get(timeout=1.0)
+        assert second.audit_kind in ("hot", "full")
+        second.finish(AuditResult("ok", 0.01))
+    finally:
+        stop.set()
+        coordinator.join()
+
+
+def test_worker_dispatches_hot_item_to_hot_audit(tmp_db, monkeypatch):
+    import mcap_catalog_builder.__main__ as main_mod
+
+    conn, caches = tmp_db
+    calls = []
+
+    def fake_hot(*_a, **kw):
+        calls.append(("hot", kw.get("window_days")))
+        return {"cataloged": 0, "skipped": 0, "failed": 0, "deleted": 0,
+                "covered_prefixes": 3, "skipped_prefixes": 1}
+
+    monkeypatch.setattr(main_mod, "hot_audit", fake_hot)
+    monkeypatch.setattr(
+        main_mod, "full_reconcile",
+        lambda *_a, **_kw: calls.append(("full", None)),
+    )
+    hot = AuditItem(audit_kind="hot")
+    full = AuditItem()
+    work_q = queue.Queue()
+    work_q.put(hot)
+    work_q.put(full)
+    work_q.put(WatchEvent("stop"))
+    worker_loop(conn, caches, object(), work_q, hot_window_days=5)
+    assert calls == [("hot", 5), ("full", None)]
+    assert hot.wait(threading.Event()).outcome == "ok"
+    assert full.wait(threading.Event()).outcome == "ok"
