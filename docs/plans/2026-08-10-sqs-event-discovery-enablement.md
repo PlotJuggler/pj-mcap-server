@@ -8,6 +8,25 @@
 
 **Tech Stack:** Python 3.11+ (builder; venv `~/.venvs/pj-catalog`), Go 1.23 (server), bash + aws CLI (staging infra), pytest / go test.
 
+
+**EXECUTION AMENDMENTS (2026-08-10, during execution):**
+1. **Runbook-only staging** (operator decision): the only AWS identity on the dev
+   box is read-only (`dexory-s3-reader`), so Tasks 2/5/17's live-AWS halves are
+   NOT executed. The setup/drill scripts land as tested artifacts + runbook;
+   translator tests use SYNTHESIZED payloads for all three event families
+   (marked as such); capturing real payloads is the documented follow-up.
+2. **Codex consult verdict folded** (session 019feb32-8045-7950-88fd-19ea3967dc22):
+   setup-script ownership guard made structural (empty-or-exactly-ours, converge
+   attributes); `--prefix`/`--whole-bucket` made explicit; hot audit is S3-only
+   (no `LocalSource.list_prefix` — local `intended_key` overrides break raw-key
+   scoping); failure hygiene compares raw ∪ effective keys; hot tier gets capped
+   backoff and zero-coverage-⇒-failed; fixed-hour honored for the non-immediate
+   initial delay; `ErrNotFound` excludes bucket-absence (NoSuchBucket /
+   ErrBucketNotExist stay plain ErrPermanent); systemd enablement via a drop-in
+   example (ExecStart hardcodes --no-watch); sidecar keys `tag_edit_expired`/
+   `tag_edit_failed` (design §6 names); registry derivation index-only DISTINCT
+   (incremental in-memory registry REJECTED: staleness risk for ~100ms/30min).
+
 **Authoritative design:** `docs/plans/2026-07-30-builder-event-discovery-design.md` (v2, Codex-reviewed, 19 findings folded). Section references (§3.5, §4.2, §5.2…) below point there. Do not re-litigate its decisions.
 
 **Repo conventions that bind this plan:**
