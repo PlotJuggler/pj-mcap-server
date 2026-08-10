@@ -155,6 +155,78 @@ def _composite_ids(caches: Caches, dims) -> tuple | None:
     return (cid, sid, rid, srcid, dims["date"], dims["filename"])
 
 
+def _run_extract_apply(
+    conn, caches, source, to_extract, *, workers, source_spec,
+    tally, progress=None, stop_event=None,
+) -> None:
+    """The shared read-phase (parallel, network-bound, NO DB) -> apply-phase
+    (serial, single-writer) engine, used by ``full_reconcile`` and the tier-2
+    ``hot_audit``. Moved verbatim from full_reconcile — the bounded-window
+    invariant (never submit-all + as_completed; see _bounded_completions)
+    lives HERE now and is still pinned by
+    test_reconcile_extraction_results_release_incrementally."""
+
+    def _apply(ex) -> None:
+        _raise_if_stopped(stop_event)
+        st = apply_extract(conn, caches, ex).status
+        tally[st] += 1
+        _raise_if_stopped(stop_event)
+        if progress is not None:
+            progress.file_done(st, getattr(ex, "summary_via", ""))
+
+    # Read phase (parallel, network-bound, NO DB) -> apply phase (serial, DB writes
+    # on this thread only). Each summary applies as soon as it lands while other
+    # fetches are still in flight, through a BOUNDED submission window (see
+    # _bounded_completions) so completed results never accumulate.
+    if workers > 1 and len(to_extract) > 1:
+        # Parallelize fetch+parse. For a remote bucket (source_spec given) use a
+        # PROCESS pool so the pure-Python MCAP parse isn't GIL-serialized — each worker
+        # has its own client + GIL; otherwise a thread pool. Size to the actual work so
+        # a small rescan doesn't spawn a full-width pool. The DB apply stays serial on
+        # THIS thread either way (per-file quarantine + count-check unchanged).
+        n = min(workers, len(to_extract))
+        if source_spec is not None:
+            # Explicit context, not the platform default: production runs Python
+            # 3.12 (CI runs 3.11 — same default), whose default start method is
+            # fork, and the daemon starts the sidecar heartbeat THREAD
+            # (status.StatusWriter.heartbeat_start) before this pool — a bare
+            # fork() would fork-after-threads, a known hazard (any lock held by
+            # a thread other than the forking one at fork time stays locked
+            # forever in the child, since only the forking thread survives the
+            # fork). forkserver forks from a clean, thread-free helper process
+            # instead, sidestepping the hazard entirely. Dev's 3.14 already
+            # defaults to forkserver, so this is a behavior change on 3.11/3.12
+            # only. Side effect: worker-process logging (targeted_summary.py's
+            # per-file DEBUG/WARNING lines) no longer inherits the parent's
+            # logging.basicConfig under forkserver the way it would under fork
+            # — the summary_* sidecar counters are parent-side (file_done runs
+            # on THIS thread) and are unaffected either way.
+            pool = ProcessPoolExecutor(
+                max_workers=n, initializer=_init_worker, initargs=(source_spec,),
+                mp_context=multiprocessing.get_context("forkserver"),
+            )
+            submit = lambda item: pool.submit(_extract_task, item)  # noqa: E731
+        else:
+            pool = ThreadPoolExecutor(max_workers=n)
+            submit = lambda item: pool.submit(extract_summary, source, *item)  # noqa: E731
+        try:
+            # window = 2n: every worker stays fed (one running + one queued each)
+            # while at most ~2n results are resident awaiting the serial apply.
+            for ex in _bounded_completions(
+                submit, to_extract, window=2 * n, stop_event=stop_event
+            ):
+                _apply(ex)
+        finally:
+            cancelled = stop_event is not None and stop_event.is_set()
+            pool.shutdown(wait=not cancelled, cancel_futures=cancelled)
+    else:
+        for item in to_extract:
+            _raise_if_stopped(stop_event)
+            ex = extract_summary(source, *item)
+            _raise_if_stopped(stop_event)
+            _apply(ex)
+
+
 def full_reconcile(
     conn: sqlite3.Connection, caches: Caches, source, workers: int = 1,
     source_spec: "SourceSpec | None" = None, progress=None, stop_event=None,
@@ -233,65 +305,11 @@ def full_reconcile(
     if progress is not None:
         progress.extract_start(len(to_extract), tally["skipped"], tally["failed"])
 
-    def _apply(ex) -> None:
-        _raise_if_stopped(stop_event)
-        st = apply_extract(conn, caches, ex).status
-        tally[st] += 1
-        _raise_if_stopped(stop_event)
-        if progress is not None:
-            progress.file_done(st, getattr(ex, "summary_via", ""))
-
-    # Read phase (parallel, network-bound, NO DB) -> apply phase (serial, DB writes
-    # on this thread only). Each summary applies as soon as it lands while other
-    # fetches are still in flight, through a BOUNDED submission window (see
-    # _bounded_completions) so completed results never accumulate.
-    if workers > 1 and len(to_extract) > 1:
-        # Parallelize fetch+parse. For a remote bucket (source_spec given) use a
-        # PROCESS pool so the pure-Python MCAP parse isn't GIL-serialized — each worker
-        # has its own client + GIL; otherwise a thread pool. Size to the actual work so
-        # a small rescan doesn't spawn a full-width pool. The DB apply stays serial on
-        # THIS thread either way (per-file quarantine + count-check unchanged).
-        n = min(workers, len(to_extract))
-        if source_spec is not None:
-            # Explicit context, not the platform default: production runs Python
-            # 3.12 (CI runs 3.11 — same default), whose default start method is
-            # fork, and the daemon starts the sidecar heartbeat THREAD
-            # (status.StatusWriter.heartbeat_start) before this pool — a bare
-            # fork() would fork-after-threads, a known hazard (any lock held by
-            # a thread other than the forking one at fork time stays locked
-            # forever in the child, since only the forking thread survives the
-            # fork). forkserver forks from a clean, thread-free helper process
-            # instead, sidestepping the hazard entirely. Dev's 3.14 already
-            # defaults to forkserver, so this is a behavior change on 3.11/3.12
-            # only. Side effect: worker-process logging (targeted_summary.py's
-            # per-file DEBUG/WARNING lines) no longer inherits the parent's
-            # logging.basicConfig under forkserver the way it would under fork
-            # — the summary_* sidecar counters are parent-side (file_done runs
-            # on THIS thread) and are unaffected either way.
-            pool = ProcessPoolExecutor(
-                max_workers=n, initializer=_init_worker, initargs=(source_spec,),
-                mp_context=multiprocessing.get_context("forkserver"),
-            )
-            submit = lambda item: pool.submit(_extract_task, item)  # noqa: E731
-        else:
-            pool = ThreadPoolExecutor(max_workers=n)
-            submit = lambda item: pool.submit(extract_summary, source, *item)  # noqa: E731
-        try:
-            # window = 2n: every worker stays fed (one running + one queued each)
-            # while at most ~2n results are resident awaiting the serial apply.
-            for ex in _bounded_completions(
-                submit, to_extract, window=2 * n, stop_event=stop_event
-            ):
-                _apply(ex)
-        finally:
-            cancelled = stop_event is not None and stop_event.is_set()
-            pool.shutdown(wait=not cancelled, cancel_futures=cancelled)
-    else:
-        for item in to_extract:
-            _raise_if_stopped(stop_event)
-            ex = extract_summary(source, *item)
-            _raise_if_stopped(stop_event)
-            _apply(ex)
+    _run_extract_apply(
+        conn, caches, source, to_extract, workers=workers,
+        source_spec=source_spec, tally=tally, progress=progress,
+        stop_event=stop_event,
+    )
 
     # Deletion sweep: composite keys present in the source (parseable + cached ids).
     # Reuses the dims parsed above; caches are now fully populated post-apply.
