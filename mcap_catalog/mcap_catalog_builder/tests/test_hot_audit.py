@@ -83,3 +83,38 @@ def test_s3_list_prefix_stop_raises_cancelled(tmp_path):
     stop.set()
     with pytest.raises(ReconcileCancelled):
         src.list_prefix(PA, stop_event=stop)
+
+
+# -- registry derivation (§4.1) ----------------------------------------------
+
+from mcap_catalog_builder.db import record_failure
+from mcap_catalog_builder.hot_audit import hot_prefixes, registry_combos
+
+
+def test_registry_combos_from_files_and_quarantine(tmp_db, tmp_path):
+    conn, caches = tmp_db
+    raw = _raw(tmp_path)
+    full_reconcile(conn, caches, S3Source(InMemoryS3Client({KA: raw}), "bucket"))
+    # A quarantined key's combo must NOT be exiled from the registry (§4.1:
+    # quarantine deletes the files row, so files alone would forget it).
+    record_failure(conn, KB, "boom")
+    conn.commit()
+    combos = registry_combos(conn)
+    assert ("acme", "hq", "r1", "ros-bags") in combos
+    assert ("beta", "hq", "r2", "ros-bags") in combos
+    # An unparseable failure key contributes nothing (and does not raise).
+    record_failure(conn, "not-a-hive-key.mcap", "boom")
+    conn.commit()
+    assert len(registry_combos(conn)) == 2
+
+
+def test_hot_prefixes_window_and_shape():
+    combos = {("acme", "hq", "r1", "ros-bags")}
+    targets = hot_prefixes(combos, TODAY, window_days=2)
+    assert [t[0] for t in targets] == [
+        "customer=acme/customer_site=hq/robot=r1/source=ros-bags/date=2026-05-31/",
+        "customer=acme/customer_site=hq/robot=r1/source=ros-bags/date=2026-06-01/",
+        "customer=acme/customer_site=hq/robot=r1/source=ros-bags/date=2026-06-02/",
+    ]
+    prefix, combo, date = targets[-1]
+    assert combo == ("acme", "hq", "r1", "ros-bags") and date == "2026-06-02"
