@@ -268,3 +268,45 @@ def test_gate_wait_drained_returns_false_on_stop():
     gate.batch_received(1)
     stop.set()
     assert gate.wait_drained(stop) is False
+
+
+# --------------------------------------------------------------------------
+# §3.2 event-family payloads (tests/data/s3_events; SYNTHESIZED per the AWS
+# event structure — see the data dir's README for the capture follow-up)
+# --------------------------------------------------------------------------
+
+import pathlib
+
+from mcap_catalog_builder.s3_producer import translate_body
+
+_DATA = pathlib.Path(__file__).parent / "data" / "s3_events"
+_EXPECT = {"create": "catalog", "delete": "delete", "ack": None}
+
+
+@pytest.mark.parametrize(
+    "path", sorted(_DATA.glob("*.json")), ids=lambda p: p.name
+)
+def test_translator_handles_event_family_payloads(path):
+    """Family encoded in the filename prefix: create_* -> one catalog record,
+    delete_* -> one delete record (incl. both LifecycleExpiration shapes),
+    ack_* -> zero records (record-less bodies ack immediately). The key must
+    round-trip URL-DECODED (S3 events carry %-encoded keys — '=' as %3D)."""
+    family = path.name.split("_", 1)[0]
+    records = translate_body(path.read_text())
+    if _EXPECT[family] is None:
+        assert records == []
+    else:
+        assert [kind for kind, _key in records] == [_EXPECT[family]]
+        key = records[0][1]
+        assert key.endswith(".mcap")
+        assert "%" not in key and key.startswith("customer=")  # decoded
+
+
+def test_event_family_fixtures_cover_all_three_families():
+    """All translator families are pinned by a fixture — without this, an
+    empty data dir would silently collect zero parametrized tests above."""
+    names = [p.name for p in _DATA.glob("*.json")]
+    assert any(n.startswith("create_") for n in names)
+    assert any(n.startswith("delete_lifecycleexpiration") for n in names)
+    assert any(n.startswith("delete_") for n in names)
+    assert any(n.startswith("ack_") for n in names)

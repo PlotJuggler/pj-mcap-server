@@ -1,0 +1,36 @@
+{
+ "Records": [
+  {
+   "eventVersion": "2.2",
+   "eventSource": "aws:s3",
+   "awsRegion": "us-east-1",
+   "eventTime": "2026-08-10T08:00:00.000Z",
+   "eventName": "ObjectRemoved:Delete",
+   "userIdentity": {
+    "principalId": "EXAMPLE"
+   },
+   "requestParameters": {
+    "sourceIPAddress": "127.0.0.1"
+   },
+   "responseElements": {
+    "x-amz-request-id": "EXAMPLE",
+    "x-amz-id-2": "EXAMPLE"
+   },
+   "s3": {
+    "s3SchemaVersion": "1.0",
+    "configurationId": "pj-cloud-catalog-mcap-events",
+    "bucket": {
+     "name": "staging-bucket",
+     "ownerIdentity": {
+      "principalId": "EXAMPLE"
+     },
+     "arn": "arn:aws:s3:::staging-bucket"
+    },
+    "object": {
+     "key": "customer%3Ddrill/customer_site%3Dlab/robot%3Dr1/source%3Dros-bags/date%3D2026-08-10/capture-1.mcap",
+     "sequencer": "0055AED6DCD90281E5"
+    }
+   }
+  }
+ ]
+}
