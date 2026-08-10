@@ -301,3 +301,30 @@ class S3Source:
             # and put_or_cancel's own check, an already-running shard task
             # still exits promptly instead of doing one more wasted LIST call.
             pool.shutdown(wait=True, cancel_futures=True)
+
+    def list_prefix(
+        self, prefix: str, stop_event: threading.Event | None = None
+    ) -> "list[Listing]":
+        """LIST one exact prefix to COMPLETION (serial pagination) and return
+        every ``.mcap`` listing under it. Raises on any error, and raises
+        ``ReconcileCancelled`` on stop — never returns a partial result. The
+        hot audit's fail-closed coverage (design 2026-07-30 §4.2) equates
+        "returned" with "complete", so a partial return here would turn an
+        enumeration failure into deletions.
+        """
+        out: list[Listing] = []
+        kw: dict = {"Bucket": self._bucket, "Prefix": prefix}
+        while True:
+            if stop_event is not None and stop_event.is_set():
+                # Deferred import: reconcile.py imports storage.py (not this
+                # module) at top level, so this cannot cycle — but keep it
+                # lazy so the dependency stays invisible at import time.
+                from .reconcile import ReconcileCancelled
+                raise ReconcileCancelled("hot-audit LIST cancelled")
+            resp = self._c.list_objects_v2(**kw)
+            for o in resp.get("Contents", []):
+                if o["Key"].endswith(".mcap"):
+                    out.append(self._listing(o))
+            if not resp.get("IsTruncated"):
+                return out
+            kw["ContinuationToken"] = resp["NextContinuationToken"]
