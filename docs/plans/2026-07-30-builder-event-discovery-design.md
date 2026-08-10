@@ -1,8 +1,11 @@
 # Builder discovery at scale: event-primary + hybrid audit (design)
 
-**Date:** 2026-07-30 · **Status:** v2 — Phases 0–2 IMPLEMENTED (branch
-`builder-event-discovery`, 2026-07-30); Phases 3–6 are ops toggles per
-`server/deploy/README.md`, Phase 7 gated on §5.4's streaming prerequisite
+**Date:** 2026-07-30 · **Status:** v2 — Phases 0–6 CODE-COMPLETE (0–2:
+branch `builder-event-discovery` 2026-07-30; 3–6 + §7.1: branch
+`sqs-event-enablement` 2026-08-10 per
+`docs/plans/2026-08-10-sqs-event-discovery-enablement.md` — live-staging
+provisioning/burn-in NOT executed, runbook'd in `server/deploy/README.md`);
+Phase 7 gated on §5.4's streaming prerequisite
 **Scope:** `mcap_catalog/` builder discovery + `server/deploy/` wiring. No Go-server,
 wire-protocol, or catalog-schema changes.
 **Revision:** v2 incorporates the 2026-07-30 Codex adversarial review (19 findings —
@@ -445,6 +448,17 @@ vanished object as `ERROR_S3_UNAVAILABLE`, indistinguishable from a bucket
 outage. Mapping the `ErrPermanent`/`NoSuchKey` case to `ERROR_NOT_FOUND` would
 let the UI say "recording was deleted — refresh the list" instead of implying a
 retryable outage. Candidate for the implementation plan's server-side touch.
+
+**IMPLEMENTED 2026-08-10** (`storage.ErrNotFound` + `planBuildErrorCode`,
+pinned by `TestPlanBuildErrorCode`): the dual-wrap covers ONLY object absence
+(S3 `NoSuchKey`/`NotFound`, GCS `ErrObjectNotExist`) — bucket absence and 403
+deliberately stay `ERROR_S3_UNAVAILABLE` (S3 answers 403 for a missing object
+without `s3:ListBucket`; claiming deletion there would misdirect the
+operator). This extends `ERROR_NOT_FOUND`'s wire semantics: besides "s3_key
+names no cataloged file at open", it now also covers "cataloged object
+vanished from the bucket at plan-build" (the proto comment was deliberately
+left untouched — a comment-only proto change would ripple into the checked-in
+generated bindings; this paragraph is the semantic record).
 
 ## 8. Rollout phases (reordered per review: burn in events *before* loosening the safety net)
 

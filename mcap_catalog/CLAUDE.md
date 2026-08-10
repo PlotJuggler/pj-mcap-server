@@ -51,8 +51,12 @@ For ad-hoc inspection of `.mcap` files, use the official CLI at
 **Single-writer, producer/consumer** (`__main__.py`). The producers — for `local`:
 the `watchdog` observer + per-path debounce `Timer`s (`WatchEvent`); for `s3`: the
 ack-hardened SQS drainer (`EventRecord`, acked only after the DB outcome commits);
-plus the `AuditCoordinator` (one coalesced, result-bearing `AuditItem` at a time,
-completion-relative) — all *only* enqueue and never touch the DB. One `worker_loop` on the main thread is the **sole consumer and the
+plus the `AuditCoordinator` (single arbiter for BOTH audit tiers — one
+coalesced, result-bearing `AuditItem` at a time; full audits
+completion-relative OR at a fixed nightly UTC hour (`--full-audit-hour`,
+skip-missed), tier-2 hot audits completion-relative (`--hot-audit-interval`);
+a due full audit supersedes a due hot one) — all *only* enqueue and never
+touch the DB. One `worker_loop` on the main thread is the **sole consumer and the
 only DB writer**, and is **backend-agnostic** (driven by a `Source`). SQLite runs in
 **WAL** mode so external readers query concurrently. The worker wraps every event
 in try/except so it can never die.
@@ -76,10 +80,22 @@ Module layering (each does one job):
   transaction. `delete_by_key` likewise. `catalog_file` / `delete_by_path` are thin
   local wrappers (path→key via `LocalSource`) kept for the watcher path + tests.
 - `reconcile.py` — `full_reconcile(conn, caches, source)`: `source.list_all()` →
-  catalog all → deletion sweep of rows with no object. **Authoritative** for removals;
-  scheduled by `__main__`'s `AuditCoordinator` (startup + completion-relative
-  `--rescan-interval`, coalesced; cancellable via `stop_event` → `ReconcileCancelled`). Accepts a `str` as shorthand for a
-  local root. `scan_disk` is retained for its test.
+  catalog all → deletion sweep of rows with no object + `catalog_failures`
+  hygiene (failure rows absent from the COMPLETE enumeration are pruned,
+  comparing raw ∪ effective keys — quarantine records `eff_key`).
+  **Authoritative** for removals; scheduled by `__main__`'s `AuditCoordinator`
+  (startup + `--rescan-interval` or `--full-audit-hour`, coalesced;
+  cancellable via `stop_event` → `ReconcileCancelled`). Accepts a `str` as
+  shorthand for a local root. `scan_disk` is retained for its test. The shared
+  read→apply engine is `_run_extract_apply` (also used by the hot audit).
+- `hot_audit.py` — tier-2 hot-window scoped audit (design 2026-07-30 §4):
+  registry combos (files ∪ parseable `catalog_failures` keys) × the last
+  `--hot-audit-window-days` of `date=` partitions, LISTed per prefix via
+  `S3Source.list_prefix` (complete-or-raise). Fail-closed per prefix — the
+  scoped sweep deletes ONLY inside covered prefixes, zero coverage fails the
+  audit, and it NEVER stamps `build_metadata` (sidecar `hot_audit_*` fields
+  only). **S3-only**: local `intended_key` overrides break raw-path prefix
+  scoping, so `--hot-audit-interval` requires `--source s3`.
 - `db.py` — connection (WAL/FK/busy_timeout set per-connection, **not** in
   schema.sql), in-memory id `Caches`, and `resolve_*` helpers.
 - `mcap_summary.py` — `summary_from_stream` parses the MCAP **summary/footer only**

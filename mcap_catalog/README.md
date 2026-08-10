@@ -31,6 +31,6 @@ upload ──► catalog builder ──► SQLite catalog ──► query server
 
 ```bash
 python3 -m mcap_catalog_builder <watch_root> [--db PATH]                 # local folder
-python3 -m mcap_catalog_builder --source s3 --s3-bucket B --sqs-url U     # S3 (experimental)
+python3 -m mcap_catalog_builder --source s3 --s3-bucket B --sqs-url U     # S3 (production shape; --no-watch = rescan-only)
 python3 -m pytest mcap_catalog_builder/tests/ -v
 ```

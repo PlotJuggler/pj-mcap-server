@@ -624,13 +624,20 @@ that is not "the finished catalog".
   `version`, `phase`, `pid`, `updated_at` (ISO-8601 UTC), `updated_at_unix`
   (float seconds — the freshness field consumers compare against), and the
   reconcile counters `listed_total`, `extract_total`, `extract_done`,
-  `cataloged`, `skipped`, `failed`, `deleted`, plus `last_error` (set with
-  `phase="error"`). Additive advisory fields (2026-07-30 event-discovery
+  `cataloged`, `skipped`, `failed`, `deleted`, `failures_pruned`
+  (tier-3 `catalog_failures` hygiene, 2026-08-10), plus `last_error` (set
+  with `phase="error"`). Additive advisory fields (2026-07-30 event-discovery
   design): `full_audit_last`/`full_audit_outcome`/`full_audit_duration` (last
   terminal full-audit result), `producer_last_poll_ok_at`/
   `producer_last_ack_at` (SQS intake liveness — distinguishes a dead intake
   thread from a quiet bucket), and the event-tier counters `events_applied`/
-  `events_acked`/`events_unknown_name`.
+  `events_acked`/`events_unknown_name`. Tier-2/window fields (2026-08-10,
+  design §4/§5.2): `hot_audit_last`/`hot_audit_outcome`/`hot_audit_duration`/
+  `hot_audit_covered_prefixes`/`hot_audit_skipped_prefixes` (last hot-window
+  scoped audit — the sidecar is the SOLE status surface for hot audits, which
+  never stamp `build_metadata`), `maintenance_window_active` (a full audit
+  holds the writer: events pause, tag edits can expire), and the tag-edit
+  counters `tag_edit_expired`/`tag_edit_failed`.
 - **Phases**: `listing` → `extracting` → `idle` (build + publish complete;
   daemon steady state between rescans, or a finished `--once`), and `error`
   (fatal failure — the exception that killed the run, truncated, in

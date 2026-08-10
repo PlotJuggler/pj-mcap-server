@@ -50,6 +50,16 @@ schema/IPC changes MUST update it.
 - **Remaining follow-ups:** `matrix.sh` migration (fail-fasts with exit 2 today; needs the
   `jkk_dataset02` corpus machine); real-bucket GCE smoke (`docs/gce-deploy-smoke.md`);
   builder gaps by design: `derive_tags()` stub, GCS Pub/Sub discovery, `file_metrics`.
+- **Event-discovery Phases 3–6 are CODE-COMPLETE (2026-08-10):** the SQS tier plus
+  the tier-2 hot-window scoped audit (`--hot-audit-interval`, S3-only), nightly
+  fixed-hour full audits (`--full-audit-hour`, skip-missed), `catalog_failures`
+  hygiene, and the §7.1 `ERROR_NOT_FOUND` mapping. **Live-staging execution was NOT
+  performed** (the dev box's only AWS identity is read-only) — provisioning/burn-in
+  are runbook'd in `server/deploy/README.md` (setup script `scripts/staging-sqs-setup.sh`,
+  drills incl. `scripts/staging-event-drills.sh`); the translator-test payloads are
+  SYNTHESIZED (capture follow-up documented in `tests/data/s3_events/README.md`).
+  Every deploy default still runs `--no-watch` — enablement is the operator's phased
+  ops change.
 - **The C++ facet UI has LANDED** (2026-07-26): browse is now gated on a required
   customer+site selection fed by `GetVocabulary`, server-filtered (`ListFiles`) and
   progressively rendered, persisted per server -- the executed plan doc was removed
@@ -230,6 +240,19 @@ doubt, but don't relitigate the decision itself.
 - API keys are stored via the plugin's own `credential_store` seam (atomic 0600 JSON
   under `XDG_CONFIG_HOME`), never in plaintext `SettingsView`; libsecret remains a
   documented drop-in behind the same seam if/when it's worth the Qt6 pull.
+- **Hot audits are fail-closed per prefix and NEVER stamp `build_metadata`** —
+  deletions happen only inside prefixes whose pagination COMPLETED
+  (`S3Source.list_prefix` raises rather than returning a partial listing), zero
+  coverage fails the audit, and tier-2 status lives in the sidecar only. S3-only:
+  local `intended_key` overrides break raw-path prefix scoping. Pinned by
+  `test_hot_audit_deletes_only_inside_covered_prefixes` /
+  `test_hot_audit_never_stamps_build_metadata` (`test_hot_audit.py`).
+- **A vanished object at session plan-build is `ERROR_NOT_FOUND`, never
+  `ERROR_S3_UNAVAILABLE`** — `storage.ErrNotFound` dual-wraps ONLY object-absence
+  (NoSuchKey/NotFound, `gcs.ErrObjectNotExist`); bucket absence and 403 stay
+  UNAVAILABLE (S3 returns 403 for missing objects without `s3:ListBucket`, so
+  claiming "recording deleted" there would misdirect the operator). Pinned by
+  `TestPlanBuildErrorCode` (`session_error_code_test.go`) + the classify tests.
 
 ## Reference codebases (MANDATORY context — always reuse these)
 
