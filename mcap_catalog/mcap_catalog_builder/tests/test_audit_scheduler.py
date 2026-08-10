@@ -287,3 +287,68 @@ def test_worker_dispatches_hot_item_to_hot_audit(tmp_db, monkeypatch):
     assert calls == [("hot", 5), ("full", None)]
     assert hot.wait(threading.Event()).outcome == "ok"
     assert full.wait(threading.Event()).outcome == "ok"
+
+
+# -- fixed-hour full audits (§5.2/§5.3, Phase 6) ------------------------------
+
+def test_next_fixed_hour_delay_math():
+    import calendar
+    from mcap_catalog_builder.__main__ import _next_fixed_hour_delay
+
+    # 2026-08-10 10:30:00 UTC
+    now = calendar.timegm((2026, 8, 10, 10, 30, 0, 0, 0, 0))
+    assert _next_fixed_hour_delay(now, 11) == 1800.0          # same day, 30 min out
+    assert _next_fixed_hour_delay(now, 2) == 15.5 * 3600.0    # tomorrow 02:00
+    at_slot = calendar.timegm((2026, 8, 10, 11, 0, 0, 0, 0, 0))
+    assert _next_fixed_hour_delay(at_slot, 11) == 86400.0     # STRICTLY after now
+
+
+def test_fixed_hour_schedules_from_completion_skip_missed(monkeypatch):
+    """After a full audit completes, the next one lands one (patched)
+    fixed-hour delay later — computed from NOW, never from a nominal missed
+    schedule, and never from --rescan-interval."""
+    import mcap_catalog_builder.__main__ as main_mod
+
+    monkeypatch.setattr(main_mod, "_next_fixed_hour_delay",
+                        lambda _now, _hour: 0.06)
+    work_q = queue.Queue()
+    stop = threading.Event()
+    coordinator = AuditCoordinator(
+        work_q, stop, interval=999.0, backoff_initial=0.02, full_audit_hour=2
+    )
+    coordinator.start(immediate=True)
+    try:
+        first = work_q.get(timeout=1.0)
+        assert first.audit_kind == "full"
+        done = time.monotonic()
+        first.finish(AuditResult("ok", 0.01))
+        second = work_q.get(timeout=1.0)
+        assert 0.04 <= time.monotonic() - done < 1.0   # the patched slot, not 999s
+        second.finish(AuditResult("ok", 0.01))
+    finally:
+        stop.set()
+        coordinator.join()
+
+
+def test_fixed_hour_honored_for_non_immediate_start(monkeypatch):
+    """A fresh build (immediate=False) must schedule its FIRST full audit at
+    the fixed hour, not one --rescan-interval out (Codex consult 2026-08-10)."""
+    import mcap_catalog_builder.__main__ as main_mod
+
+    monkeypatch.setattr(main_mod, "_next_fixed_hour_delay",
+                        lambda _now, _hour: 0.06)
+    work_q = queue.Queue()
+    stop = threading.Event()
+    coordinator = AuditCoordinator(
+        work_q, stop, interval=999.0, backoff_initial=0.02, full_audit_hour=2
+    )
+    started = time.monotonic()
+    coordinator.start(immediate=False)
+    try:
+        first = work_q.get(timeout=1.0)
+        assert first.audit_kind == "full"
+        assert time.monotonic() - started < 1.0   # not 999s
+        first.finish(AuditResult("ok", 0.01))
+    finally:
+        stop.set()
+        coordinator.join()
