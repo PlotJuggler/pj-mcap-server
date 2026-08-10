@@ -118,3 +118,98 @@ def test_hot_prefixes_window_and_shape():
     ]
     prefix, combo, date = targets[-1]
     assert combo == ("acme", "hq", "r1", "ros-bags") and date == "2026-06-02"
+
+
+# -- hot_audit (§4.2): scoped catalog + fail-closed scoped sweep --------------
+
+from mcap_catalog_builder.hot_audit import hot_audit
+
+
+def _seed(conn, caches, tmp_path, objects):
+    """Full-reconcile the given object keys in, returning the raw bytes used."""
+    raw = _raw(tmp_path)
+    full_reconcile(conn, caches, S3Source(InMemoryS3Client(
+        {k: raw for k in objects}), "bucket"))
+    return raw
+
+
+def _count(conn, filename):
+    return conn.execute(
+        "SELECT COUNT(*) FROM files WHERE filename=?", (filename,)
+    ).fetchone()[0]
+
+
+def test_hot_audit_catalogs_new_skips_unchanged(tmp_db, tmp_path):
+    conn, caches = tmp_db
+    raw = _seed(conn, caches, tmp_path, [KA])
+    src = S3Source(InMemoryS3Client({KA: raw, PA + "new.mcap": raw}), "bucket")
+    tally = hot_audit(conn, caches, src, today=TODAY)
+    assert tally["cataloged"] == 1 and tally["skipped"] == 1
+    assert _count(conn, "new.mcap") == 1
+    assert tally["covered_prefixes"] >= 1 and tally["skipped_prefixes"] == 0
+
+
+def test_hot_audit_deletes_only_inside_covered_prefixes(tmp_db, tmp_path):
+    """One failed prefix among many (§9): the failed prefix's stale row
+    SURVIVES; the covered prefix's stale row is deleted."""
+    conn, caches = tmp_db
+    raw = _seed(conn, caches, tmp_path, [KA, KB])
+    # Both objects vanish; prefix A's LIST breaks on page 2 -> A uncovered.
+    src = S3Source(Page2FailsClient({PA + "x1.mcap": raw, PA + "x2.mcap": raw}, PA),
+                   "bucket")
+    tally = hot_audit(conn, caches, src, today=TODAY)
+    assert tally["skipped_prefixes"] >= 1
+    assert _count(conn, "a.mcap") == 1      # uncovered prefix: NO deletion
+    assert _count(conn, "b.mcap") == 0      # covered empty prefix: deleted
+    assert tally["deleted"] == 1
+
+
+def test_hot_audit_covered_empty_prefix_is_authoritative(tmp_db, tmp_path):
+    conn, caches = tmp_db
+    _seed(conn, caches, tmp_path, [KA])
+    src = S3Source(InMemoryS3Client({}), "bucket")   # everything gone, LISTs fine
+    tally = hot_audit(conn, caches, src, today=TODAY)
+    assert tally["deleted"] == 1 and _count(conn, "a.mcap") == 0
+
+
+def test_hot_audit_ignores_dates_outside_window(tmp_db, tmp_path):
+    conn, caches = tmp_db
+    raw = _raw(tmp_path)
+    old = "customer=acme/customer_site=hq/robot=r1/source=ros-bags/date=2026-05-01/old.mcap"
+    full_reconcile(conn, caches, S3Source(InMemoryS3Client({old: raw}), "bucket"))
+    # Object vanishes, but its date is outside [TODAY-2, TODAY]: tier 3's job.
+    tally = hot_audit(conn, caches, S3Source(InMemoryS3Client({}), "bucket"),
+                      today=TODAY)
+    assert _count(conn, "old.mcap") == 1 and tally["deleted"] == 0
+
+
+def test_hot_audit_never_stamps_build_metadata(tmp_db, tmp_path):
+    conn, caches = tmp_db
+    raw = _seed(conn, caches, tmp_path, [KA])
+    before = conn.execute("SELECT build_id FROM build_metadata").fetchone()[0]
+    hot_audit(conn, caches,
+              S3Source(InMemoryS3Client({KA: raw, PA + "n.mcap": raw}), "bucket"),
+              today=TODAY)
+    after = conn.execute("SELECT build_id FROM build_metadata").fetchone()[0]
+    assert after == before  # §4.2: a subset scan stamping freshness would lie
+
+
+def test_hot_audit_quarantined_combo_is_scanned_and_repaired(tmp_db, tmp_path):
+    conn, caches = tmp_db
+    record_failure(conn, KB, "boom")   # combo known ONLY via quarantine
+    conn.commit()
+    raw = _raw(tmp_path)
+    tally = hot_audit(conn, caches,
+                      S3Source(InMemoryS3Client({KB: raw}), "bucket"), today=TODAY)
+    assert tally["cataloged"] == 1 and _count(conn, "b.mcap") == 1
+
+
+def test_hot_audit_stop_raises_cancelled_and_changes_nothing(tmp_db, tmp_path):
+    conn, caches = tmp_db
+    _seed(conn, caches, tmp_path, [KA])
+    stop = threading.Event()
+    stop.set()
+    with pytest.raises(ReconcileCancelled):
+        hot_audit(conn, caches, S3Source(InMemoryS3Client({}), "bucket"),
+                  today=TODAY, stop_event=stop)
+    assert _count(conn, "a.mcap") == 1
