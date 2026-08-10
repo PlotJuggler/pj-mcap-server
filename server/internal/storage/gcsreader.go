@@ -104,7 +104,16 @@ func (g *gcsStore) Head(ctx context.Context, key string) (ObjectInfo, error) {
 		return nil
 	}, classifyGCS)
 	if err != nil {
-		return ObjectInfo{}, err
+		// §7.1: ErrObjectNotExist is ambiguous (object Attrs normalize a
+		// bucket-level 404 to the same sentinel). Upgrade to ErrNotFound only
+		// after confirming the bucket exists; error-path-only cost, and the
+		// probe budget/detachment policy lives in disambiguate404.
+		return ObjectInfo{}, disambiguate404(ctx, err,
+			errors.Is(err, gcs.ErrObjectNotExist),
+			func(pc context.Context) error {
+				_, bErr := g.client.Bucket(g.bucket).Attrs(pc)
+				return bErr
+			})
 	}
 	return info, nil
 }
@@ -163,7 +172,11 @@ func classifyGCS(err error) error {
 		return nil
 	}
 	if errors.Is(err, gcs.ErrObjectNotExist) || errors.Is(err, gcs.ErrBucketNotExist) {
-		return fmt.Errorf("%w: %v", ErrPermanent, err)
+		// ErrObjectNotExist is NOT dual-wrapped with ErrNotFound here: object
+		// Attrs normalize a bucket-level 404 to the same sentinel, so at the
+		// classifier level it is ambiguous — gcsStore.Head disambiguates
+		// with a bucket probe (§7.1; see storage.disambiguate404).
+		return fmt.Errorf("%w: %w", ErrPermanent, err)
 	}
 	code := 0
 	var gae *googleapi.Error
@@ -178,11 +191,11 @@ func classifyGCS(err error) error {
 	}
 	switch {
 	case code == http.StatusNotFound, code == http.StatusForbidden, code == http.StatusBadRequest:
-		return fmt.Errorf("%w: %v", ErrPermanent, err)
+		return fmt.Errorf("%w: %w", ErrPermanent, err)
 	case code == http.StatusTooManyRequests, code >= 500:
-		return fmt.Errorf("%w: %v", ErrTransient, err)
+		return fmt.Errorf("%w: %w", ErrTransient, err)
 	default:
 		// Network/timeout/unknown -> transient by default (mirrors s3.go).
-		return fmt.Errorf("%w: %v", ErrTransient, err)
+		return fmt.Errorf("%w: %w", ErrTransient, err)
 	}
 }

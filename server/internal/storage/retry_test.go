@@ -176,4 +176,20 @@ func TestS3_ClassifyErrors(t *testing.T) {
 	if !errors.Is(classify(errors.New("dial tcp: connection refused")), ErrTransient) {
 		t.Error("an unclassified network error should default to transient")
 	}
+	// §7.1 (event-discovery design): the OBJECT-absent subset additionally
+	// carries ErrNotFound so the session plan-build can report a vanished
+	// recording as ERROR_NOT_FOUND. Bucket absence and auth-shaped permanents
+	// deliberately do NOT carry it — claiming "recording deleted" on a
+	// misconfigured bucket or a 403 would misdirect the operator.
+	if !errors.Is(classify(&apiErr{code: "NoSuchKey", msg: "x"}), ErrNotFound) {
+		t.Error("NoSuchKey (GET-shaped, unambiguous) should carry ErrNotFound")
+	}
+	// Bare "NotFound" is a HEAD 404 that cannot name its cause (missing
+	// object vs missing bucket) — the classifier must NOT wrap it; the
+	// upgrade happens in s3Store.Head via disambiguate404's bucket probe.
+	for _, code := range []string{"NotFound", "NoSuchBucket", "AccessDenied"} {
+		if errors.Is(classify(&apiErr{code: code, msg: "x"}), ErrNotFound) {
+			t.Errorf("code %q must NOT carry ErrNotFound at the classifier", code)
+		}
+	}
 }

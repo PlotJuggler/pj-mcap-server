@@ -1,0 +1,35 @@
+# Phase-4 overlay (event-discovery design 2026-07-30 §3.6/§8): event-driven
+# discovery ON. Compose `command` overrides are WHOLESALE, so the full list is
+# repeated here — keep it in lockstep with docker-compose.aws.yml's builder.
+#
+# Usage:
+#   docker compose -f docker-compose.aws.yml -f docker-compose.aws.events.yml up -d
+#
+# Prereqs:
+#   - scripts/staging-sqs-setup.sh ran for THIS bucket with a notification
+#     prefix EXACTLY matching PJ_CLOUD_S3_PREFIX (an out-of-scope event would
+#     be cataloged and then swept by the prefix-scoped full audit, forever);
+#   - the instance role carries the SQS grants (docs/ec2-deploy.md).
+services:
+  builder:
+    command:
+      - "--source=s3"
+      - "--s3-bucket=${PJ_CLOUD_S3_BUCKET:?set PJ_CLOUD_S3_BUCKET}"
+      # ${VAR?} (no colon): must be SET, but MAY be empty — "" = whole bucket,
+      # matching a --whole-bucket notification configuration.
+      - "--s3-prefix=${PJ_CLOUD_S3_PREFIX?set PJ_CLOUD_S3_PREFIX (empty string = whole bucket)}"
+      - "--sqs-url=${MCAP_CATALOG_SQS_URL:?set MCAP_CATALOG_SQS_URL (scripts/staging-sqs-setup.sh prints it)}"
+      - "--tag-socket=/var/lib/pj-cloud/tag.sock"
+      - "--db=/var/lib/pj-cloud/catalog.db"
+      # Events carry freshness; the 6 h full audit is the safety net until
+      # Phase 6 moves it to a nightly fixed hour (below).
+      - "--rescan-interval=21600"
+      # Tier 2 (Phase 5): scoped hot-window audit every 30 min — repairs lost
+      # events within one cadence; fail-closed per prefix; sidecar-only status.
+      - "--hot-audit-interval=1800"
+      # Phase 6 (enable LAST, only after tiers 1-2 burn in — design §8): the
+      # full audit moves to a fixed off-peak UTC hour, nightly, skip-missed.
+      # Uncomment and pick the hour; --rescan-interval is then unused for
+      # scheduling (fixed-hour wins) but stays harmless if left in place.
+      #- "--full-audit-hour=3"
+      - "--log-level=INFO"

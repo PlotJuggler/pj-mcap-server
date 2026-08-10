@@ -505,3 +505,62 @@ def test_worker_delete_event_head_guard_deletes_vanished_object(tmp_db, monkeypa
     worker_loop(conn, caches, src, q)
     assert deleted == ["customer=a/x.mcap"]
     assert ack_q.get_nowait() is rec.batch
+
+
+# -- Phase 5/6 flags (design §4/§5.2) -----------------------------------------
+
+def test_hot_audit_flag_defaults():
+    args = build_parser().parse_args(["."])
+    assert args.hot_audit_interval == 0.0     # tier 2 is opt-in (deploy flag)
+    assert args.hot_audit_window_days == 2
+    assert args.full_audit_hour is None
+
+
+def test_hot_audit_rejected_for_non_s3_sources(tmp_path):
+    # local: raw-path scoping vs intended_key overrides — S3-only by decision.
+    rc = main([str(tmp_path), "--hot-audit-interval", "1800", "--once"])
+    assert rc == 2
+    # gcs: no scoped-LIST wiring.
+    rc = main([".", "--source", "gcs", "--gcs-bucket", "b",
+               "--hot-audit-interval", "1800", "--once"])
+    assert rc == 2
+
+
+def test_hot_audit_negative_values_rejected():
+    rc = main([".", "--source", "s3", "--s3-bucket", "b", "--once",
+               "--hot-audit-interval", "-1"])
+    assert rc == 2
+    rc = main([".", "--source", "s3", "--s3-bucket", "b", "--once",
+               "--hot-audit-window-days", "-1"])
+    assert rc == 2
+
+
+def test_full_audit_hour_range_validated():
+    rc = main([".", "--full-audit-hour", "24", "--once"])
+    assert rc == 2
+    rc = main([".", "--full-audit-hour", "-1", "--once"])
+    assert rc == 2
+
+
+def test_worker_acks_out_of_scope_event_without_cataloging(tmp_db, monkeypatch):
+    """Tier-1 scope guard (Fable review 2026-08-10): an event whose key falls
+    outside the source's --s3-prefix scope is ACKED (redelivery cannot help)
+    and never cataloged — the prefix-scoped full audit would sweep it forever."""
+    conn, caches = tmp_db
+    import mcap_catalog_builder.__main__ as m
+
+    cataloged: list[str] = []
+    monkeypatch.setattr(m, "catalog_object",
+                        lambda c, ca, k, s, stat=None: cataloged.append(k))
+
+    class ScopedSource:
+        scope_prefix = "customer=acme/"
+
+    rec, ack_q = _event_record("catalog", "customer=beta/customer_site=s/robot=r/source=x/date=2026-06-02/f.mcap")
+    q: queue.Queue = queue.Queue()
+    q.put(rec)
+    q.put(WatchEvent("stop"))
+    worker_loop(conn, caches, ScopedSource(), q)
+
+    assert cataloged == []               # never cataloged
+    assert not ack_q.empty()             # but ACKED (terminal)

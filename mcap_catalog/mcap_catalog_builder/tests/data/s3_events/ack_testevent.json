@@ -1,0 +1,8 @@
+{
+ "Service": "Amazon S3",
+ "Event": "s3:TestEvent",
+ "Time": "2026-08-10T08:00:00.000Z",
+ "Bucket": "staging-bucket",
+ "RequestId": "EXAMPLE",
+ "HostId": "EXAMPLE"
+}

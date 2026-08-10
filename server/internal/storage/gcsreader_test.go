@@ -55,6 +55,16 @@ func TestGCS_ClassifyErrors(t *testing.T) {
 	if !errors.Is(classifyGCS(gcs.ErrObjectNotExist), ErrPermanent) {
 		t.Error("ErrObjectNotExist should be permanent")
 	}
+	// §7.1: NEITHER sentinel carries ErrNotFound at the classifier — object
+	// Attrs normalize a bucket-level 404 to ErrObjectNotExist, so the
+	// object/bucket call is made in gcsStore.Head via disambiguate404's
+	// bucket probe, never here.
+	if errors.Is(classifyGCS(gcs.ErrObjectNotExist), ErrNotFound) {
+		t.Error("ErrObjectNotExist must NOT carry ErrNotFound at the classifier")
+	}
+	if errors.Is(classifyGCS(gcs.ErrBucketNotExist), ErrNotFound) {
+		t.Error("ErrBucketNotExist must NOT carry ErrNotFound")
+	}
 	if !errors.Is(classifyGCS(gcs.ErrBucketNotExist), ErrPermanent) {
 		t.Error("ErrBucketNotExist should be permanent")
 	}

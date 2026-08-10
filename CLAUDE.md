@@ -50,6 +50,16 @@ schema/IPC changes MUST update it.
 - **Remaining follow-ups:** `matrix.sh` migration (fail-fasts with exit 2 today; needs the
   `jkk_dataset02` corpus machine); real-bucket GCE smoke (`docs/gce-deploy-smoke.md`);
   builder gaps by design: `derive_tags()` stub, GCS Pub/Sub discovery, `file_metrics`.
+- **Event-discovery Phases 3–6 are CODE-COMPLETE (2026-08-10):** the SQS tier plus
+  the tier-2 hot-window scoped audit (`--hot-audit-interval`, S3-only), nightly
+  fixed-hour full audits (`--full-audit-hour`, skip-missed), `catalog_failures`
+  hygiene, and the §7.1 `ERROR_NOT_FOUND` mapping. **Live-staging execution was NOT
+  performed** (the dev box's only AWS identity is read-only) — provisioning/burn-in
+  are runbook'd in `server/deploy/README.md` (setup script `scripts/staging-sqs-setup.sh`,
+  drills incl. `scripts/staging-event-drills.sh`); the translator-test payloads are
+  SYNTHESIZED (capture follow-up documented in `tests/data/s3_events/README.md`).
+  Every deploy default still runs `--no-watch` — enablement is the operator's phased
+  ops change.
 - **The C++ facet UI has LANDED** (2026-07-26): browse is now gated on a required
   customer+site selection fed by `GetVocabulary`, server-filtered (`ListFiles`) and
   progressively rendered, persisted per server -- the executed plan doc was removed
@@ -230,6 +240,42 @@ doubt, but don't relitigate the decision itself.
 - API keys are stored via the plugin's own `credential_store` seam (atomic 0600 JSON
   under `XDG_CONFIG_HOME`), never in plaintext `SettingsView`; libsecret remains a
   documented drop-in behind the same seam if/when it's worth the Qt6 pull.
+- **Hot audits are fail-closed per prefix and NEVER stamp `build_metadata`** —
+  deletions happen only inside prefixes whose pagination COMPLETED
+  (`S3Source.list_prefix` raises rather than returning a partial listing), every
+  deletion candidate is HEAD-confirmed at sweep time (live/ambiguous ⇒ skip — a
+  re-upload landing between LIST and sweep must not cascade `tags_override`),
+  zero coverage FAILS the audit, and tier-2 status lives in the sidecar only.
+  S3-only: local `intended_key` overrides break raw-path prefix scoping.
+  Targets intersect the deployment's `--s3-prefix` scope, and a pass-level
+  bucket probe vetoes all deletions when the bucket can't be confirmed. Pinned
+  by `test_hot_audit_deletes_only_inside_covered_prefixes` /
+  `test_hot_audit_sweep_head_guards_deletion_candidates` /
+  `test_hot_audit_zero_coverage_raises` /
+  `test_hot_audit_respects_configured_source_prefix` /
+  `test_hot_audit_skips_deletions_when_bucket_unconfirmed` /
+  `test_hot_audit_never_stamps_build_metadata` (`test_hot_audit.py`).
+- **A vanished object at session plan-build is `ERROR_NOT_FOUND`, never
+  `ERROR_S3_UNAVAILABLE`** — but only when object-absence is UNAMBIGUOUS: the
+  classifier dual-wraps `storage.ErrNotFound` solely for GET-shaped `NoSuchKey`,
+  and a HEAD 404 (which S3/GCS return for a missing object AND a missing bucket
+  alike) is upgraded only by the store `Head` methods after a bucket-existence
+  probe (`disambiguate404`, error-path-only). Bucket absence, ambiguous 404s,
+  and 403 stay UNAVAILABLE (S3 returns 403 for missing objects without
+  `s3:ListBucket`, so claiming "recording deleted" there would misdirect the
+  operator). Classifiers preserve the cause chain with `%w` — a `%v` there
+  silently kills the Head-path upgrade (merge-gate-caught). Pinned by
+  `TestPlanBuildErrorCode`, `TestDisambiguate404`,
+  `TestHeadErrorFlowPreserves404Shape`, and the classify tests.
+- **A failed event record SETTLES the intake gate without acking** — the §3.5
+  audit drain barrier waits for settlement (acked OR abandoned-for-redelivery),
+  never for a message SQS will redeliver anyway; before this, ONE failed record
+  wedged every audit tier permanently behind `wait_drained` while the
+  healthcheck stayed green (Fable review 2026-08-10). The worker also acks
+  out-of-scope event keys without cataloging (the tier-1 mirror of the hot
+  audit's `--s3-prefix` intersection). Pinned by
+  `test_failed_record_settles_gate_without_ack` /
+  `test_worker_acks_out_of_scope_event_without_cataloging`.
 
 ## Reference codebases (MANDATORY context — always reuse these)
 

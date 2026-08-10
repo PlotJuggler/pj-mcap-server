@@ -8,7 +8,9 @@ writer. It is driven by a storage ``Source`` and is identical for all backends.
 """
 
 import argparse
+import calendar
 import logging
+import math
 import os
 import queue
 import signal
@@ -19,6 +21,7 @@ from dataclasses import dataclass
 
 from .db import Caches, load_caches, open_db
 from .builder import catalog_object, delete_by_key
+from .hot_audit import hot_audit
 from .publish import build_and_publish
 from .reconcile import ReconcileCancelled, SourceSpec, full_reconcile
 from .s3_producer import EventRecord, IntakeGate
@@ -32,6 +35,23 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_DB = "/tmp/pj-cloud-catalog.db"
 _AUDIT_BACKOFF_INITIAL = 1.0
+# Fixed-hour mode has no completion-relative interval to cap backoff at;
+# retry a failing nightly audit at most hourly (never past the next slot —
+# see the backoff arm in AuditCoordinator._run).
+_FIXED_HOUR_BACKOFF_CAP = 3600.0
+
+
+def _next_fixed_hour_delay(now_wall: float, hour: int) -> float:
+    """Seconds from ``now_wall`` (unix) to the NEXT occurrence of ``hour``:00
+    UTC STRICTLY after now. Always computed from now — a slot that passed
+    while the process was down or an audit overran is simply skipped (§5.2
+    skip-missed), never replayed."""
+    t = time.gmtime(now_wall)
+    today_slot = float(calendar.timegm(
+        (t.tm_year, t.tm_mon, t.tm_mday, hour, 0, 0, 0, 0, 0)))
+    if now_wall < today_slot:
+        return today_slot - now_wall
+    return today_slot + 86400.0 - now_wall
 
 
 @dataclass(frozen=True)
@@ -54,7 +74,8 @@ class AuditItem:
 
     kind = "audit"
 
-    def __init__(self) -> None:
+    def __init__(self, audit_kind: str = "full") -> None:
+        self.audit_kind = audit_kind  # "full" | "hot" (worker dispatch key)
         self._lock = threading.Lock()
         self._done = threading.Event()
         self._state = "pending"  # pending | running | finished
@@ -102,11 +123,16 @@ class AuditItem:
 
 
 class AuditCoordinator:
-    """Single arbiter for completion-relative full-audit scheduling.
+    """Single arbiter for BOTH audit tiers (design §5.2).
 
-    Exactly one item may be queued or running. Successful audits schedule the
-    next audit one full interval after completion; failures retry with
-    exponential backoff capped at that same interval.
+    Exactly one audit — hot or full — may be queued or running; a due full
+    audit supersedes a due hot one, and a hot audit never delays a due full
+    audit by more than its own runtime. Full audits schedule either
+    completion-relative (``interval``) or at a fixed nightly UTC hour
+    (``full_audit_hour``, skip-missed); hot audits are completion-relative
+    (``hot_interval``; 0 = tier 2 off). Failures on either tier retry with
+    exponential backoff capped at the tier's cadence (fixed-hour: capped at
+    ``_FIXED_HOUR_BACKOFF_CAP``, never past the next slot).
     """
 
     def __init__(
@@ -117,6 +143,9 @@ class AuditCoordinator:
         *,
         backoff_initial: float = _AUDIT_BACKOFF_INITIAL,
         intake_gate=None,
+        hot_interval: float = 0.0,
+        full_audit_hour: int | None = None,
+        wall_clock=time.time,
     ) -> None:
         self._work_q = work_q
         self._stop_event = stop_event
@@ -125,6 +154,9 @@ class AuditCoordinator:
         # §3.5 handshake: pause SQS intake and wait until every received batch
         # is terminal AND acked before an audit runs (None = no event tier).
         self._gate = intake_gate
+        self._hot_interval = max(0.0, hot_interval)
+        self._full_hour = full_audit_hour
+        self._wall = wall_clock
         self._lock = threading.Lock()
         self._queued_or_running = False
         self._current: AuditItem | None = None
@@ -141,8 +173,11 @@ class AuditCoordinator:
         return item is not None
 
     def start(self, *, immediate: bool) -> None:
-        """Start scheduling; ``immediate`` is used for an existing served DB."""
-        initial_delay = 0.0 if immediate else self._interval
+        """Start scheduling; ``immediate`` is used for an existing served DB.
+        A non-immediate start honors the fixed hour too (a fresh build must
+        not schedule its first full audit off --rescan-interval when
+        --full-audit-hour is set — Codex consult 2026-08-10)."""
+        initial_delay = 0.0 if immediate else self._full_delay()
         self._thread = threading.Thread(
             target=self._run,
             args=(initial_delay,),
@@ -151,16 +186,22 @@ class AuditCoordinator:
         )
         self._thread.start()
 
+    def _full_delay(self) -> float:
+        """Delay from NOW to the next scheduled full audit."""
+        if self._full_hour is None:
+            return self._interval
+        return _next_fixed_hour_delay(self._wall(), self._full_hour)
+
     def join(self, timeout: float = 5.0) -> None:
         if self._thread is not None:
             self._thread.join(timeout=timeout)
             self._thread = None
 
-    def _enqueue_if_idle(self) -> AuditItem | None:
+    def _enqueue_if_idle(self, kind: str = "full") -> AuditItem | None:
         with self._lock:
             if self._stop_event.is_set() or self._queued_or_running:
                 return None
-            item = AuditItem()
+            item = AuditItem(audit_kind=kind)
             self._queued_or_running = True
             self._current = item
         try:
@@ -178,56 +219,95 @@ class AuditCoordinator:
                 self._current = None
                 self._queued_or_running = False
 
-    def _run(self, initial_delay: float) -> None:
-        delay = initial_delay
-        failures = 0
-        while not self._stop_event.wait(delay):
-            try:
-                if self._gate is not None:
-                    # Pause intake BEFORE enqueueing the audit, then wait for
-                    # every already-received batch to be committed and acked —
-                    # a message must never sit un-acked behind a long audit
-                    # blowing its visibility timeout (§3.5). resume() runs in
-                    # the outer finally on every exit path.
-                    self._gate.pause()
-                    if not self._gate.wait_drained(self._stop_event):
-                        return  # stop arrived during the drain
-                item = self._enqueue_if_idle()
+    def _fire(self, kind: str) -> "tuple[AuditItem, AuditResult | None] | None":
+        """Run one audit through the arbiter: pause/drain intake (§3.5, BOTH
+        tiers — a message must never sit un-acked behind an audit blowing its
+        visibility timeout), enqueue (or observe an externally-requested
+        active item), wait for the worker's result. Returns the ITEM alongside
+        the result — the coalescing path can hand back a DIFFERENT tier's item
+        (request_due() always creates a full one), and the scheduler must
+        attribute the outcome to the audit that actually ran, not the tier
+        whose tick fired. None = stop arrived; resume() runs in the finally
+        on every exit path."""
+        try:
+            if self._gate is not None:
+                self._gate.pause()
+                if not self._gate.wait_drained(self._stop_event):
+                    return None  # stop arrived during the drain
+            item = self._enqueue_if_idle(kind)
+            if item is None:
+                # A due tick while an audit is queued/running is deliberately
+                # coalesced. If another caller requested the active audit, this
+                # scheduler observes that same result instead of creating work.
+                with self._lock:
+                    item = self._current
                 if item is None:
-                    # A due tick while an audit is queued/running is deliberately
-                    # coalesced. If another caller requested the active audit, this
-                    # scheduler observes that same result instead of creating work.
-                    with self._lock:
-                        item = self._current
-                    if item is None:
-                        return  # stop raced the due tick
-                result: AuditResult | None = None
-                try:
-                    result = item.wait(self._stop_event)
-                    if result is None or result.outcome == "cancelled":
-                        return
-                    if result.outcome == "ok":
-                        failures = 0
-                        delay = self._interval
-                    else:
-                        failures += 1
-                        delay = min(
-                            self._interval,
-                            self._backoff_initial * (2 ** (failures - 1)),
-                        )
-                        logger.warning(
-                            "full audit failed; retrying in %.1fs (failure %d): %s",
-                            delay,
-                            failures,
-                            result.error or "unknown error",
-                        )
-                finally:
-                    # Never leave the arbiter stuck after failure, cancellation,
-                    # or an unexpected result-handling exception.
-                    self._clear_active(item)
+                    return None  # stop raced the due tick
+            try:
+                return item, item.wait(self._stop_event)
             finally:
-                if self._gate is not None:
-                    self._gate.resume()
+                # Never leave the arbiter stuck after failure, cancellation,
+                # or an unexpected result-handling exception.
+                self._clear_active(item)
+        finally:
+            if self._gate is not None:
+                self._gate.resume()
+
+    def _run(self, initial_delay: float) -> None:
+        mono = time.monotonic
+        # One schedule/backoff state per tier; a disabled hot tier is simply
+        # never due (math.inf) rather than a special case at every use site.
+        failures = {"full": 0, "hot": 0}
+        next_due = {
+            "full": mono() + initial_delay,
+            "hot": (mono() + self._hot_interval) if self._hot_interval > 0
+                   else math.inf,
+        }
+        while True:
+            if self._stop_event.wait(max(0.0, min(next_due.values()) - mono())):
+                break
+            now = mono()
+            if now < min(next_due.values()):
+                continue
+            kind = "full" if now >= next_due["full"] else "hot"  # full supersedes (§5.2)
+            fired = self._fire(kind)
+            if fired is None:
+                break
+            item, result = fired
+            if result is None or result.outcome == "cancelled":
+                break
+            # Attribute to the audit that RAN (see _fire): a hot tick that
+            # coalesced into an externally-requested full item must advance
+            # the FULL schedule and leave the hot tick due.
+            kind = item.audit_kind
+            if kind not in next_due:
+                continue  # unknown tier: nothing to schedule (worker failed it)
+            if result.outcome == "ok":
+                failures[kind] = 0
+                delay = self._full_delay() if kind == "full" else self._hot_interval
+            else:
+                # §5.2's result-bearing rule, both tiers: capped exponential
+                # backoff, never slower than the tier's cadence; fixed-hour
+                # mode additionally never retries past the next slot.
+                failures[kind] += 1
+                if kind == "full":
+                    cap = (self._interval if self._full_hour is None
+                           else _FIXED_HOUR_BACKOFF_CAP)
+                else:
+                    cap = self._hot_interval
+                delay = min(cap, self._backoff_initial * (2 ** (failures[kind] - 1)))
+                if kind == "full" and self._full_hour is not None:
+                    delay = min(
+                        delay,
+                        _next_fixed_hour_delay(self._wall(), self._full_hour),
+                    )
+                logger.warning(
+                    "%s audit failed; retrying in %.1fs (failure %d): %s",
+                    kind, delay, failures[kind], result.error or "unknown error",
+                )
+            if kind == "hot" and self._hot_interval <= 0:
+                continue  # coalesced hot item with tier 2 off: keep it off
+            next_due[kind] = mono() + delay
 
         # Stop may arrive while the first/due timer is waiting. If an external
         # due request queued an item, make it a dropped terminal item.
@@ -276,6 +356,22 @@ def build_parser() -> argparse.ArgumentParser:
                    help="seconds between full audits, completion-relative: the next audit "
                         "is scheduled this long after the previous one finished; "
                         "failures retry with capped exponential backoff (default: 300)")
+    p.add_argument("--hot-audit-interval", type=float, default=0.0,
+                   help="[s3 daemon] seconds between tier-2 hot-window scoped "
+                        "audits (design 2026-07-30 §4): a cheap LIST of only "
+                        "the registry-derived recent date= prefixes, repairing "
+                        "lost events within one cadence; fail-closed per "
+                        "prefix; never stamps build_metadata. 0 = disabled "
+                        "(default). Deploys with the SQS event tier typically "
+                        "set 1800. S3-only.")
+    p.add_argument("--hot-audit-window-days", type=int, default=2,
+                   help="tier-2 window W: audit date= partitions in "
+                        "[today-W, today] UTC (default: 2)")
+    p.add_argument("--full-audit-hour", type=int, default=None,
+                   help="run the FULL audit at this fixed UTC hour (0-23) "
+                        "nightly, skip-missed, instead of completion-relative "
+                        "--rescan-interval (design §5.2/§5.3 — Phase 6; "
+                        "enable only after the event tier has burned in)")
     p.add_argument("--no-watch", action="store_true",
                    help="daemon mode: start no live event producer at all — no "
                         "local watchdog/inotify observer, no S3 SQS long-poll "
@@ -313,6 +409,7 @@ def worker_loop(
     source_spec: "SourceSpec | None" = None,
     progress=None,
     stop_event: threading.Event | None = None,
+    hot_window_days: int = 2,
 ) -> None:
     """Drain the work queue and perform all DB writes (the single writer).
 
@@ -346,31 +443,61 @@ def worker_loop(
             started = time.monotonic()
             outcome = "ok"
             error = None
+            is_full = ev.audit_kind == "full"
+            hot_tally: dict | None = None
             try:
-                full_reconcile(
-                    conn,
-                    caches,
-                    source,
-                    workers=workers,
-                    source_spec=source_spec,
-                    progress=progress,
-                    stop_event=stop_event,
-                )
+                if is_full:
+                    if progress is not None:
+                        # §5.2's declared window: events pause and tag edits
+                        # can expire while the full audit holds the writer.
+                        progress.maintenance_window(True)
+                    full_reconcile(
+                        conn,
+                        caches,
+                        source,
+                        workers=workers,
+                        source_spec=source_spec,
+                        progress=progress,
+                        stop_event=stop_event,
+                    )
+                elif ev.audit_kind == "hot":
+                    # Caller-owned tally: on a raise (incl. zero-coverage) the
+                    # partial counts — covered/skipped, the diagnostic — still
+                    # reach the sidecar below instead of reporting 0/0.
+                    hot_tally = {}
+                    hot_audit(
+                        conn, caches, source, window_days=hot_window_days,
+                        workers=workers, source_spec=source_spec,
+                        stop_event=stop_event, tally=hot_tally,
+                    )
+                else:
+                    # Positive dispatch, fail closed: a typo'd kind must never
+                    # fall through to the expensive, globally-deleting tier.
+                    raise ValueError(f"unknown audit kind {ev.audit_kind!r}")
             except ReconcileCancelled:
                 outcome = "cancelled"
-                logger.info("full audit cancelled")
+                logger.info("%s audit cancelled", ev.audit_kind)
             except Exception as e:  # noqa: BLE001 - result is explicit; worker survives
                 outcome = "failed"
                 error = f"{type(e).__name__}: {e}"
-                logger.exception("full audit failed")
+                logger.exception("%s audit failed", ev.audit_kind)
             finally:
                 result = AuditResult(outcome, time.monotonic() - started, error)
                 try:
                     if progress is not None:
-                        progress.audit_finished(result.outcome, result.duration)
-                        progress.idle()
+                        if is_full:
+                            progress.maintenance_window(False)
+                            progress.audit_finished(result.outcome, result.duration)
+                            progress.idle()
+                        elif ev.audit_kind == "hot":
+                            t = hot_tally or {}
+                            progress.hot_audit_finished(
+                                result.outcome, result.duration,
+                                t.get("covered_prefixes", 0),
+                                t.get("skipped_prefixes", 0),
+                            )
                 except Exception:  # noqa: BLE001 - observability cannot kill the worker
-                    logger.exception("failed to record full-audit status")
+                    logger.exception("failed to record audit status")
                 finally:
                     ev.finish(result)
             continue
@@ -382,7 +509,19 @@ def worker_loop(
             # terminal: the message stays unacked and SQS redelivers it.
             terminal = False
             try:
-                if ev.kind == "catalog":
+                scope = getattr(source, "scope_prefix", "")
+                if scope and not ev.key.startswith(scope):
+                    # Structural guard mirroring the hot audit's (Fable review
+                    # 2026-08-10): an out-of-scope key would be cataloged and
+                    # then swept forever by the prefix-scoped full audit. The
+                    # notification prefix SHOULD equal --s3-prefix (deploy
+                    # rule), but config drift must not become churn. Ack it —
+                    # redelivery cannot make it in-scope.
+                    logger.warning(
+                        "event key outside --s3-prefix scope, ignoring: %s", ev.key
+                    )
+                    terminal = True
+                elif ev.kind == "catalog":
                     catalog_object(conn, caches, ev.key, source)
                     terminal = True
                 elif ev.kind == "delete":
@@ -407,11 +546,21 @@ def worker_loop(
                     ev.batch.record_terminal()
                     if progress is not None:
                         progress.event_applied()
+                else:
+                    # Abandoned for redelivery (§3.3) — settle the gate
+                    # WITHOUT acking, or one failed record wedges every
+                    # audit's drain barrier forever (Fable review 2026-08-10).
+                    ev.batch.record_failed()
             continue
 
         try:
             if isinstance(ev, TagEditItem):
+                # TagEditItem is result-bearing (status set on every path
+                # before its event fires) — read the outcome here instead of
+                # threading a telemetry hook into the pure IPC module.
                 handle_tag_edit(conn, caches, ev)
+                if progress is not None:
+                    progress.tag_edit_result(ev.result.status)
                 continue
             if ev.kind == "stop":
                 break
@@ -435,6 +584,18 @@ def main(argv: list[str] | None = None) -> int:
         level=getattr(logging, args.log_level),
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
+
+    if args.full_audit_hour is not None and not (0 <= args.full_audit_hour <= 23):
+        logger.error("--full-audit-hour must be 0-23 (UTC)")
+        return 2
+    if args.hot_audit_interval < 0 or args.hot_audit_window_days < 0:
+        logger.error("--hot-audit-interval/--hot-audit-window-days must be >= 0")
+        return 2
+    if args.hot_audit_interval > 0 and args.source != "s3":
+        # S3-only by decision (Codex consult 2026-08-10): local intended_key
+        # overrides break raw-path prefix scoping; GCS has no scoped-LIST wiring.
+        logger.error("--hot-audit-interval requires --source s3")
+        return 2
 
     work_q: "queue.Queue[WatchEvent | TagEditItem | AuditItem]" = queue.Queue()
     stop_event = threading.Event()
@@ -652,13 +813,16 @@ def _locked_main(args, source, start_producer, work_q, stop_event,
             start_producer()
 
         audit_coordinator = AuditCoordinator(
-            work_q, stop_event, args.rescan_interval, intake_gate=intake_gate
+            work_q, stop_event, args.rescan_interval, intake_gate=intake_gate,
+            hot_interval=args.hot_audit_interval,
+            full_audit_hour=args.full_audit_hour,
         )
         audit_coordinator.start(immediate=startup_audit)
 
         worker_loop(conn, caches, source, work_q, workers=args.extract_workers,
                     source_spec=extract_spec, progress=progress,
-                    stop_event=stop_event)
+                    stop_event=stop_event,
+                    hot_window_days=args.hot_audit_window_days)
     finally:
         stop_event.set()
         if audit_coordinator is not None:

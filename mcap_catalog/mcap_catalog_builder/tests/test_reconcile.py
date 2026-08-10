@@ -440,3 +440,50 @@ def test_stop_during_apply_is_prompt_and_does_not_stamp_build(
     assert stamped == []
     assert conn.execute("SELECT COUNT(*) FROM files").fetchone()[0] == 1
     assert conn.execute("SELECT * FROM build_metadata WHERE id=1").fetchone() is None
+
+
+# -- catalog_failures hygiene (§5.3, Phase 6) ---------------------------------
+
+def test_full_reconcile_prunes_failure_rows_for_vanished_objects(tmp_db, tmp_path):
+    from mcap_catalog_builder.db import record_failure
+    from mcap_catalog_builder.s3_storage import S3Source
+    from mcap_catalog_builder.tests.fixtures import InMemoryS3Client
+
+    conn, caches = tmp_db
+    present_bad = "customer=a/customer_site=s/robot=r/source=x/date=2026-06-02/present.mcap"
+    record_failure(conn, present_bad, "still failing")     # object still listed
+    record_failure(conn, "customer=a/customer_site=s/robot=r/source=x/date=2026-06-02/gone.mcap",
+                   "object vanished")                       # object NOT listed
+    conn.commit()
+
+    tally = full_reconcile(conn, caches, S3Source(
+        InMemoryS3Client({present_bad: b"not an mcap"}), "bucket"))
+
+    keys = {r["s3_key"] for r in conn.execute("SELECT s3_key FROM catalog_failures")}
+    assert present_bad in keys          # listed => kept (still quarantined)
+    assert not any("gone.mcap" in k for k in keys)   # absent from a COMPLETE enum => pruned
+    assert tally["failures_pruned"] == 1
+
+
+def test_hygiene_never_prunes_effective_key_failures(tmp_db, tmp_path):
+    """A local file whose embedded s3_key overrides its path is quarantined
+    under the EFFECTIVE key, which never appears among raw listing keys — the
+    hygiene must compare raw ∪ effective or it would prune the fresh failure
+    it just wrote, every reconcile (Codex consult 2026-08-10)."""
+    from mcap_catalog_builder.tests.fixtures import write_unsummarized_mcap
+
+    conn, caches = tmp_db
+    root = tmp_path / "root"
+    root.mkdir()
+    eff = "customer=a/customer_site=s/robot=r/source=x/date=2026-06-02/broken.mcap"
+    write_unsummarized_mcap(str(root / "flat-broken.mcap"), s3_key=eff)
+
+    tally = full_reconcile(conn, caches, str(root))
+    assert tally["failed"] == 1
+    keys = {r["s3_key"] for r in conn.execute("SELECT s3_key FROM catalog_failures")}
+    assert eff in keys                  # recorded under the EFFECTIVE key
+
+    tally = full_reconcile(conn, caches, str(root))   # second pass: must survive
+    assert tally["failures_pruned"] == 0
+    keys = {r["s3_key"] for r in conn.execute("SELECT s3_key FROM catalog_failures")}
+    assert eff in keys

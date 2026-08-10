@@ -155,83 +155,42 @@ def _composite_ids(caches: Caches, dims) -> tuple | None:
     return (cid, sid, rid, srcid, dims["date"], dims["filename"])
 
 
-def full_reconcile(
-    conn: sqlite3.Connection, caches: Caches, source, workers: int = 1,
-    source_spec: "SourceSpec | None" = None, progress=None, stop_event=None,
-) -> dict[str, int]:
-    """Catalog all objects in ``source``, then delete catalog rows with no object.
+def _classify_listing(conn, source, lst, stored_etag_for, tally):
+    """Shared per-listing classification for BOTH audit tiers — the rules here
+    are pinned and must never diverge between them: an unparseable key is
+    quarantined, never a guessed row (R3); an unchanged etag skips with ZERO
+    network (R4 — the listing carries the fingerprint); everything else emits
+    the exact ``(key, stat, dims, eff_key)`` tuple ``_run_extract_apply``
+    consumes. ``stored_etag_for(dims)`` is the tier's fingerprint lookup
+    (full: whole-catalog composite map; hot: per-prefix filename map).
 
-    ``source`` is a storage ``Source``; a ``str`` is accepted as shorthand for a
-    local watch root. ``workers`` > 1 fetches summaries on a thread pool (the slow,
-    network-bound, out-of-transaction read); DB writes stay on this single thread.
-    When ``source_spec`` is given (a picklable recipe for the ``Source``), that read
-    phase runs in a PROCESS pool instead, so the GIL-bound pure-Python MCAP parse
-    scales across cores; the DB apply stays serial on this thread either way.
-    ``progress`` is an optional ``status.ReconcileProgress`` — milestone/per-file
-    callbacks stay on THIS thread (worker processes never see it).
-    Returns a tally ``{"cataloged", "skipped", "failed", "deleted"}``.
+    Returns ``(dims, eff_key, extract_item_or_None)``; ``(None, None, None)``
+    for a quarantined key. record_failure is NOT committed here — callers
+    commit once after their classify loop (a per-key fsync 48x/day per
+    persistently-bad key was measurable on the hot cadence).
     """
-    if isinstance(source, str):
-        source = LocalSource(source)
+    res = resolve_key_dims(lst.key, source)
+    if res is None:
+        record_failure(conn, lst.key, "unparseable key")
+        tally["failed"] += 1
+        return None, None, None
+    dims, eff_key = res
+    if stored_etag_for(dims) == lst.stat.etag:
+        tally["skipped"] += 1
+        return dims, eff_key, None
+    return dims, eff_key, (lst.key, lst.stat, dims, eff_key)
 
-    _raise_if_stopped(stop_event)
-    tally = {"cataloged": 0, "skipped": 0, "failed": 0, "deleted": 0}
-    listings = []
-    listing_iter = (
-        source.list_all(stop_event=stop_event)
-        if stop_event is not None
-        else source.list_all()
-    )
-    for lst in listing_iter:
-        _raise_if_stopped(stop_event)
-        listings.append(lst)
-        # First object = the LIST provably began (credentials/bucket access
-        # work) — that is the sidecar's first-milestone write (§12), so the
-        # healthcheck sees a fresh phase=listing within seconds, not after
-        # 5000 objects. Then periodic count updates.
-        if progress is not None and (len(listings) == 1 or len(listings) % 5000 == 0):
-            progress.listing(len(listings))
-    _raise_if_stopped(stop_event)
-    if progress is not None:
-        progress.listed(len(listings))
 
-    # Fingerprints already catalogued, keyed by the composite id-tuple. An unchanged
-    # file is then skipped in classification below with NO network at all (R4) —
-    # neither a HEAD nor a summary read — since the listing already carries the etag.
-    stored: dict[tuple, str] = {}
-    for r in conn.execute(
-        "SELECT customer_id, site_id, robot_id, source_id, date, filename, etag FROM files"
-    ).fetchall():
-        _raise_if_stopped(stop_event)
-        stored[(
-            r["customer_id"], r["site_id"], r["robot_id"], r["source_id"],
-            r["date"], r["filename"],
-        )] = r["etag"]
-
-    # Classify every listing (no DB writes beyond recording unparseable keys, no
-    # summary reads): resolve dims ONCE here, skip unchanged files, queue the rest
-    # for the read phase carrying those same dims (one identity per file — see
-    # extract_summary). dims_by_key drives the deletion sweep below.
-    dims_by_key: dict[str, dict] = {}
-    to_extract: list = []  # (key, stat, dims, eff_key)
-    for lst in listings:
-        _raise_if_stopped(stop_event)
-        res = resolve_key_dims(lst.key, source)
-        if res is None:
-            record_failure(conn, lst.key, "unparseable key")
-            conn.commit()
-            tally["failed"] += 1
-            continue
-        dims, eff_key = res
-        dims_by_key[lst.key] = dims
-        comp = _composite_ids(caches, dims)
-        if comp is not None and stored.get(comp) == lst.stat.etag:
-            tally["skipped"] += 1
-            continue
-        to_extract.append((lst.key, lst.stat, dims, eff_key))
-
-    if progress is not None:
-        progress.extract_start(len(to_extract), tally["skipped"], tally["failed"])
+def _run_extract_apply(
+    conn, caches, source, to_extract, *, workers, source_spec,
+    tally, progress=None, stop_event=None,
+) -> None:
+    """The shared read-phase (parallel, network-bound, NO DB) -> apply-phase
+    (serial, single-writer) engine, used by ``full_reconcile`` and the tier-2
+    ``hot_audit``. Moved verbatim from full_reconcile — the bounded-window
+    invariant (never submit-all + as_completed; see _bounded_completions)
+    lives HERE now and is still pinned by
+    test_reconcile_extraction_results_release_incrementally."""
 
     def _apply(ex) -> None:
         _raise_if_stopped(stop_event)
@@ -293,6 +252,97 @@ def full_reconcile(
             _raise_if_stopped(stop_event)
             _apply(ex)
 
+
+def full_reconcile(
+    conn: sqlite3.Connection, caches: Caches, source, workers: int = 1,
+    source_spec: "SourceSpec | None" = None, progress=None, stop_event=None,
+) -> dict[str, int]:
+    """Catalog all objects in ``source``, then delete catalog rows with no object.
+
+    ``source`` is a storage ``Source``; a ``str`` is accepted as shorthand for a
+    local watch root. ``workers`` > 1 fetches summaries on a thread pool (the slow,
+    network-bound, out-of-transaction read); DB writes stay on this single thread.
+    When ``source_spec`` is given (a picklable recipe for the ``Source``), that read
+    phase runs in a PROCESS pool instead, so the GIL-bound pure-Python MCAP parse
+    scales across cores; the DB apply stays serial on this thread either way.
+    ``progress`` is an optional ``status.ReconcileProgress`` — milestone/per-file
+    callbacks stay on THIS thread (worker processes never see it).
+    Returns a tally ``{"cataloged", "skipped", "failed", "deleted"}``.
+    """
+    if isinstance(source, str):
+        source = LocalSource(source)
+
+    _raise_if_stopped(stop_event)
+    tally = {"cataloged": 0, "skipped": 0, "failed": 0, "deleted": 0,
+             "failures_pruned": 0}
+    listings = []
+    listing_iter = (
+        source.list_all(stop_event=stop_event)
+        if stop_event is not None
+        else source.list_all()
+    )
+    for lst in listing_iter:
+        _raise_if_stopped(stop_event)
+        listings.append(lst)
+        # First object = the LIST provably began (credentials/bucket access
+        # work) — that is the sidecar's first-milestone write (§12), so the
+        # healthcheck sees a fresh phase=listing within seconds, not after
+        # 5000 objects. Then periodic count updates.
+        if progress is not None and (len(listings) == 1 or len(listings) % 5000 == 0):
+            progress.listing(len(listings))
+    _raise_if_stopped(stop_event)
+    if progress is not None:
+        progress.listed(len(listings))
+
+    # Fingerprints already catalogued, keyed by the composite id-tuple. An unchanged
+    # file is then skipped in classification below with NO network at all (R4) —
+    # neither a HEAD nor a summary read — since the listing already carries the etag.
+    stored: dict[tuple, str] = {}
+    for r in conn.execute(
+        "SELECT customer_id, site_id, robot_id, source_id, date, filename, etag FROM files"
+    ).fetchall():
+        _raise_if_stopped(stop_event)
+        stored[(
+            r["customer_id"], r["site_id"], r["robot_id"], r["source_id"],
+            r["date"], r["filename"],
+        )] = r["etag"]
+
+    # Classify every listing (no DB writes beyond recording unparseable keys, no
+    # summary reads): resolve dims ONCE here, skip unchanged files, queue the rest
+    # for the read phase carrying those same dims (one identity per file — see
+    # extract_summary). dims_by_key drives the deletion sweep below.
+    dims_by_key: dict[str, dict] = {}
+    to_extract: list = []  # (key, stat, dims, eff_key)
+    # Every key this enumeration accounts for, RAW ∪ EFFECTIVE — quarantine
+    # records failures under eff_key (which a local s3_key override can make
+    # differ from the raw listing key), so the hygiene sweep below compares
+    # against this one set (folded here rather than unioned later: two extra
+    # 1M-element throwaway sets were ~67 MB transient in the function whose
+    # memory ceiling was the 2026-07-28 production kill).
+    present_keys: set[str] = set()
+    for lst in listings:
+        _raise_if_stopped(stop_event)
+        present_keys.add(lst.key)
+        dims, eff_key, item = _classify_listing(
+            conn, source, lst,
+            lambda d: stored.get(_composite_ids(caches, d)), tally)
+        if dims is None:
+            continue
+        present_keys.add(eff_key)
+        dims_by_key[lst.key] = dims
+        if item is not None:
+            to_extract.append(item)
+    conn.commit()  # the classify loop's record_failure upserts, one fsync
+
+    if progress is not None:
+        progress.extract_start(len(to_extract), tally["skipped"], tally["failed"])
+
+    _run_extract_apply(
+        conn, caches, source, to_extract, workers=workers,
+        source_spec=source_spec, tally=tally, progress=progress,
+        stop_event=stop_event,
+    )
+
     # Deletion sweep: composite keys present in the source (parseable + cached ids).
     # Reuses the dims parsed above; caches are now fully populated post-apply.
     present: set[tuple] = set()
@@ -318,6 +368,20 @@ def full_reconcile(
             if comp not in present:
                 conn.execute("DELETE FROM files WHERE id=?", (r["id"],))
                 tally["deleted"] += 1
+        # §5.3 catalog_failures hygiene (tier 3 ONLY — the hot audit never
+        # touches failure rows): prune failure rows whose keys are absent
+        # from this COMPLETE enumeration. Reachable only when list_all
+        # finished without raising, so absence here is authoritative — the
+        # same fail-closed rule as row deletion. present_keys (built in the
+        # classify loop) is raw listing keys ∪ effective keys — quarantine
+        # records eff_key.
+        for r in conn.execute("SELECT s3_key FROM catalog_failures").fetchall():
+            _raise_if_stopped(stop_event)
+            if r["s3_key"] not in present_keys:
+                conn.execute(
+                    "DELETE FROM catalog_failures WHERE s3_key=?", (r["s3_key"],)
+                )
+                tally["failures_pruned"] += 1
         _raise_if_stopped(stop_event)
         conn.commit()
     except ReconcileCancelled:

@@ -1,8 +1,11 @@
 # Builder discovery at scale: event-primary + hybrid audit (design)
 
-**Date:** 2026-07-30 · **Status:** v2 — Phases 0–2 IMPLEMENTED (branch
-`builder-event-discovery`, 2026-07-30); Phases 3–6 are ops toggles per
-`server/deploy/README.md`, Phase 7 gated on §5.4's streaming prerequisite
+**Date:** 2026-07-30 · **Status:** v2 — Phases 0–6 CODE-COMPLETE (0–2:
+branch `builder-event-discovery` 2026-07-30; 3–6 + §7.1: branch
+`sqs-event-enablement` 2026-08-10 per
+`docs/plans/2026-08-10-sqs-event-discovery-enablement.md` — live-staging
+provisioning/burn-in NOT executed, runbook'd in `server/deploy/README.md`);
+Phase 7 gated on §5.4's streaming prerequisite
 **Scope:** `mcap_catalog/` builder discovery + `server/deploy/` wiring. No Go-server,
 wire-protocol, or catalog-schema changes.
 **Revision:** v2 incorporates the 2026-07-30 Codex adversarial review (19 findings —
@@ -198,7 +201,13 @@ rare in an append-only bucket.
 - **Intake pause around audits** (handshake, not just a flag): before an audit
   starts, the coordinator (§5.3) signals pause; the producer stops receiving;
   the audit waits until every already-received batch is terminal **and acked**;
-  only then does the audit run. The pause clears in a `finally` on every exit
+  only then does the audit run. *(Amended 2026-08-10, Fable review: the drain
+  barrier waits for every batch to be SETTLED — acked, or abandoned-for-
+  redelivery. As originally written, one failed (non-terminal) record leaked
+  the gate's counters forever and the next audit's drain wedged every tier
+  permanently while the healthcheck stayed green. `SqsBatch.record_failed`
+  settles without acking; pinned by
+  `test_failed_record_settles_gate_without_ack`.)* The pause clears in a `finally` on every exit
   path. Alternative if drain latency ever hurts: `ChangeMessageVisibility`
   heartbeats on in-flight messages (IAM already granted). Tier-2 pauses are
   seconds-to-a-minute; tier-3 pauses are the §5.2 maintenance window.
@@ -239,7 +248,10 @@ entry with a **mandatory scope**:
 - The deletion sweep considers only rows whose exact
   `(customer, site, robot, source, date)` lies in a *covered* prefix. Ambiguous
   coverage ⇒ **no deletions at all** for that pass. Global deletion is
-  structurally impossible from a scoped feed.
+  structurally impossible from a scoped feed. *(As built, 2026-08-10:
+  coverage is tracked per prefix, so "ambiguous" cannot arise — a prefix is
+  either fully listed (deletions allowed there, each candidate additionally
+  HEAD-confirmed) or excluded entirely; zero coverage fails the whole pass.)*
 - DB work is scoped too (v1 said O(scope) but reused O(catalog) internals —
   Codex finding 10): stored-fingerprint lookup and sweep candidates go through
   composite-indexed predicates / a temp scope table, so a hot pass is O(scope)
@@ -445,6 +457,29 @@ vanished object as `ERROR_S3_UNAVAILABLE`, indistinguishable from a bucket
 outage. Mapping the `ErrPermanent`/`NoSuchKey` case to `ERROR_NOT_FOUND` would
 let the UI say "recording was deleted — refresh the list" instead of implying a
 retryable outage. Candidate for the implementation plan's server-side touch.
+
+**IMPLEMENTED 2026-08-10** (`storage.ErrNotFound` + `planBuildErrorCode`,
+pinned by `TestPlanBuildErrorCode`/`TestDisambiguate404`): attachment is
+conservative because a HEAD 404 cannot name its cause — S3 `HeadObject`
+returns bare `NotFound` for a missing object AND a missing bucket, and GCS
+object `Attrs` normalize a bucket-level 404 to `ErrObjectNotExist`. So the
+classifier dual-wraps only GET-shaped `NoSuchKey`, and the store `Head`
+methods upgrade a 404 via a bucket-existence probe (`disambiguate404`,
+error-path-only); bucket absence, ambiguous 404s, and 403 deliberately stay
+`ERROR_S3_UNAVAILABLE` (S3 answers 403 for a missing object without
+`s3:ListBucket`; claiming deletion there would misdirect the operator). This
+extends `ERROR_NOT_FOUND`'s wire semantics: besides "s3_key names no
+cataloged file at open", it now also covers "cataloged object vanished from
+the bucket at plan-build" (the proto comment was deliberately left untouched
+— a comment-only proto change would ripple into the checked-in generated
+bindings; this paragraph is the semantic record).
+
+**Hot-sweep HEAD-guard (2026-08-10 branch review):** the tier-2 scoped sweep
+HEAD-confirms every deletion candidate (live/ambiguous ⇒ skip), because its
+LIST-to-sweep window recurs ~50x more often per day than tier 3's. Tier 3's
+full sweep keeps this section's live-LIST-authority semantics unchanged; the
+§7 "HEAD-miss → re-upload → row deleted" row's bounded-staleness claim now
+applies to tier 3 only.
 
 ## 8. Rollout phases (reordered per review: burn in events *before* loosening the safety net)
 

@@ -60,9 +60,30 @@ Group=pjcloud
 WorkingDirectory=/opt/pj-cloud-builder
 EnvironmentFile=/etc/pj-cloud/builder.env
 # --no-watch: daemon mode, rescan-only (no inotify/SQS producer) — the safe
-# default for a bare-metal box; drop it if you want live S3 SQS / local
-# inotify event-driven discovery instead of pure periodic rescans.
+# default for a bare-metal box.
 # BUILDER_ARGS (source/bucket/prefix) comes from the EnvironmentFile above.
+#
+# Event-mode drop-in (design 2026-07-30 Phase 4-6): --no-watch is hardcoded
+# in ExecStart below, so BUILDER_ARGS alone CANNOT enable event-driven
+# discovery — install a drop-in that REPLACES ExecStart instead:
+#
+#   # /etc/systemd/system/pj-cloud-builder.service.d/events.conf
+#   [Service]
+#   ExecStart=
+#   ExecStart=/opt/pj-cloud-builder/venv/bin/python3 -m mcap_catalog_builder \
+#       --sqs-url ${MCAP_CATALOG_SQS_URL} \
+#       --tag-socket /var/lib/pj-cloud/tag.sock \
+#       --db /var/lib/pj-cloud/catalog.db \
+#       --rescan-interval 21600 \
+#       --hot-audit-interval 1800 \
+#       --log-level INFO \
+#       $BUILDER_ARGS
+#
+# (MCAP_CATALOG_SQS_URL goes in /etc/pj-cloud/builder.env; provision the
+# queue with scripts/staging-sqs-setup.sh — its notification prefix MUST
+# equal the builder's --s3-prefix. After tiers 1-2 burn in, add
+# --full-audit-hour <utc hour> per design §8: the safety net loosens LAST.
+# Then: systemctl daemon-reload && systemctl restart pj-cloud-builder.)
 # --rescan-interval 21600: 6 h full-audit interval (design 2026-07-30
 # Phase 0) — a 300 s full-bucket LIST treadmill saturates at millions of
 # objects; SQS events (Phase 4) carry freshness, the rescan is the safety net.

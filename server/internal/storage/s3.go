@@ -125,7 +125,17 @@ func (s *s3Store) Head(ctx context.Context, key string) (ObjectInfo, error) {
 		return nil
 	}, classify)
 	if err != nil {
-		return ObjectInfo{}, err
+		// §7.1: a HEAD 404 is ambiguous (missing object vs missing bucket —
+		// HeadObject returns bare NotFound for both). Upgrade to ErrNotFound
+		// only after confirming the bucket exists; error-path-only cost, and
+		// the probe budget/detachment policy lives in disambiguate404.
+		return ObjectInfo{}, disambiguate404(ctx, err, isHead404(err),
+			func(pc context.Context) error {
+				_, bErr := s.client.HeadBucket(pc, &s3.HeadBucketInput{
+					Bucket: aws.String(s.bucket),
+				})
+				return bErr
+			})
 	}
 	return info, nil
 }
@@ -178,32 +188,58 @@ func deref(p *string) string {
 	return *p
 }
 
+// isHead404 reports whether err is 404-shaped as HeadObject surfaces it.
+// One check suffices: the SDK's typed types.NotFound / types.NoSuchKey both
+// implement smithy.APIError with exactly these codes.
+func isHead404(err error) bool {
+	var apiErr smithy.APIError
+	if !errors.As(err, &apiErr) {
+		return false
+	}
+	code := apiErr.ErrorCode()
+	return code == "NotFound" || code == "NoSuchKey"
+}
+
 // classify maps an S3/smithy error onto ErrTransient / ErrPermanent so the
-// caller can decide whether to retry, while preserving the original message.
+// caller can decide whether to retry. The cause is wrapped with %w, NOT
+// stringified: Head's §7.1 disambiguation (isHead404) inspects the typed SDK
+// error AFTER classification, so classify must preserve the chain (a %v here
+// silently killed that path — 2026-08-10 merge-gate review).
 func classify(err error) error {
 	if err == nil {
 		return nil
 	}
 	var nf *types.NoSuchKey
+	if errors.As(err, &nf) {
+		// Object-absent: additionally carries ErrNotFound (§7.1) so the
+		// session plan-build can distinguish "recording deleted" from outage.
+		return fmt.Errorf("%w: %w: %w", ErrPermanent, ErrNotFound, err)
+	}
 	var nb *types.NoSuchBucket
-	if errors.As(err, &nf) || errors.As(err, &nb) {
-		return fmt.Errorf("%w: %v", ErrPermanent, err)
+	if errors.As(err, &nb) {
+		return fmt.Errorf("%w: %w", ErrPermanent, err)
 	}
 	var apiErr smithy.APIError
 	if errors.As(err, &apiErr) {
 		switch code := apiErr.ErrorCode(); {
-		case code == "NoSuchKey" || code == "NotFound" || code == "NoSuchBucket" ||
+		case code == "NoSuchKey":
+			// GET-shaped and unambiguous (GetObject distinguishes
+			// NoSuchBucket). Bare "NotFound" (a HEAD 404) is NOT wrapped
+			// here — it cannot name its cause (missing object vs missing
+			// bucket); s3Store.Head disambiguates it with a bucket probe.
+			return fmt.Errorf("%w: %w: %w", ErrPermanent, ErrNotFound, err)
+		case code == "NotFound" || code == "NoSuchBucket" ||
 			code == "AccessDenied" || code == "Forbidden" || strings.HasPrefix(code, "InvalidAccessKeyId") ||
 			// PreconditionFailed = a GetRangeVersioned If-Match miss: the object
 			// was overwritten (a new version). Retrying can NEVER succeed against
 			// this ETag, so it is PERMANENT — retrying just delays the clean
 			// "object changed mid-session" failure.
 			code == "PreconditionFailed" || code == "412":
-			return fmt.Errorf("%w: %v", ErrPermanent, err)
+			return fmt.Errorf("%w: %w", ErrPermanent, err)
 		default:
-			return fmt.Errorf("%w: %v", ErrTransient, err)
+			return fmt.Errorf("%w: %w", ErrTransient, err)
 		}
 	}
 	// Network/timeout/unknown -> transient by default.
-	return fmt.Errorf("%w: %v", ErrTransient, err)
+	return fmt.Errorf("%w: %w", ErrTransient, err)
 }
