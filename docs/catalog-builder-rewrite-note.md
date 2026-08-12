@@ -124,6 +124,52 @@ compute; Python: exploratory analyzers over a Rust core), never per component.
 C++ remains rejected: aws-sdk-cpp plus hand-rolled plumbing, with neither Go's reuse
 nor Rust's ecosystem to show for it.
 
+### 1.7 The wider premise: if BOTH writer and server are rewritten (added 2026-08-10)
+
+Everything above answers "rewrite the builder, keep the server." Under the wider
+premise — one language for both sides — the analysis inverts, because the argument
+that carried Go was *joining the reader's language*, and with the reader itself in
+play, **either language deletes the contract**. The tiebreaker moves to what each
+side's workload needs, and from the §1.6 ecosystem check every remaining asymmetry
+points one way:
+
+- **The lakehouse compute plane** (Parquet projections, embedded query engine,
+  Lance/LeRobot export) is only first-class in Rust — in Go it is second-tier
+  libraries or forbidden cgo. A full rewrite that picks Go unifies the product as it
+  is; one that picks Rust unifies the product this review series says it wants to
+  become.
+- **The server's own stack has no gap in Rust**: tokio + tungstenite/axum for the WS
+  layer, prost for the wire, rusqlite for the read-only catalog, `object_store` for
+  ranged reads (a better fit for the range-GET-shaped serving path than the Go SDKs),
+  the first-party `mcap` crate for the format layer, no GC in the streaming hot path.
+  One property changes shape: the CGO_ENABLED=0 purity becomes "vendored C compiled
+  statically" (rusqlite/zstd-sys) — the operational property (one static
+  cross-compiled binary, no runtime deps) is preserved via musl/zig builds, the
+  no-C-toolchain purity is not. (Watch item, not a plan: Turso's pure-Rust SQLite.)
+- **The C++ plugin and the wasm decode core become an argument instead of a
+  bystander**: Rust↔C++ FFI (cxx) is far saner than cgo, and Rust's wasm toolchain is
+  best-in-class — one decode core could serve the native server, the C++ plugin, and
+  the browser build from a single crate.
+
+**So under the both-sides premise: Rust.** Go remains the answer only if the
+lakehouse ambition is dropped — then its simplicity, iteration speed, and the
+avoidance of Rust's learning curve win on their own.
+
+Two honest caveats, recorded so the recommendation is not mistaken for an urging:
+
+1. **The premise is the expensive part.** The builder has a real rewrite driver
+   (§1.1–§1.2); the server does not — it is hardened, pinned by tests encoding years
+   of subtle findings (handshake starvation, deterministic marshal, TLS/SNI, resume),
+   and rewriting it discards that for zero user-visible gain. A both-sides rewrite is
+   justified by the lakehouse trajectory or not at all.
+2. **If it happens, it happens strangler-style, server last**: shared core crates
+   first (keyparse, varint, summary read, schema), then the builder (gated on
+   `catalog-semantic-diff.py`), then the compute plane, and the server only when the
+   Rust stack has proven itself — behind the same wire contract, gated on the
+   language-agnostic harness (`make smoke` / `e2e-layout` don't care what serves the
+   protocol). The proto and the harness make even a server swap a verifiable step
+   rather than a leap.
+
 ---
 
 ## 2. What I would do differently
