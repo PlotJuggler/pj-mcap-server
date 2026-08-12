@@ -72,14 +72,57 @@ builder. So the language boundary does not vanish — it moves to where it earns
 Go for footer-only metadata on the hot path, Python for optional enrichment that reads
 payloads off the critical path.
 
-### 1.6 Why not Rust or C++
+### 1.6 Why not Rust or C++ — REVISED 2026-08-10 after an ecosystem check
 
-Rust is faster, has a good MCAP crate, and would suit the extraction loop. But the win
-being claimed here is *reuse and contract deletion*, and that is Go's for free — the
-storage seam, the MCAP reader, the SQLite driver, the config and metrics plumbing all
-already exist in Go in this repo. A fourth language in a C++/Go/Python stack is a cost
-with no offsetting reuse. C++ would mean aws-sdk-cpp and hand-rolled SQLite plumbing for
-no benefit.
+The original two-sentence dismissal ("good MCAP crate, but the win is reuse") was too
+thin, and a deliberate look at the 2026 ecosystem splits the answer by scope.
+
+**For the builder rewrite in isolation: still Go, unchanged.** The claimed win is
+*contract deletion* — joining the reader's language so `CATALOG_CONTRACT.md`, the
+byte-identical codecs, and the duplicated summary reader all disappear. Rust does not
+deliver that: the server stays Go, so a Rust builder is still a two-language system with
+the entire §1.1 table intact — it merely swaps Python for a faster, safer second
+language. Real gains (the GIL scaffolding of §1.2 evaporates; the official `mcap` crate
+is upstreamed into foxglove/mcap with memory-mapped indexed reading and
+partial-file recovery; `object_store` is Apache-Arrow-governed and production-proven at
+InfluxDB/crates.io scale), but the headline benefit is gone. Reuse still decides it.
+
+**For the lakehouse compute plane (the greenfield note's Tiers 2–3 and the analytical
+door): the ecosystem answer is Rust, and it is not close.** What the check found:
+
+- **The columnar stack's canonical implementations are Rust.** `arrow-rs` +
+  `parquet` are the reference tooling of the new lakehouse generation; DataFusion is
+  the embeddable query engine of the "deconstructed data systems" era — ClickBench-
+  leading on Parquet, tens of millions of plans/day inside InfluxDB 3, chosen by teams
+  *migrating off DuckDB* partly to remove their last C++ dependency. Go has no
+  equivalent: its Parquet/Arrow libraries are second-tier, and there is no embeddable
+  Go SQL engine over Parquet — the Go path to an analytical door is shelling out to
+  DuckDB via cgo, which this repo's constraints forbid.
+- **The training-export target is Rust-native.** Lance (and the LanceDB stack) is
+  Rust; a LeRobot/Lance projection tier written in Go would be calling across a
+  boundary that a Rust tier gets in-process.
+- **The robotics-infrastructure field is moving the same way.** Rerun's entire data
+  layer is Rust; dora-rs hit 1.0 in Q1 2026; the official MCAP Rust implementation is
+  first-party. A Rust compute plane swims with this current; a Go one swims alone.
+- **Two side benefits line up with this repo's actual needs:** `object_store`'s
+  unified ranged-read API is precisely the primitive the whole system lives on, and
+  Rust's wasm story could serve the plugin's wasm decode core from the same codebase.
+  Python analyzers keep their place by *wrapping* a Rust core (the PyO3 pattern Polars
+  and Lance use) instead of reimplementing readers.
+
+**The decision rule, then, is about trajectory, not taste.** If the product stays
+"catalog + streaming connector," Go-only is the low-entropy choice and this note's
+recommendation stands as written. If the lakehouse evolution is *committed* — Parquet
+projections, an embedded query engine, training exports — the new compute-plane
+components should start in Rust, because that is where their load-bearing libraries
+are canonical; and at that point folding a rewritten T0 indexer into the Rust plane
+(rather than Go) becomes defensible, with the Go server remaining untouched as the
+hardened interactive door. The three-language cost this note warns about is real
+either way — the mitigation is to draw the boundary per *plane* (Go: serving; Rust:
+compute; Python: exploratory analyzers over a Rust core), never per component.
+
+C++ remains rejected: aws-sdk-cpp plus hand-rolled plumbing, with neither Go's reuse
+nor Rust's ecosystem to show for it.
 
 ---
 
