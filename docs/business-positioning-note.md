@@ -124,6 +124,85 @@ data-sovereignty buyers; and the existing PlotJuggler user base as the standing 
 
 ---
 
+## 7. The wedge decision: diagnostics first, ML as a projection (2026-08-21)
+
+**The question:** focus the product on the ML training-data use case (where Rerun is
+aiming), on fleet diagnostics over recorded data, or both — and is this an early
+commitment or an easy pivot?
+
+**The decision: fleet diagnostics is the wedge. The ML export ships as a feature, not
+as the pitch.** "Both" lives in the architecture (which is use-case-agnostic by
+design); "diagnostics" lives in every sentence a customer reads. What a wedge choice
+actually fixes early is persona, messaging, and roadmap order — not code.
+
+### 7.1 Market evidence (researched 2026-08-21)
+
+**The ML side is a capital war converging on a free floor.** Rerun: ~$23.2M raised,
+Rerun Hub explicitly "the data layer for Physical AI" (catalog + storage engine +
+GPU-feeding dataloaders; early-availability, contact-sales). Foxglove's April 2026
+relaunch is framed entirely as physical-AI curation. Lightwheel: ~$100M Q1-2026 orders
+on $145M raised (sim/synthetic). Encord: $60M Series C, physical-AI revenue up 10x.
+Beneath them, Hugging Face's LeRobot ecosystem passed **58,000 community datasets**
+(50x YoY) with free curation tooling. Collection budgets are real but concentrated in
+funded labs (a 2,000-demo bimanual IL dataset runs ~$110–215k). **No evidence was
+found that ordinary non-foundation-model robotics SMEs pay for ML data tooling at
+all** — the free LeRobot stack plus VC-subsidized platforms covers them.
+
+**The diagnostics side has loud, organic, unmonetized pain.** An Oct 2025 HN thread on
+robotics data management: "combing through the syslogs to find issues is an absolute
+nightmare… even more so if you are told the machine broke at some point last night";
+silent failures found long after the fact; everyone on custom scripts. ROS Discourse
+keeps sprouting DIY triage tools (e.g. `robot-triage`, Aug 2026). Companies post
+$180–215k data-infrastructure roles to build this in-house — the pricing anchor for a
+tool far below one engineer-year. Competitively: live-telemetry players (Formant
+~$250–600/robot/mo; InOrbit) do real-time dashboards, not archive forensics. Roboto
+($4.8M seed, hosted SaaS) is the one pure recorded-log play — and its **Roboto Agents**
+announcement (2026-08-17: agentic triage + root-cause over rosbags/MCAP) shows where
+the feature bar is going. Foxglove BYOS keeps data in the customer's bucket but the
+control plane and index compute remain Foxglove's, enterprise-gated. **Nobody sells
+post-hoc fleet diagnostics over an MCAP archive the customer owns, fully self-hosted,
+priced for a 5–50-person team.** That is this project's exact posture (§4).
+
+### 7.2 The pivot-cost asymmetry — why the decision is easier than it looks
+
+Given the lakehouse architecture (immutable lake + artifact registry + projections),
+the two pivot directions are not symmetric:
+
+- **Diagnostics-first → add ML later:** the LeRobot export is one Tier-3 copyist
+  policy in the registry — a projection. Weeks of work, already designed (architecture
+  note; "archives preserve, exports opine"). It becomes a checkbox ("your archive is
+  training-ready") and an expansion sale to an existing customer.
+- **ML-first → add diagnostics later:** requires building the entire interactive
+  surface — browse, facets, event search, incident workflow, the streaming door — for
+  a persona not yet reached, while re-earning distribution among the engineers skipped
+  the first time. A second company, not a feature release.
+
+When pivot costs are this asymmetric, wedge on the side that keeps the other option
+cheap. Three more forces point the same way: **(1) distribution** — PlotJuggler's
+daily users are diagnosticians; the funnel converts to a diagnostics product at zero
+acquisition cost and to an ML-curation product barely at all; **(2) sovereignty
+sells to the diagnostics buyer** — the cannot-SaaS segment has diagnostics pain today
+and ML ambitions someday, while physical-AI labs are cloud-native and VC-subsidized;
+**(3) land-and-expand runs downhill** — the fleet whose recordings we catalog for
+diagnostics is the fleet that will eventually train policies; being the system of
+record means the ML expansion comes to us, whereas Rerun must fight *down* into
+fleets to get what we would already hold.
+
+### 7.3 Consequences and revisit triggers
+
+- Analyzer roadmap orders by triage value (bump/battery/error-burst detection), not
+  dataset curation; the long-stubbed automatic tagging is, in this light, the product
+  roadmap — and the substrate an agentic-triage layer (the Roboto Agents feature bar)
+  plugs into.
+- The wedge must be *genuine* self-hosting (air-gap, no egress, no vendor control
+  plane) plus the PJ-native workflow — Foxglove's $20/mo Pro + BYOS is "close enough"
+  for teams without hard sovereignty requirements, so do not feature-race their
+  roadmap.
+- **Revisit trigger:** a real customer with a real budget pulling toward training
+  data. That is handled as an expansion (ship the export projection), not a pivot.
+
+---
+
 *Market facts referenced: Foxglove reduced self-service pricing and basic-seats
 announcements, BYOS and index-in-place launches, April 2026 search/curation platform
 launch; Nominal/Sift funding via CB Insights; ReductStore pricing via Capterra; the
