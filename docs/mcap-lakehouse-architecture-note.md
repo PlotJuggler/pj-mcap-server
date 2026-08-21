@@ -87,7 +87,7 @@ Three independent vendors arrived at the same three moves:
 ## 2. The architecture I would build
 
 One sentence: **an immutable MCAP lake, a SQL metadata plane whose core abstraction is a
-ledger of derived artifacts, a compute plane of idempotent analyzers and projections
+registry of derived artifacts, a compute plane of idempotent analyzers and projections
 keyed to content identity, and two access doors over both.**
 
 ```
@@ -107,7 +107,7 @@ keyed to content identity, and two access doors over both.**
         ┌──────────────▼───────────────────────────────────────────────┐
         │ METADATA PLANE (SQL)                                         │
         │  recordings · runs · events · tags(2-layer) · topic stats    │
-        │  artifact ledger: (content_id, producer, version) → status   │
+        │  artifact registry: (content_id, producer, version) → status   │
         └──────┬────────────────────────────────────┬──────────────────┘
                │                                    │
      ┌─────────▼──────────┐              ┌──────────▼──────────────┐
@@ -145,7 +145,7 @@ Retrofitting grains later is the expensive path (this repo's stitching re-derive
 run per session; annotations attach to files because files are all there is). In a
 greenfield schema, `runs` and `events` cost two tables and repay themselves immediately.
 
-### 2.3 The metadata plane: SQL, with a derived-artifact ledger at its core
+### 2.3 The metadata plane: SQL, with a derived-artifact registry at its core
 
 Metadata lives in a SQL database (single-writer SQLite or Postgres — a deployment
 choice behind a seam, per the rewrite note; not an architectural one). The schema keeps
@@ -153,7 +153,7 @@ what the current system got right — normalized dimensions, deduped topic-set l
 two-layer tags where human overrides always win and survive rebuilds, quarantine as a
 first-class outcome — and adds the generalization that turns a catalog into a lakehouse:
 
-**The artifact ledger.** One table:
+**The artifact registry.** One table:
 
 ```
 artifacts(content_id,        -- the recording's etag: artifacts bind to CONTENT
@@ -165,13 +165,24 @@ artifacts(content_id,        -- the recording's etag: artifacts bind to CONTENT
 ```
 
 Every derived thing in the system — the T0 index row, each analyzer's tags/events, each
-Parquet projection — is an entry. The ledger *is* the lakehouse: freshness is a query
+Parquet projection — is an entry. The registry *is* the lakehouse: freshness is a query
 (`content_id × producer` pairs not `built` at current `producer_version`), re-analysis
 after an analyzer upgrade is a version bump, staleness on re-upload is automatic (new
 etag ⇒ no entries), and "what produced this tag?" always has an answer. R12/R13 of the
 current requirements (metrics stamped by fingerprint, pending-never-scan) are this
-ledger specialized to one artifact kind; the greenfield move is making it the spine for
+registry specialized to one artifact kind; the greenfield move is making it the spine for
 *all* of them.
+
+> **Naming note (2026-08-21):** this concept was called the "artifact ledger" in earlier
+> drafts of this note and in session records. Renamed to **artifact registry** because
+> "ledger" implies append-only in industry usage (accounting, blockchain, event logs)
+> while this table mutates `status` in place, and "registry" has exact precedent
+> (schema registry, container registry: a keyed, authoritative store of named things
+> and their status). Nearest industry-standard neighbors, for orientation: Dagster's
+> *asset materializations*, Bazel's *action cache*, Nix's derivation store. Distinct
+> from the **catalog**: the catalog records what data exists (read by humans/clients);
+> the registry records what work ran (read by workers) — and the catalog is itself an
+> artifact the registry tracks.
 
 **Provenance on every assertion.** Tags and events carry their producer. Human edits are
 a distinct layer that masks or overrides machine output and is never touched by
@@ -181,7 +192,7 @@ recomputation — the override-survives-reindex model, generalized from tags to 
 
 All tiers read the lake via range-GETs, write metadata with provenance, and are
 idempotent per `(content_id, producer, producer_version)` — which makes retries,
-backfills, and re-runs boring. The ledger is the work queue: at startup or on schedule,
+backfills, and re-runs boring. The registry is the work queue: at startup or on schedule,
 `pending ∪ stale` is the todo list; discovery (events or listing) only inserts rows.
 
 - **Tier 0 — footer indexer.** Mandatory, cheap (1–2 range GETs/file), the only tier on
@@ -192,7 +203,7 @@ backfills, and re-runs boring. The ledger is the work queue: at startup or on sc
   per-signal statistics (min/max/percentiles for threshold queries), embedding
   extractors later. Each declares input topics + output kinds; runs as a sandboxed job
   (container; per-signal stats can be built-in). This is Roboto's Actions and the
-  "system that adds tags to MCAPs automatically" — as ledger subscribers, not as
+  "system that adds tags to MCAPs automatically" — as registry subscribers, not as
   ingest steps. An analyzer crash quarantines one artifact, never the catalog.
 - **Tier 2 — projections.** Policy-driven materializations into `derived/` in the same
   bucket: topic → Parquet for analytics ("strategic timeseries conversion" — for the
@@ -238,7 +249,7 @@ Retention has three surfaces, each with a different owner:
   tiering steps before it) declaratively, evaluated by the provider, in configuration
   the customer controls. The platform issues no deletes against originals — it
   *tolerates* deletion (the audit sweep already reconciles vanished objects) and
-  *argues for clemency*: a ledger chore stamps object tags (e.g. `retain=hold`) from
+  *argues for clemency*: a registry chore stamps object tags (e.g. `retain=hold`) from
   catalog facts — a moment on the recording, a human note, an open investigation — and
   lifecycle rules filter on those tags, so "delete at 90 days **except incidents**"
   needs no platform delete path at all. Deletion authority stays in bucket config;
@@ -324,11 +335,11 @@ dependency order:
 
 1. **Grains** — `runs` + `events` tables; recorder metadata for run identity; browse
    and open-session address runs. (Schema bump; pairs with the one already planned.)
-2. **Ledger + provenance** — the artifacts table; tags/events carry producers; the
+2. **Registry + provenance** — the artifacts table; tags/events carry producers; the
    existing tag-override layer generalizes to events unchanged.
 3. **Analyzer bus** — `derive_tags()`'s replacement is the first, in-process analyzer
    (the capability review's summary-derived tags); containerized Tier 1 follows.
-4. **Projections** — topic→Parquet with ledger-tracked freshness; catalog export as
+4. **Projections** — topic→Parquet with registry-tracked freshness; catalog export as
    open tables (the analytical door's cheapest form); preview MCAPs.
 5. **Producer contract** — the linter + profile, and a catalog "grade" per file.
 

@@ -185,7 +185,7 @@ on `catalog-semantic-diff.py` for the builder and on the language-agnostic harne
 
 ### 3.6 The greenfield architecture
 
-One sentence: **an immutable MCAP lake, a SQL metadata plane whose spine is a ledger of
+One sentence: **an immutable MCAP lake, a SQL metadata plane whose spine is a registry of
 derived artifacts, a compute plane of idempotent analyzers keyed to content identity, and
 two access doors.**
 
@@ -203,7 +203,7 @@ The design:
   transcode, no proprietary format.
 - **Three grains from day one:** recording (file) → **run/mission** (the browse unit,
   spans ~36 files) → **event/moment** (where value concentrates).
-- **The artifact ledger:** `(content_id=etag, producer, producer_version) → status`.
+- **The artifact registry:** `(content_id=etag, producer, producer_version) → status`.
   Every derived thing is a row. Freshness is a query; analyzer upgrades are a version
   bump; re-upload invalidates automatically; every fact has an author. *This is the
   abstraction that turns a catalog into a lakehouse.*
@@ -217,7 +217,7 @@ The design:
   separate layers, overrides never overwritten.
 
 **Your current system is two boxes of this** (interactive door + T0 indexer). Extension
-order: grains → ledger → analyzers → projections/open tables → producer linter.
+order: grains → registry → analyzers → projections/open tables → producer linter.
 
 ### 3.7 DataFusion / DuckDB / DuckLake / Vortex — conversational only, NOT yet in any doc
 
