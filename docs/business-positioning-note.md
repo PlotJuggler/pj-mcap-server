@@ -20,7 +20,7 @@ not price**, and the single biggest asset is not in the codebase at all.
 | **Roboto** | SaaS analytics engine (index + topic stats + RoboQL), seed-stage | Ingest-and-analyze teams |
 | **Heex** | Enterprise "smart data" — event-triggered capture | ADAS, large fleets |
 | **coScene** | SceneOps data platform | Strong in Asia |
-| **ReductStore** | Open-core; Pro ≈ $150–300/mo; edge-first time-series blob store + ROS recorder agent | Edge recording/retention — record-grain, *not* an MCAP-content catalog |
+| **ReductStore** | Open-core (core Apache 2.0 since v1.19); Pro ≈ $150–300/mo; edge-first store + ROS agent + conditional replication | **Complementary, not competing**: candidate edge/ingestion tier upstream of the lake (integration assessed in the architecture note §2.9) |
 | **Lichtblick** (BMW's fork of Foxglove Studio) | Free OSS, visualization only | The community that left Foxglove |
 
 Nobody on this list sells a **self-hosted, bring-your-own-bucket MCAP catalog + subset-
@@ -114,6 +114,10 @@ data-sovereignty buyers; and the existing PlotJuggler user base as the standing 
   away from it (it cannibalizes the meter), but it is the move to watch.
 - **The moat is a person.** The distribution asset and the trust asset are the author's;
   the bus factor is the moat and the risk at once.
+- **A second widening move (added 2026-08-21):** ReductStore integration as the ingestion
+  funnel — their edge store feeding this lakehouse via an unloader is complementary by
+  construction (they stop where we start), both sides are open-source-aligned, and a
+  documented integration converts their robot-side users into lake-side prospects.
 - **One cheap widening move:** the wire protocol is open protobuf — a Lichtblick client
   for it would turn the BMW-fork community from bystanders into a second funnel, and
   make the platform multi-client by demonstration rather than promise.

@@ -272,6 +272,46 @@ catalog as an availability grade — never just an accounting one.
 - **No mandatory SaaS control plane** — self-hosted, bucket-resident derived data;
   everything above works air-gapped.
 
+### 2.9 Upstream of the lake: the edge tier (added 2026-08-21, after investigation)
+
+The design above starts when a recording reaches the bucket, and the producer contract
+says how files should be *written* — but the machinery that gets them there was left
+implicit: rotation, disk-bounded buffering across connectivity loss, retry, and
+selective upload under constrained bandwidth. For fleets where "the robot uploads its
+MCAPs" is not trivially true, that gap needs an owner.
+
+**ReductStore is the strongest open-source candidate for that tier** — investigated
+2026-08-21, revising an earlier one-line dismissal that had only evaluated it as a
+catalog competitor (it isn't one; it stops exactly where this design starts):
+
+- Core relicensed **Apache 2.0** (from BUSL); `reductstore_agent` records ROS 2 topics
+  with splitting by time/size/topic groups (the contract's rotation rule, implemented),
+  YAML config, labels, downsampling.
+- **FIFO-by-volume quotas** are the edge retention primitive a robot's finite disk
+  needs — the one retention surface §2.7's bucket lifecycle rules cannot reach.
+- **Conditional, label-based replication** built for intermittent links is the
+  "upload only what matters" (Heex) thesis, in the open: incident-labeled segments
+  stream up promptly; bulk data stays edge-side until quota evicts it.
+
+**The integration pattern:** edge ReductStore (agent + quota) → conditional
+replication → an **unloader** at the cloud boundary that mints contract-compliant
+MCAPs into the lake — Hive key, stamped mission identity, summary present, sane
+chunks — gated by the §2.6 linter. Everything downstream (skim → catalog → analyzers)
+is unchanged; ReductStore never enters the serving path and rule zero starts at the
+bucket, as before.
+
+**Bounds on the verdict.** (1) As the *lake* itself the answer stays no, now
+confirmed rather than assumed: ReductStore's S3 backend stores its own batched block
+layout behind its API (single-writer, lock-file failover), so the bucket would stop
+being an open lake — breaking rule zero's "any tool reads the recordings" and the
+sovereignty story. (2) The edge tier stays **optional** — an *interface* (the producer
+contract enforced at the bucket boundary), with ReductStore as the recommended
+implementation for store-and-forward fleets, never a required dependency. (3) Named
+risks for whoever builds it: unloader fidelity (schemas stored as attachments must
+reconstruct into valid MCAP; timestamps preserved), the quota-vs-replication race
+(FIFO eviction must not outrun a slow uplink — test it), and a young single-vendor
+project, mitigated by the Apache 2.0 core.
+
 ---
 
 ## 3. Mapping the existing system onto this
