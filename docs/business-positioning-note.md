@@ -201,6 +201,54 @@ fleets to get what we would already hold.
 - **Revisit trigger:** a real customer with a real budget pulling toward training
   data. That is handled as an expansion (ship the export projection), not a pivot.
 
+### 7.4 Act two: annexing the capture turf — edge promotion (added 2026-08-21)
+
+Follow-on decision to §7: the founder's instinct to compete toward the Heex/Roboto
+turf — edge intelligence deciding which data is worth uplinking — is adopted **as the
+second act of the same play, not a change of wedge**. Two clarifications shape it:
+
+**The turfs are different.** Roboto (post-hoc triage over an archive) is *already* our
+turf — §7's analyzer roadmap contests it directly. Heex's turf is capture-side
+filtering; that is the extension, and it is sequenced *after* the lake because the
+trap in edge filtering is that it quietly reverses rule zero ("keep everything, decide
+later" becomes "decide now, discard forever") and because good discard rules cannot be
+written a priori — **every trustworthy edge trigger is a graduate of the lake**,
+proven post-hoc on full recordings before being promoted to gate capture.
+
+**The two-lane reframe (the founder's insight, and the correct product shape).** Robot
+data is two classes ~two orders of magnitude apart, deserving opposite policies:
+*thin telemetry* (battery, velocity, CPU, states — kB/s scalars) is recorded
+continuously and (near-)always uplinked — cheap, columnar-bound, and the substrate for
+trend analytics; *fat modalities* (pointclouds, images, maps — the bulk of MCAP bytes)
+are ring-buffered at the edge and cross the link only as **event windows around
+incidents**. Triggers evaluate continuously on the cheap thin lane and gate the
+expensive fat lane; the decision is **defer-don't-delete** (what crosses the link now,
+not what exists — the buffer holds days and supports retro-fetch). So the edge agent
+is not a filter over one stream but a *policy over two lanes* — which also mirrors the
+lake's two doors downstream. Mechanics in the architecture note §2.9.
+
+**Strategic consequences:**
+
+1. **Build the intelligence, not the edge store.** Rebuilding edge storage against
+   ReductStore's open-source substrate (FIFO quotas, conditional replication) is a
+   losing use of a small team; the differentiation is the analyzer/trigger layer on
+   top — which also activates §6's ingestion-funnel move.
+2. **The card nobody else holds:** one analyzer contract, two placements — the same
+   registry-tracked producer runs in the lake to tag history and at the edge to gate
+   capture — closed by the **from-plot-to-policy loop**: see the anomaly in
+   PlotJuggler, express it as a condition on thin telemetry, deploy it fleet-wide as a
+   capture rule. Heex cannot start that loop (no viz roots), Roboto cannot finish it
+   (no edge presence), Foxglove is web-first by identity.
+3. **Second revenue line with a growth curve:** edge agents meter naturally
+   **per-robot** (Heex's model) beside the flat per-deployment lake license — value
+   scales with fleet size, giving the sustainable model growth that flat site
+   licenses lack.
+4. **Sequencing is the discipline:** leading with edge capture before the lake exists
+   would make us a thinner Heex with no archive story, shipping the hardest kind of
+   software (on-robot, heterogeneous fleets, OTA, on-call) as a first product. Act
+   one (§7: self-hosted archive diagnostics) is unchanged and first; act two is the
+   promotion of its proven analyzers to the edge.
+
 ---
 
 *Market facts referenced: Foxglove reduced self-service pricing and basic-seats

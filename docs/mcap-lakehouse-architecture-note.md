@@ -311,6 +311,44 @@ chunks — gated by the §2.6 linter. Everything downstream (skim → catalog �
 is unchanged; ReductStore never enters the serving path and rule zero starts at the
 bucket, as before.
 
+**The two-lane capture model (amended 2026-08-21).** A first framing of this tier as
+"decide which data is worth saving" hides the fact that robot data is not one stream —
+it is two classes with a ~two-order-of-magnitude size gap, and they deserve opposite
+capture policies:
+
+- **Thin telemetry** — battery, velocity, CPU, states, diagnostics: kB/s scalars.
+  Record **continuously**, uplink (near-)always. It is cheap enough that filtering it
+  buys nothing and costs trend history; downstream it is exactly what the columnar
+  projections and the analytical door consume. Continuous thin history is what makes
+  fleet analytics, regression comparison, and "when did this start degrading?" possible.
+- **Fat modalities** — pointclouds, images, video, maps: the bulk of every MCAP's
+  bytes. Continuous recording of these seldom makes sense; their value concentrates
+  around *incidents*. They live in the edge **ring buffer** (the FIFO quota above) and
+  cross the link only as **event windows**: a trigger fires, and the seconds-to-minutes
+  of fat context around it are promoted to the lake.
+
+The consequences fall out cleanly. **Triggers evaluate on the thin lane** — cheap to
+compute continuously — **and gate the fat lane**: "decide what to save" becomes "decide
+which fat windows the always-on thin history justifies uplinking." The decision is
+**defer-don't-delete**: it governs what crosses the constrained link now, not what
+exists — the buffer holds days, and the lake can reach back for extra context around an
+event before quota eviction. The two lanes mirror the lake's two doors (thin → columnar
+/ analytical, fat → MCAP archive / streaming door), and they are the §2.6
+high-bitrate-separation rule pushed one stage earlier: the separation originates at
+capture, not at file-writing. Retention math splits the same way — continuous thin
+history is cheap enough to keep for years in columnar form, while §2.7's lifecycle
+rules are really about the fat event windows.
+
+**Analyzer promotion.** Edge trigger rules are not written from intuition — they are
+**lake-proven analyzers promoted to the edge**: the same producer contract
+(producer@version, declared inputs, registry-tracked provenance) runs post-hoc over
+full recordings first, and once an analyzer's judgment is trusted it is deployed
+edge-side as a capture trigger. One contract, two placements. The authoring loop this
+enables — an engineer sees the anomaly in PlotJuggler, expresses it as a condition on
+thin telemetry, and ships it fleet-wide as a capture policy — is a differentiator no
+current player can copy (capture-side vendors have no archive analytics; archive-side
+vendors have no edge presence; the positioning note §7.4 carries the business case).
+
 **Bounds on the verdict.** (1) As the *lake* itself the answer stays no, now
 confirmed rather than assumed: ReductStore's S3 backend stores its own batched block
 layout behind its API (single-writer, lock-file failover), so the bucket would stop
