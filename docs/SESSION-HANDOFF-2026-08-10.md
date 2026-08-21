@@ -250,6 +250,27 @@ This is the part most at risk of being lost; capture it if it matters.
   when that tier is built. None replaces anything current — they all live in `derived/`,
   the part that's safe to adopt or abandon because the MCAPs never move.
 
+**Addendum 2026-08-21 — DuckDB 2.0 preview (announced 2026-08-17, release fall 2026)**
+nuances two of the verdicts above:
+
+- **Quack client/server goes stable.** The "no DuckDB in the serving path" verdict rested
+  on cgo + the exclusive single-process file lock. The second leg changes: DuckDB 2.0 can
+  run as a network server (`ATTACH 'quack:host'`, token auth). This does NOT reopen the
+  browse-path question (still seek-shaped, still SQLite) — but it adds a legitimate
+  *third shape* for the analytical door: a stock `duckdb` server process over `derived/`
+  + DuckLake, zero custom code, same "one more stateful service" cost class as Postgres.
+  Compare against embed-DataFusion when the served door is actually built.
+- **The DuckLake bet is reinforced**: partition-aware query planning for lakehouse
+  formats, and a DuckDB Foundation advisory board covering DuckDB/DuckLake/Quack —
+  softening the vendor-concentration caveat.
+- Also relevant: stable async I/O ("dramatically faster queries on network storage",
+  Parquet first) improves the consumer side of published Parquet for free; the stable
+  single-header C API makes embedding DuckDB in the C++ plugin cheaper (client-side
+  analytics — never blocked by cgo, now easier); storage format v2.0 is a breaking
+  change, which reinforces choosing SQLite (not a .duckdb file) as the DuckLake
+  metadata home; `NEAREST` top-k similarity joins are a future hook for
+  "find moments like this one" (lesson 9 territory).
+
 ---
 
 ## 4. Threads left open
