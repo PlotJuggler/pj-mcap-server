@@ -228,7 +228,40 @@ linter in the upload path or CI on the robot side; grade files in the catalog. T
 cheapest place to fix query performance is at write time, and a startup audience will
 happily adopt a profile that makes every tool faster.
 
-### 2.7 What I would explicitly not do
+### 2.7 Retention: the lake is immutable, not eternal
+
+Rule zero says nothing rewrites a recording; it does not say recordings live forever.
+Retention has three surfaces, each with a different owner:
+
+- **Originals — owned by bucket lifecycle rules, never by the platform.** S3/GCS
+  lifecycle policies express "delete under this prefix N days after creation" (and
+  tiering steps before it) declaratively, evaluated by the provider, in configuration
+  the customer controls. The platform issues no deletes against originals — it
+  *tolerates* deletion (the audit sweep already reconciles vanished objects) and
+  *argues for clemency*: a ledger chore stamps object tags (e.g. `retain=hold`) from
+  catalog facts — a moment on the recording, a human note, an open investigation — and
+  lifecycle rules filter on those tags, so "delete at 90 days **except incidents**"
+  needs no platform delete path at all. Deletion authority stays in bucket config;
+  metadata-aware exceptions come from the catalog.
+- **Metadata — outlives the data by default.** When recordings expire, their rows
+  become tombstones (`data_expired`); missions, moments, and every human note persist
+  as history — fleet statistics and the browse view of the past keep working, and the
+  streaming door refuses an expired recording with a clear reason instead of a 404
+  mystery. This is the identity rule paying off again: semantic facts never depended
+  on the bytes existing. The one exception is **erasure** (legal/GDPR/customer
+  offboarding): an explicit, audited cascade chore that removes metadata and derived
+  artifacts too — deliberately a different verb than retention.
+- **Derived — governed by its own policies.** Each projection policy carries its
+  retention window; previews and exports are GC'd by policy; table-format snapshot
+  history is bounded by the expiry settings (DuckLake `expire_older_than` /
+  `delete_older_than`) — the time-travel dial priced in storage.
+
+One trap worth naming: lifecycle *tiering* (archive storage classes) breaks the
+range-GET latency the streaming door lives on. Transitions to cold classes are an
+architecture decision — either excluded for served prefixes, or surfaced in the
+catalog as an availability grade — never just an accounting one.
+
+### 2.8 What I would explicitly not do
 
 - **No transcode at ingest** — walked back by the vendor who tried it; keep re-chunking
   as an opt-in cache (T2).
