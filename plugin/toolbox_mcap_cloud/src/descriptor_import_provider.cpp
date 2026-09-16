@@ -309,15 +309,24 @@ PJ_descriptor_import_outcome_t DescriptorImportProvider::JobState::runToTerminal
   // empty s3_keys, so this is unreachable via the ABI — but the .front()
   // below must never be UB even if a future caller constructs a JobState
   // some other way.
-  if (descriptor.s3_keys.empty()) {
+  // T8b: a SELECTION descriptor carries no keys by construction (the parser's
+  // per-kind allowlist rejects s3_keys outright), so the guard below is the
+  // key-addressed path's alone -- applying it to a selection would refuse the
+  // v3 shape for exactly the property that makes it safe.
+  const bool selection_open = (descriptor.kind == kSelectionKind);
+  if (!selection_open && descriptor.s3_keys.empty()) {
     *message = "descriptor has no s3 keys";
     return PJ_DESCRIPTOR_IMPORT_FAILED;
   }
   PullRequest request;
   request.connection = connection;
-  request.sequence_names = descriptor.s3_keys;
-  request.group_name =
-      descriptor.display_name.empty() ? descriptor.s3_keys.front() : descriptor.display_name;
+  request.selection_id = descriptor.selection_id;  // empty for the session kind
+  request.sequence_names = descriptor.s3_keys;     // empty for the selection kind
+  // Display fallback: the selection id, never s3_keys.front() -- there is no
+  // front to take.
+  request.group_name = !descriptor.display_name.empty() ? descriptor.display_name
+                       : selection_open               ? descriptor.selection_id
+                                                      : descriptor.s3_keys.front();
   request.topic_names = descriptor.topics;
   request.start_ns = descriptor.start_ns;
   request.end_ns = descriptor.end_ns;

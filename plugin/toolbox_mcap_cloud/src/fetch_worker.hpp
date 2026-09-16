@@ -42,6 +42,11 @@ enum class PullTerminal {
 /// threading contract) and hands the pull a self-contained request.
 struct PullRequest {
   ConnectionSnapshot connection;            // resolved target + credentials (by value)
+  /// T8b, v3: non-empty = a SERVER-RESOLVED frozen selection. The pull then
+  /// negotiates "open-selection/v3" at Hello and sends OpenSession{selection};
+  /// sequence_names/topic_names/start_ns/end_ns are empty by construction (the
+  /// descriptor kind has no such fields) and the server owns all three.
+  std::string selection_id;
   std::vector<std::string> sequence_names;  // wire s3_keys, deterministic order
   std::string group_name;                   // dataset display/group name
   std::vector<std::string> topic_names;     // empty = all union topics (wire contract)

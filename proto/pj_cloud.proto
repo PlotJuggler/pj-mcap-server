@@ -71,7 +71,13 @@ message EncodedServerMessage {
 // -----------------------------------------------------------------------------
 
 message Hello {
-  // current = 2. v2 (2026-07-17) made OpenFresh key-addressed (s3_keys, not
+  // current = 3 (v3 is an ADDITIVE evolution of v2: every v2 field keeps its
+  // number and meaning, and a v2 client -- including the pinned binary -- is
+  // served unchanged). A v3 client sends 3 and lists the additive features it
+  // understands in `features`; the server answers with the INTERSECTION in
+  // HelloResponse.features. A feature that is not in that intersection is not
+  // available: the request that needs it FAILS, and never silently degrades to
+  // a v2 shape (see OpenSelection). v2 (2026-07-17) made OpenFresh key-addressed (s3_keys, not
   // file_ids); a v1 client that would send catalog rowids fails cleanly at the
   // handshake (ERROR_PROTOCOL_VERSION) instead of later with "no s3_keys".
   uint32 protocol_version = 1;
@@ -82,12 +88,19 @@ message Hello {
   // iff the client advertised the matching encoding here. Negotiated once at
   // Hello; the HelloResponse itself is ALWAYS raw.
   repeated CompressionEncoding accepted_response_encodings = 3;
+  // v3, ADDITIVE. Opaque feature names, e.g. "open-selection/v3". Empty (proto3
+  // default) = a v2 client: nothing changes for it.
+  repeated string features = 4;
 }
 
 message HelloResponse {
   string server_version = 1;               // semver
   Capabilities capabilities = 2;
   BackendCapabilities backend = 3;         // M0: storage-backend-shaped client hints
+  // v3, ADDITIVE: the NEGOTIATED set = what the client listed AND the server
+  // implements. Empty for a v2 client. The client must treat a feature absent
+  // here as unavailable; the server refuses the corresponding request.
+  repeated string features = 4;
 }
 
 message Capabilities {
@@ -319,7 +332,22 @@ message OpenSessionRequest {
   oneof mode {
     OpenFresh  fresh  = 1;
     OpenResume resume = 2;
+    // v3, ADDITIVE: open a SERVER-RESOLVED frozen selection by its id. Requires
+    // the negotiated feature "open-selection/v3"; without it the open fails
+    // with ERROR_INVALID_REQUEST rather than falling back to client-supplied
+    // object keys, which would re-open the race the selection exists to close.
+    OpenSelection selection = 3;
   }
+}
+
+// OpenSelection carries NO object keys, no versions and no credentials: the
+// server already froze the membership (sources + their exact object versions),
+// the topics and the half-open log-time window when the selection was created,
+// and it re-authorizes the caller and re-resolves that membership in ONE catalog
+// snapshot at open time. A source version that is gone fails explicitly; the
+// same key's replacement is never substituted.
+message OpenSelection {
+  string selection_id = 1;
 }
 
 message OpenFresh {

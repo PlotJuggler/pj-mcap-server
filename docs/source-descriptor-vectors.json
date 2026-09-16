@@ -1,5 +1,5 @@
 {
-  "comment": "Cross-repo contract: canonical serialization + identity vectors for the source descriptor (docs/canonical-layout-import.md §4). PJ4-side tests must consume this file byte-identically. Regenerating requires bumping the descriptor version. The e2e-8082-* cases are the FROZEN stage-5 live-E2E scenario identities (docs/plans/2026-08-01-layout-import-stage5-e2e.md §1 E4a): scripts/e2e-layout-import.sh consumes their descriptor bytes + identities VERBATIM, and their s3_keys/topics/time ranges MUST keep matching the deterministic gen-ci-fixtures -hive -hive-big corpus the harness seeds into the e2e-layout bucket.",
+  "comment": "Cross-repo contract: canonical serialization + identity vectors for the source descriptor (docs/canonical-layout-import.md §4). PJ4-side tests must consume this file byte-identically. Regenerating requires bumping the descriptor version. The e2e-8082-* cases are the FROZEN stage-5 live-E2E scenario identities (docs/plans/2026-08-01-layout-import-stage5-e2e.md §1 E4a): scripts/e2e-layout-import.sh consumes their descriptor bytes + identities VERBATIM, and their s3_keys/topics/time ranges MUST keep matching the deterministic gen-ci-fixtures -hive -hive-big corpus the harness seeds into the e2e-layout bucket. The selection-* cases (T8b, 2026-09-17) are the v3 \"mcap-cloud-selection\" kind: an opaque server-resolved selection id and the server URI, no object keys, no window. They are APPENDED -- the kind lives INSIDE the canonical bytes, so no existing case moves and the descriptor version stays 1. Their canonical bytes are exactly what pj-data-platform crates/platform/src/web.rs selection_descriptor() emits.",
   "cases": [
     { "name": "minimal-whole-range-all-topics",
       "descriptor": {"v":1,"kind":"mcap-cloud-session","server_uri":"ws://localhost:8080","s3_keys":["a.mcap"],"topics":[],"start_ns":"0","end_ns":"0","include_latched":true,"display_name":"A"},
@@ -24,6 +24,14 @@
     { "name": "e2e-8082-trust-leg",
       "descriptor": {"v":1,"kind":"mcap-cloud-session","server_uri":"ws://localhost:8082","s3_keys":["customer=test/customer_site=lab/robot=r1/source=synthetic/date=2026-06-22/ci_synth_c.mcap"],"topics":[],"start_ns":"3000100000000","end_ns":"3000400000000","include_latched":false,"display_name":"E2E trust leg (:8082)"},
       "canonical": "{\"end_ns\":\"3000400000000\",\"include_latched\":false,\"kind\":\"mcap-cloud-session\",\"s3_keys\":[\"customer=test/customer_site=lab/robot=r1/source=synthetic/date=2026-06-22/ci_synth_c.mcap\"],\"server_uri\":\"ws://localhost:8082\",\"start_ns\":\"3000100000000\",\"topics\":[],\"v\":1}",
-      "identity": "mcap-cloud:v1:sha256/128:036abe494beb9188d84fe43dea0104e8" }
+      "identity": "mcap-cloud:v1:sha256/128:036abe494beb9188d84fe43dea0104e8" },
+    { "name": "selection-frozen-window",
+      "descriptor": {"v":1,"kind":"mcap-cloud-selection","server_uri":"ws://127.0.0.1:18080","selection_id":"sel-7f3a2b19"},
+      "canonical": "{\"kind\":\"mcap-cloud-selection\",\"selection_id\":\"sel-7f3a2b19\",\"server_uri\":\"ws://127.0.0.1:18080\",\"v\":1}",
+      "identity": "mcap-cloud:v1:sha256/128:4d9bf1475085da77b270e0d158879281" },
+    { "name": "selection-display-name-does-not-change-identity",
+      "descriptor": {"v":1,"kind":"mcap-cloud-selection","server_uri":"wss://mcap.example.com","selection_id":"0f2c9d41aa7b4e58","display_name":"Run 42 [20s,22s)"},
+      "canonical": "{\"kind\":\"mcap-cloud-selection\",\"selection_id\":\"0f2c9d41aa7b4e58\",\"server_uri\":\"wss://mcap.example.com\",\"v\":1}",
+      "identity": "mcap-cloud:v1:sha256/128:5d2073b7489a07e1820177f9b1fadc5f" }
   ]
 }

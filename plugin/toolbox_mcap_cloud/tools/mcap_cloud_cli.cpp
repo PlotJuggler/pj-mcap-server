@@ -80,6 +80,9 @@ void printUsage(std::ostream& os) {
         "                                   (--lean = what the browse picker actually asks for)\n"
         "  topics <sequence-name> [--json]  list a sequence's topics (name, schema, encoding, count)\n"
         "  download <seq1> [<seq2> ...] --output FILE [--topics a,b] [--time-range s,e] [--latched] [--json]\n"
+        "  download --selection ID --output FILE [--json]\n"
+        "                                   open a SERVER-RESOLVED frozen selection (protocol v3)\n"
+        "                                   and reconstruct its window; carries no object keys\n"
         "                                   open a session and reconstruct a local MCAP\n"
         "                                   (multiple sequences are stitched, time-ordered)\n"
         "  tag <sequence-name> [--set k=v]... [--unset k]... [--json]\n"
@@ -94,6 +97,9 @@ void printUsage(std::ostream& os) {
         "  --cert FILE              wss://: CA bundle to verify the server (env MCAP_CLOUD_CACERT;\n"
         "                           default: auto-detect the system bundle)\n"
         "  --output FILE            (download) destination MCAP path (required)\n"
+        "  --selection ID           (download) a frozen selection id from the web app's\n"
+        "                           layout descriptor; the server owns the sources, topics\n"
+        "                           and window, so no <sequence-name>/--topics/--time-range\n"
         "  --topics a,b,c           (download/debug) comma-separated topic subset (default: all)\n"
         "  --time-range startNs,endNs (download/debug) optional time window in nanoseconds\n"
         "  --latched                (download) also deliver each topic's last message before the\n"
@@ -393,14 +399,83 @@ const char* eosName(mcap_cloud::SessionEos eos) {
   }
 }
 
+
+// The download report, shared by the key-addressed and the v3 selection arms
+// (one formatter, so the two can never drift into different JSON).
+int reportDownload(const mcap_cloud::SessionStats& stats, const mcap_cloud::SessionInfo& info,
+                   const std::string& display, const std::string& output, bool as_json,
+                   const std::string& error) {
+  (void)error;  // already folded into stats.error by downloadToMcap
+  const bool ok = stats.eos == mcap_cloud::SessionEos::Complete && stats.error.empty();
+
+  if (as_json) {
+    nlohmann::json obj;
+    obj["sequence"] = display;
+    obj["output"] = output;
+    obj["subscription_id"] = info.subscription_id;
+    obj["topic_count"] = info.topics.size();
+    obj["schema_count"] = info.schemas.size();
+    obj["estimated_chunk_bytes"] = info.estimated_chunk_bytes;
+    obj["approximate_messages"] = info.approximate_messages;
+    obj["messages_received"] = stats.messages_received;
+    obj["bytes_received"] = stats.bytes_received;
+    obj["batches_received"] = stats.batches_received;
+    obj["eos_reason"] = eosName(stats.eos);
+    obj["eos_total_messages_sent"] = stats.eos_total_messages_sent;
+    obj["eos_total_bytes_sent"] = stats.eos_total_bytes_sent;
+    if (!stats.error.empty()) {
+      obj["error"] = stats.error;
+    }
+    std::cout << obj.dump(2) << '\n';
+  } else {
+    std::cout << "download " << display << " -> " << output << '\n'
+              << "  subscription_id: " << info.subscription_id << '\n'
+              << "  topics: " << info.topics.size() << "  schemas: " << info.schemas.size() << '\n'
+              << "  estimate: ~" << info.approximate_messages << " messages, "
+              << mcap_cloud::formatBytes(static_cast<std::int64_t>(info.estimated_chunk_bytes)) << '\n'
+              << "  received: " << stats.messages_received << " messages in " << stats.batches_received
+              << " batch(es), " << mcap_cloud::formatBytes(static_cast<std::int64_t>(stats.bytes_received)) << '\n'
+              << "  eos: " << eosName(stats.eos) << " (server total_messages_sent=" << stats.eos_total_messages_sent
+              << ")\n";
+    if (!stats.error.empty()) {
+      std::cout << "  error: " << stats.error << '\n';
+    }
+  }
+
+  return ok ? kExitOk : kExitFailure;
+}
+
 int runDownload(mcap_cloud::BackendConnection& conn, const std::vector<std::string>& sequence_names,
                 const std::string& output, const std::vector<std::string>& topics,
                 const std::optional<std::int64_t>& start_ns, const std::optional<std::int64_t>& end_ns, bool as_json,
-                bool include_latched) {
+                bool include_latched, const std::string& selection_id = {}) {
   if (output.empty()) {
     std::cerr << "download: --output FILE is required\n";
     return kExitUsage;
   }
+
+  // ---- v3: a SERVER-RESOLVED frozen selection --------------------------------
+  // Nothing below applies: there are no names to list, order or overlap-check,
+  // and no window to send -- the server froze the sources, their exact object
+  // versions, the topics and the half-open window when the selection was
+  // created. Supplying any of them here would be a second, client-side opinion
+  // about what the selection is, which is the race it exists to close.
+  if (!selection_id.empty()) {
+    if (!sequence_names.empty() || !topics.empty() || start_ns.has_value() || end_ns.has_value() ||
+        include_latched) {
+      std::cerr << "download: --selection takes no <sequence-name>, --topics, --time-range or "
+                   "--latched (the server owns all of them)\n";
+      return kExitUsage;
+    }
+    mcap_cloud::OpenSessionParams params;
+    params.selection_id = selection_id;
+    mcap_cloud::SessionInfo info;
+    std::string error;
+    const mcap_cloud::SessionStats stats =
+        mcap_cloud::downloadToMcap(conn, params, output, &info, &error);
+    return reportDownload(stats, info, "selection " + selection_id, output, as_json, error);
+  }
+
   if (sequence_names.empty()) {
     std::cerr << "download: at least one <sequence-name> is required\n";
     return kExitUsage;
@@ -483,43 +558,7 @@ int runDownload(mcap_cloud::BackendConnection& conn, const std::vector<std::stri
   std::string error;
   const mcap_cloud::SessionStats stats = mcap_cloud::downloadToMcap(conn, params, output, &info, &error);
 
-  const bool ok = stats.eos == mcap_cloud::SessionEos::Complete && stats.error.empty();
-
-  if (as_json) {
-    nlohmann::json obj;
-    obj["sequence"] = display;
-    obj["output"] = output;
-    obj["subscription_id"] = info.subscription_id;
-    obj["topic_count"] = info.topics.size();
-    obj["schema_count"] = info.schemas.size();
-    obj["estimated_chunk_bytes"] = info.estimated_chunk_bytes;
-    obj["approximate_messages"] = info.approximate_messages;
-    obj["messages_received"] = stats.messages_received;
-    obj["bytes_received"] = stats.bytes_received;
-    obj["batches_received"] = stats.batches_received;
-    obj["eos_reason"] = eosName(stats.eos);
-    obj["eos_total_messages_sent"] = stats.eos_total_messages_sent;
-    obj["eos_total_bytes_sent"] = stats.eos_total_bytes_sent;
-    if (!stats.error.empty()) {
-      obj["error"] = stats.error;
-    }
-    std::cout << obj.dump(2) << '\n';
-  } else {
-    std::cout << "download " << display << " -> " << output << '\n'
-              << "  subscription_id: " << info.subscription_id << '\n'
-              << "  topics: " << info.topics.size() << "  schemas: " << info.schemas.size() << '\n'
-              << "  estimate: ~" << info.approximate_messages << " messages, "
-              << mcap_cloud::formatBytes(static_cast<std::int64_t>(info.estimated_chunk_bytes)) << '\n'
-              << "  received: " << stats.messages_received << " messages in " << stats.batches_received
-              << " batch(es), " << mcap_cloud::formatBytes(static_cast<std::int64_t>(stats.bytes_received)) << '\n'
-              << "  eos: " << eosName(stats.eos) << " (server total_messages_sent=" << stats.eos_total_messages_sent
-              << ")\n";
-    if (!stats.error.empty()) {
-      std::cout << "  error: " << stats.error << '\n';
-    }
-  }
-
-  return ok ? kExitOk : kExitFailure;
+  return reportDownload(stats, info, display, output, as_json, error);
 }
 
 // ---- debug ------------------------------------------------------------------
@@ -798,6 +837,7 @@ int main(int argc, char** argv) {
   bool vocab_lean = false;
   bool include_latched = false;  // download --latched (latched/transient-local replay)
   std::string output;          // download --output
+  std::string selection_id;    // download --selection (v3 frozen selection)
   std::string topics_csv;      // download/debug --topics
   std::string time_range_csv;  // download/debug --time-range
   std::uint64_t debug_limit = 10;  // debug --limit (0 = all)
@@ -858,6 +898,12 @@ int main(int argc, char** argv) {
         return kExitUsage;
       }
       output = v;
+    } else if (arg == "--selection") {
+      const char* v = needValue(arg, i);
+      if (v == nullptr) {
+        return kExitUsage;
+      }
+      selection_id = v;
     } else if (arg == "--topics") {
       const char* v = needValue(arg, i);
       if (v == nullptr) {
@@ -983,8 +1029,10 @@ int main(int argc, char** argv) {
   std::optional<std::int64_t> start_ns;
   std::optional<std::int64_t> end_ns;
   if (command == "download") {
-    if (positionals.empty()) {
-      std::cerr << "error: 'download' requires a <sequence-name>\n";
+    // v3: --selection REPLACES the sequence names (the server owns the
+    // membership), so exactly one of the two addressing modes must be present.
+    if (positionals.empty() && selection_id.empty()) {
+      std::cerr << "error: 'download' requires a <sequence-name> or --selection ID\n";
       printUsage(std::cerr);
       return kExitUsage;
     }
@@ -1032,6 +1080,11 @@ int main(int argc, char** argv) {
   // skip-verify the GUI plugin exposes so a wss:// dev-cert leg works end-to-end.
   mcap_cloud::BackendConnection conn(url, /*cert_path=*/cert, /*api_key=*/token,
                                        /*allow_insecure=*/insecure);
+  // v3: the feature is requested PER OPEN and must be in the Hello, so it is
+  // declared before connect(). Every other command stays a v2 client verbatim.
+  if (!selection_id.empty()) {
+    conn.requestOpenSelectionFeature();
+  }
   std::string error;
   if (!conn.connect(&error)) {
     // Surface the verbatim connection/handshake error.
@@ -1051,7 +1104,8 @@ int main(int argc, char** argv) {
   if (command == "download") {
     // All positionals are sequence names (one or more); they stitch into one
     // OpenFresh. A single positional is byte-identical to the pre-Slice-7 path.
-    return runDownload(conn, positionals, output, splitCsv(topics_csv), start_ns, end_ns, as_json, include_latched);
+    return runDownload(conn, positionals, output, splitCsv(topics_csv), start_ns, end_ns, as_json,
+                       include_latched, selection_id);
   }
   if (command == "tag") {
     return runTag(conn, positionals.front(), set_tags, unset_keys, as_json);

@@ -286,6 +286,12 @@ struct OpenSessionParams {
   // rebuilds, so an id captured at browse time could name a DIFFERENT object
   // by open time. The server resolves the keys in its CURRENT generation.
   std::vector<std::string> s3_keys;
+  // T8b, v3: when non-empty the open is SERVER-RESOLVED — OpenSessionRequest
+  // carries `selection` and nothing else, every field above is ignored, and
+  // the open FAILS (kOpenSelectionUnsupportedError) unless "open-selection/v3"
+  // was negotiated at Hello. It never falls back to s3_keys: that fallback is
+  // the client-supplied-key race the frozen selection exists to close.
+  std::string selection_id;
   std::vector<std::string> topic_names;
   std::optional<std::int64_t> start_ns;
   std::optional<std::int64_t> end_ns;

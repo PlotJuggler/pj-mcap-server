@@ -32,6 +32,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include <ixwebsocket/IXWebSocketServer.h>
 
@@ -59,9 +60,16 @@ using mcap_cloud_test::findFreePort;
 // same as the pre-existing update_tags_frames_seen_ atomic below.
 class FakeCapsServer {
  public:
-  FakeCapsServer(bool resume_supported, bool tag_edit_supported, bool answer_list_and_update_tags)
+  // T8b: `offer_selection_feature` makes this fake a v3 server -- it answers
+  // with the INTERSECTION of the client's Hello.features and
+  // {"open-selection/v3"}. Left at its default the fake is a v2 server: it
+  // echoes NO features, whatever the client asked for, which is exactly the
+  // pinned legacy server's behaviour and the refusal case below.
+  FakeCapsServer(bool resume_supported, bool tag_edit_supported, bool answer_list_and_update_tags,
+                 bool offer_selection_feature = false)
       : port_(findFreePort()), server_(port_, "127.0.0.1") {
-    server_.setOnClientMessageCallback([this, resume_supported, tag_edit_supported, answer_list_and_update_tags](
+    server_.setOnClientMessageCallback([this, resume_supported, tag_edit_supported, answer_list_and_update_tags,
+                                        offer_selection_feature](
                                             std::shared_ptr<ix::ConnectionState>, ix::WebSocket& ws,
                                             const ix::WebSocketMessagePtr& msg) {
       if (msg->type != ix::WebSocketMessageType::Message) {
@@ -79,6 +87,20 @@ class FakeCapsServer {
         auto* caps = hello_response->mutable_capabilities();
         caps->set_resume_supported(resume_supported);
         caps->set_tag_edit_supported(tag_edit_supported);
+        {
+          std::lock_guard<std::mutex> lock(mu_);
+          last_hello_protocol_version_ = request.hello().protocol_version();
+          last_hello_features_.assign(request.hello().features().begin(),
+                                      request.hello().features().end());
+          ++hello_frames_seen_;
+        }
+        if (offer_selection_feature) {
+          for (const auto& feature : request.hello().features()) {
+            if (feature == "open-selection/v3") {
+              hello_response->add_features(feature);
+            }
+          }
+        }
         std::string payload;
         response.SerializeToString(&payload);
         ws.sendBinary(payload);
@@ -108,6 +130,10 @@ class FakeCapsServer {
           response.SerializeToString(&payload);
           ws.sendBinary(payload);
         }
+      } else if (request.has_open_session()) {
+        // Counted, never answered: the T8b cases assert only WHETHER an
+        // OpenSession reached the wire. A refused selection must send none.
+        ++open_session_frames_seen_;
       } else if (request.has_get_file()) {
         ++get_file_frames_seen_;
         {
@@ -148,6 +174,19 @@ class FakeCapsServer {
   [[nodiscard]] bool ok() const { return ok_; }
   [[nodiscard]] std::string uri() const { return "ws://127.0.0.1:" + std::to_string(port_); }
   [[nodiscard]] int updateTagsFramesSeen() const { return update_tags_frames_seen_; }
+  [[nodiscard]] int openSessionFramesSeen() const { return open_session_frames_seen_; }
+  // Written under mu_ on the server thread strictly BEFORE the HelloResponse
+  // is sent; read under the same mu_ after connect() returns (which cannot
+  // happen before that reply arrives) -- the same happens-before argument the
+  // last-seen s3_key fields above rely on.
+  [[nodiscard]] std::uint32_t lastHelloProtocolVersion() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return last_hello_protocol_version_;
+  }
+  [[nodiscard]] std::vector<std::string> lastHelloFeatures() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return last_hello_features_;
+  }
   [[nodiscard]] int getFileFramesSeen() const { return get_file_frames_seen_; }
 
   [[nodiscard]] std::string lastUpdateTagsS3Key() const {
@@ -174,6 +213,8 @@ class FakeCapsServer {
   ix::WebSocketServer server_;
   bool ok_ = false;
   std::atomic<int> update_tags_frames_seen_{0};
+  std::atomic<int> open_session_frames_seen_{0};
+  int hello_frames_seen_ = 0;
   std::atomic<int> get_file_frames_seen_{0};
 
   mutable std::mutex mu_;
@@ -181,6 +222,8 @@ class FakeCapsServer {
   bool last_update_tags_has_s3_key_ = false;
   std::string last_get_file_s3_key_;
   bool last_get_file_has_s3_key_ = false;
+  std::uint32_t last_hello_protocol_version_ = 0;
+  std::vector<std::string> last_hello_features_;
 };
 
 constexpr const char* kExpectedGateError =
@@ -331,4 +374,75 @@ TEST(McapCloudServerCaps, GetFileCarriesS3KeyWithoutPriorList) {
   EXPECT_GE(server.getFileFramesSeen(), 1);
   EXPECT_TRUE(server.lastGetFileHasS3Key()) << "GetFileRequest.s3_key must be PRESENT on the wire";
   EXPECT_EQ(server.lastGetFileS3Key(), kNeverListedName);
+}
+
+// -----------------------------------------------------------------------------
+// v3 (T8b): the feature is negotiated at HELLO, and only for a
+// selection-backed open. The version is chosen PER OPEN — a session open still
+// says 2 with no features, because the pinned legacy server rejects any other
+// version outright (../mcap_server/server/internal/ws/server.go:585).
+// -----------------------------------------------------------------------------
+
+TEST(McapCloudServerCaps, SelectionOpenAdvertisesTheFeatureAndSessionOpenDoesNot) {
+  FakeCapsServer server(/*resume_supported=*/true, /*tag_edit_supported=*/false,
+                        /*answer_list_and_update_tags=*/false,
+                        /*offer_selection_feature=*/true);
+  ASSERT_TRUE(server.ok());
+
+  // A selection-backed open: protocol_version 3 + the one feature this client
+  // understands; the server's intersection comes back and is recorded.
+  {
+    mcap_cloud::BackendConnection conn(server.uri(), /*cert_path=*/"", /*api_key=*/"",
+                                       /*allow_insecure=*/false);
+    conn.requestOpenSelectionFeature();
+    std::string error;
+    ASSERT_TRUE(conn.connect(&error)) << error;
+    EXPECT_EQ(server.lastHelloProtocolVersion(), 3u);
+    EXPECT_EQ(server.lastHelloFeatures(),
+              std::vector<std::string>{mcap_cloud::kOpenSelectionFeature});
+    EXPECT_TRUE(conn.hasNegotiatedFeature(mcap_cloud::kOpenSelectionFeature));
+    EXPECT_FALSE(conn.hasNegotiatedFeature("some-other/v9"));
+  }
+
+  // An ordinary session open on the SAME server: version 2, no features. The
+  // v3 arm is opt-in per open, never a global bump.
+  {
+    mcap_cloud::BackendConnection conn(server.uri(), /*cert_path=*/"", /*api_key=*/"",
+                                       /*allow_insecure=*/false);
+    std::string error;
+    ASSERT_TRUE(conn.connect(&error)) << error;
+    EXPECT_EQ(server.lastHelloProtocolVersion(), 2u);
+    EXPECT_TRUE(server.lastHelloFeatures().empty());
+    EXPECT_FALSE(conn.hasNegotiatedFeature(mcap_cloud::kOpenSelectionFeature));
+  }
+}
+
+// A v2 server (this fake echoes no features, exactly like the pinned legacy
+// server) must make a selection open FAIL BY NAME — never fall back to
+// client-supplied object keys, and never reach the wire at all.
+TEST(McapCloudServerCaps, ASelectionDescriptorIsRefusedWhenTheServerOffersNoFeature) {
+  FakeCapsServer server(/*resume_supported=*/true, /*tag_edit_supported=*/false,
+                        /*answer_list_and_update_tags=*/false,
+                        /*offer_selection_feature=*/false);
+  ASSERT_TRUE(server.ok());
+
+  mcap_cloud::BackendConnection conn(server.uri(), /*cert_path=*/"", /*api_key=*/"",
+                                     /*allow_insecure=*/false);
+  conn.requestOpenSelectionFeature();
+  std::string error;
+  ASSERT_TRUE(conn.connect(&error)) << error;
+  EXPECT_FALSE(conn.hasNegotiatedFeature(mcap_cloud::kOpenSelectionFeature))
+      << "a server that echoes no features offers none";
+
+  mcap_cloud::OpenSessionParams params;
+  params.selection_id = "sel-7f3a";
+  mcap_cloud::SessionInfo info;
+  std::string open_error;
+  EXPECT_FALSE(conn.openSessionFresh(params, &info, &open_error));
+  EXPECT_EQ(open_error, mcap_cloud::kOpenSelectionUnsupportedError);
+
+  // Give a frame time to arrive if the refusal had NOT short-circuited.
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+  EXPECT_EQ(server.openSessionFramesSeen(), 0)
+      << "a selection open must not reach a server that did not negotiate the feature";
 }
