@@ -898,6 +898,7 @@ bool BackendConnection::openSessionFresh(const OpenSessionParams& params, Sessio
   {
     std::lock_guard<std::mutex> lock(mu_);
     session_active_ = true;
+    session_from_selection_ = selection_open;  // the resume guard reads this
     session_subscription_id_ = 0;
     session_inbox_.clear();
     // cancel_requested_ is deliberately NOT reset here: cancelSession() latches
@@ -1260,6 +1261,20 @@ bool BackendConnection::openSessionResume(std::uint64_t subscription_id, std::ui
   };
   if (!socket_) {
     set_error("not connected");
+    return false;
+  }
+  // T8b review round 1, MEDIUM: reconnectAndHello() re-negotiates against what
+  // may be a DIFFERENT peer, and it REFRESHES negotiated_features_. A
+  // selection-backed session must be re-validated on every resume, and that
+  // re-validation needs the feature on THIS connection -- so a peer that
+  // dropped it is refused here, before the frame goes out. Flagged as a server
+  // REJECTION so the caller fails cleanly instead of burning the reconnect
+  // budget: no number of retries puts a missing feature back.
+  if (session_from_selection_ && !hasNegotiatedFeature(kOpenSelectionFeature)) {
+    set_error(kOpenSelectionUnsupportedError);
+    if (rejected != nullptr) {
+      *rejected = true;
+    }
     return false;
   }
 

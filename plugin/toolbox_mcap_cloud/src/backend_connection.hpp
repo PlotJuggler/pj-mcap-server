@@ -476,6 +476,11 @@ class BackendConnection {
   // prevent. Worker-thread only, like every other member here.
   bool request_open_selection_ = false;
   std::vector<std::string> negotiated_features_;
+  // Set by openSessionFresh: the ACTIVE session was opened from a frozen
+  // selection, so every resume of it must re-negotiate the feature (the server
+  // re-validates the selection on each resume). Worker-thread only, like the
+  // rest of the session state.
+  bool session_from_selection_ = false;
   // TEST-ONLY outbound frame observer (see testSetOutboundFrameObserver).
   std::function<void(const std::string&)> outbound_observer_;
 

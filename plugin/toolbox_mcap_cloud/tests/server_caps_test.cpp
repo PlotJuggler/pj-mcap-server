@@ -24,6 +24,7 @@
 
 #include <gtest/gtest.h>
 
+#include "fake_streaming_server.hpp"
 #include "find_free_port.hpp"
 
 #include <atomic>
@@ -445,4 +446,94 @@ TEST(McapCloudServerCaps, ASelectionDescriptorIsRefusedWhenTheServerOffersNoFeat
   std::this_thread::sleep_for(std::chrono::milliseconds(200));
   EXPECT_EQ(server.openSessionFramesSeen(), 0)
       << "a selection open must not reach a server that did not negotiate the feature";
+}
+
+// -----------------------------------------------------------------------------
+// T8b review round 1, MEDIUM: the AUTOMATIC reconnect path. `reconnectAndHello`
+// re-negotiates against what may be a DIFFERENT peer; if that peer no longer
+// offers "open-selection/v3" the client must refuse the resume itself, before
+// the frame goes out. Driven through downloadSessionResumable() -- the real
+// drop/reconnect/OpenResume loop -- not through two hand-made connections.
+//
+// This case also guards the refresh: if parseNegotiatedFeatures() stopped being
+// called on reconnect, the stale first-handshake "yes" would let the OpenResume
+// through and resumeOpens() would be 1.
+// -----------------------------------------------------------------------------
+
+TEST(McapCloudServerCaps, ASelectionResumeIsRefusedWhenTheReconnectedPeerDropsTheFeature) {
+  mcap_cloud_test::FakeStreamingServer server(
+      mcap_cloud_test::FakeStreamingServer::Mode::kDropAfterOneBatch,
+      /*offer_selection_feature=*/true);
+  ASSERT_TRUE(server.ok());
+  server.dropFeatureAfterFirstHello();
+
+  mcap_cloud::BackendConnection conn(server.uri(), /*cert_path=*/"", /*api_key=*/"",
+                                     /*allow_insecure=*/false);
+  conn.requestOpenSelectionFeature();
+  std::string error;
+  ASSERT_TRUE(conn.connect(&error)) << error;
+  ASSERT_TRUE(conn.hasNegotiatedFeature(mcap_cloud::kOpenSelectionFeature));
+
+  mcap_cloud::OpenSessionParams params;
+  params.selection_id = "sel-7f3a2b19";
+  mcap_cloud::SessionInfo info;
+  ASSERT_TRUE(conn.openSessionFresh(params, &info, &error)) << error;
+  ASSERT_EQ(server.selectionOpens(), 1);
+
+  std::atomic<unsigned> resume_hints{0};
+  conn.setResumeHint([&](unsigned, unsigned) { resume_hints.fetch_add(1); });
+  // A safety net, not part of the contract: with the refusal in place the call
+  // returns within the first backoff. WITHOUT it the OpenResume goes out to a
+  // fake that never answers, and this deadline turns a 3 x 120 s hang into a
+  // fast, readable failure.
+  conn.setSessionDeadline(std::chrono::steady_clock::now() + std::chrono::seconds(20));
+  std::uint64_t counted = 0;
+  const mcap_cloud::SessionStats stats =
+      conn.downloadSessionResumable(info, [&](const mcap_cloud::DecodedMessage&) -> bool {
+        ++counted;
+        return true;
+      });
+
+  // The drop DID happen and the client DID reconnect...
+  EXPECT_GE(resume_hints.load(), 1u) << "the resume path never fired";
+  EXPECT_GE(server.hellos(), 2) << "the client never re-handshook";
+  // ...and the resume was refused LOCALLY, by name, as a clean rejection (a
+  // retry cannot put the feature back, so it must not burn the attempt budget).
+  EXPECT_EQ(stats.eos, mcap_cloud::SessionEos::Error);
+  EXPECT_EQ(stats.error, mcap_cloud::kOpenSelectionUnsupportedError);
+  EXPECT_EQ(server.resumeOpens(), 0)
+      << "a selection resume must never reach a peer that did not negotiate the feature";
+  // The first leg's messages are kept; nothing is duplicated or invented.
+  EXPECT_EQ(counted, static_cast<std::uint64_t>(mcap_cloud_test::kFakeMessagesPerBatch));
+}
+
+// The control: the SAME drop/reconnect loop against a peer that keeps offering
+// the feature does reach OpenResume. Without this, the case above would also
+// pass if the resume were refused for some unrelated reason.
+TEST(McapCloudServerCaps, ASelectionResumeReachesTheWireWhenTheFeatureSurvivesTheReconnect) {
+  mcap_cloud_test::FakeStreamingServer server(
+      mcap_cloud_test::FakeStreamingServer::Mode::kDropAfterOneBatch,
+      /*offer_selection_feature=*/true);
+  ASSERT_TRUE(server.ok());
+
+  mcap_cloud::BackendConnection conn(server.uri(), /*cert_path=*/"", /*api_key=*/"",
+                                     /*allow_insecure=*/false);
+  conn.requestOpenSelectionFeature();
+  std::string error;
+  ASSERT_TRUE(conn.connect(&error)) << error;
+
+  mcap_cloud::OpenSessionParams params;
+  params.selection_id = "sel-7f3a2b19";
+  mcap_cloud::SessionInfo info;
+  ASSERT_TRUE(conn.openSessionFresh(params, &info, &error)) << error;
+
+  // The fake never answers OpenResume, so the loop exhausts its attempts; what
+  // this case pins is that the frame was SENT at all.
+  conn.setSessionDeadline(std::chrono::steady_clock::now() + std::chrono::seconds(8));
+  const mcap_cloud::SessionStats stats =
+      conn.downloadSessionResumable(info, [](const mcap_cloud::DecodedMessage&) -> bool { return true; });
+  (void)stats;
+  EXPECT_GE(server.resumeOpens(), 1)
+      << "the negotiated feature survived the reconnect, so the resume must go out";
+  EXPECT_NE(stats.error, mcap_cloud::kOpenSelectionUnsupportedError);
 }

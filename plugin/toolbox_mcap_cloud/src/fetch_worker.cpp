@@ -1633,7 +1633,14 @@ PullResult FetchWorker::pull(PullRequest request) {
   // exception before the tee captures it restores under the ticket by
   // member-destruction order alone.
 
-  if (request.sequence_names.empty()) {
+  // T8b review round 1, HIGH: BOTH guards below are the KEY-ADDRESSED path's.
+  // A selection-backed pull carries no object keys BY CONSTRUCTION -- the
+  // descriptor kind has no s3_keys field and the server owns the membership --
+  // so an unconditional emptiness check here rejected every desktop selection
+  // import before it could reach the negotiation, and `.front()` had nothing to
+  // take. The selection id is the identity in both roles.
+  const bool selection_pull = !request.selection_id.empty();
+  if (!selection_pull && request.sequence_names.empty()) {
     result.error = "empty selection (no s3 keys)";
     return result;
   }
@@ -1642,7 +1649,7 @@ PullResult FetchWorker::pull(PullRequest request) {
     return result;
   }
   if (request.group_name.empty()) {
-    request.group_name = request.sequence_names.front();
+    request.group_name = selection_pull ? request.selection_id : request.sequence_names.front();
   }
   auto cancelled_now = [this]() { return cancel_flag_.load(std::memory_order_relaxed); };
   auto finish_cancelled = [&result]() {

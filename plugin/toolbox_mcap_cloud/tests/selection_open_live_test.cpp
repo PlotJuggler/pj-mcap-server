@@ -192,12 +192,27 @@ TEST(McapCloudSelectionOpenLive, SendsNoObjectKeyOnTheWire) {
   wire.attach(conn);
   ASSERT_TRUE(connectNegotiated(conn));
 
+  // Round 1 low: fill EVERY key-addressed field with a sentinel the server
+  // would visibly honour if it ever saw it. The selection arm must discard all
+  // of them -- "no object key on the wire" is only a real claim when there was
+  // an object key to drop.
+  OpenSessionParams params = selectionParams();
+  params.s3_keys = {"sentinel/should-never-reach-the-wire.mcap"};
+  params.topic_names = {"/sentinel_topic"};
+  params.start_ns = 1;
+  params.end_ns = 2;
+  params.include_latched = true;
+
   SessionInfo info;
   std::string error;
-  ASSERT_TRUE(conn.openSessionFresh(selectionParams(), &info, &error)) << error;
+  ASSERT_TRUE(conn.openSessionFresh(params, &info, &error)) << error;
   const SessionStats stats =
       conn.downloadSession(info, [](const mcap_cloud::DecodedMessage&) -> bool { return true; });
   ASSERT_EQ(stats.eos, SessionEos::Complete) << stats.error;
+  // The sentinel window [1,2) holds nothing; a COMPLETE stream over the FROZEN
+  // window proves the client's window was ignored, not merely absent.
+  EXPECT_GT(stats.messages_received, 0u)
+      << "the client-side window leaked into the open";
 
   // Every ClientMessage field that can carry an object key: OpenFresh.s3_keys,
   // GetFileRequest.s3_key, UpdateTagsRequest.s3_key. None may appear.
@@ -205,6 +220,13 @@ TEST(McapCloudSelectionOpenLive, SendsNoObjectKeyOnTheWire) {
   const auto frames = wire.parsed();
   ASSERT_FALSE(frames.empty()) << "the observer saw no frames at all";
   for (const auto& message : frames) {
+    // Byte-level: the sentinel key never appears anywhere in any frame.
+    std::string bytes;
+    ASSERT_TRUE(message.SerializeToString(&bytes));
+    EXPECT_EQ(bytes.find("sentinel/should-never-reach-the-wire.mcap"), std::string::npos)
+        << "a client-supplied object key reached the wire";
+    EXPECT_EQ(bytes.find("/sentinel_topic"), std::string::npos)
+        << "a client-supplied topic reached the wire";
     EXPECT_FALSE(message.has_get_file()) << "GetFile addresses an object by key";
     EXPECT_FALSE(message.has_update_tags()) << "UpdateTags addresses an object by key";
     if (!message.has_open_session()) {

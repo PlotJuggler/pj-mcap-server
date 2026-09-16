@@ -461,6 +461,7 @@ int runDownload(mcap_cloud::BackendConnection& conn, const std::vector<std::stri
   // created. Supplying any of them here would be a second, client-side opinion
   // about what the selection is, which is the race it exists to close.
   if (!selection_id.empty()) {
+    // Defensive: main() already refused this combination before connecting.
     if (!sequence_names.empty() || !topics.empty() || start_ns.has_value() || end_ns.has_value() ||
         include_latched) {
       std::cerr << "download: --selection takes no <sequence-name>, --topics, --time-range or "
@@ -1028,12 +1029,27 @@ int main(int argc, char** argv) {
 
   std::optional<std::int64_t> start_ns;
   std::optional<std::int64_t> end_ns;
+  // v3: --selection belongs to `download` alone. Elsewhere it would silently
+  // turn an ordinary browse command into a protocol-3 Hello (round 1 low).
+  if (!selection_id.empty() && command != "download") {
+    std::cerr << "error: --selection is only valid for 'download'\n";
+    printUsage(std::cerr);
+    return kExitUsage;
+  }
   if (command == "download") {
     // v3: --selection REPLACES the sequence names (the server owns the
     // membership), so exactly one of the two addressing modes must be present.
     if (positionals.empty() && selection_id.empty()) {
       std::cerr << "error: 'download' requires a <sequence-name> or --selection ID\n";
       printUsage(std::cerr);
+      return kExitUsage;
+    }
+    // Incompatible options are a usage error, decided BEFORE any socket opens:
+    // a request that can never be sent must not cost a connection first.
+    if (!selection_id.empty() &&
+        (!positionals.empty() || !topics_csv.empty() || !time_range_csv.empty() || include_latched)) {
+      std::cerr << "error: --selection takes no <sequence-name>, --topics, --time-range or "
+                   "--latched (the server owns all of them)\n";
       return kExitUsage;
     }
     if (output.empty()) {
