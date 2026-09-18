@@ -27,6 +27,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -41,9 +42,22 @@ namespace pj_cloud::v1 {
 class ServerMessage;
 class ClientMessage;
 class Hello;
+class HelloResponse;
 }  // namespace pj_cloud::v1
 
 namespace mcap_cloud {
+
+// The ONE v3 feature this client understands (proto/pj_cloud.proto Hello.features).
+// Opaque on the wire; requested per open, never globally.
+inline constexpr const char* kOpenSelectionFeature = "open-selection/v3";
+
+// The typed refusal when a selection open meets a server that did not
+// negotiate that feature. Named (not formatted at the failure site) so callers
+// and tests can compare it exactly: this is a REFUSAL, not a transport error,
+// and it must never be mistaken for one that a retry or a fallback could fix.
+inline constexpr const char* kOpenSelectionUnsupportedError =
+    "this server did not negotiate \"open-selection/v3\"; a frozen selection cannot be opened "
+    "here, and this client will not fall back to sending object keys";
 
 // Page size requested for every ListFiles page.
 //
@@ -238,6 +252,21 @@ class BackendConnection {
   // -------------------------------------------------------------------------
 
 
+  // v3 (T8b), per-open negotiation. Call BEFORE connect() when this connection
+  // will open a FROZEN SELECTION: the Hello then declares protocol_version 3
+  // and lists "open-selection/v3", and the server answers with the
+  // intersection. A connection that never calls this is a v2 client on the
+  // wire, byte-for-byte — which is what keeps the pinned legacy Go server
+  // (which rejects any version but 2 outright) working unchanged. The flag is
+  // sticky for the connection's lifetime so the resume path's re-handshake
+  // negotiates the same feature the server re-validates the selection against.
+  void requestOpenSelectionFeature() { request_open_selection_ = true; }
+
+  // Was `feature` in HelloResponse.features — i.e. in the server's INTERSECTION
+  // with what this client asked for? A feature absent here is unavailable: the
+  // request that needs it fails, and never degrades to a v2 shape.
+  [[nodiscard]] bool hasNegotiatedFeature(std::string_view feature) const;
+
   // OpenSessionRequest{fresh}: open a streaming session over the given file_ids
   // (time-ordered), an optional topic subset (empty = all union topics), and an
   // optional time window. On success fills *info with the subscription handle +
@@ -246,6 +275,12 @@ class BackendConnection {
   // reason). An EMPTY plan (no surviving topic / empty range) is NOT a failure:
   // *info comes back with zeroed estimates + empty maps and the immediately
   // following Eos{COMPLETE} is consumed by the next downloadSession() call.
+  //
+  // v3 (T8b): when params.selection_id is non-empty this sends
+  // OpenSessionRequest{selection} instead — an opaque id, no keys, no versions
+  // — and requires "open-selection/v3" in the negotiated set. Without it the
+  // call fails with kOpenSelectionUnsupportedError BEFORE anything reaches the
+  // wire; there is no fallback to the key-addressed shape.
   [[nodiscard]] bool openSessionFresh(const OpenSessionParams& params, SessionInfo* info, std::string* error);
 
   // The callback the download loop invokes for each decoded message, in stream
@@ -295,6 +330,16 @@ class BackendConnection {
   // against a real server. Reset after firing once so subsequent (resumed)
   // attempts complete normally. NOT used in production paths.
   void testForceDropAfterBatches(unsigned n) { test_drop_after_ = n; }
+
+  // TEST-ONLY observability: called with the SERIALIZED bytes of every
+  // ClientMessage this connection puts on the wire, on the sending thread,
+  // before the send. The live selection suite uses it to assert what the
+  // plugin did NOT send (no OpenFresh, no GetFile, no object key anywhere) —
+  // a claim the client cannot otherwise make about its own wire. Set once
+  // before connect(); never set in production paths.
+  void testSetOutboundFrameObserver(std::function<void(const std::string&)> observer) {
+    outbound_observer_ = std::move(observer);
+  }
 
   // TEST-ONLY: drive openSessionResume() directly (e.g. with a bogus
   // subscription_id) to assert the verbatim RESUME_NOT_POSSIBLE handling without
@@ -397,6 +442,10 @@ class BackendConnection {
   // can't drift (Codex review).
   void fillHello(pj_cloud::v1::Hello* hello) const;
 
+  // Record HelloResponse.features -- the server's INTERSECTION with what this
+  // client asked for. Called from connect() AND reconnectAndHello().
+  void parseNegotiatedFeatures(const pj_cloud::v1::HelloResponse& response);
+
   std::uint64_t nextRequestId();
 
   std::string uri_;        // raw user URI (ws:// or wss://); /api/ws is appended on connect
@@ -419,6 +468,21 @@ class BackendConnection {
   // existing convention). nullopt when the server omits the field
   // (has_capabilities()==false).
   std::optional<ServerCaps> server_caps_;
+  // v3: this client's request (sticky, set before connect) and the server's
+  // answer. UNLIKE version_/backend_caps_/server_caps_ the negotiated set IS
+  // refreshed by reconnectAndHello(): a stale "yes" from a previous socket
+  // would let a later open pass the client-side guard on a connection that
+  // never negotiated the feature, which is the one thing the guard exists to
+  // prevent. Worker-thread only, like every other member here.
+  bool request_open_selection_ = false;
+  std::vector<std::string> negotiated_features_;
+  // Set by openSessionFresh: the ACTIVE session was opened from a frozen
+  // selection, so every resume of it must re-negotiate the feature (the server
+  // re-validates the selection on each resume). Worker-thread only, like the
+  // rest of the session state.
+  bool session_from_selection_ = false;
+  // TEST-ONLY outbound frame observer (see testSetOutboundFrameObserver).
+  std::function<void(const std::string&)> outbound_observer_;
 
   static constexpr std::chrono::seconds kRequestTimeout{10};
   // OpenSession/OpenResume only: the server answers AFTER loading every

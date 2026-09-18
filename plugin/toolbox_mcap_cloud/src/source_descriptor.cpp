@@ -12,16 +12,19 @@ namespace mcap_cloud {
 
 namespace {
 
-constexpr const char* kKind = "mcap-cloud-session";
-
-// The complete field allowlist — a descriptor carrying ANYTHING else (a
-// token, a cert path, a future field) is rejected outright rather than
+// The complete field allowlist PER KIND — a descriptor carrying ANYTHING else
+// (a token, a cert path, a future field) is rejected outright rather than
 // silently ignored: unknown fields are the credential-smuggling and
-// forward-compat hazard the spec's §7 layer 1 closes.
-constexpr const char* kAllowedFields[] = {"v",        "kind",     "server_uri",
+// forward-compat hazard the spec's §7 layer 1 closes. The lists are disjoint
+// apart from the four shared fields, so the OTHER kind's fields are simply
+// unknown here — that is how a selection descriptor rejects s3_keys (T8b): the
+// client-supplied-key shape must not ride along beside a server-resolved id.
+constexpr const char* kSessionFields[] = {"v",        "kind",     "server_uri",
                                           "s3_keys",  "topics",   "start_ns",
                                           "end_ns",   "include_latched",
                                           "display_name"};
+constexpr const char* kSelectionFields[] = {"v", "kind", "server_uri", "selection_id",
+                                            "display_name"};
 
 bool fail(std::string* error, std::string message) {
   if (error != nullptr) {
@@ -159,23 +162,6 @@ std::optional<SourceDescriptor> parseSourceDescriptor(std::string_view json,
     return std::nullopt;
   }
 
-  // Allowlist BEFORE field extraction: an unknown field is rejected even when
-  // everything required is present and valid.
-  for (const auto& [key, value] : obj.items()) {
-    (void)value;
-    bool allowed = false;
-    for (const char* candidate : kAllowedFields) {
-      if (key == candidate) {
-        allowed = true;
-        break;
-      }
-    }
-    if (!allowed) {
-      fail(error, "unknown field \"" + key + "\"");
-      return std::nullopt;
-    }
-  }
-
   SourceDescriptor d;
 
   const auto v_it = obj.find("v");
@@ -197,18 +183,69 @@ std::optional<SourceDescriptor> parseSourceDescriptor(std::string_view json,
   }
   d.version = 1;
 
+  // The kind selects the field allowlist, so it is read BEFORE the allowlist
+  // sweep; everything after that is kind-dependent.
   if (!takeString(obj, "kind", &d.kind, error)) {
     return std::nullopt;
   }
-  if (d.kind != kKind) {
-    fail(error, "unsupported kind \"" + d.kind + "\" (expected \"" + kKind + "\")");
+  const bool is_selection = (d.kind == kSelectionKind);
+  if (!is_selection && d.kind != kSessionKind) {
+    fail(error, "unsupported kind \"" + d.kind + "\" (expected \"" + kSessionKind +
+                    "\" or \"" + kSelectionKind + "\")");
     return std::nullopt;
+  }
+
+  // Allowlist BEFORE the remaining field extraction: an unknown field is
+  // rejected even when everything required is present and valid.
+  for (const auto& [key, value] : obj.items()) {
+    (void)value;
+    bool allowed = false;
+    if (is_selection) {
+      for (const char* candidate : kSelectionFields) {
+        if (key == candidate) {
+          allowed = true;
+          break;
+        }
+      }
+    } else {
+      for (const char* candidate : kSessionFields) {
+        if (key == candidate) {
+          allowed = true;
+          break;
+        }
+      }
+    }
+    if (!allowed) {
+      fail(error, "unknown field \"" + key + "\" for kind \"" + d.kind + "\"");
+      return std::nullopt;
+    }
   }
 
   if (!takeString(obj, "server_uri", &d.server_uri, error) ||
       !validateServerUri(d.server_uri, error)) {
     return std::nullopt;
   }
+
+  // display_name is optional for BOTH kinds: the canonical form omits it, and
+  // a canonical string must itself parse (dedup/cache comparison feeds it back
+  // in).
+  if (obj.contains("display_name") && !takeString(obj, "display_name", &d.display_name, error)) {
+    return std::nullopt;
+  }
+
+  // ---- the selection kind (v3): an opaque id and nothing else -------------
+  if (is_selection) {
+    if (!takeString(obj, "selection_id", &d.selection_id, error)) {
+      return std::nullopt;
+    }
+    if (d.selection_id.empty()) {
+      fail(error, "selection_id must not be empty");
+      return std::nullopt;
+    }
+    return d;
+  }
+
+  // ---- the session kind (v2, unchanged) -----------------------------------
   if (!takeStringArray(obj, "s3_keys", kMaxKeys, &d.s3_keys, error) ||
       !takeStringArray(obj, "topics", kMaxTopics, &d.topics, error)) {
     return std::nullopt;
@@ -253,14 +290,6 @@ std::optional<SourceDescriptor> parseSourceDescriptor(std::string_view json,
   }
   d.include_latched = latched_it->get<bool>();
 
-  // display_name is optional: the canonical form omits it, and a canonical
-  // string must itself parse (dedup/cache comparison feeds it back in).
-  if (obj.contains("display_name")) {
-    if (!takeString(obj, "display_name", &d.display_name, error)) {
-      return std::nullopt;
-    }
-  }
-
   // "0"/"0" is the whole-range sentinel; any other end < start is nonsense.
   if (d.end_ns < d.start_ns) {
     fail(error, "end_ns " + std::to_string(d.end_ns) + " is before start_ns " +
@@ -275,6 +304,19 @@ std::string canonicalSourceDescriptorJson(const SourceDescriptor& d) {
   // order below IS the cross-repo contract (vectors file), never an artifact
   // of map ordering. display_name is deliberately absent (identity excludes
   // it: a rename is not a collision).
+  //
+  // The selection kind's four fields are exactly the bytes the v3 server emits
+  // (pj-data-platform crates/platform/src/web.rs selection_descriptor()), so a
+  // layout's <materialize> CDATA and the identity computed here agree by
+  // construction rather than by convention.
+  if (d.kind == kSelectionKind) {
+    nlohmann::ordered_json sel;
+    sel["kind"] = d.kind;
+    sel["selection_id"] = d.selection_id;
+    sel["server_uri"] = d.server_uri;
+    sel["v"] = d.version;
+    return sel.dump();
+  }
   nlohmann::ordered_json j;
   j["end_ns"] = std::to_string(d.end_ns);
   j["include_latched"] = d.include_latched;
@@ -295,6 +337,15 @@ std::string descriptorIdentity(const SourceDescriptor& d) {
 std::string toSourceDescriptorJson(const SourceDescriptor& d) {
   // Canonical fields + display_name, still in alphabetical insert order
   // ("display_name" sorts first).
+  if (d.kind == kSelectionKind) {
+    nlohmann::ordered_json sel;
+    sel["display_name"] = d.display_name;
+    sel["kind"] = d.kind;
+    sel["selection_id"] = d.selection_id;
+    sel["server_uri"] = d.server_uri;
+    sel["v"] = d.version;
+    return sel.dump();
+  }
   nlohmann::ordered_json j;
   j["display_name"] = d.display_name;
   j["end_ns"] = std::to_string(d.end_ns);

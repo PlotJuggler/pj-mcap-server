@@ -36,6 +36,10 @@ namespace {
 // peer fails cleanly at the Hello handshake (ERROR_PROTOCOL_VERSION).
 constexpr std::uint32_t kProtocolVersion = 2;
 
+// v3 (T8b): the version a SELECTION-backed open declares, alongside
+// Hello.features. Never sent for anything else -- see fillHello().
+constexpr std::uint32_t kSelectionProtocolVersion = 3;
+
 // The canonical wire mounts the WebSocket at /api/ws on top of the user's host
 // URI. Accept ws:// and wss://; append the path (avoiding a double slash if the
 // user already typed a trailing one).
@@ -123,7 +127,17 @@ std::uint64_t BackendConnection::nextRequestId() {
 }
 
 void BackendConnection::fillHello(pj_cloud::v1::Hello* hello) const {
-  hello->set_protocol_version(kProtocolVersion);
+  // The version is chosen PER OPEN (T8b). A session descriptor keeps saying 2,
+  // because the pinned legacy Go server rejects any other version outright
+  // (server/internal/ws/server.go:585) -- that per-open choice IS the whole
+  // v2-compatibility story, so kProtocolVersion is NOT bumped globally. Only a
+  // selection-backed connection declares 3 and lists the additive feature; the
+  // v3 server gates the feature set on the version, so both must move together.
+  hello->set_protocol_version(request_open_selection_ ? kSelectionProtocolVersion
+                                                      : kProtocolVersion);
+  if (request_open_selection_) {
+    hello->add_features(kOpenSelectionFeature);
+  }
   hello->set_auth_token(api_key_);
   // Opt into the compressed-envelope path: advertise the response encodings this
   // client can decode. The server wraps allowlisted RPC responses only when it
@@ -221,6 +235,9 @@ bool BackendConnection::sendAndWait(pj_cloud::v1::ClientMessage& request, pj_clo
     pending_[request_id] = Pending{};
   }
 
+  if (outbound_observer_) {
+    outbound_observer_(payload);
+  }
   const auto send_info = socket_->sendBinary(payload);
   if (!send_info.success) {
     std::lock_guard<std::mutex> lock(mu_);
@@ -438,6 +455,7 @@ bool BackendConnection::connect(std::string* error_out) {
   // updateTags() past its gate).
   backend_caps_.reset();
   server_caps_.reset();
+  parseNegotiatedFeatures(response.hello_response());
   // Parse the optional BackendCapabilities (HelloResponse.backend). Absent when
   // the server omits it (has_backend()==false): leave backend_caps_ at nullopt.
   if (response.hello_response().has_backend()) {
@@ -790,6 +808,9 @@ bool BackendConnection::sendFrame(const pj_cloud::v1::ClientMessage& request) {
       return false;
     }
   }
+  if (outbound_observer_) {
+    outbound_observer_(payload);
+  }
   return socket_->sendBinary(payload).success;
 }
 
@@ -823,8 +844,19 @@ bool BackendConnection::openSessionFresh(const OpenSessionParams& params, Sessio
     set_error("not connected");
     return false;
   }
-  if (params.s3_keys.empty()) {
+  const bool selection_open = !params.selection_id.empty();
+  // The empty-selection guard is the KEY-ADDRESSED path's: a selection open
+  // has no keys by construction, and firing here would refuse the v3 shape for
+  // the exact reason it exists.
+  if (!selection_open && params.s3_keys.empty()) {
     set_error("no recordings selected for session");
+    return false;
+  }
+  // v3 (T8b): an un-negotiated feature FAILS, here, before anything reaches
+  // the wire -- no fallback to client-supplied keys (the server refuses the
+  // same way, so this is a fast, named refusal rather than a new rule).
+  if (selection_open && !hasNegotiatedFeature(kOpenSelectionFeature)) {
+    set_error(kOpenSelectionUnsupportedError);
     return false;
   }
 
@@ -832,21 +864,32 @@ bool BackendConnection::openSessionFresh(const OpenSessionParams& params, Sessio
   // the server resolves them in its CURRENT catalog generation, so no local
   // name->file_id index (nor its freshness) is involved. An unknown key comes
   // back as a verbatim ERROR_NOT_FOUND naming the key.
+  //
+  // Selection-addressed OpenSelection (wire v3): ONLY the opaque id. The server
+  // already froze the membership (sources and their exact object versions), the
+  // topics and the half-open window when the selection was created, and it
+  // re-authorizes and re-resolves them in one catalog snapshot at open time --
+  // so every other field of params is deliberately ignored here rather than
+  // echoed back as a second, client-side opinion about what the window is.
   pj_cloud::v1::ClientMessage request;
   auto* open = request.mutable_open_session();
-  auto* fresh = open->mutable_fresh();
-  for (const auto& key : params.s3_keys) {
-    fresh->add_s3_keys(key);
+  if (selection_open) {
+    open->mutable_selection()->set_selection_id(params.selection_id);
+  } else {
+    auto* fresh = open->mutable_fresh();
+    for (const auto& key : params.s3_keys) {
+      fresh->add_s3_keys(key);
+    }
+    for (const auto& topic : params.topic_names) {
+      fresh->add_topic_names(topic);
+    }
+    if (params.start_ns.has_value() && params.end_ns.has_value()) {
+      auto* tr = fresh->mutable_time_range();
+      tr->set_start_ns(*params.start_ns);
+      tr->set_end_ns(*params.end_ns);
+    }
+    fresh->set_include_latched(params.include_latched);
   }
-  for (const auto& topic : params.topic_names) {
-    fresh->add_topic_names(topic);
-  }
-  if (params.start_ns.has_value() && params.end_ns.has_value()) {
-    auto* tr = fresh->mutable_time_range();
-    tr->set_start_ns(*params.start_ns);
-    tr->set_end_ns(*params.end_ns);
-  }
-  fresh->set_include_latched(params.include_latched);
 
   // Arm the session inbox BEFORE sending: the server may begin pumping batches
   // (request_id==0) immediately after the OpenSessionResponse, and that response
@@ -855,6 +898,7 @@ bool BackendConnection::openSessionFresh(const OpenSessionParams& params, Sessio
   {
     std::lock_guard<std::mutex> lock(mu_);
     session_active_ = true;
+    session_from_selection_ = selection_open;  // the resume guard reads this
     session_subscription_id_ = 0;
     session_inbox_.clear();
     // cancel_requested_ is deliberately NOT reset here: cancelSession() latches
@@ -1187,7 +1231,22 @@ bool BackendConnection::reconnectAndHello(std::string* error_out) {
     }
     return false;
   }
+  // Unlike version_/backend_caps_/server_caps_ (deliberately NOT refreshed on
+  // the resume re-handshake), the negotiated feature set IS re-read here: this
+  // is a NEW connection to a possibly DIFFERENT peer, and carrying a stale
+  // "yes" forward would let a later selection open pass the client-side guard
+  // on a socket that never negotiated the feature.
+  parseNegotiatedFeatures(response.hello_response());
   return true;
+}
+
+void BackendConnection::parseNegotiatedFeatures(const pj_cloud::v1::HelloResponse& response) {
+  negotiated_features_.assign(response.features().begin(), response.features().end());
+}
+
+bool BackendConnection::hasNegotiatedFeature(std::string_view feature) const {
+  return std::find(negotiated_features_.begin(), negotiated_features_.end(), feature) !=
+         negotiated_features_.end();
 }
 
 bool BackendConnection::openSessionResume(std::uint64_t subscription_id, std::uint64_t resume_after_seq,
@@ -1202,6 +1261,20 @@ bool BackendConnection::openSessionResume(std::uint64_t subscription_id, std::ui
   };
   if (!socket_) {
     set_error("not connected");
+    return false;
+  }
+  // T8b review round 1, MEDIUM: reconnectAndHello() re-negotiates against what
+  // may be a DIFFERENT peer, and it REFRESHES negotiated_features_. A
+  // selection-backed session must be re-validated on every resume, and that
+  // re-validation needs the feature on THIS connection -- so a peer that
+  // dropped it is refused here, before the frame goes out. Flagged as a server
+  // REJECTION so the caller fails cleanly instead of burning the reconnect
+  // budget: no number of retries puts a missing feature back.
+  if (session_from_selection_ && !hasNegotiatedFeature(kOpenSelectionFeature)) {
+    set_error(kOpenSelectionUnsupportedError);
+    if (rejected != nullptr) {
+      *rejected = true;
+    }
     return false;
   }
 

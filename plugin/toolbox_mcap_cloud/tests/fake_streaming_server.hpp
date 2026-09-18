@@ -60,13 +60,24 @@ class FakeStreamingServer {
     kStallAfterTwoBatches,
     kEmptyPlan,
     kCompleteEmpty,
+    // T8b: one batch, then the socket is CLOSED with no Eos -- the resumable
+    // transport drop that drives the client's automatic reconnect + OpenResume.
+    kDropAfterOneBatch,
     // kComplete plus a flood of empty Progress control frames BETWEEN the
     // last batch and the Eos — the F6 shape: bytes beyond the last message
     // that only a FINAL cumulative ceiling check can observe.
     kCompleteWithProgressFlood,
   };
 
-  explicit FakeStreamingServer(Mode mode) : mode_(mode), port_(findFreePort()), server_(port_, "127.0.0.1") {
+  // `offer_selection_feature` makes this a v3 peer: it answers Hello with the
+  // INTERSECTION of the client's features and {"open-selection/v3"}. Left at
+  // its default the fake is a v2 peer -- it echoes no features at all, which is
+  // the pinned legacy server's behaviour.
+  explicit FakeStreamingServer(Mode mode, bool offer_selection_feature = false)
+      : mode_(mode),
+        offer_selection_feature_(offer_selection_feature),
+        port_(findFreePort()),
+        server_(port_, "127.0.0.1") {
     server_.setOnClientMessageCallback([this](std::shared_ptr<ix::ConnectionState>,
                                               ix::WebSocket& ws,
                                               const ix::WebSocketMessagePtr& msg) {
@@ -78,14 +89,40 @@ class FakeStreamingServer {
         return;
       }
       if (request.has_hello()) {
+        const int hello_index = hellos_.fetch_add(1);
         pj_cloud::v1::ServerMessage response;
         response.set_request_id(request.request_id());
-        response.mutable_hello_response()->set_server_version("test-fake-1.0");
+        auto* hello_response = response.mutable_hello_response();
+        hello_response->set_server_version("test-fake-1.0");
+        // The RECONNECT handshake may deliberately drop the feature: that is
+        // the peer-downgrade shape the client must refuse locally instead of
+        // putting a selection resume on the wire.
+        const bool offer = offer_selection_feature_ &&
+                           !(drop_feature_after_first_hello_ && hello_index > 0);
+        if (offer) {
+          for (const auto& feature : request.hello().features()) {
+            if (feature == "open-selection/v3") {
+              hello_response->add_features(feature);
+            }
+          }
+        }
         send(ws, response);
         return;
       }
       if (!request.has_open_session()) {
         return;  // acks/cancels need no reply here
+      }
+      if (request.open_session().has_resume()) {
+        // Counted and IGNORED: the T8b resume cases assert only WHETHER an
+        // OpenResume reached the wire.
+        resume_opens_.fetch_add(1);
+        return;
+      }
+      if (request.open_session().has_selection()) {
+        selection_opens_.fetch_add(1);
+        last_selection_id_ = request.open_session().selection().selection_id();
+      } else {
+        fresh_opens_.fetch_add(1);
       }
       open_sessions_.fetch_add(1);
       pj_cloud::v1::ServerMessage response;
@@ -112,7 +149,9 @@ class FakeStreamingServer {
       }
       const int batches = (mode_ == Mode::kComplete || mode_ == Mode::kCompleteWithProgressFlood)
                               ? kFakeBatches
-                              : (mode_ == Mode::kCompleteEmpty ? 0 : 2);
+                              : (mode_ == Mode::kCompleteEmpty      ? 0
+                                 : mode_ == Mode::kDropAfterOneBatch ? 1
+                                                                     : 2);
       std::uint64_t sent = 0;
       for (int b = 0; b < batches; ++b) {
         pj_cloud::v1::ServerMessage frame;
@@ -155,6 +194,9 @@ class FakeStreamingServer {
         eos->set_total_bytes_sent(sent * kFakePayloadBytes);
         send(ws, eos_frame);
       }
+      if (mode_ == Mode::kDropAfterOneBatch) {
+        ws.close();  // no Eos: a RESUMABLE transport drop, not a terminal
+      }
       // kStallAfterTwoBatches: silence — the client's cancel wakes the wait.
     });
     auto res = server_.listen();
@@ -171,6 +213,16 @@ class FakeStreamingServer {
   [[nodiscard]] bool ok() const { return ok_; }
   [[nodiscard]] std::string uri() const { return "ws://127.0.0.1:" + std::to_string(port_); }
   [[nodiscard]] int openSessions() const { return open_sessions_.load(); }
+  [[nodiscard]] int freshOpens() const { return fresh_opens_.load(); }
+  [[nodiscard]] int selectionOpens() const { return selection_opens_.load(); }
+  [[nodiscard]] int resumeOpens() const { return resume_opens_.load(); }
+  [[nodiscard]] int hellos() const { return hellos_.load(); }
+  // Written on the server thread before the OpenSessionResponse is sent; read
+  // after the corresponding blocking client call has returned.
+  [[nodiscard]] std::string lastSelectionId() const { return last_selection_id_; }
+  // Offer the feature on the FIRST Hello only, so the automatic reconnect
+  // re-handshakes against a peer that no longer has it.
+  void dropFeatureAfterFirstHello() { drop_feature_after_first_hello_ = true; }
 
  private:
   static void send(ix::WebSocket& ws, const pj_cloud::v1::ServerMessage& message) {
@@ -180,10 +232,17 @@ class FakeStreamingServer {
   }
 
   Mode mode_;
+  bool offer_selection_feature_ = false;
+  std::atomic<bool> drop_feature_after_first_hello_{false};
   int port_;
   ix::WebSocketServer server_;
   bool ok_ = false;
   std::atomic<int> open_sessions_{0};
+  std::atomic<int> fresh_opens_{0};
+  std::atomic<int> selection_opens_{0};
+  std::atomic<int> resume_opens_{0};
+  std::atomic<int> hellos_{0};
+  std::string last_selection_id_;
 };
 
 // The tuple the worker sends -> the descriptor identity it must tee under.
@@ -213,6 +272,20 @@ inline mcap_cloud::SourceDescriptor descriptorFor(const std::string& uri,
   d.start_ns = 0;
   d.end_ns = 0;
   d.include_latched = true;
+  d.display_name = display_name;
+  return d;
+}
+
+// T8b: the SELECTION descriptor the provider imports -- an opaque id and the
+// server URI, no object keys at all.
+inline mcap_cloud::SourceDescriptor selectionDescriptorFor(const std::string& uri,
+                                                           const std::string& selection_id,
+                                                           const std::string& display_name = {}) {
+  mcap_cloud::SourceDescriptor d;
+  d.version = 1;
+  d.kind = mcap_cloud::kSelectionKind;
+  d.server_uri = uri;
+  d.selection_id = selection_id;
   d.display_name = display_name;
   return d;
 }

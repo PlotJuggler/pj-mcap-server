@@ -59,11 +59,17 @@ struct SessionKey {
   // dataset serve a true-latched request (and promote the wrong artifact
   // over it).
   bool include_latched{false};
+  // T8b: set ONLY for a v3 selection-backed session, where the server owns the
+  // membership and the client holds no object keys at all. Its own field, not
+  // a synthetic sequence_name, so a selection can never alias a key-addressed
+  // session whose object key is spelled like the id. Empty for every v2 key.
+  std::string selection_id;
   std::uint64_t hash{0};            // FNV-1a over the canonical encoding
 
   bool operator==(const SessionKey& o) const {
     return server_uri == o.server_uri && sequence_names == o.sequence_names && topics == o.topics &&
-           start_ns == o.start_ns && end_ns == o.end_ns && include_latched == o.include_latched;
+           start_ns == o.start_ns && end_ns == o.end_ns && include_latched == o.include_latched &&
+           selection_id == o.selection_id;
   }
   bool operator!=(const SessionKey& o) const { return !(*this == o); }
 };
@@ -131,6 +137,19 @@ inline SessionKey computeSessionKey(const std::string& server_uri, std::vector<s
   key.end_ns = time_range.end_ns;
   key.include_latched = include_latched;
   key.hash = h;
+  return key;
+}
+
+// T8b: the key for a v3 selection-backed session. There are no object keys,
+// topics or window to normalize — the server froze all three when the
+// selection was created — so the selection id IS the logical selection. The id
+// is mixed AFTER the v2 encoding, which leaves every existing key's hash and
+// equality byte-for-byte unchanged (an empty selection_id is never mixed).
+inline SessionKey computeSelectionSessionKey(const std::string& server_uri,
+                                             const std::string& selection_id) {
+  SessionKey key = computeSessionKey(server_uri, {}, {}, TimeRangeNs{}, /*include_latched=*/false);
+  key.selection_id = selection_id;
+  detail::fnvStr(key.hash, selection_id);
   return key;
 }
 

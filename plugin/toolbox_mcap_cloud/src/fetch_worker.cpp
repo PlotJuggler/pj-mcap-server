@@ -1633,7 +1633,14 @@ PullResult FetchWorker::pull(PullRequest request) {
   // exception before the tee captures it restores under the ticket by
   // member-destruction order alone.
 
-  if (request.sequence_names.empty()) {
+  // T8b review round 1, HIGH: BOTH guards below are the KEY-ADDRESSED path's.
+  // A selection-backed pull carries no object keys BY CONSTRUCTION -- the
+  // descriptor kind has no s3_keys field and the server owns the membership --
+  // so an unconditional emptiness check here rejected every desktop selection
+  // import before it could reach the negotiation, and `.front()` had nothing to
+  // take. The selection id is the identity in both roles.
+  const bool selection_pull = !request.selection_id.empty();
+  if (!selection_pull && request.sequence_names.empty()) {
     result.error = "empty selection (no s3 keys)";
     return result;
   }
@@ -1642,7 +1649,7 @@ PullResult FetchWorker::pull(PullRequest request) {
     return result;
   }
   if (request.group_name.empty()) {
-    request.group_name = request.sequence_names.front();
+    request.group_name = selection_pull ? request.selection_id : request.sequence_names.front();
   }
   auto cancelled_now = [this]() { return cancel_flag_.load(std::memory_order_relaxed); };
   auto finish_cancelled = [&result]() {
@@ -1706,6 +1713,13 @@ PullResult FetchWorker::pull(PullRequest request) {
     result.error = "failed to create session connection";
     return result;
   }
+  // v3 (T8b): a selection-backed pull declares the feature at Hello, BEFORE
+  // connect(). The flag is sticky, so the resume path's re-handshake
+  // negotiates it again -- which is what lets the server re-validate the
+  // selection on every resume.
+  if (!request.selection_id.empty()) {
+    session_owned->requestOpenSelectionFeature();
+  }
   BackendConnection* session_backend = session_owned.get();
   struct CancelHookGuard {
     FetchWorker* worker;
@@ -1752,6 +1766,7 @@ PullResult FetchWorker::pull(PullRequest request) {
   // DESCRIPTOR: the same field feeds the wire request and the identity the
   // caller computed, so the identity always names the request actually sent.
   OpenSessionParams params;
+  params.selection_id = request.selection_id;  // non-empty => OpenSession{selection}
   params.s3_keys = request.sequence_names;
   params.topic_names = request.topic_names;
   if (request.start_ns != 0 || request.end_ns != 0) {
@@ -2046,9 +2061,16 @@ PullResult FetchWorker::pull(PullRequest request) {
 
   // COMPLETE-only shared SessionCache store (D7) — same suppression rules as
   // the interactive path (decode errors / nothing decodable -> no entry).
-  const PJ::cloud::SessionKey session_key = PJ::cloud::computeSessionKey(
-      request.connection.uri, request.sequence_names, request.topic_names,
-      {request.start_ns, request.end_ns}, request.include_latched);  // F1: the descriptor field keys
+  // T8b: a selection-backed session has no keys, topics or window of its own --
+  // the server froze all three -- so the selection id IS the cache key. Keying
+  // it on the (empty) v2 tuple would collapse EVERY selection on a server into
+  // one entry and serve one frozen window's counts for another.
+  const PJ::cloud::SessionKey session_key =
+      request.selection_id.empty()
+          ? PJ::cloud::computeSessionKey(request.connection.uri, request.sequence_names,
+                                         request.topic_names, {request.start_ns, request.end_ns},
+                                         request.include_latched)  // F1: the descriptor field keys
+          : PJ::cloud::computeSelectionSessionKey(request.connection.uri, request.selection_id);
 
   if (result.terminal == PullTerminal::kComplete && total_decode_errors == 0 && driver.hasDecodable()) {
     storeCompletedSessionEntry(rt->sessionCache(), session_key, request.group_name,

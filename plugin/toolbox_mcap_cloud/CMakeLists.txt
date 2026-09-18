@@ -1411,6 +1411,28 @@ if(BUILD_TESTING)
   )
   add_test(NAME McapCloudServerCapsTest COMMAND toolbox_mcap_cloud_server_caps_test)
 
+  # LIVE v3 frozen-selection open (T8b). Same source set as the caps test above
+  # (BackendConnection + the wire codecs only -- no SDK, no import runtime):
+  # this suite is the WIRE contract of the selection open, not an ingest path.
+  # Self-skips without MCAP_CLOUD_LIVE_URL + MCAP_CLOUD_LIVE_SELECTION_ID.
+  add_executable(toolbox_mcap_cloud_selection_open_live_test
+    tests/selection_open_live_test.cpp
+    src/backend_connection.cpp
+    src/wire_mapping.cpp
+    src/session_decode.cpp
+    ${MCAP_CLOUD_PROTO_SRCS}
+  )
+  target_compile_features(toolbox_mcap_cloud_selection_open_live_test PRIVATE cxx_std_20)
+  target_include_directories(toolbox_mcap_cloud_selection_open_live_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${MCAP_CLOUD_PROTO_OUT_DIR}
+  )
+  target_link_libraries(toolbox_mcap_cloud_selection_open_live_test PRIVATE
+    protobuf::libprotobuf ixwebsocket::ixwebsocket zstd::libzstd_static LZ4::lz4_static GTest::gtest_main
+  )
+  add_test(NAME McapCloudSelectionOpenLiveTest COMMAND toolbox_mcap_cloud_selection_open_live_test)
+  set_tests_properties(McapCloudSelectionOpenLiveTest PROPERTIES TIMEOUT 180)
+
   # Trusted-origin ledger (HERMETIC): spec §7 guard 1 — trusted = origin
   # recorded after a SUCCESSFUL interactive Hello. Deliberately NOT the
   # credential store (credentials can exist before any successful connect).

@@ -53,6 +53,7 @@
 #include <pj_base/sdk/plugin_data_api.hpp>
 #include <pj_base/sdk/settings_store_host.hpp>
 
+#include "backend_connection.hpp"  // kOpenSelectionUnsupportedError
 #include "descriptor_import_provider.hpp"
 #include "fake_promotion_host.hpp"
 #include "fake_streaming_server.hpp"
@@ -1241,4 +1242,70 @@ TEST(McapCloudProviderJob, ReferencedIdentityRefusalLeavesEveryReferenceIntact) 
   }
   EXPECT_EQ(h.rt.leaseRefs(identity), 3u)
       << "a refused job must not disturb a single reference (F2)";
+}
+
+// -----------------------------------------------------------------------------
+// T8b review round 1, HIGH: the DESKTOP import of a frozen selection. The
+// provider correctly hands FetchWorker::pull a request with NO object keys (a
+// selection descriptor has none by construction), so every guard on the way to
+// the wire must be selection-aware. This drives the WHOLE path the live suite
+// and the CLI bypass -- descriptor_import_provider -> fetch_worker ->
+// backend_connection -> OpenSession{selection} -- against a v3 fake.
+// -----------------------------------------------------------------------------
+
+TEST(McapCloudProviderJob, SelectionDescriptorImportsWithoutObjectKeys) {
+  FakeStreamingServer server(FakeStreamingServer::Mode::kComplete,
+                             /*offer_selection_feature=*/true);
+  ASSERT_TRUE(server.ok());
+  ProviderHarness h("job-selection");
+
+  const mcap_cloud::SourceDescriptor descriptor =
+      mcap_cloud_test::selectionDescriptorFor(server.uri(), "sel-7f3a2b19");
+  const std::string json = mcap_cloud::toSourceDescriptorJson(descriptor);
+
+  JobRecorder recorder;
+  ScopedJob job;
+  ASSERT_TRUE(h.start(json, recorder, job));
+  ASSERT_TRUE(recorder.waitTerminal(std::chrono::seconds(20)));
+  job.job.vtable->join(job.job.ctx);
+
+  ASSERT_EQ(recorder.terminalCount(), 1u);
+  EXPECT_EQ(recorder.terminal(0).first, PJ_DESCRIPTOR_IMPORT_SUCCEEDED_EAGER_ONLY)
+      << recorder.terminal(0).second;
+  ASSERT_EQ(recorder.datasetCount(), 1u) << "on_dataset exactly once";
+
+  // The wire shape, observed server-side: the selection open, never the
+  // key-addressed one.
+  EXPECT_EQ(server.selectionOpens(), 1);
+  EXPECT_EQ(server.freshOpens(), 0) << "a selection import must never send OpenFresh";
+  EXPECT_EQ(server.lastSelectionId(), "sel-7f3a2b19");
+
+  // Materialized under the SELECTION identity (the kind is inside it).
+  fs::path cache_file;
+  EXPECT_TRUE(h.rt.fileCache().lookup(mcap_cloud::descriptorIdentity(descriptor), &cache_file));
+}
+
+// The same path against a v2 peer: the import fails BY NAME rather than falling
+// back to a key-addressed open it has no keys for.
+TEST(McapCloudProviderJob, SelectionDescriptorImportRefusedByAV2Server) {
+  FakeStreamingServer server(FakeStreamingServer::Mode::kComplete,
+                             /*offer_selection_feature=*/false);
+  ASSERT_TRUE(server.ok());
+  ProviderHarness h("job-selection-v2");
+
+  const std::string json = mcap_cloud::toSourceDescriptorJson(
+      mcap_cloud_test::selectionDescriptorFor(server.uri(), "sel-7f3a2b19"));
+
+  JobRecorder recorder;
+  ScopedJob job;
+  ASSERT_TRUE(h.start(json, recorder, job));
+  ASSERT_TRUE(recorder.waitTerminal(std::chrono::seconds(20)));
+  job.job.vtable->join(job.job.ctx);
+
+  ASSERT_EQ(recorder.terminalCount(), 1u);
+  EXPECT_EQ(recorder.terminal(0).first, PJ_DESCRIPTOR_IMPORT_FAILED);
+  EXPECT_NE(recorder.terminal(0).second.find(mcap_cloud::kOpenSelectionUnsupportedError),
+            std::string::npos)
+      << "expected the typed refusal, got: " << recorder.terminal(0).second;
+  EXPECT_EQ(server.openSessions(), 0) << "nothing may reach the wire";
 }

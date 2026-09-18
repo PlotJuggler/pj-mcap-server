@@ -89,3 +89,34 @@ TEST(SessionKeyTest, IncludeLatchedDistinguishesRequests) {
   EXPECT_TRUE(latched_true.include_latched);
   EXPECT_FALSE(latched_false.include_latched);
 }
+
+// T8b: a selection-backed session (v3 OpenSelection) has NO object keys to
+// normalize — the server owns the membership — so the selection id is the
+// logical selection. Two selections must never share a SessionCache entry,
+// and a selection must never alias a key-addressed session whose object key
+// happens to be spelled like the id (the id lives in its OWN field, so the
+// FNV encoding cannot collapse them).
+TEST(McapCloudSessionKeyTest, TwoSelectionsNeverShareASessionCacheEntry) {
+  const SessionKey a = computeSelectionSessionKey("ws://127.0.0.1:18080", "sel-a");
+  const SessionKey b = computeSelectionSessionKey("ws://127.0.0.1:18080", "sel-b");
+  EXPECT_FALSE(a == b);
+  EXPECT_NE(a.hash, b.hash);
+  EXPECT_EQ(a.selection_id, "sel-a");
+  EXPECT_TRUE(a.sequence_names.empty()) << "a selection carries no object keys";
+
+  // Same id, different server: still two sessions.
+  const SessionKey elsewhere = computeSelectionSessionKey("ws://127.0.0.1:18081", "sel-a");
+  EXPECT_FALSE(a == elsewhere);
+  EXPECT_NE(a.hash, elsewhere.hash);
+
+  // The same id repeated IS the same session (the cache must still hit).
+  const SessionKey again = computeSelectionSessionKey("ws://127.0.0.1:18080", "sel-a");
+  EXPECT_TRUE(a == again);
+  EXPECT_EQ(a.hash, again.hash);
+
+  // No aliasing with the key-addressed shape.
+  const SessionKey keyed = computeSessionKey("ws://127.0.0.1:18080", {"sel-a"}, {}, {0, 0}, false);
+  EXPECT_FALSE(a == keyed);
+  EXPECT_NE(a.hash, keyed.hash);
+  EXPECT_TRUE(keyed.selection_id.empty());
+}
